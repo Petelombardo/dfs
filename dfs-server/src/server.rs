@@ -13337,6 +13337,31 @@ impl Server {
         (loc.chunk_id != stale_chunk_id).then_some(loc)
     }
 
+    /// Whether `base` can serve as a patch base on THIS node's evidence alone —
+    /// no leader, no peers, nothing that can be stale-by-propagation.
+    ///
+    /// Two ways to qualify:
+    ///   - local patch_state resolves it (a Pending accumulator is by construction
+    ///     already chained to a real base here; a Folded(real) qualifies when
+    ///     `real`'s bytes are present), or
+    ///   - it has BOTH a registered ChunkLocation and its bytes physically on disk.
+    ///
+    /// Both halves matter for the second case: bytes without a registration are the
+    /// concurrent-supersede signature apply_patch's fresh-accumulator branch already
+    /// rejects, and a registration without bytes is the ghost that guard exists for.
+    /// Used only to decide whether local evidence beats a leader answer already
+    /// proven dead — never to skip a check the leader could have answered correctly.
+    async fn local_base_is_self_sufficient(&self, base: ChunkId) -> bool {
+        match self.metadata.get_patch_state_async(base).await {
+            Ok(Some(PatchState::Pending { .. })) => return true,
+            Ok(Some(PatchState::Folded(real))) => return self.storage.has_chunk(&real),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        matches!(self.metadata.get_chunk_location_async(base).await, Ok(Some(_)))
+            && self.storage.has_chunk(&base)
+    }
+
     /// Self-heal a chunk that's missing locally by pulling it from any online peer
     /// in `candidate_nodes`, verifying content against the chunk's own file-scoped
     /// hash before trusting it, and persisting a local copy on success.
@@ -13497,6 +13522,14 @@ impl Server {
         patches: Vec<(usize, Vec<u8>)>,
         client_write_seq: Option<u64>,
         prefetched: Option<Arc<Vec<u8>>>,
+        // Skip the fresh-accumulator leader-confirmation below because the caller
+        // has ALREADY proven the leader's answer for this slot is unusable — see
+        // handle_multi_patch's ghost-chunk guard, which only sets this after an
+        // authoritative peer round-trip has established that the leader's claimed
+        // current chunk is a patch token no node can resolve. Never set on an
+        // ordinary first attempt: the leader-confirmation is what stops a lagging
+        // replica from silently building on stale-but-physically-present bytes.
+        trust_local_base: bool,
     ) -> Result<(ChunkId, usize, Option<u64>, Option<Arc<Vec<u8>>>, Option<ChunkLocation>), (String, ErrorCode)> {
         let Some(cidx) = chunk_idx else {
             // No stable per-slot key to track a pending patch against — see
@@ -13664,7 +13697,21 @@ impl Server {
                 // leader's. Runs once per fold cycle (a fresh accumulator start,
                 // never a coalesced merge) when it does run, so cost is bounded by
                 // fold frequency, not patch frequency.
-                if !resolved_via_local_fold {
+                //
+                // `trust_local_base` (2026-09-05, VM-108 guest death): the gate above
+                // is `resolved_via_local_fold` alone, which is false for an ordinary
+                // folded chunk that simply has no local patch_state — so a base with a
+                // registered ChunkLocation AND its bytes on disk still deferred to the
+                // leader unconditionally. When the leader's chunk_map is stuck on a
+                // dangling patch token (no patch_state anywhere, no location, no bytes
+                // on any node), that deference rejects a perfectly good local base as
+                // "superseded" on the authority of an answer that resolves to nothing,
+                // and the caller's ghost-chunk retry then fails on the same dead token
+                // — reproducing exactly the livelock this comment says was fixed in
+                // 2026-07-10, just through a different door. The caller sets this only
+                // after proving that dead-token case via an authoritative peer
+                // round-trip; see handle_multi_patch's ghost-chunk guard.
+                if !resolved_via_local_fold && !trust_local_base {
                     if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, base_for_lookup).await {
                         drop(patch_guard);
                         return Err((
@@ -14438,7 +14485,7 @@ impl Server {
         let patch_len = patch_data.len();
         let result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
-            vec![(intra_offset, patch_data)], None, None,
+            vec![(intra_offset, patch_data)], None, None, false,
         ).await;
 
         match result {
@@ -14454,6 +14501,20 @@ impl Server {
                 // the real current location as a retriable ChunkStale instead —
                 // the client's already-bounded retry logic (Gap A/B, fixed earlier
                 // today) handles this cleanly.
+                //
+                // 2026-09-05: `current.chunk_id` here is normally EQUAL to the
+                // incoming chunk_id (the guard rejected the advance, so chunk_map
+                // still holds the base the client patched from). That looks like the
+                // self-referential ChunkStale fixed in the Err arm below, but it is
+                // NOT the same case and must NOT be given the same treatment: this
+                // rejection is keyed on client_write_seq, not identity, and the
+                // client consumes a FRESH next_write_seq on every retry (see
+                // do_multi_patch's patch_client_write_seq, computed inside the retry
+                // loop). So re-sending the "identical" request actually does carry
+                // new information and can legitimately clear the guard within the
+                // retry budget. The Err-arm case has no such escape — nothing about
+                // the request changes there — which is exactly why one is a livelock
+                // and this one is a working, if indirect, recovery.
                 if let Some(current) = chunk_map_rejected {
                     info!("PatchChunk: {} -> {} chunk_map update rejected as stale (current is {}) — \
                            returning ChunkStale instead of false success",
@@ -14509,6 +14570,21 @@ impl Server {
                                 Some(loc) => Some(loc),
                                 None => self.refresh_slot_from_leader(file_id, cidx, chunk_id).await,
                             };
+                            // NOTE (2026-09-05): `loc.chunk_id` here can equal the
+                            // client's own chunk_id, which reads like a no-op "rebase onto
+                            // what you already have". Filtering that case out was tried and
+                            // reverted: this ChunkStale is not only a rebase instruction,
+                            // it is also the RETRIABILITY signal that keeps a transient
+                            // ghost from becoming an immediate guest EIO (the 2026-07-19
+                            // VM-111-install fix above, covered by
+                            // chunk_seq_gap_onto_ghost_base_is_retriable_not_hard_eio).
+                            // Dropping it turns "back off and let healing converge" into a
+                            // hard failure. The genuine livelock this looked like is fixed
+                            // at its source instead — see apply_patch's `trust_local_base`
+                            // and the dead-token fallback in the ghost-chunk guard — plus
+                            // client-side handling that escalates a self-referential
+                            // ChunkStale to RevalidateChunkSlot rather than blindly
+                            // re-sending it (see do_multi_patch's stale_ahead handling).
                             candidate.map(|loc| Response::ChunkStale {
                                 current_chunk_id: loc.chunk_id,
                                 current_nodes: loc.nodes,
@@ -14721,7 +14797,7 @@ impl Server {
         let apply_patch_start = std::time::Instant::now();
         let mut result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
-            patches.clone(), client_write_seq, prefetched.clone(),
+            patches.clone(), client_write_seq, prefetched.clone(), false,
         ).await;
         let apply_patch_elapsed = apply_patch_start.elapsed();
 
@@ -14794,6 +14870,10 @@ impl Server {
                 // extra peer round-trip(s) here are proportionate, not a new cost
                 // category.
                 let mut retry_chunk_id = fresh_loc.chunk_id;
+                // Set only when an authoritative peer round-trip proves the leader's
+                // claimed-current chunk is a patch token NO node can resolve — see the
+                // `None` arm below and the fallback after this match.
+                let mut leader_answer_is_dead_token = false;
                 if fresh_loc.chunk_id.looks_like_patch_token() {
                     match self.resolve_patch_token_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes).await {
                         Some(dfs_common::RemotePatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq: peer_seq }) => {
@@ -14819,11 +14899,50 @@ impl Server {
                             retry_chunk_id = real;
                         }
                         None => {
-                            self.pull_chunk_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await;
+                            // Nobody recognizes it as a token. Per the level-3 comment
+                            // above this is either a long-since-pruned token or the rare
+                            // marker false-positive, so still try the ordinary content
+                            // path — but if that ALSO comes up empty, the leader's answer
+                            // is structurally dead, not merely unfetchable right now: a
+                            // token is a node-local record, so one that no authoritative
+                            // peer holds and whose bytes exist nowhere can never resolve,
+                            // however long we retry.
+                            let pulled = self.pull_chunk_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await;
+                            leader_answer_is_dead_token =
+                                pulled.is_none() && !self.storage.has_chunk(&fresh_loc.chunk_id);
                         }
                     }
                 } else {
                     self.pull_chunk_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await;
+                }
+
+                // 2026-09-05 (VM-108 guest death, chunk_idx 3293/1790): the leader's
+                // answer resolves to nothing at all, so retrying with it is a guaranteed
+                // NotFound — and the Err arm below would then hand the client a
+                // ChunkStale naming the very id it just sent, which it can only answer by
+                // re-sending the identical request. That livelock burned the client's
+                // whole stale-retry budget in ~250ms, dropped it into the fresh-write
+                // reconstruct path, and EIO'd every flush and fsync of a live qcow2 for
+                // 46s until the guest took its root device offline.
+                //
+                // A dead token is not evidence of anything. If our own base is
+                // self-sufficient on local evidence (registered ChunkLocation + bytes
+                // here, or a resolvable local patch_state), prefer it and tell apply_patch
+                // to skip the leader-confirmation that just rejected it — otherwise this
+                // retry re-asks the same wrong leader and fails identically.
+                //
+                // Deliberately NOT extended to a non-token answer that merely failed to
+                // pull: that can be a transient fetch failure, and preferring local state
+                // there would reintroduce the stale-base hazard the leader-confirmation
+                // exists to prevent. Only a token no peer can resolve is conclusive.
+                let mut trust_local_base = false;
+                if leader_answer_is_dead_token && self.local_base_is_self_sufficient(chunk_id).await {
+                    warn!("MultiPatch: leader's current chunk {} for file {} chunk {} is a patch token \
+                           no node can resolve — preferring our own locally-verified base {} rather than \
+                           failing this write on a dead leader answer",
+                        fresh_loc.chunk_id, file_id, cidx, chunk_id);
+                    retry_chunk_id = chunk_id;
+                    trust_local_base = true;
                 }
 
                 let lock = self.chunk_patch_locks
@@ -14833,7 +14952,7 @@ impl Server {
                 let retry_guard = lock.lock_owned().await;
                 result = self.apply_patch(
                     Some(retry_guard), retry_chunk_id, file_id, chunk_idx, chunk_file_offset,
-                    patches, client_write_seq, prefetched,
+                    patches, client_write_seq, prefetched, trust_local_base,
                 ).await;
             }
         }
@@ -14992,6 +15111,21 @@ impl Server {
                                 Some(loc) => Some(loc),
                                 None => self.refresh_slot_from_leader(file_id, cidx, chunk_id).await,
                             };
+                            // NOTE (2026-09-05): `loc.chunk_id` here can equal the
+                            // client's own chunk_id, which reads like a no-op "rebase onto
+                            // what you already have". Filtering that case out was tried and
+                            // reverted: this ChunkStale is not only a rebase instruction,
+                            // it is also the RETRIABILITY signal that keeps a transient
+                            // ghost from becoming an immediate guest EIO (the 2026-07-19
+                            // VM-111-install fix above, covered by
+                            // chunk_seq_gap_onto_ghost_base_is_retriable_not_hard_eio).
+                            // Dropping it turns "back off and let healing converge" into a
+                            // hard failure. The genuine livelock this looked like is fixed
+                            // at its source instead — see apply_patch's `trust_local_base`
+                            // and the dead-token fallback in the ghost-chunk guard — plus
+                            // client-side handling that escalates a self-referential
+                            // ChunkStale to RevalidateChunkSlot rather than blindly
+                            // re-sending it (see do_multi_patch's stale_ahead handling).
                             candidate.map(|loc| Response::ChunkStale {
                                 current_chunk_id: loc.chunk_id,
                                 current_nodes: loc.nodes,
@@ -20156,14 +20290,14 @@ mod tests {
             let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token1, ..) = server.apply_patch(
                 Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off1, data1.to_vec())], Some(seq1), None,
+                vec![(off1, data1.to_vec())], Some(seq1), None, false,
             ).await.expect("first apply_patch should succeed");
 
             let (off2, data2, seq2) = second;
             let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token2, ..) = server.apply_patch(
                 Some(lock2), token1, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off2, data2.to_vec())], Some(seq2), None,
+                vec![(off2, data2.to_vec())], Some(seq2), None, false,
             ).await.expect("second apply_patch (merge) should succeed");
 
             let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");
@@ -20263,7 +20397,7 @@ mod tests {
             let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token1, ..) = server.apply_patch(
                 Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off1, data1.to_vec())], Some(seq1), None,
+                vec![(off1, data1.to_vec())], Some(seq1), None, false,
             ).await.expect("first apply_patch should succeed");
 
             let hits_before = server.materialized_ring_hits.load(std::sync::atomic::Ordering::Relaxed);
@@ -20273,7 +20407,7 @@ mod tests {
             let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token2, ..) = server.apply_patch(
                 Some(lock2), token1, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off2, data2.to_vec())], Some(seq2), None,
+                vec![(off2, data2.to_vec())], Some(seq2), None, false,
             ).await.expect("second apply_patch (merge) should succeed");
 
             let hits_after = server.materialized_ring_hits.load(std::sync::atomic::Ordering::Relaxed);
@@ -20360,7 +20494,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
         ).await.expect("first apply_patch should succeed");
 
         let state_a = metadata.get_patch_state(&token_a).unwrap().expect("token_a must resolve");
@@ -20374,7 +20508,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, size_b, ts_b, buf_b, _rejected_b) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(301), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(301), None, false,
         ).await.expect("no-op merge apply_patch should still succeed");
 
         assert_eq!(token_b, token_a, "a merge-time no-op must return the unchanged prior identity");
@@ -20399,7 +20533,7 @@ mod tests {
         let lock_c = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_c, ..) = server.apply_patch(
             Some(lock_c), token_b, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(20usize, vec![0xDDu8; 4])], Some(302), None,
+            vec![(20usize, vec![0xDDu8; 4])], Some(302), None, false,
         ).await.expect("third (real) apply_patch should succeed");
         assert_ne!(token_c, token_b, "a genuinely new patch after a no-op must still mint a new identity");
 
@@ -20498,7 +20632,7 @@ mod tests {
         let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let result = server.apply_patch(
             Some(lock), claimed_base_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(1), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(1), None, false,
         ).await;
 
         let (public_token, ..) = result.expect(
@@ -20758,6 +20892,137 @@ mod tests {
         }
     }
 
+
+    /// 2026-09-05, VM-108 guest death (chunk_idx 3293/1790, dfs-client wedged
+    /// 18:24:02→18:24:48 then the guest took its root device offline for 36h).
+    ///
+    /// The slot's real current chunk was intact and 3-way readable, but the
+    /// LEADER's chunk_map was stuck on a dangling patch token — no patch_state
+    /// anywhere, no registered ChunkLocation, no bytes on any node. apply_patch's
+    /// fresh-accumulator leader-confirmation (`!resolved_via_local_fold`) defers to
+    /// the leader unconditionally, so a base this node could verify perfectly well
+    /// on its own (registered location + bytes on disk) was rejected as
+    /// "superseded" on the say-so of an answer that resolves to nothing at all.
+    /// The ghost-chunk guard then retried with that same dead token, failed again,
+    /// and the Err arm handed back `ChunkStale { current_chunk_id: <the id the
+    /// client just sent> }` — an instruction to rebase onto what it already had.
+    /// The client dutifully re-sent the identical request 4 times
+    /// (MAX_STALE_RETRY_ATTEMPTS), gave up, fell into the fresh-write reconstruct
+    /// path, and the 7dadf19 safety check correctly refused to gap-fill zeros over
+    /// real data — surfacing EIO on every flush and fsync of the qcow2.
+    ///
+    /// This is the same livelock apply_patch's own leader-confirmation comment says
+    /// was fixed in 2026-07-10, reached through a different door: that fix only
+    /// gated on `resolved_via_local_fold`, which is false for an ordinary folded
+    /// chunk that merely has no local patch_state. A leader's answer must not
+    /// override verified local state when the leader's answer resolves to nothing.
+    ///
+    /// Two real Server instances with real networking — a single-process test
+    /// can't reach this, since refresh_slot_from_leader reads the same in-process
+    /// chunk_map when this node IS the leader.
+    #[tokio::test]
+    async fn leader_dangling_token_must_not_defeat_a_locally_valid_base() {
+        use crate::network::NetworkServer;
+        use dfs_common::NodeInfo;
+
+        let leader_temp_storage = TempDir::new().unwrap();
+        let leader_temp_metadata = TempDir::new().unwrap();
+        let leader_temp_metadata_dir = TempDir::new().unwrap();
+        let leader_storage = Arc::new(ChunkStorage::new(leader_temp_storage.path().to_path_buf()).unwrap());
+        let leader_metadata = Arc::new(MetadataStore::new(leader_temp_metadata.path().to_path_buf()).unwrap());
+        let leader_node_id = NodeId::from_bytes([0x00u8; 16]);
+        let leader_addr: SocketAddr = "127.0.0.1:19322".parse().unwrap();
+        let leader_cluster = Arc::new(ClusterManager::new(leader_node_id, leader_addr, 10, 30));
+        let leader_server = Arc::new(Server::new(
+            leader_storage.clone(), leader_metadata.clone(), 4 * 1024 * 1024, leader_cluster.clone(), 3,
+            leader_temp_metadata_dir.path().to_path_buf(), leader_temp_metadata_dir.path().join("config.toml"), true,
+        ));
+        let leader_peer_listen = crate::network::peer_port_addr(leader_addr);
+        let mut leader_net_server = NetworkServer::new(leader_peer_listen, leader_server.clone(), 10);
+        tokio::spawn(async move { leader_net_server.start().await.ok(); });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // The leader's poisoned view: a patch token that resolves to NOTHING.
+        // No patch_state (so resolve_patch_token_from_peers answers None), no
+        // ChunkLocation, and no bytes on any node (so pull_chunk_from_peers
+        // fails too) — exactly the production `df7c8850…` state.
+        let dangling_token = ChunkId::patch_token_identity(
+            ChunkId::from_hash(compute_chunk_hash(b"delta-that-no-longer-exists-anywhere")),
+        );
+        let dangling_loc = ChunkLocation {
+            chunk_id: dangling_token, nodes: vec![leader_node_id], size: 4096,
+            checksum: dangling_token.hash, file_offset: Some(chunk_file_offset),
+            written_at: Some(2000), client_write_seq: Some(2), file_id: Some(file_id),
+        };
+        leader_server.chunk_map.insert(file_id, (vec![dangling_loc], 2));
+        assert!(leader_metadata.get_patch_state(&dangling_token).unwrap().is_none(),
+            "precondition: the leader's token is genuinely dangling — no patch_state to resolve it");
+        assert!(!leader_storage.has_chunk(&dangling_token),
+            "precondition: no bytes exist for the leader's token anywhere");
+
+        // The follower — the node under test — holds the slot's REAL current
+        // chunk: bytes on disk, a registered ChunkLocation, and its own
+        // chunk_map entry. Everything needed to serve this patch locally.
+        let follower_h = make_overlay_test_harness();
+        follower_h.server.cluster().add_node(NodeInfo::new(leader_node_id, leader_addr, None)).await.unwrap();
+        assert!(!follower_h.server.cluster().is_leader().await,
+            "test setup assumes the follower is NOT leader, so the leader-confirmation takes the real network path");
+
+        let base_content = vec![0x11u8; 4096];
+        let real_base_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        follower_h.storage.write_chunk(&real_base_id, &base_content).unwrap();
+        let real_loc = ChunkLocation {
+            chunk_id: real_base_id, nodes: vec![follower_h.server.cluster.local_node_id()],
+            size: base_content.len(), checksum: real_base_id.hash, file_offset: Some(chunk_file_offset),
+            written_at: Some(3000), client_write_seq: Some(3), file_id: Some(file_id),
+        };
+        follower_h.metadata.put_chunk_location(&real_loc).unwrap();
+        follower_h.server.chunk_map.insert(file_id, (vec![real_loc], 3));
+
+        // The client patches the identity the follower's own chunk_map reports
+        // as current — i.e. it is doing exactly the right thing.
+        let resp = follower_h.server.handle_multi_patch(
+            real_base_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(64usize, vec![0x22u8; 4])], None, Some(4), None, Some(4),
+        ).await;
+
+        // Invariant, independent of the recovery below: a ChunkStale naming the
+        // very id the client sent is a protocol contradiction. The client's only
+        // possible response is to re-send the identical request and get the
+        // identical answer — a guaranteed livelock, never a recovery.
+        if let Response::ChunkStale { current_chunk_id, .. } = &resp {
+            assert_ne!(*current_chunk_id, real_base_id,
+                "BUG REPRODUCED (self-referential ChunkStale): the server told the client to rebase \
+                 onto {} — the exact chunk_id the client just sent. Retrying can only reproduce this \
+                 response, which is precisely how VM-108's writes livelocked into EIO on 2026-09-03.",
+                current_chunk_id);
+        }
+
+        match resp {
+            Response::MultiPatchResult { .. } => {}
+            other => panic!(
+                "BUG REPRODUCED: the leader's chunk_map held a dangling token that resolves to \
+                 nothing, and that unusable answer was allowed to override a base this node had \
+                 fully verified locally (registered ChunkLocation + bytes on disk). The patch must \
+                 succeed on local evidence instead of failing on the leader's say-so. Got {:?}",
+                other),
+        }
+
+        // The write must genuinely be on this node's slot, not merely acked.
+        let chunk_map_binding = follower_h.server.chunk_map_ref();
+        let entry = chunk_map_binding.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_ne!(locs[0].chunk_id, dangling_token,
+            "the slot must never come to point at the leader's dangling token");
+    }
+
+
     /// 2026-08-13 fix — the actual root cause of the CT-119 24h-stuck-slot
     /// incident, confirmed via live log tracing on two independent replicas
     /// (same 31-36ms creation-to-abandon gap on both). update_chunk_map_after_patch
@@ -20877,14 +21142,14 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
         ).await.expect("first apply_patch should succeed");
 
         // Differs by exactly one byte from what's already at this range.
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, ..) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8, 0xCCu8, 0xCCu8, 0xCDu8])], Some(301), None,
+            vec![(10usize, vec![0xCCu8, 0xCCu8, 0xCCu8, 0xCDu8])], Some(301), None, false,
         ).await.expect("genuinely-changed merge apply_patch should succeed");
 
         assert_ne!(token_b, token_a, "a genuinely-changed patch must mint a new identity, not be treated as a no-op");
@@ -20955,7 +21220,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_200, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xBBu8; 4])], Some(200), None,
+            vec![(10usize, vec![0xBBu8; 4])], Some(200), None, false,
         ).await.expect("seq=200 apply_patch should succeed");
 
         // Arrives SECOND but carries seq=100 (lower) — and its content is
@@ -20965,7 +21230,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_100, ..) = server.apply_patch(
             Some(lock_b), token_200, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xBBu8; 4])], Some(100), None,
+            vec![(10usize, vec![0xBBu8; 4])], Some(100), None, false,
         ).await.expect("reordered seq=100 apply_patch should succeed");
 
         assert_ne!(
@@ -21046,20 +21311,20 @@ mod tests {
             let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (t1, ..) = server.apply_patch(
                 Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(10usize, vec![0xAAu8; 4])], Some(100), None,
+                vec![(10usize, vec![0xAAu8; 4])], Some(100), None, false,
             ).await.unwrap();
 
             let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (t2, ..) = server.apply_patch(
                 Some(lock2), t1, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(10usize, vec![0xAAu8; 4])], Some(101), None,
+                vec![(10usize, vec![0xAAu8; 4])], Some(101), None, false,
             ).await.unwrap();
             assert_eq!(t2, t1, "sanity: this replica's own no-op detection must fire identically to the others");
 
             let lock3 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (t3, ..) = server.apply_patch(
                 Some(lock3), t2, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(30usize, vec![0xEEu8; 4])], Some(102), None,
+                vec![(30usize, vec![0xEEu8; 4])], Some(102), None, false,
             ).await.unwrap();
 
             let state = metadata.get_patch_state(&t3).unwrap().expect("final token must resolve");
@@ -21138,7 +21403,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server_a.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
         ).await.expect("first apply_patch should succeed");
 
         // Server B: a brand-new Server instance over the SAME storage/metadata
@@ -21158,7 +21423,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, ..) = server_b.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(301), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(301), None, false,
         ).await.expect("cold no-op merge apply_patch should still succeed");
 
         let misses_after = server_b.materialized_ring_misses.load(std::sync::atomic::Ordering::Relaxed);
@@ -21215,7 +21480,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(5000), None,
+            vec![(10usize, vec![0xCCu8; 4])], Some(5000), None, false,
         ).await.expect("first apply_patch should succeed");
 
         let state_a = metadata.get_patch_state(&token_a).unwrap().expect("token_a must resolve");
@@ -21232,7 +21497,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, ..) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], None, None,
+            vec![(10usize, vec![0xCCu8; 4])], None, None, false,
         ).await.expect("seqless merge apply_patch should succeed");
 
         // Whether or not identity happens to change is not the point here (a
@@ -23603,7 +23868,7 @@ mod tests {
             let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token2, ..) = server.apply_patch(
                 Some(lock), public_token, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(20usize, vec![0xEFu8; 4])], Some(999), None,
+                vec![(20usize, vec![0xEFu8; 4])], Some(999), None, false,
             ).await.expect("merge onto a pre-existing legacy accumulator must succeed");
 
             let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");

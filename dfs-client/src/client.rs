@@ -7206,6 +7206,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         // churn (expected to settle in milliseconds), not riding out a node outage.
         const STALE_RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(25);
         let mut stale_retry_attempts: u8 = 0;
+        // One-shot: a self-referential ChunkStale (server "corrects" us to the id we
+        // already sent) gets exactly one RevalidateChunkSlot escalation per call. See
+        // where this is consumed below for why re-sending unchanged would otherwise be
+        // the only thing we could do.
+        let mut self_referential_revalidate_done = false;
         let retry_started = std::time::Instant::now();
         // Attempt count is now just a hard safety backstop against a genuine infinite
         // loop bug — the real gate on connection-failure retries is CONNECT_RETRY_BUDGET
@@ -7418,8 +7423,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 }
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
-                    warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
-                        addr, old_chunk_id, current_chunk_id);
+                    // Distinguish a real identity correction from a self-referential one.
+                    // The latter logged as "chunk_id X is stale, server has X" for months
+                    // and read as a transient blip; it is actually the signature of a slot
+                    // this node cannot reconcile, and it is what VM-108's writes died on
+                    // (2026-09-03). Naming it plainly keeps the next person out of the
+                    // same 36-hour hole.
+                    if current_chunk_id == old_chunk_id {
+                        warn!("MultiPatch replica {}: server reports chunk_id {} as stale but names \
+                               that SAME id as current for file {} chunk {:?} — not an identity \
+                               correction; re-sending unchanged cannot change the outcome",
+                            addr, old_chunk_id, file_id, chunk_idx);
+                    } else {
+                        warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
+                            addr, old_chunk_id, current_chunk_id);
+                    }
                     stale_ahead.push((addr, current_chunk_id));
                     if stale_retry.is_none() {
                         // Save corrected location; retry only if no replica succeeded.
@@ -7466,7 +7484,49 @@ leader_addr: Arc::new(RwLock::new(None)),
         // our assumed base was wrong for ALL replicas, so we need to patch the real base.
         let has_any_success = replica_results.iter().any(|(_, r)| r.is_ok());
         if !has_any_success {
-            if let Some((fresh_id, fresh_loc)) = stale_retry {
+            if let Some((mut fresh_id, mut fresh_loc)) = stale_retry {
+                // 2026-09-05 (VM-108 guest death): when the server's "corrected" identity
+                // IS the one we just sent, the ordinary retry below re-sends a byte-
+                // identical request and gets a byte-identical answer. On staging that
+                // burned all 4 attempts in ~250ms, dropped the flush into the fresh-write
+                // reconstruct path, and EIO'd every fsync of a live qcow2 until the guest
+                // took its root device offline for 36 hours.
+                //
+                // The retry itself is still worth keeping — for a *transient* ghost it is
+                // the back-off window that lets healing converge (see the server's
+                // 2026-07-19 VM-111-install fix, which deliberately answers an unreachable
+                // base with a retriable ChunkStale rather than a hard error). What was
+                // missing is an escalation for the case where nothing will converge because
+                // the slot's recorded identity is itself wrong. RevalidateChunkSlot is the
+                // one path that bypasses every chunk_map cache and re-derives the winner
+                // from authoritative CHUNK_TABLE arbitration, so ask it once before
+                // spending retries on a resend that carries no new information.
+                if fresh_id == old_chunk_id && !self_referential_revalidate_done {
+                    self_referential_revalidate_done = true;
+                    if let Some(cidx) = chunk_idx {
+                        match self.revalidate_chunk_slot(file_id, cidx, old_chunk_id).await {
+                            Ok(Some(loc)) if loc.chunk_id != old_chunk_id => {
+                                info!("MultiPatch: self-referential ChunkStale for file {} chunk {} — \
+                                       RevalidateChunkSlot re-derived the slot as {} (was {}), \
+                                       retrying with the corrected identity",
+                                    file_id, cidx, loc.chunk_id, old_chunk_id);
+                                fresh_id = loc.chunk_id;
+                                fresh_loc = loc;
+                            }
+                            Ok(_) => {
+                                warn!("MultiPatch: self-referential ChunkStale for file {} chunk {} — \
+                                       RevalidateChunkSlot confirms {} really is the slot's current \
+                                       identity, so the failure is not a stale chunk_id; falling back \
+                                       to the bounded retry to give healing a convergence window",
+                                    file_id, cidx, old_chunk_id);
+                            }
+                            Err(e) => {
+                                warn!("MultiPatch: self-referential ChunkStale for file {} chunk {} — \
+                                       RevalidateChunkSlot failed: {}", file_id, cidx, e);
+                            }
+                        }
+                    }
+                }
                 // Bounded independently of CONNECT_RETRY_BUDGET's much larger attempt
                 // cap (1000, gated by wall-clock instead of count) — a stale response
                 // recurring indefinitely would indicate a genuinely broken invariant
@@ -9372,6 +9432,142 @@ mod tests {
             "must complete the read using the corrected identity RevalidateChunkSlot returned");
         assert!(revalidate_calls.load(Ordering::SeqCst) >= 1,
             "must have called RevalidateChunkSlot at least once to discover the correction");
+    }
+
+
+    /// Mock node that answers every MultiPatch against `stale_id` with a
+    /// SELF-REFERENTIAL ChunkStale — naming `stale_id` itself as the slot's
+    /// current identity — and accepts a MultiPatch against `corrected_id`.
+    /// RevalidateChunkSlot answers `corrected_id`. Returns
+    /// (self_referential_multipatch_attempts, revalidate_calls).
+    fn spawn_self_referential_stale_node(
+        addr: SocketAddr,
+        node_id: NodeId,
+        stale_id: ChunkId,
+        corrected_id: ChunkId,
+        result_id: ChunkId,
+    ) -> (Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let stale_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let revalidate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sa, rc) = (stale_attempts.clone(), revalidate_calls.clone());
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let (sa, rc) = (sa.clone(), rc.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let request_id = envelope.request_id;
+                        let Message::Request(req) = envelope.message else { return };
+                        match req {
+                            Request::MultiPatch { chunk_id, .. } if chunk_id == stale_id => {
+                                sa.fetch_add(1, Ordering::SeqCst);
+                                // The bug's exact shape: "you are stale — rebase onto
+                                // the very id you just sent me".
+                                write_envelope(&mut stream, request_id, Response::ChunkStale {
+                                    current_chunk_id: stale_id,
+                                    current_nodes: vec![node_id],
+                                }).await;
+                            }
+                            Request::MultiPatch { chunk_id, .. } if chunk_id == corrected_id => {
+                                write_envelope(&mut stream, request_id, Response::MultiPatchResult {
+                                    new_chunk_id: result_id, size: 4096, patch_ts: Some(3000), chunk_seq: Some(3),
+                                }).await;
+                            }
+                            Request::RevalidateChunkSlot { file_id, .. } => {
+                                rc.fetch_add(1, Ordering::SeqCst);
+                                let loc = ChunkLocation {
+                                    chunk_id: corrected_id, nodes: vec![node_id], size: 4096,
+                                    checksum: corrected_id.hash, file_offset: Some(0),
+                                    written_at: Some(2000), client_write_seq: Some(2), file_id: Some(file_id),
+                                };
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id, locations: vec![loc], from_chunk: 0, total_chunks: 1, write_seq: 2,
+                                }).await;
+                            }
+                            _ => {
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: "unhandled in mock".to_string(), code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (stale_attempts, revalidate_calls)
+    }
+
+    /// 2026-09-05, VM-108 guest death. A server that answers MultiPatch with a
+    /// ChunkStale naming the id the client just sent gives the client nothing to
+    /// act on: the "corrected" identity is the one already in hand, so the retry
+    /// re-sends a byte-identical request and gets a byte-identical answer. On
+    /// staging that consumed all four MAX_STALE_RETRY_ATTEMPTS in ~250ms, dropped
+    /// the flush into the fresh-write reconstruct path, and EIO'd every fsync of a
+    /// live qcow2 until the guest took its root device offline for 36 hours.
+    ///
+    /// RevalidateChunkSlot is the one path that bypasses every chunk_map cache and
+    /// re-derives the slot from authoritative CHUNK_TABLE arbitration, so it must
+    /// be consulted before spending retries on an uninformative resend. This is the
+    /// client half of the fix; the server half stops the disagreement arising in the
+    /// first place (see dfs-server's
+    /// leader_dangling_token_must_not_defeat_a_locally_valid_base).
+    #[tokio::test]
+    async fn multipatch_escalates_self_referential_chunkstale_to_revalidate() {
+        let addr: SocketAddr = "127.0.0.1:19405".parse().unwrap();
+        let node_id = NodeId::new();
+        let file_id = FileId::new();
+        let stale_id = chunk_id_with_hash0(0xD1);
+        let corrected_id = chunk_id_with_hash0(0xD2);
+        let result_id = chunk_id_with_hash0(0xD3);
+
+        let (stale_attempts, revalidate_calls) =
+            spawn_self_referential_stale_node(addr, node_id, stale_id, corrected_id, result_id);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = DfsClient::new(vec![addr]).unwrap();
+        *client.leader_addr.write().await = Some(addr);
+        client.addr_to_node_id.write().await.insert(addr, node_id);
+
+        let loc = ChunkLocation {
+            chunk_id: stale_id, nodes: vec![node_id], size: 4096,
+            checksum: stale_id.hash, file_offset: Some(0),
+            written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.multi_patch_chunk_on_replicas_verified(
+                stale_id, file_id, 0, 0, vec![(10usize, vec![0x22u8; 4])],
+                &loc, None, false, Arc::new(HashMap::new()),
+            ),
+        ).await;
+
+        let result = result.expect("multi_patch must not hang past the 10s test timeout");
+
+        assert_eq!(revalidate_calls.load(Ordering::SeqCst), 1,
+            "BUG REPRODUCED: the client never escalated a self-referential ChunkStale to \
+             RevalidateChunkSlot — it can only have re-sent the identical request until its \
+             retry budget ran out, which is exactly how VM-108's writes died on 2026-09-03");
+
+        assert!(result.is_ok(),
+            "with the slot re-derived to a usable identity the patch must complete, not fail: {:?}",
+            result.as_ref().err());
+
+        let attempts = stale_attempts.load(Ordering::SeqCst);
+        assert!(attempts <= 2,
+            "must not burn the stale-retry budget on a resend that carries no new information — \
+             {} self-referential MultiPatch attempts were made", attempts);
     }
 
     /// Companion negative control: when RevalidateChunkSlot confirms the SAME

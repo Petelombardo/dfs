@@ -13,6 +13,7 @@ mod network;
 mod server;
 mod stats;
 mod storage;
+mod watchdog;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -742,6 +743,17 @@ async fn run_planned_offline_compaction(
     // happened. Same remedy as every other site: if the exclusive lock is still wedged
     // after 60s, there is no way to un-stick it from here — restart so HA replicas keep
     // serving and a fresh process gets a clean redb handle.
+    //
+    // 2026-09-05 (gluster1, 6h zombie): the tokio::time::timeout below is NOT
+    // sufficient on its own — it demonstrably failed to fire on exactly this call
+    // site while compact_db_blocking sat in self.db.write(). The process stayed
+    // alive with no listener bound and systemd still reporting `active`, so nothing
+    // restarted it. HardDeadline is a plain OS thread + libc::_exit, sharing no
+    // machinery with the async path that failed; see watchdog.rs for the full
+    // post-mortem. Armed slightly wider than the async timeout so that when the
+    // runtime IS healthy the existing, cleaner path still wins.
+    let _compact_watchdog = crate::watchdog::HardDeadline::arm(
+        "planned offline compaction", std::time::Duration::from_secs(90));
     let compact_task = tokio::task::spawn_blocking(move || metadata.compact_db_blocking());
     let compact_result = match tokio::time::timeout(std::time::Duration::from_secs(60), compact_task).await {
         Ok(r) => r,

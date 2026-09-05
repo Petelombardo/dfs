@@ -11244,6 +11244,10 @@ impl Server {
                     // headroom under the 60s hard limit below, which now only fires for a
                     // genuine, non-time-bounded wedge (e.g. a real deadlock) rather than
                     // "legitimately slow under heavy load."
+                    // See watchdog.rs — same rationale as the blocking-compaction site
+                    // below; this path takes the shared read lock and can wedge the same way.
+                    let _prep_watchdog = crate::watchdog::HardDeadline::arm(
+                        "redb compact_db Phase 1-2", std::time::Duration::from_secs(90));
                     let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(30), std::time::Duration::from_secs(5), 64));
                     let prep_result = match tokio::time::timeout(std::time::Duration::from_secs(60), prep_task).await {
                         Ok(r) => r,
@@ -11390,6 +11394,12 @@ impl Server {
                         // a brief diff+swap — quiesce for the full attempt.
                         compaction_quiescing.store(true, std::sync::atomic::Ordering::Relaxed);
                         let m = metadata.clone();
+                        // See watchdog.rs: the async timeout below is not sufficient on its
+                        // own — it failed to fire on this exact operation on gluster1
+                        // (2026-09-05), leaving a wedged process alive for 6h with no
+                        // listener and systemd still reporting `active`.
+                        let _compact_watchdog = crate::watchdog::HardDeadline::arm(
+                            "redb blocking compaction", std::time::Duration::from_secs(90));
                         let task = tokio::task::spawn_blocking(move || m.compact_db_blocking());
                         match tokio::time::timeout(std::time::Duration::from_secs(60), task).await {
                             Ok(Ok(Ok((before, after)))) => {

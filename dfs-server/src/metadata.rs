@@ -1872,6 +1872,15 @@ impl MetadataStore {
     }
 
     /// Stream all file metadata records, calling `f` for each without materialising all in RAM.
+    ///
+    /// **`f` runs while this holds `self.db.read()`, so it MUST NOT call back into
+    /// `MetadataStore`.** A nested acquisition deadlocks the moment a writer (i.e.
+    /// compaction) queues between the two: `parking_lot`'s RwLock is fair, so the
+    /// recursive read waits behind the writer and the writer waits on this guard. That
+    /// is the real 2026-09-05 gluster1 wedge — see `scan_all_files`, which was the
+    /// caller that did exactly this and has since been restructured to release the
+    /// lock around each callback. Every current caller here only touches local state;
+    /// if you need to re-enter the store, collect first and act after the scan.
     pub fn scan_files<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(FileMetadata) -> Result<()>,
@@ -3493,6 +3502,9 @@ impl MetadataStore {
     }
 
     /// Stream chunk location records, calling `f` for each. Return `false` to stop early.
+    ///
+    /// **`f` runs while this holds `self.db.read()` — it MUST NOT call back into
+    /// `MetadataStore`.** See `scan_files` for the deadlock this avoids.
     pub fn scan_chunk_locations<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(ChunkLocation) -> bool,
@@ -3566,6 +3578,11 @@ impl MetadataStore {
     /// transactions, so a commit landing between them could make the live-id set and
     /// the filtered locations reflect slightly different snapshots; this uses one
     /// shared transaction for both, eliminating that window.
+    /// **`f` runs while this holds `self.db.read()` — it MUST NOT call back into
+    /// `MetadataStore`.** See `scan_files` for the deadlock this avoids. (This one
+    /// additionally relies on a single shared read transaction for the snapshot
+    /// property documented above, so it cannot simply batch the way `scan_all_files`
+    /// now does.)
     pub fn scan_live_chunk_locations<F>(&self, mut f: F) -> Result<std::collections::HashSet<ChunkId>>
     where
         F: FnMut(ChunkLocation),
@@ -4023,20 +4040,87 @@ impl MetadataStore {
     }
 
     /// Scan all file records, calling `f` for each deserialized FileMetadata.
+    /// Stream every file record to `f`, **releasing the database lock before each
+    /// callback runs**.
+    ///
+    /// That lock discipline is the contract, not an implementation detail. This used
+    /// to hold one `self.db.read()` across the entire scan, callback included, which
+    /// permanently deadlocked gluster1 on 2026-09-05:
+    ///
+    ///   1. the leader's follower-catchup (`server.rs`, the sole caller) scans here
+    ///      and its callback calls `next_meta_sequence` + `enqueue_meta_for_node`,
+    ///      both of which take `self.db.read()` again;
+    ///   2. the periodic compaction fires and calls `self.db.write()`, which queues;
+    ///   3. `parking_lot`'s RwLock is FAIR — once a writer is queued, every new
+    ///      reader queues behind it, **including a recursive read from a thread that
+    ///      already holds a read guard**;
+    ///   4. so the callback's nested read waits for the writer, and the writer waits
+    ///      for the outer guard this scan is still holding. Neither can ever proceed.
+    ///
+    /// Post-mortem signature: 8 threads in `lock_shared_slow`, 1 in
+    /// `lock_exclusive_slow` → `wait_for_readers`, and no thread visibly "holding"
+    /// the lock — because the holder is itself blocked, one frame deeper, on its own
+    /// second acquisition. That looked like a guard held across an `.await`; it isn't,
+    /// and it can't be — a `parking_lot` guard is `!Send`, so a `Send` future can't
+    /// hold one across an await point at all.
+    ///
+    /// The node stayed wedged for 6h with no listener bound while systemd still
+    /// reported it `active`. See `watchdog.rs` for the separate supervision fix; this
+    /// is the actual deadlock.
+    ///
+    /// Batching, rather than materialising every record, keeps peak memory bounded on
+    /// a large FILE_TABLE while still letting a queued writer through between
+    /// batches. Consequence to be aware of: the scan is no longer one consistent redb
+    /// snapshot but a sequence of them, so a record created or deleted mid-scan may
+    /// be seen or missed. That is fine for the catchup caller (a best-effort sync that
+    /// re-runs), and any future caller needing a true snapshot should collect under a
+    /// single transaction instead — but must then not call back into this store.
     pub fn scan_all_files<F>(&self, mut f: F) -> Result<usize>
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
-        let _db = self.db.read();
-        let txn = _db.begin_read()?;
-        let table = txn.open_table(FILE_TABLE)?;
+        // Trades lock re-acquisitions against peak memory. Small enough that a queued
+        // writer waits microseconds, large enough to avoid per-record lock churn.
+        const SCAN_BATCH: usize = 256;
         let mut count = 0usize;
-        for item in table.range::<&str>(..)? {
-            let (_, v) = item?;
-            if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
+        let mut resume_after: Option<String> = None;
+        loop {
+            let (batch, last_key) = {
+                let _db = self.db.read();
+                let txn = _db.begin_read()?;
+                let table = txn.open_table(FILE_TABLE)?;
+                let mut batch: Vec<FileMetadata> = Vec::new();
+                let mut last_key: Option<String> = None;
+                let iter = match resume_after.as_deref() {
+                    Some(k) => table.range::<&str>(k..)?,
+                    None => table.range::<&str>(..)?,
+                };
+                for item in iter {
+                    let (k, v) = item?;
+                    let key = k.value();
+                    // `range(k..)` is inclusive — skip the record we resumed from.
+                    if resume_after.as_deref() == Some(key) {
+                        continue;
+                    }
+                    last_key = Some(key.to_string());
+                    if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
+                        batch.push(m);
+                    }
+                    if batch.len() >= SCAN_BATCH {
+                        break;
+                    }
+                }
+                (batch, last_key)
+            }; // guard released here — before any callback runs
+
+            // Terminate on "no further keys", NOT on an empty batch: a run of
+            // undeserializable records yields an empty batch with more to come.
+            let Some(last_key) = last_key else { break };
+            for m in batch {
                 f(m)?;
                 count += 1;
             }
+            resume_after = Some(last_key);
         }
         Ok(count)
     }
@@ -4695,6 +4779,118 @@ mod tests {
     use super::*;
     use dfs_common::{ChunkId, FileType, NodeId};
     use tempfile::TempDir;
+
+
+    /// 2026-09-05, gluster1 6h wedge. `scan_all_files` held one `self.db.read()`
+    /// across the whole scan *including the caller's callback*, and its only caller
+    /// (the leader's follower-catchup) calls `next_meta_sequence` +
+    /// `enqueue_meta_for_node` from inside that callback — both of which take
+    /// `self.db.read()` again. `parking_lot`'s RwLock is fair, so once the periodic
+    /// compaction queued a `write()`, the recursive read queued behind it and the
+    /// writer waited on the outer guard: an unbreakable cycle.
+    ///
+    /// Asserted as a lock-discipline invariant rather than by racing a real writer.
+    /// A timing-based reproduction (spawn a writer, hope it queues in the window)
+    /// is exactly the kind of test this project has been burned by; `try_write()`
+    /// succeeding inside the callback is a direct, deterministic proof that no read
+    /// guard is held, and it fails 100% of the time against the old code.
+    #[test]
+    fn scan_all_files_must_not_hold_the_db_lock_while_invoking_the_callback() {
+        let temp = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
+
+        for i in 0..5 {
+            let m = FileMetadata::new(format!("/scan-lock-{}.bin", i), FileType::RegularFile);
+            store.put_file(&m).unwrap();
+        }
+
+        let mut seen = 0usize;
+        store
+            .scan_all_files(|_m| {
+                seen += 1;
+                // If a read guard is still held, a writer cannot acquire — which is
+                // precisely the state that let a queued compaction deadlock the
+                // callback's own nested read.
+                assert!(
+                    store.db.try_write().is_some(),
+                    "BUG REPRODUCED: the db lock is still held while the callback runs. \
+                     Any callback that re-enters MetadataStore (the real caller calls \
+                     next_meta_sequence and enqueue_meta_for_node) will deadlock the \
+                     moment a compaction writer queues between the two acquisitions — \
+                     the gluster1 2026-09-05 wedge."
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen, 5, "every stored record must still be visited");
+    }
+
+    /// The production shape end-to-end: the callback re-enters the store exactly the
+    /// way the follower-catchup path does. Under the old code this could not be
+    /// written at all without risking a hang; it must now simply work.
+    #[test]
+    fn scan_all_files_callback_may_reenter_the_metadata_store() {
+        let temp = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
+
+        for i in 0..3 {
+            let m = FileMetadata::new(format!("/reenter-{}.bin", i), FileType::RegularFile);
+            store.put_file(&m).unwrap();
+        }
+
+        let mut sequences = Vec::new();
+        let scanned = store
+            .scan_all_files(|m| {
+                // Both of these take self.db.read() internally — the exact nested
+                // acquisition that deadlocked.
+                let seq = store.next_meta_sequence()?;
+                store.enqueue_meta_for_node(NodeId::from_bytes([7u8; 16]), seq, &m)?;
+                sequences.push(seq);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(scanned, 3, "all records visited");
+        assert_eq!(sequences.len(), 3, "the re-entrant call must have run for every record");
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "each nested next_meta_sequence must yield a distinct sequence");
+    }
+
+    /// Batching must not drop, duplicate, or reorder records across batch
+    /// boundaries — the resume cursor is inclusive, so an off-by-one there would
+    /// silently re-emit or skip one record per batch. Uses more records than
+    /// SCAN_BATCH (256) so several boundaries are actually crossed.
+    #[test]
+    fn scan_all_files_batching_visits_every_record_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
+
+        const N: usize = 600;
+        let mut expected = std::collections::HashSet::new();
+        for i in 0..N {
+            // Zero-padded so lexicographic key order is stable and unsurprising.
+            let m = FileMetadata::new(format!("/batch-{:04}.bin", i), FileType::RegularFile);
+            store.put_file(&m).unwrap();
+            expected.insert(m.id);
+        }
+
+        let mut seen: Vec<FileId> = Vec::new();
+        let count = store
+            .scan_all_files(|m| {
+                seen.push(m.id);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(count, N, "returned count must match records stored");
+        assert_eq!(seen.len(), N, "callback must fire exactly once per record");
+        let unique: std::collections::HashSet<FileId> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), N, "no record may be visited twice across a batch boundary");
+        assert_eq!(unique, expected, "the set of visited records must be exactly what was stored");
+    }
 
     /// redb's `fragmented_bytes` is NOT reclaimable waste, and must never be used as
     /// a compaction trigger. Measured 2026-07-16 with this exact workload:

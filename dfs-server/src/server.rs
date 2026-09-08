@@ -578,6 +578,16 @@ pub struct Server {
     /// Count of reads served via the (file_id, chunk_idx) slot backstop — see
     /// resolve_by_slot. A high rate means clients are being handed stale chunk maps.
     slot_backstop_hits: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Per-class counters for declined ChunkLocation merges — see RclRejectClass.
+    /// Metered instead of logged line-by-line: the Older/Equal classes are the guard
+    /// working correctly and are pure volume (573,924 lines in one 25-minute window
+    /// on 2026-08-31, 92% of them these two), while Newer is rare and genuinely
+    /// diagnostic. An aggregate line every RCL_REJECT_LOG_EVERY keeps the rate
+    /// visible without the log being made of it.
+    rcl_rejected_older: Arc<std::sync::atomic::AtomicU64>,
+    rcl_rejected_equal: Arc<std::sync::atomic::AtomicU64>,
+    rcl_rejected_newer: Arc<std::sync::atomic::AtomicU64>,
     /// Last time resolve_by_slot escalated to a CHUNK_TABLE re-derivation for a
     /// file, to keep that spawn_blocking scan off every failed read of a slot whose
     /// re-derived winner simply isn't on this node. See resolve_by_slot.
@@ -1074,6 +1084,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::QueryChunkSizes { .. }
         | Request::ReplicateChunkLocation { .. }
         | Request::ReplicateChunkLocations { .. }
+        | Request::ReplicateChunkLocationsWithReceipts { .. }
         | Request::ConfirmChunksLive { .. }
         | Request::GetPendingPatchChunkIds { .. }
         | Request::GetOrphanAuthInfo
@@ -1685,6 +1696,71 @@ struct DirtyPatchSlot {
 /// that command. Long and conservative on purpose: nothing else depends on
 /// it firing promptly, and a live client's own 8s active-fold timer will
 /// almost always beat it under any real write pattern.
+/// Why a slot merge declined an incoming ChunkLocation. Split out because the three
+/// classes have wildly different meanings and wildly different volumes, and lumping
+/// them together under one `warn!` produced 573,924 messages in a single 25-minute
+/// window on gluster1 (2026-08-31 02:05-02:29) — 92% of them the guard working
+/// exactly as designed. That volume is the bulk of a 7GB log file, and the write I/O
+/// it costs the leader is itself a plausible contributor to the slow-leader stalls
+/// that make clients defer their registrations in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RclRejectClass {
+    /// Incoming carried a strictly OLDER client_write_seq. Overwhelmingly the normal
+    /// case (91.7% of that window): a re-queued/deferred registration draining after
+    /// something newer already landed. Correct, expected, and not worth a line each.
+    Older,
+    /// Equal seq, different identity. Almost always a fold result colliding with the
+    /// very token it folded — a fold inherits its base's client_write_seq, so the two
+    /// tie and location_supersedes breaks it on fold origin. Also correct.
+    Equal,
+    /// Incoming carried a strictly NEWER client_write_seq and still lost. This is the
+    /// one that can leave the leader authoritatively behind a client, and it is the
+    /// only class that warrants a line of its own: 41,051 of these in that same
+    /// window (7.4%) — a real, unexplained arbitration gap worth investigating.
+    Newer,
+}
+
+/// Result of merging one ChunkLocation into a slot. Returned rather than logged
+/// in-place so the caller can both meter it (see RclRejectClass) and answer the
+/// sender truthfully about whether the update actually took — the same gap
+/// Response::FoldReceipt closed for ReplicatePatchFold on 2026-08-14, which was
+/// never extended to the chunk-location path.
+#[derive(Debug, Clone)]
+pub(crate) enum SlotMergeOutcome {
+    /// The slot now names `current` because of this call (replaced or first insert).
+    Applied { current: ChunkId },
+    /// Arbitration kept what was already there; the slot still names `current`.
+    Rejected {
+        class: RclRejectClass,
+        chunk_idx: u64,
+        current: ChunkId,
+        kept_seq: Option<u64>,
+        kept_gen: Option<u64>,
+        kept_is_fold: bool,
+        dropped: ChunkId,
+        dropped_seq: Option<u64>,
+        dropped_gen: Option<u64>,
+        dropped_is_fold: bool,
+    },
+    /// Offset-less and unplaceable — see the legacy tail of the merge fn.
+    Unplaceable,
+}
+
+impl SlotMergeOutcome {
+    /// True when the sender's location is what the slot names after this call.
+    pub(crate) fn applied(&self) -> bool {
+        matches!(self, SlotMergeOutcome::Applied { .. })
+    }
+    /// What the slot names now, so a sender can see exactly what it lost to.
+    pub(crate) fn current_chunk_id(&self) -> Option<ChunkId> {
+        match self {
+            SlotMergeOutcome::Applied { current } => Some(*current),
+            SlotMergeOutcome::Rejected { current, .. } => Some(*current),
+            SlotMergeOutcome::Unplaceable => None,
+        }
+    }
+}
+
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Minimum time a Pending patch must have existed before a local "file
@@ -5212,6 +5288,9 @@ impl Server {
             // client staleness window can reference.
             retired_chunk_aliases: Arc::new(ShardedAliasMap::new(65536)),
             slot_backstop_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rcl_rejected_older: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rcl_rejected_equal: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rcl_rejected_newer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             slot_rederive_attempts: Arc::new(DashMap::new()),
             active_fold_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5923,7 +6002,7 @@ impl Server {
     /// the client, clock-agnostic) when available; fall back to written_at (server-side
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
-    async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
+    async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) -> SlotMergeOutcome {
         // Backfill the slot's CURRENT occupant's generation before arbitrating, if this
         // node never directly recorded it. chunk_generations is in-memory, per-chunk_id,
         // and only ever populated by whichever node computed a patch/fold's merge
@@ -5955,8 +6034,62 @@ impl Server {
                 }
             }
         }
-        Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, Some(&self.chunk_generations), file_id, location);
+        let outcome = Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, Some(&self.chunk_generations), file_id, location);
+        self.meter_slot_merge_outcome(file_id, &outcome);
+        outcome
     }
+
+    /// Count a declined merge and log it according to its class — the whole point of
+    /// RclRejectClass. Older/Equal are metered silently (with a periodic aggregate);
+    /// only Newer, the class that can leave the leader authoritatively behind a
+    /// client, gets a line of its own.
+    fn meter_slot_merge_outcome(&self, file_id: FileId, outcome: &SlotMergeOutcome) {
+        /// How many Older+Equal rejections between aggregate lines. Sized so a storm
+        /// like 2026-08-31's (573,924 in 25 minutes) produces ~50 lines instead of
+        /// half a million, while an idle cluster stays silent.
+        const RCL_REJECT_LOG_EVERY: u64 = 10_000;
+
+        let SlotMergeOutcome::Rejected {
+            class, chunk_idx, current, kept_seq, kept_gen, kept_is_fold,
+            dropped, dropped_seq, dropped_gen, dropped_is_fold,
+        } = outcome else { return };
+
+        match class {
+            RclRejectClass::Newer => {
+                // Rare and genuinely diagnostic: the incoming registration carried a
+                // strictly newer client_write_seq and still lost, so the leader may now
+                // be authoritatively behind the client that sent it. 41,051 of these
+                // in the 2026-08-31 window — an unexplained arbitration gap, not yet
+                // root-caused. Keep every field location_supersedes arbitrates on.
+                let n = self.rcl_rejected_newer.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!("[RCL-rejected-NEWER #{}] file={:?} chunk_idx={} kept={} (seq={:?} gen={:?} is_fold={}) \
+                       dropped={} (seq={:?} gen={:?} is_fold={}) — incoming was NEWER and still lost; \
+                       the sender's view of this slot may now outrank the leader's",
+                    n, file_id, chunk_idx,
+                    current, kept_seq, kept_gen, kept_is_fold,
+                    dropped, dropped_seq, dropped_gen, dropped_is_fold);
+            }
+            RclRejectClass::Older | RclRejectClass::Equal => {
+                let c = if matches!(class, RclRejectClass::Older) {
+                    &self.rcl_rejected_older
+                } else {
+                    &self.rcl_rejected_equal
+                };
+                let n = c.fetch_add(1, Ordering::Relaxed) + 1;
+                debug!("[RCL-rejected-{:?}] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
+                    class, file_id, chunk_idx, current, kept_seq, dropped, dropped_seq);
+                if n % RCL_REJECT_LOG_EVERY == 0 {
+                    info!("[RCL-reject-stats] older={} equal={} newer={} — Older/Equal are the \
+                           staleness guard working as designed (a deferred registration draining \
+                           late, or a fold tying with the token it folded); only `newer` is a gap",
+                        self.rcl_rejected_older.load(Ordering::Relaxed),
+                        self.rcl_rejected_equal.load(Ordering::Relaxed),
+                        self.rcl_rejected_newer.load(Ordering::Relaxed));
+                }
+            }
+        }
+    }
+
 
     /// Sync core of chunk_map_update_location_for_file — extracted so
     /// rebuild_chunk_map_from_metadata (which runs on a plain std::thread, not the
@@ -5986,7 +6119,7 @@ impl Server {
         chunk_generations: Option<&DashMap<ChunkId, u64>>,
         file_id: FileId,
         location: &ChunkLocation,
-    ) {
+    ) -> SlotMergeOutcome {
         // Use entry() to atomically create-or-get: for brand-new files that have no
         // chunk_map entry yet, this inserts an empty Vec so subsequent logic can push
         // the first chunk in. Without this, every ReplicateChunkLocation for a new file
@@ -6037,6 +6170,7 @@ impl Server {
                     chunk_to_file.remove(&loc.chunk_id);
                     *loc = location.clone();
                     chunk_to_file.insert(location.chunk_id, file_id);
+                    return SlotMergeOutcome::Applied { current: location.chunk_id };
                 } else {
                     // Stale RCL rejected: warn! (not debug!) and include every field
                     // location_supersedes actually arbitrates on — generation and
@@ -6049,18 +6183,37 @@ impl Server {
                     // nodes). A rejection here is inherently rare (the common case is
                     // should_update=true and never reaches this branch), so warn!-level
                     // volume is not a concern the way it would be for a per-write path.
-                    warn!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?} gen={:?} is_fold={}) \
-                           dropped={} (seq={:?} gen={:?} is_fold={})",
-                        file_id, incoming_chunk_idx,
-                        loc.chunk_id, loc.client_write_seq, existing_gen, existing_is_fold,
-                        location.chunk_id, location.client_write_seq, incoming_gen, incoming_is_fold);
+                    // Classify rather than log here: the caller meters these and logs
+                    // only the class that matters (see RclRejectClass). Logging every
+                    // one at warn! here is what produced 573,924 lines in 25 minutes.
+                    let class = match (location.client_write_seq, loc.client_write_seq) {
+                        (Some(inc), Some(ext)) if inc > ext => RclRejectClass::Newer,
+                        (Some(inc), Some(ext)) if inc < ext => RclRejectClass::Older,
+                        (Some(_), Some(_)) => RclRejectClass::Equal,
+                        // A seq-less incoming losing to a seq-bearing existing is the
+                        // ordinary "older" shape; the reverse can't reach here.
+                        (None, Some(_)) => RclRejectClass::Older,
+                        (Some(_), None) => RclRejectClass::Newer,
+                        (None, None) => RclRejectClass::Equal,
+                    };
+                    return SlotMergeOutcome::Rejected {
+                        class,
+                        chunk_idx: incoming_chunk_idx,
+                        current: loc.chunk_id,
+                        kept_seq: loc.client_write_seq,
+                        kept_gen: existing_gen,
+                        kept_is_fold: existing_is_fold,
+                        dropped: location.chunk_id,
+                        dropped_seq: location.client_write_seq,
+                        dropped_gen: incoming_gen,
+                        dropped_is_fold: incoming_is_fold,
+                    };
                 }
-                return;
             }
             // No entry for this chunk_idx — insert at sorted position so Vec stays ordered.
             locs.insert(pos, location.clone());
             chunk_to_file.insert(location.chunk_id, file_id);
-            return;
+            return SlotMergeOutcome::Applied { current: location.chunk_id };
         }
         // No file_offset (legacy path only — every real write carries one, so this is
         // never the hot path): chunk_idx position can't be determined, so fall back to
@@ -6069,7 +6222,7 @@ impl Server {
             if loc.chunk_id == location.chunk_id {
                 *loc = location.clone();
                 chunk_to_file.insert(location.chunk_id, file_id);
-                return;
+                return SlotMergeOutcome::Applied { current: location.chunk_id };
             }
         }
         // No file_offset and no exact chunk_id match: this entry can't be placed at
@@ -6092,6 +6245,7 @@ impl Server {
         // chunk_map consistent.
         debug!("[CHUNK_MAP] file={:?} chunk_id={} dropping unplaceable file_offset=None entry (no chunk_idx, no exact chunk_id match)",
                file_id, location.chunk_id);
+        SlotMergeOutcome::Unplaceable
     }
 
     /// Remove a file from the chunk map (on deletion).
@@ -7126,7 +7280,10 @@ impl Server {
                 self.handle_replicate_chunk_location(location, file_id, generation).await
             }
             Request::ReplicateChunkLocations { locations } => {
-                self.handle_replicate_chunk_locations(locations).await
+                self.handle_replicate_chunk_locations(locations, false).await
+            }
+            Request::ReplicateChunkLocationsWithReceipts { locations } => {
+                self.handle_replicate_chunk_locations(locations, true).await
             }
             Request::ReplicateChunkLocationsV2 { locations } => {
                 self.handle_replicate_chunk_locations_v2(locations).await
@@ -9268,8 +9425,13 @@ impl Server {
         }
     }
 
-    async fn handle_replicate_chunk_locations(&self, locations: Vec<ChunkLocation>) -> Response {
-        debug!("Handling batch replicate of {} chunk locations", locations.len());
+    async fn handle_replicate_chunk_locations(&self, locations: Vec<ChunkLocation>, want_receipts: bool) -> Response {
+        debug!("Handling batch replicate of {} chunk locations (receipts={})", locations.len(), want_receipts);
+        // chunk_id -> (applied, slot's chunk_id after the merge). Only populated when
+        // the sender asked for receipts; empty otherwise so the legacy path costs
+        // nothing extra.
+        let mut merge_results: std::collections::HashMap<ChunkId, (bool, Option<ChunkId>)> =
+            std::collections::HashMap::new();
 
         {
             let now_ms = std::time::SystemTime::now()
@@ -9497,9 +9659,23 @@ impl Server {
             //    known, scan-based fallback otherwise — same as the singular handler).
             for location in &to_commit {
                 if let Some(fid) = location.file_id {
-                    self.chunk_map_update_location_for_file(fid, location).await;
+                    let outcome = self.chunk_map_update_location_for_file(fid, location).await;
+                    if want_receipts {
+                        merge_results.insert(
+                            location.chunk_id,
+                            (outcome.applied(), outcome.current_chunk_id()),
+                        );
+                    }
                 } else {
+                    // Offset-less legacy/healer records go through the scan-based path,
+                    // which reports no per-slot outcome. Report these as applied rather
+                    // than inventing a rejection: a false "declined" would be worse than
+                    // silence, since the whole point of receipts is that a declined one
+                    // means something. Every client-originated location carries file_id.
                     self.chunk_map_update_location(location).await;
+                    if want_receipts {
+                        merge_results.insert(location.chunk_id, (true, Some(location.chunk_id)));
+                    }
                 }
             }
 
@@ -9515,14 +9691,30 @@ impl Server {
             }
         }
 
-        if failed == 0 {
-            Response::Ok { data: None }
-        } else {
-            Response::Error {
+        if failed != 0 {
+            return Response::Error {
                 message: format!("Failed to replicate {}/{} chunk locations", failed, locations.len()),
                 code: ErrorCode::InternalError,
-            }
+            };
         }
+        if !want_receipts {
+            return Response::Ok { data: None };
+        }
+        // One receipt per location sent, in the order sent. A location the orphan gate
+        // dropped before to_commit has no entry in merge_results, and is correctly
+        // reported as not-applied — that rejection was previously just as silent as an
+        // arbitration loss.
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let receipts = locations.iter().map(|l| {
+            let (applied, current) = merge_results.get(&l.chunk_id).copied().unwrap_or((false, None));
+            dfs_common::ChunkLocationReceipt {
+                file_id: l.file_id,
+                chunk_idx: l.file_offset.map(|o| o / CHUNK_SIZE),
+                applied,
+                current_chunk_id: current,
+            }
+        }).collect();
+        Response::ChunkLocationReceipts { receipts }
     }
 
     /// Batch, authoritative chunk-location replication — the healer's completion
@@ -18007,6 +18199,108 @@ mod tests {
         );
     }
 
+    /// 2026-09-08: the merge now REPORTS its outcome instead of logging every decline
+    /// at warn!. Two things depend on that report being right — the per-class metering
+    /// (which decides what gets logged at all) and ChunkLocationReceipts (which tells
+    /// the sender whether its registration actually took). Both are useless if the
+    /// classification is wrong, and a misclassified `Newer` would hide the one class
+    /// that indicates a real arbitration gap among the 92% that are routine.
+    ///
+    /// Context for the thresholds: gluster1 logged 573,924 declines in one 25-minute
+    /// window (2026-08-31 02:05-02:29) — 91.7% Older, 0.8% Equal, 7.4% Newer.
+    #[test]
+    fn slot_merge_outcome_reports_applied_and_classifies_declines() {
+        fn loc(seq: u64, content: &[u8]) -> ChunkLocation {
+            let h = compute_chunk_hash(content);
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(h), nodes: vec![dfs_common::NodeId::new()],
+                size: 4096, checksum: h, file_offset: Some(0),
+                written_at: Some(1_000_000 + seq), client_write_seq: Some(seq), file_id: None,
+            }
+        }
+        let file_id = FileId::new();
+
+        // First write into an empty slot: applied, and the slot names it.
+        let chunk_map = DashMap::new();
+        let chunk_to_file = DashMap::new();
+        let fold_ids = dashmap::DashSet::new();
+        let base = loc(100, b"base-content-for-slot-zero");
+        let out = Server::chunk_map_update_location_for_file_sync(
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &base);
+        assert!(out.applied(), "a first insert must report applied");
+        assert_eq!(out.current_chunk_id(), Some(base.chunk_id));
+
+        // Strictly newer supersedes: applied, slot moves.
+        let newer = loc(101, b"newer-content-supersedes-base");
+        let out = Server::chunk_map_update_location_for_file_sync(
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &newer);
+        assert!(out.applied(), "a strictly newer seq must supersede");
+        assert_eq!(out.current_chunk_id(), Some(newer.chunk_id));
+
+        // Strictly older loses, and must be classified Older — the routine, high-volume
+        // case (a deferred registration draining after something newer landed).
+        let older = loc(99, b"older-content-must-lose-here");
+        let out = Server::chunk_map_update_location_for_file_sync(
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &older);
+        assert!(!out.applied(), "a strictly older seq must be declined");
+        assert_eq!(out.current_chunk_id(), Some(newer.chunk_id),
+            "a declined merge must report what the slot actually names, so the sender \
+             can see what it lost to rather than guessing");
+        match out {
+            SlotMergeOutcome::Rejected { class, dropped, .. } => {
+                assert_eq!(class, RclRejectClass::Older);
+                assert_eq!(dropped, older.chunk_id);
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
+    /// The Equal class specifically: a fold inherits the client_write_seq of the token
+    /// it folded, so the fold result and that token tie on seq and the contest is broken
+    /// on fold origin. This was 380 of the 414 equal-seq declines on the VM-108 disk
+    /// image in the 2026-08-31 window — i.e. the dominant shape for that file, and
+    /// correct behavior. It must classify as Equal, not Newer, or it would pollute the
+    /// one signal that indicates a genuine gap.
+    #[test]
+    fn equal_seq_fold_versus_its_own_token_classifies_as_equal_not_newer() {
+        let file_id = FileId::new();
+        let chunk_map = DashMap::new();
+        let chunk_to_file = DashMap::new();
+        let fold_ids = dashmap::DashSet::new();
+
+        let fold_hash = compute_chunk_hash(b"fold-result-bytes-for-this-slot");
+        let fold = ChunkLocation {
+            chunk_id: ChunkId::from_hash(fold_hash), nodes: vec![dfs_common::NodeId::new()],
+            size: 4096, checksum: fold_hash, file_offset: Some(0),
+            written_at: Some(1_000_044), client_write_seq: Some(44), file_id: None,
+        };
+        fold_ids.insert(fold.chunk_id);
+
+        // The patch token the fold consumed — same seq, different identity.
+        let tok_hash = compute_chunk_hash(b"the-patch-token-that-was-folded");
+        let token = ChunkLocation {
+            chunk_id: ChunkId::from_hash(tok_hash), nodes: vec![dfs_common::NodeId::new()],
+            size: 4096, checksum: tok_hash, file_offset: Some(0),
+            written_at: Some(1_000_044), client_write_seq: Some(44), file_id: None,
+        };
+
+        Server::chunk_map_update_location_for_file_sync(
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &fold);
+        let out = Server::chunk_map_update_location_for_file_sync(
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &token);
+
+        assert!(!out.applied(), "the fold must win against the token it folded");
+        match out {
+            SlotMergeOutcome::Rejected { class, kept_is_fold, .. } => {
+                assert_eq!(class, RclRejectClass::Equal,
+                    "a fold/token tie is the Equal class — misfiling it as Newer would bury \
+                     the genuine-gap signal under the single most common decline shape");
+                assert!(kept_is_fold, "the receipt must record that a fold won");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
     /// L1 invariant (2026-07-19 ghost-clobber fix): once the healer preserves the
     /// healed chunk's real seq instead of registering `None` (see healing.rs L1
     /// edits), a *current* chunk always carries its seq — so a stale broadcast of an
@@ -22459,7 +22753,7 @@ mod tests {
             file_id: Some(file_id),
         };
 
-        let response = server.handle_replicate_chunk_locations(vec![stale_incoming]).await;
+        let response = server.handle_replicate_chunk_locations(vec![stale_incoming], false).await;
         assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
 
         let resolved = server.metadata.get_chunk_location(&chunk_id).unwrap().unwrap();
@@ -22522,7 +22816,7 @@ mod tests {
         };
         server.metadata.put_file(&file_meta).unwrap();
 
-        let response = server.handle_replicate_chunk_locations(locations).await;
+        let response = server.handle_replicate_chunk_locations(locations, false).await;
         assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
 
         for chunk_id in chunk_ids {
@@ -22592,7 +22886,7 @@ mod tests {
             file_offset: Some(i as u64 * CHUNK_SIZE), written_at: None, client_write_seq: Some(2), file_id: Some(file_id),
         }).collect();
 
-        let response = server.handle_replicate_chunk_locations(new_locations.clone()).await;
+        let response = server.handle_replicate_chunk_locations(new_locations.clone(), false).await;
         assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
 
         // The file-record patch goes through sled_write_tx's background worker
@@ -22687,7 +22981,7 @@ mod tests {
             file_offset: Some(0), written_at: Some(1_001), client_write_seq: None, file_id: Some(file_id),
         };
 
-        let response = server.handle_replicate_chunk_locations(vec![first, second]).await;
+        let response = server.handle_replicate_chunk_locations(vec![first, second], false).await;
         assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
 
         let resolved = server.metadata.get_chunk_location(&chunk_id).unwrap().unwrap();

@@ -840,6 +840,37 @@ impl MetadataQueue {
 /// comment for why chunk_id itself can't be the key.
 type ChunkLocationSlotKey = (Option<dfs_common::FileId>, Option<u64>);
 
+/// Does this error mean the peer could not HANDLE the request (so it predates the
+/// receipt variant), as opposed to us never having reached it?
+///
+/// Only the former justifies latching receipts off for the session. Getting this wrong
+/// is expensive and silent in one direction: a false positive permanently disables the
+/// mechanism that makes declined registrations visible, and nothing ever says so again.
+/// A false negative just costs a few retries against a genuinely old peer.
+///
+/// Found the hard way — the first version had no error inspection at all and latched
+/// purely on "new request failed, legacy then succeeded", which is exactly what a node
+/// restart looks like: the receipt attempts hit a down node, the legacy retry lands
+/// after it returns. One restart in the local suite (2026-09-08, "Failed to connect to
+/// node") silently disabled receipts for that client's whole life, and the suite still
+/// passed 110/0 — pass/fail could never have caught it.
+///
+/// Conservative by construction: anything connection-shaped is NOT unsupported, and an
+/// absent error (every attempt timed out, so nothing was ever recorded) is NOT
+/// unsupported either.
+fn error_indicates_unsupported_request(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    !(e.contains("connect")
+        || e.contains("connection")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("broken pipe")
+        || e.contains("reset")
+        || e.contains("refused")
+        || e.contains("unreachable")
+        || e.contains("eof"))
+}
+
 /// Upsert `locations` into `pending` keyed by chunk slot, freshest-wins via
 /// client_write_seq. Shared by every pending_chunk_locations writer (enqueue,
 /// the two failed-send re-queue paths, and the two direct-extend call sites) so
@@ -1072,6 +1103,13 @@ pub struct DfsClient {
     /// produced ~9.6 chunk-location-replicated completions per actual patch applied
     /// before this dedup existed.
     pending_chunk_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, dfs_common::ChunkLocation>>>,
+
+    /// Whether the current leader understands Request::ReplicateChunkLocationsWithReceipts.
+    /// Starts optimistic; latches off only on positive evidence of an older peer (see
+    /// send_chunk_locations_batched), never on a transient failure.
+    chunk_location_receipts_supported: Arc<std::sync::atomic::AtomicBool>,
+    /// Count of registrations the leader told us it declined — previously unobservable.
+    declined_chunk_locations: Arc<std::sync::atomic::AtomicU64>,
 
     /// Per-file monotonic write sequence counter. Each metadata enqueue increments
     /// the counter for that file_id and stamps it on the metadata before queuing.
@@ -1404,6 +1442,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             single_replica_emergency_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             single_replica_followup_exhausted_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            chunk_location_receipts_supported: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            declined_chunk_locations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             write_seq: Arc::new(DashMap::new()),
             chunk_seq: Arc::new(DashMap::new()),
             read_write_seq_cache: Arc::new(DashMap::new()),
@@ -6224,18 +6264,131 @@ leader_addr: Arc::new(RwLock::new(None)),
         if locations.is_empty() {
             return Ok(());
         }
-        let req = Request::ReplicateChunkLocations { locations };
+        // Prefer the receipt-bearing variant so a declined registration is visible
+        // instead of being reported as success — see
+        // Request::ReplicateChunkLocationsWithReceipts' doc comment. Falls back to the
+        // legacy request against a leader that predates it; `receipts_supported`
+        // latches off only on evidence (the new request failing where the old one
+        // immediately succeeds), never on a plain transient error, so a flaky network
+        // can't permanently downgrade a capable cluster.
+        let use_receipts = self.chunk_location_receipts_supported.load(Ordering::Relaxed);
+        let req = if use_receipts {
+            Request::ReplicateChunkLocationsWithReceipts { locations: locations.clone() }
+        } else {
+            Request::ReplicateChunkLocations { locations: locations.clone() }
+        };
         let mut backoff_ms = 250u64;
+        let mut first_err: Option<String> = None;
         for attempt in 1u32..=4 {
             match tokio::time::timeout(Duration::from_secs(3), self.send_request(leader, req.clone())).await {
+                Ok(Ok(Response::ChunkLocationReceipts { receipts })) => {
+                    self.audit_chunk_location_receipts(leader, &locations, &receipts);
+                    return Ok(());
+                }
                 Ok(Ok(_)) => return Ok(()),
-                Ok(Err(e)) => warn!("ReplicateChunkLocations to leader {} failed (attempt {}): {}", leader, attempt, e),
-                Err(_)    => warn!("ReplicateChunkLocations to leader {} timed out (attempt {})", leader, attempt),
+                Ok(Err(e)) => {
+                    if first_err.is_none() { first_err = Some(e.to_string()); }
+                    warn!("ReplicateChunkLocations to leader {} failed (attempt {}): {}", leader, attempt, e);
+                }
+                Err(_) => warn!("ReplicateChunkLocations to leader {} timed out (attempt {})", leader, attempt),
             }
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             backoff_ms = (backoff_ms * 2).min(4_000);
         }
+
+        // Every attempt with the new variant failed. Before giving up, try the legacy
+        // request once: if THAT succeeds, this leader simply doesn't understand the new
+        // variant (an older binary mid-rollout), so latch receipts off rather than
+        // failing every registration until it's upgraded.
+        if use_receipts {
+            let legacy = Request::ReplicateChunkLocations { locations };
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), self.send_request(leader, legacy)).await {
+                // The legacy request worked where the receipt one didn't — but that alone
+                // is NOT evidence of an old binary, and treating it as such is a trap:
+                // during a node restart the receipt attempts hit a down node and the
+                // legacy retry lands after it comes back, which looks identical. Caught
+                // in the local suite 2026-09-08: a single restart produced "Failed to
+                // connect to node" and silently disabled receipts for the rest of that
+                // client's life. A connectivity failure must never latch — the cost of
+                // being wrong is that the whole feature turns itself off permanently and
+                // invisibly, which is the exact class of silent failure it exists to
+                // expose. Latch only on an error that shows we actually reached the peer
+                // and it could not handle the request; anything connection-shaped, and
+                // the all-timeouts case (which leaves first_err None), stays retryable.
+                let unsupported = first_err.as_deref()
+                    .map(error_indicates_unsupported_request)
+                    .unwrap_or(false);
+                if unsupported {
+                    self.chunk_location_receipts_supported.store(false, Ordering::Relaxed);
+                    warn!("leader {} rejected ReplicateChunkLocationsWithReceipts but accepted the legacy \
+                           request ({}) — treating it as a pre-receipt binary and disabling receipts for \
+                           this session; declined registrations will be silent again until it is upgraded",
+                        leader, first_err.as_deref().unwrap_or("unknown error"));
+                } else {
+                    debug!("leader {} took the legacy chunk-location request after the receipt variant \
+                            failed ({}) — connection-shaped, so keeping receipts enabled",
+                        leader, first_err.as_deref().unwrap_or("all attempts timed out"));
+                }
+                return Ok(());
+            }
+        }
         anyhow::bail!("ReplicateChunkLocations to leader {} failed after 4 attempts", leader)
+    }
+
+    /// Report any registration the leader declined. This is the signal that used to be
+    /// wire-invisible: the leader's chunk_map does NOT name our chunk_id for that slot,
+    /// so unless a later write touches it, the leader stays behind our own view of it
+    /// indefinitely (observed: eight days, 2026-09-08 server4 investigation).
+    ///
+    /// Deliberately reports rather than mutates. Reacting automatically — re-registering
+    /// with a fresh seq, or adopting the leader's answer into the read engine — is a real
+    /// design decision with its own failure modes, and doing it silently inside a
+    /// fire-and-forget batch worker is how the original bug stayed invisible for so long.
+    /// Make it observable first.
+    fn audit_chunk_location_receipts(
+        &self,
+        leader: SocketAddr,
+        sent: &[dfs_common::ChunkLocation],
+        receipts: &[dfs_common::ChunkLocationReceipt],
+    ) {
+        if receipts.len() != sent.len() {
+            warn!("chunk-location receipts from {}: got {} receipts for {} locations — \
+                   cannot match them up, skipping audit", leader, receipts.len(), sent.len());
+            return;
+        }
+        for (loc, r) in sent.iter().zip(receipts.iter()) {
+            if r.applied {
+                continue;
+            }
+            let n = self.declined_chunk_locations.fetch_add(1, Ordering::Relaxed) + 1;
+            match r.current_chunk_id {
+                // The leader names a DIFFERENT identity for this slot: arbitration
+                // (location_supersedes) kept something else. This is the shape that can
+                // leave the leader authoritatively behind us, because nothing re-delivers
+                // a losing arbitration — only a later write to the same slot can move it.
+                Some(theirs) => {
+                    warn!("[RCL-declined #{}] leader {} kept a different identity for this slot: \
+                           file={:?} chunk_idx={:?} ours={} (client_write_seq={:?}) theirs={} — \
+                           arbitration declined ours; nothing re-delivers this, so the slot stays \
+                           on their identity until something writes it again",
+                        n, leader, r.file_id, r.chunk_idx, loc.chunk_id, loc.client_write_seq, theirs);
+                }
+                // The leader has NO entry for the slot, i.e. this never reached
+                // arbitration at all — handle_replicate_chunk_locations' liveness gate
+                // dropped it because the file's FILE_TABLE record hadn't landed yet.
+                // Routine for a fresh write, and NOT a divergence: flush_metadata_sync is
+                // the authoritative backstop and delivers this state regardless (see that
+                // gate's own doc comment). Logged at debug so it doesn't read as an
+                // incident — observed 4 times across a full local suite run.
+                None => {
+                    debug!("[RCL-not-yet-recorded #{}] leader {} has no entry for this slot yet: \
+                            file={:?} chunk_idx={:?} ours={} (client_write_seq={:?}) — dropped by the \
+                            liveness gate before arbitration (file record not committed yet); \
+                            flush_metadata_sync remains the backstop for it",
+                        n, leader, r.file_id, r.chunk_idx, loc.chunk_id, loc.client_write_seq);
+                }
+            }
+        }
     }
 
     /// Return a snapshot of the NodeId→SocketAddr reverse map for use by callers that
@@ -8725,6 +8878,88 @@ leader_addr: Arc::new(RwLock::new(None)),
         self.metadata_queue.push_and_wait(stamped).await;
     }
 
+    /// Shutdown-time flush of pending_chunk_locations, plus a LOUD report of anything
+    /// that still didn't make it.
+    ///
+    /// `pending_chunk_locations` is an in-memory HashMap with no durability of any
+    /// kind. The background worker retries forever, which is right while the process
+    /// lives — but at exit, whatever is still queued simply evaporates, and nothing
+    /// anywhere records that it did. Those entries are post-write location
+    /// registrations for bytes that are already durable on the storage nodes, so
+    /// losing one means the leader's chunk_map never learns the client's newest
+    /// identity for that slot. If no later write touches the slot, the leader stays
+    /// authoritatively behind that client's own view of it — permanently.
+    ///
+    /// That is the leading candidate mechanism behind the 2026-09-08 server4
+    /// investigation, where a VM disk's read engine stayed pinned to retired patch
+    /// tokens for eight days: 166 of the 199 "took >1s — re-queuing for the background
+    /// worker" warnings in the entire 14-day client log fell inside the single hour
+    /// (2026-08-31 02:00) that also produced 447 of the 749 stuck-token mints, while
+    /// the leader was wedged in compaction. Nothing logged the consequence.
+    ///
+    /// Bounded by `deadline` for the same reason every other shutdown step is (see
+    /// FlushHandle::drain's Step 1 comment): an unreachable leader must cost one
+    /// bounded wait, not an indefinite hang of the SIGTERM path.
+    pub async fn drain_pending_chunk_locations_for_shutdown(&self, deadline: tokio::time::Instant) {
+        loop {
+            let batch: Vec<dfs_common::ChunkLocation> = {
+                let mut pending = self.pending_chunk_locations.lock().await;
+                if pending.is_empty() {
+                    return; // everything registered — the normal path
+                }
+                std::mem::take(&mut *pending).into_values().collect()
+            };
+            let count = batch.len();
+
+            if tokio::time::Instant::now() >= deadline {
+                self.report_lost_chunk_locations(&batch, "shutdown deadline reached");
+                return;
+            }
+            let Some(leader) = *self.leader_addr.read().await else {
+                self.report_lost_chunk_locations(&batch, "no known leader at shutdown");
+                return;
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.send_chunk_locations_batched(leader, batch.clone()),
+            ).await {
+                Ok(Ok(())) => {
+                    info!("shutdown drain: registered {} pending chunk locations with leader {}", count, leader);
+                    // Loop again — more may have arrived while this send was in flight.
+                }
+                Ok(Err(e)) => {
+                    self.report_lost_chunk_locations(&batch, &format!("send to leader {} failed: {}", leader, e));
+                    return;
+                }
+                Err(_) => {
+                    self.report_lost_chunk_locations(&batch, &format!("send to leader {} timed out", leader));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Make an otherwise-silent loss auditable. error!-level and per-slot detail is
+    /// deliberate: this is durable data becoming unreachable-by-metadata, it is rare,
+    /// and the whole problem with the old behavior was that it left no trace at all.
+    fn report_lost_chunk_locations(&self, lost: &[dfs_common::ChunkLocation], why: &str) {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        error!("shutdown drain: LOSING {} unregistered chunk location(s) — {}. The bytes are \
+                durable on the storage nodes but the leader's chunk_map will never learn these \
+                identities, so any slot below with no later write stays permanently behind this \
+                client's own view of it.", lost.len(), why);
+        for loc in lost.iter().take(32) {
+            error!("  lost chunk location: file={:?} chunk_idx={:?} chunk_id={} client_write_seq={:?}",
+                loc.file_id,
+                loc.file_offset.map(|o| o / CHUNK_SIZE),
+                loc.chunk_id,
+                loc.client_write_seq);
+        }
+        if lost.len() > 32 {
+            error!("  ... and {} more not listed", lost.len() - 32);
+        }
+    }
+
     /// Spawn the background chunk-location batch drain task onto the given runtime.
     /// Must be called once after construction. Wakes on a short fixed interval,
     /// drains whatever has accumulated in pending_chunk_locations, and sends it as one
@@ -10277,5 +10512,53 @@ mod tests {
         let (primary, fallbacks) = client.pick_replica_by_load(&loc0, &nim, &cluster);
         assert_eq!(primary, addr_b);
         assert_eq!(fallbacks, vec![addr_a]);
+    }
+
+    /// Regression for the 2026-09-08 latch defect. `send_chunk_locations_batched` falls
+    /// back to the legacy chunk-location request when the receipt variant fails, and may
+    /// then conclude the peer predates receipts and disable them FOR THE SESSION. That
+    /// conclusion has to be drawn from the error, not from "the fallback worked" — during
+    /// a node restart the receipt attempts hit a down node and the legacy retry lands
+    /// after it comes back, which is indistinguishable from an old binary by outcome
+    /// alone.
+    ///
+    /// The first version had no error inspection whatsoever. A single restart in the
+    /// local suite silently disabled receipts for that client's whole life, and the suite
+    /// still reported 110 passed / 0 failed — this is not a defect pass/fail can catch,
+    /// so it gets a direct test.
+    ///
+    /// Asymmetric on purpose: a false positive permanently and invisibly turns off the
+    /// mechanism that exists to make declined registrations visible; a false negative
+    /// costs a handful of retries. So every connection-shaped error must read as
+    /// "retryable", and only a genuine could-not-handle-it error may latch.
+    #[test]
+    fn only_a_non_connection_error_may_disable_receipts() {
+        // Every one of these is a peer we never reached, or reached and lost — the
+        // restart shape. None may latch.
+        for e in [
+            "Failed to connect to node",          // the exact string from the suite
+            "Connection refused (os error 111)",
+            "connection reset by peer",
+            "Broken pipe",
+            "request timed out",
+            "Timeout waiting for response",
+            "network unreachable",
+            "unexpected EOF while reading",
+        ] {
+            assert!(!error_indicates_unsupported_request(e),
+                "{e:?} is connection-shaped and must NOT disable receipts — a node restart \
+                 would otherwise permanently and silently turn the feature off");
+        }
+
+        // Reached the peer, and it could not decode/dispatch the request: the only shape
+        // that actually indicates a pre-receipt binary.
+        for e in [
+            "invalid value: integer `47`, expected variant index",
+            "io error: failed to fill whole buffer while deserializing Request",
+            "Unknown request variant",
+        ] {
+            assert!(error_indicates_unsupported_request(e),
+                "{e:?} indicates the peer could not handle the request, so latching is correct");
+        }
     }
 }

@@ -1332,6 +1332,16 @@ impl ShutdownHandle {
             }
         }
 
+        // Step 4: register anything still sitting in pending_chunk_locations, and make
+        // any residue LOUD. This queue is in-memory only, so whatever is left when the
+        // process exits is silently lost — see
+        // Client::drain_pending_chunk_locations_for_shutdown for the incident that
+        // makes this worth a dedicated step rather than trusting the 10ms worker to
+        // have kept up.
+        client.drain_pending_chunk_locations_for_shutdown(
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(30),
+        ).await;
+
         info!("shutdown drain: all buffers flushed and metadata committed");
     }
 }

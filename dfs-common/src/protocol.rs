@@ -955,6 +955,37 @@ pub enum Request {
     /// dispatch for the ~13 variants defined after it and breaking a live
     /// client mount — caught only because the mount visibly broke).
     GetOrphanAuthInfo,
+
+    /// Identical payload to `ReplicateChunkLocations`, but the leader answers with a
+    /// per-slot `ChunkLocationReceipts` instead of a bare `Ok`.
+    ///
+    /// Exists for the same reason `Response::FoldReceipt` was added on 2026-08-14 for
+    /// ReplicatePatchFold: the receiving handler's arbitration
+    /// (`Server::location_supersedes`) can legitimately decline an incoming update
+    /// while the RPC still returns success, so "recorded" and "declined" were
+    /// wire-identical. That gap was closed for folds and never extended to the
+    /// chunk-location path, which is by far the higher-volume one — gluster1 declined
+    /// 573,924 chunk-location merges in a single 25-minute window on 2026-08-31 and
+    /// every one of those senders was told `Ok`.
+    ///
+    /// The consequence is not cosmetic. A declined registration means the leader's
+    /// chunk_map never learns that client's newest identity for the slot; if no later
+    /// write touches it, the leader stays authoritatively behind that client's own
+    /// view of the slot indefinitely (observed: eight days, see the 2026-09-08 server4
+    /// investigation). With a receipt the sender can at least see it happened.
+    ///
+    /// A NEW request variant rather than changing `ReplicateChunkLocations`' response,
+    /// because an old client must never receive a Response variant it cannot decode.
+    /// Old clients keep using the old request and keep getting `Ok`; only a sender that
+    /// opts in by using this variant can be sent receipts.
+    ///
+    /// APPENDED at end to preserve wire compatibility — bincode encodes enum variants
+    /// by ordinal position, so inserting anywhere but the end shifts every later
+    /// variant's encoding. See GetOrphanAuthInfo's doc comment above for the live
+    /// incident (2026-08-11) caused by getting exactly this wrong.
+    ReplicateChunkLocationsWithReceipts {
+        locations: Vec<ChunkLocation>,
+    },
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1021,6 +1052,23 @@ pub enum RemotePatchState {
 }
 
 /// Response types
+/// Per-slot outcome of one ChunkLocation registration — see
+/// `Request::ReplicateChunkLocationsWithReceipts`.
+///
+/// `applied` answers the only question the sender actually cares about: does the
+/// leader's chunk_map name MY chunk_id for this slot now? `current_chunk_id` says what
+/// it names instead when the answer is no, so the sender can log precisely what it lost
+/// to rather than guessing — the same shape as `Response::FoldReceipt`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkLocationReceipt {
+    pub file_id: Option<FileId>,
+    /// Chunk index (file_offset / 4MiB), or None for an offset-less legacy record.
+    pub chunk_idx: Option<u64>,
+    pub applied: bool,
+    /// What the slot names after this call. None when the location was unplaceable.
+    pub current_chunk_id: Option<ChunkId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     /// Reply to a Ping liveness probe. Payload-free — its mere arrival is the signal.
@@ -1475,6 +1523,14 @@ pub enum Response {
     FoldReceipt {
         applied: bool,
         current_chunk_id: ChunkId,
+    },
+
+    /// Answer to `Request::ReplicateChunkLocationsWithReceipts` — one receipt per
+    /// location sent, in the same order. See that request's doc comment for why this
+    /// exists. Only ever sent in response to that request, so a client that predates
+    /// it can never receive it. APPENDED at end to preserve wire compatibility.
+    ChunkLocationReceipts {
+        receipts: Vec<ChunkLocationReceipt>,
     },
 }
 

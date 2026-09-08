@@ -12,7 +12,7 @@ pub use types::{
     LeaveReason, NodeHealthGossip, NodeId, NodeInfo, NodeStatus, PATCH_TOKEN_MARKER,
 };
 pub use protocol::{
-    ClusterMessage, DeleteQueueEntry, ErrorCode, FoldReleaseOutcome, Message, MessageEnvelope,
+    ChunkLocationReceipt, ClusterMessage, DeleteQueueEntry, ErrorCode, FoldReleaseOutcome, Message, MessageEnvelope,
     MetadataOperation, PendingHealingEntry, ProposeFoldOutcome, RemotePatchState, Request,
     RequestId, Response,
 };

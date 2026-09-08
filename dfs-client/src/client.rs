@@ -3127,6 +3127,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                         }
                         Err(e) if e.to_string().contains("metadata may be stale") => {
                             error!("Range chunk {} missing on all replicas — will refresh metadata and retry", rf.cid);
+                            // Every replica the map named answered "not found" — this
+                            // identity is retired, not merely mis-routed. Record it so a
+                            // later chunk_map merge can't reinstate it over the corrected
+                            // one (2026-09-08 server4 incident — see
+                            // InodeReadEngine::mark_chunk_proven_absent).
+                            engine.mark_chunk_proven_absent(rf.cid);
                             stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk, rf.cid));
                         }
                         Err(e) => return Err(e),
@@ -3541,6 +3547,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                         // dd EIO on a chunk verified present + hash-correct on all 3 replicas).
                         // Bounded by STALE_RETRY_DELAYS_MS below — not unconditional retry.
                         warn!("Chunk {} failed on all replicas ({}) — will refresh metadata and retry", cid, e);
+                        // Only a genuine "every named replica says not found" answer
+                        // proves the identity retired. This branch also catches plain
+                        // connectivity/timeout failures (see the comment above), and
+                        // blacklisting a live chunk_id on a transient error would pin the
+                        // slot exactly the way this mechanism exists to prevent — so gate
+                        // on fetch_chunk_with_fallback's all_not_found discriminator.
+                        if e.to_string().contains("metadata may be stale") {
+                            engine.mark_chunk_proven_absent(cid);
+                        }
                         stale_retries.push((idx, cid));
                     }
                 }

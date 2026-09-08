@@ -44,6 +44,22 @@ pub struct InodeReadEngine {
     /// DashSet is sharded — no single lock, scales with CPU count.
     pub in_flight: DashSet<ChunkId>,
 
+    /// chunk_ids a real read has PROVEN physically absent — every replica the map
+    /// named answered "not found". This is the one fact the client can establish
+    /// on its own that no seq comparison can express, and without recording it the
+    /// engine has no way to tell "the server is trying to revert me to older
+    /// content" (must reject) from "the id I hold is dead and the server's answer
+    /// is the only live identity" (must accept). See
+    /// update_chunk_map_window's doc comment for the 2026-09-08 server4 incident
+    /// where conflating those two pinned a live VM disk to retired patch tokens
+    /// for eight days.
+    ///
+    /// Bounded: a long-lived engine on a heavily-rewritten file would otherwise
+    /// accumulate one entry per retired identity forever. Overflowing simply
+    /// clears the set — that costs the optimization, never correctness, since the
+    /// leader's resolve_by_slot backstop still resolves the slot either way.
+    proven_absent: DashSet<ChunkId>,
+
     /// Index of the next chunk the pipeline should speculatively fetch.
     pub pipeline_head: AtomicUsize,
 
@@ -111,6 +127,7 @@ impl InodeReadEngine {
             last_map_refresh_ms: AtomicU64::new(stale_ms),
             node_id_to_addr: RwLock::new(Arc::new(HashMap::new())),
             in_flight: DashSet::new(),
+            proven_absent: DashSet::new(),
             pipeline_head: AtomicUsize::new(0),
             pipeline_depth: 4,
             refresh_in_progress: AtomicBool::new(false),
@@ -122,6 +139,71 @@ impl InodeReadEngine {
             last_chunk_fetch_ms: AtomicU64::new(50),
             last_read_end: AtomicU64::new(0),
         })
+    }
+
+    /// Record that `cid` was found on NO replica the chunk map named. Called from
+    /// the read path's all-replicas-failed branch, which is the only place that can
+    /// establish this: a single node answering "not found" proves nothing (the map's
+    /// node list can simply be stale), but every named replica answering it proves
+    /// the identity itself is retired.
+    ///
+    /// Deliberately one-way for the life of the engine. A retired patch token never
+    /// becomes live again — the fold that retired it is durable — so re-admitting one
+    /// could only ever re-pin the slot to a dead id.
+    pub fn mark_chunk_proven_absent(&self, cid: ChunkId) {
+        /// Cap on distinct proven-absent identities held per open file. Staging's
+        /// worst observed case was 481 on a single VM disk image; this leaves two
+        /// orders of magnitude of headroom before the clear-and-restart kicks in.
+        const PROVEN_ABSENT_CAP: usize = 4096;
+
+        // Restricted to patch tokens, which is the entire observed population: every
+        // one of the 481 dangling ids on server4 carried PATCH_TOKEN_MARKER. Two
+        // reasons to keep it that narrow. A token is minted per patch and dies once,
+        // for good, when its fold retires it — so blacklisting one can never lock out
+        // content that comes back. A real content hash is the opposite: it is
+        // file-scoped, so identical 4MB blocks (an all-zero region of a VM image, say)
+        // share one id across several slots, and a stale node list on ONE slot could
+        // otherwise blacklist an id that is perfectly alive at another. A genuine
+        // content chunk missing from every replica is a healing/data-loss matter, not
+        // a staleness artifact, and must keep going down the existing retry path.
+        if !cid.looks_like_patch_token() {
+            return;
+        }
+        if self.proven_absent.len() >= PROVEN_ABSENT_CAP {
+            self.proven_absent.clear();
+        }
+        if self.proven_absent.insert(cid) {
+            debug!("Engine inode={}: chunk {} proven absent on every replica — it can no \
+                    longer win a chunk_map merge for its slot", self.inode, cid);
+        }
+    }
+
+    /// True once a read has proven this chunk_id absent on every replica.
+    pub fn is_chunk_proven_absent(&self, cid: &ChunkId) -> bool {
+        self.proven_absent.contains(cid)
+    }
+
+    /// Shared merge admission rule for both chunk-map update paths.
+    ///
+    /// Returns true when `incoming` should replace `existing` at a slot. The seq
+    /// comparison stays exactly as it was for the ordinary case — this only adds the
+    /// two rulings seq alone cannot make:
+    ///
+    ///   * the slot currently holds an identity a read has proven dead, so ANY
+    ///     different identity is an improvement regardless of seq; and
+    ///   * the incoming identity is itself proven dead, so it must never be
+    ///     installed over a live one no matter how new its seq claims to be.
+    fn merge_admits(&self, existing: &ChunkLocation, incoming: &ChunkLocation, seq_ok: bool) -> bool {
+        if incoming.chunk_id == existing.chunk_id {
+            return seq_ok;
+        }
+        if self.is_chunk_proven_absent(&incoming.chunk_id) {
+            return false;
+        }
+        if self.is_chunk_proven_absent(&existing.chunk_id) {
+            return true;
+        }
+        seq_ok
     }
 
     /// Force-expire the chunk map TTL so the next needs_refresh() returns true.
@@ -242,10 +324,11 @@ impl InodeReadEngine {
             if idx >= map.len() {
                 map.resize(idx + 1, nil_loc);
             }
-            let should_update = match (incoming_seq, map[idx].client_write_seq) {
+            let seq_ok = match (incoming_seq, map[idx].client_write_seq) {
                 (Some(inc), Some(ext)) => inc >= ext,
                 _ => true,
             };
+            let should_update = self.merge_admits(&map[idx], &loc, seq_ok);
             if !should_update {
                 None
             } else {
@@ -351,7 +434,7 @@ impl InodeReadEngine {
                 // resolved winner, so trusting it outright at equal seq (`>=`) is the
                 // client-side counterpart of the same (seq, origin) rule, not a separate
                 // guess. Strictly-lower incoming seq is still rejected.
-                let should_update = if from_write_path {
+                let seq_ok = if from_write_path {
                     true
                 } else {
                     match (loc.client_write_seq, new_map[idx].client_write_seq) {
@@ -361,6 +444,12 @@ impl InodeReadEngine {
                         (None, None)           => true,
                     }
                 };
+                // Overlay the proven-absent rulings on top of the seq verdict. Note
+                // this also applies to write-path calls: an id already proven dead
+                // must not be reinstalled by a late write-path update either, which
+                // is how the same slot kept coming back after RevalidateChunkSlot
+                // had already corrected it.
+                let should_update = self.merge_admits(&new_map[idx], &loc, seq_ok);
                 if should_update {
                     new_map[idx] = loc;
                 }
@@ -541,6 +630,16 @@ mod tests {
     fn chunk_id_with_hash0(b: u8) -> ChunkId {
         let mut hash = [0u8; 32];
         hash[0] = b;
+        ChunkId::from_hash(hash)
+    }
+
+    /// A ChunkId carrying PATCH_TOKEN_MARKER, i.e. what apply_patch actually mints —
+    /// the `df7c…` ids that made up 100% of the server4 dangling population.
+    fn patch_token_id(b: u8) -> ChunkId {
+        let mut hash = [0u8; 32];
+        hash[0] = dfs_common::PATCH_TOKEN_MARKER[0];
+        hash[1] = dfs_common::PATCH_TOKEN_MARKER[1];
+        hash[2] = b;
         ChunkId::from_hash(hash)
     }
 
@@ -841,5 +940,213 @@ mod tests {
         engine.update_single_chunk(equal.clone(), 4 * 1024 * 1024, Arc::new(HashMap::new()));
         let (map2, _, _) = engine.snapshot();
         assert_eq!(map2[0].chunk_id, equal.chunk_id, "equal seq must still be applied");
+    }
+
+    /// 2026-09-08 server4 read-throughput investigation: `dd` of a live VM disk on
+    /// staging ran at 39 MB/s. Not disk, not network (0.28ms RTT to every node) —
+    /// the client was burning the run re-failing reads against retired patch tokens.
+    ///
+    /// Measured on server4 inside one 198s dd: 882 reads that failed on ALL replicas,
+    /// 7,980 wasted "chunk not found" RPCs, and 860 full chunk-map refetches from the
+    /// leader totalling 58.8s. Every single failing id was `df7c…`-prefixed — a
+    /// retired patch token (ChunkId::looks_like_patch_token), never a real hash.
+    ///
+    /// The leader was NOT at fault, which is what makes this a client bug. gluster1's
+    /// resolve_by_slot backstop reads the same `self.chunk_map` that
+    /// handle_get_file_chunk_map serves from, and it resolved every one of those
+    /// slots to a real, readable, non-token chunk id (one distinct id per chunk_idx,
+    /// e.g. idx=117 -> 007410f5…, idx=1280 -> 00b0b2cd…). The request was a full-map
+    /// refresh (from_chunk=0), so those slots were inside the served window. The
+    /// leader therefore sent the CORRECT id for every failing slot — and this
+    /// function threw it away.
+    ///
+    /// The shape: the client writes a slot, minting a patch token at client_write_seq
+    /// N and installing it via the write path (`from_write_path=true`, which bypasses
+    /// the guard entirely and always applies). The server later folds that patch and
+    /// its chunk_map names the fold's real result — but carrying the seq preserved
+    /// from the record it folded, which is BEHIND the client's latest write seq for
+    /// that slot. The refresh then arrives with `inc < ext` and the guard rejects it.
+    ///
+    /// Nothing else can correct the slot, so the engine stays pinned to a physically
+    /// absent id for the life of the open file. On staging that meant tokens minted
+    /// 2026-08-31 were still being requested on 09-08, one of them 1,022 times in a
+    /// single day, each request costing 6 failed RPCs plus a 66ms full-map refetch.
+    /// Reads still SUCCEED — the leader's slot backstop covers them — so this never
+    /// surfaces as EIO, only as a permanent throughput tax that hides as "slow disk".
+    #[test]
+    fn refresh_must_recover_slot_pinned_to_retired_token_by_newer_client_seq() {
+        let engine = InodeReadEngine::new(1);
+
+        // The client's own write installs a patch token at seq 105 via the write
+        // path. from_write_path=true, so this is applied unconditionally.
+        let retired_token = ChunkLocation {
+            client_write_seq: Some(105),
+            file_offset: Some(0),
+            ..loc_with_nodes(patch_token_id(0x01), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![retired_token.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, true);
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, retired_token.chunk_id,
+            "sanity: the client's own write installs the patch token");
+
+        // A read of the slot now fails on EVERY replica the map named: the fold
+        // retired the token and no node holds it. This is the step that gives the
+        // engine the one fact seq cannot express, and in production it always
+        // precedes the refresh below — read_file marks the id here and then calls
+        // refresh_engine from the same stale-retry branch.
+        engine.mark_chunk_proven_absent(retired_token.chunk_id);
+
+        // The server folded that patch. Its chunk_map now names the fold's real
+        // result, but at the seq preserved from the folded record (104) — behind the
+        // client's own latest write seq for the slot. This is what GetFileChunkMap
+        // sends, and it is the authoritative, correct answer.
+        let true_current = ChunkLocation {
+            client_write_seq: Some(104),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(0x26), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![true_current.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, false);
+
+        let (map2, _, _) = engine.snapshot();
+        assert_eq!(map2[0].chunk_id, true_current.chunk_id,
+            "a server refresh must be able to correct a slot the client itself last \
+             wrote: the client's entry names a retired patch token that is physically \
+             absent on every replica, and the leader's answer is the authoritative \
+             post-fold identity. Rejecting it on seq alone pins the engine to a dead \
+             id forever — 39 MB/s instead of line rate, with the leader's slot \
+             backstop silently paying for every read.");
+    }
+
+    /// Companion to the above, second rejection arm of the same guard. A fold result
+    /// that carries no client_write_seq at all (server-origin, no client write behind
+    /// it) hits `(None, Some(_)) => false` and is rejected against any client-written
+    /// entry — equally unrecoverable, and for the same reason: the client has no way
+    /// to tell "older" from "authoritative correction" using seq alone.
+    #[test]
+    fn refresh_must_recover_slot_when_server_answer_has_no_client_seq() {
+        let engine = InodeReadEngine::new(1);
+
+        let retired_token = ChunkLocation {
+            client_write_seq: Some(105),
+            file_offset: Some(0),
+            ..loc_with_nodes(patch_token_id(0x01), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![retired_token.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, true);
+        engine.mark_chunk_proven_absent(retired_token.chunk_id);
+
+        let true_current = ChunkLocation {
+            client_write_seq: None,
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(0x26), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![true_current.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, false);
+
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, true_current.chunk_id,
+            "a seq-less server answer must still be able to correct a slot pinned to a \
+             retired patch token — (None, Some(_)) => false makes the slot permanently \
+             unrecoverable by refresh");
+    }
+
+    /// Negative control for the pair above, and the reason the fix is gated on a
+    /// proven-absent id rather than on relaxing the seq comparison. An ordinary
+    /// strictly-older server answer — no read has proven anything dead — must STILL
+    /// be rejected. This is the 2026-08-08/09 VM-108 restore-corruption guard
+    /// (a slow ForceFold landing after a faster later flush); weakening it to fix
+    /// the throughput bug would trade a slow disk for a corrupt one.
+    #[test]
+    fn strictly_older_refresh_still_rejected_when_nothing_proven_absent() {
+        let engine = InodeReadEngine::new(1);
+
+        let current = ChunkLocation {
+            client_write_seq: Some(105),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(0x26), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![current.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, true);
+
+        let older = ChunkLocation {
+            client_write_seq: Some(104),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(0x11), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![older], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, false);
+
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, current.chunk_id,
+            "with nothing proven absent, a strictly-older server answer must still lose — \
+             the anti-revert guard must survive the proven-absent fix intact");
+    }
+
+    /// The other half of the mechanism: once an id is proven dead, no later merge may
+    /// reinstate it — including a write-path call, which bypasses the seq guard
+    /// entirely. Without this, a late write-path update re-pins the slot moments after
+    /// RevalidateChunkSlot corrected it, which is why the staging engine kept
+    /// re-requesting the same token 1,022 times in one day.
+    #[test]
+    fn proven_absent_id_can_never_be_reinstated_even_by_write_path() {
+        let engine = InodeReadEngine::new(1);
+
+        let dead = ChunkLocation {
+            client_write_seq: Some(100),
+            file_offset: Some(0),
+            ..loc_with_nodes(patch_token_id(0x01), vec![dfs_common::NodeId::new()])
+        };
+        let live = ChunkLocation {
+            client_write_seq: Some(101),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(0x26), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(
+            vec![live.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, true);
+        engine.mark_chunk_proven_absent(dead.chunk_id);
+
+        // Write path — unconditional by seq rules, and with a HIGHER seq than the live
+        // entry, so only the proven-absent ruling can stop it.
+        let dead_newer = ChunkLocation { client_write_seq: Some(102), ..dead.clone() };
+        engine.update_chunk_map_window(
+            vec![dead_newer], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, true);
+
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, live.chunk_id,
+            "an id proven absent on every replica must never be reinstated into the map, \
+             not even by a newer-seq write-path update");
+
+        // update_single_chunk is the other feed into the same map and must agree.
+        engine.update_single_chunk(
+            ChunkLocation { client_write_seq: Some(103), ..dead },
+            4 * 1024 * 1024, Arc::new(HashMap::new()));
+        let (map2, _, _) = engine.snapshot();
+        assert_eq!(map2[0].chunk_id, live.chunk_id,
+            "update_single_chunk must honour the same proven-absent ruling");
+    }
+
+    /// Safety bound on the mechanism: a real content-addressed chunk id must NEVER be
+    /// blacklisted, even after a read finds it on no replica. Chunk hashing is
+    /// file-scoped, so identical 4MB blocks in one file (an all-zero region of a VM
+    /// image) share a single id across several slots — blacklisting it because ONE
+    /// slot's node list went stale would lock a live identity out of every other slot
+    /// that legitimately needs it. A genuine content chunk absent everywhere is a
+    /// healing/data-loss matter and must stay on the ordinary retry path.
+    #[test]
+    fn real_content_chunk_id_is_never_blacklisted() {
+        let engine = InodeReadEngine::new(1);
+        let real_id = chunk_id_with_hash0(0x42);
+        assert!(!real_id.looks_like_patch_token(), "sanity: not a token");
+
+        engine.mark_chunk_proven_absent(real_id);
+        assert!(!engine.is_chunk_proven_absent(&real_id),
+            "a real content-addressed chunk id must never enter the proven-absent set");
+
+        let token = patch_token_id(0x01);
+        engine.mark_chunk_proven_absent(token);
+        assert!(engine.is_chunk_proven_absent(&token),
+            "a patch token proven absent on every replica must be recorded");
     }
 }

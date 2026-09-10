@@ -8587,8 +8587,18 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// with the bytes on disk. Pinning the target to configured RF (floored at 2, unless
     /// RF itself is below 2) means every patch always tries to reach 2 replicas
     /// regardless of the chunk's current state.
+    ///
+    /// Delegates to `dfs_common::types::write_quorum` rather than restating the formula.
+    /// This value is half of a two-sided contract: the server's `location_supersedes`
+    /// durability guard decides whether a write that reached this many replicas is
+    /// allowed to supersede what a slot already holds. When the two sides carried
+    /// SEPARATE copies of "how many replicas is durable", they disagreed — the server
+    /// compared against the existing record's (healer-raised) node count instead of a
+    /// fixed floor, so every write this function acknowledged at 2 replicas was silently
+    /// discarded once the slot had been healed to 3. That cost a real acknowledged write
+    /// on VM-108 (2026-09-10, vm-108-disk-1 chunk_idx 9). One definition, one place.
     fn compute_required_replicas(configured_rf: usize) -> usize {
-        if configured_rf >= 2 { 2 } else { configured_rf.max(1) }
+        dfs_common::types::write_quorum(configured_rf)
     }
 
     /// Ask the leader to heal `chunk_id` immediately, bypassing healing_delay_secs —

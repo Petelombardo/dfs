@@ -174,6 +174,38 @@ pub struct NodeHealthGossip {
 /// tokens minted going forward, not a replacement.
 pub const PATCH_TOKEN_MARKER: [u8; 2] = [0xDF, 0x7C];
 
+/// How many replicas a client write must reach before it counts as durable — the
+/// single definition of write quorum, shared by BOTH halves of the protocol.
+///
+/// It lives here, in dfs-common, because the client and the server each used to answer
+/// this question separately and **they answered it differently**, which silently lost
+/// acknowledged writes (root-caused 2026-09-10, VM-108 vm-108-disk-1 chunk_idx 9):
+///
+///   - the client acknowledged a MultiPatch once it reached this many replicas
+///     (`compute_required_replicas`, 2 of RF=3) and moved on;
+///   - the server's `location_supersedes` durability guard rejected any non-fold write
+///     carrying FEWER NODES THAN THE RECORD IT WOULD REPLACE.
+///
+/// Those two rules are compatible only while the existing record sits at or below the
+/// quorum floor. The healer's whole job is to raise it to RF — so once a slot had been
+/// healed to 3, EVERY subsequent 2-replica client write to it was guaranteed to lose.
+/// Not a race: deterministic. Measured on staging during one VM boot, 668 of 1243
+/// chunk-location registrations landed at 2 nodes and only 375 at 3, with the leader
+/// declining a steady stream of them and, per its own log, "nothing re-delivers this".
+///
+/// The rejected write's patch token was then never adopted, never folded, its
+/// patch_state was GC'd and its bytes swept as an orphan — while its CHUNK_TABLE row
+/// survived on all five nodes. The slot was left pointing at an identity nothing could
+/// resolve, and the only surviving content was the PRE-WRITE base. The guest's write
+/// was gone.
+///
+/// Keep this as the one source of truth. A guard that compares against a moving target
+/// (the current replica count of whatever is already there) cannot express "did this
+/// write achieve durability?" — only a fixed floor can.
+pub fn write_quorum(replication_factor: usize) -> usize {
+    if replication_factor >= 2 { 2 } else { replication_factor.max(1) }
+}
+
 /// Unique identifier for a chunk of data
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChunkId {

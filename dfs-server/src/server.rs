@@ -410,6 +410,26 @@ pub struct Server {
     /// whose patch settled long ago) — see resolve_chunk_content.
     pending_patch_ids: Arc<DashMap<ChunkId, (FileId, u64)>>,
 
+    /// Last time handle_get_file_chunk_map ran its CHUNK_TABLE self-heal for a file,
+    /// so it can't run more than once per CHUNK_MAP_SELF_HEAL_INTERVAL per file.
+    ///
+    /// The self-heal calls re_derive_and_repair_chunk_map, which is O(CHUNK_TABLE) —
+    /// a full walk and bincode-deserialize of every row (~400k on staging). It was
+    /// previously unbounded: any request whose window contained one bad identity paid
+    /// for a whole scan. That is safe only while the scan can actually fix the entry,
+    /// which is true for a purged chunk_id (it cannot come back) but NOT for a slot
+    /// whose CHUNK_TABLE winner is itself the dead identity — there the repair is a
+    /// no-op and the next request scans again. With a client re-fetching a hot file's
+    /// map ~7 times a second (measured 2026-09-10), that is a full-table scan per
+    /// request on the leader's runtime, and the leading suspect for the same window's
+    /// `[META COMMITTER] slow commit: 9675.19ms for a 1-op batch (queue_depth=0)` —
+    /// "external blocking, not volume", as that warning itself says.
+    ///
+    /// Rate-limiting rather than one-shot-latching deliberately: the condition is
+    /// genuinely repairable in the common case (that is the whole point), so this must
+    /// keep retrying — just not once per read.
+    chunk_map_self_heal_at: Arc<DashMap<FileId, std::time::Instant>>,
+
     /// Retry backstop for the ReplicateChunkLocation/ReplicatePatchFold broadcast
     /// run_single_fold sends immediately after a fold completes. That broadcast
     /// skips any peer not currently NodeStatus::Online and is otherwise
@@ -1719,6 +1739,11 @@ pub(crate) enum RclRejectClass {
     /// window (7.4%) — a real, unexplained arbitration gap worth investigating.
     Newer,
 }
+
+/// A peer took delivery of a ReplicatePatchFold broadcast. `None` if its chunk_map
+/// now names the fold result; `Some(id)` if it processed the announcement (patch_state
+/// is durably Folded either way) but its chunk_map holds `id` for the slot instead.
+pub(crate) type PeerFoldDelivery = Option<ChunkId>;
 
 /// Result of merging one ChunkLocation into a slot. Returned rather than logged
 /// in-place so the caller can both meter it (see RclRejectClass) and answer the
@@ -3911,10 +3936,44 @@ impl OverlayForkCtx {
                                     public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
                                     location: Some(new_loc.clone()),
                                 };
-                                fold_ok = matches!(
-                                    tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(node_addr, Message::Request(fold_request))).await,
-                                    Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
-                                );
+                                // handle_replicate_patch_fold has answered with
+                                // Response::FoldReceipt, never Response::Ok, since 075bd00
+                                // (2026-08-14) — but this check was written a week earlier
+                                // (1587592) and still required Ok, so from that commit until
+                                // 2026-09-10 EVERY peer broadcast of EVERY fold reported
+                                // failure on EVERY peer. Measured on staging: 436 "failed to
+                                // broadcast patch fold" warnings in one 6-minute window =
+                                // 109 folds x exactly 4 peers, against 0 failures of the
+                                // sibling ReplicateChunkLocation on the same connection in
+                                // the same round. Cost was 3 wasted re-sends per peer per
+                                // fold (each one a durable update_patch_state_folded_async
+                                // plus a re-run of the receiver's location_supersedes
+                                // arbitration), and — worse — it buried the genuine
+                                // lost-announcement signal this warning exists to raise,
+                                // which is the 2026-08-14 VM-108 daily-EIO root cause.
+                                //
+                                // Unlike notify_leader_of_fold, applied:false is NOT a
+                                // failure here: for a non-leader peer the receipt only has
+                                // to prove the message was processed (patch_state is flipped
+                                // to Folded before the receipt is built), and a peer whose
+                                // chunk_map legitimately holds a newer identity for the slot
+                                // is best-effort coverage either way — the same reasoning
+                                // start_patch_fold_rebroadcast_loop already applies to
+                                // non-leader responses.
+                                if let Ok(Ok(envelope)) = tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(node_addr, Message::Request(fold_request))).await {
+                                    if let Some(delivery) = Self::classify_peer_fold_response(&envelope.message) {
+                                        if let Some(current_chunk_id) = delivery {
+                                            // debug!, not warn!: routine during write churn
+                                            // (a hot slot can retire ten tokens a second), so
+                                            // warning here would recreate the very noise this
+                                            // fix removes.
+                                            debug!("single fold: peer {} took delivery of {} -> {} but its chunk_map \
+                                                    names {} for file {} chunk {}",
+                                                node_id, public_token, new_chunk_id, current_chunk_id, file_id, chunk_idx);
+                                        }
+                                        fold_ok = true;
+                                    }
+                                }
                             }
                             if loc_ok && fold_ok {
                                 return;
@@ -3962,6 +4021,30 @@ impl OverlayForkCtx {
         Some((new_chunk_id, final_size, fold_buf, final_client_write_seq))
     }
 
+    /// What a *non-leader peer* said in response to a ReplicatePatchFold broadcast.
+    ///
+    /// Split out of the broadcast retry loop purely so it can be unit-tested: the
+    /// bug it encodes (requiring `Response::Ok` from a handler that has answered
+    /// `Response::FoldReceipt` since 075bd00) lived undetected for 27 days inside a
+    /// detached `tokio::spawn`, where nothing could reach it.
+    ///
+    /// `None` means nothing was delivered and the send must be retried. Both receipt
+    /// variants mean delivered — see the call site for why `applied: false` is not a
+    /// failure for a peer the way it is for the leader.
+    fn classify_peer_fold_response(msg: &Message) -> Option<PeerFoldDelivery> {
+        match msg {
+            Message::Response(Response::FoldReceipt { applied: true, .. }) => Some(None),
+            Message::Response(Response::FoldReceipt { applied: false, current_chunk_id }) => {
+                Some(Some(*current_chunk_id))
+            }
+            // Old-protocol peer mid-rollout, still answering with a bare Ok — accept it
+            // as best-effort delivery rather than treating version skew as a hard
+            // failure, exactly as notify_leader_of_fold does.
+            Message::Response(Response::Ok { .. }) => Some(None),
+            _ => None,
+        }
+    }
+
     /// Synchronously push a completed fold's result to the leader, with a
     /// couple of short, timeout-guarded retries, before run_single_fold
     /// considers the fold's dissemination done.
@@ -3994,6 +4077,7 @@ impl OverlayForkCtx {
     /// false (not blocking further) if the leader is still unconfirmed after
     /// retries — pending_patch_fold_broadcasts's rebroadcast loop is the
     /// backstop for that case, same as it always was.
+
     async fn notify_leader_of_fold(
         &self,
         public_token: ChunkId,
@@ -5230,6 +5314,7 @@ impl Server {
             )),
             last_fold_leader_confirm: Arc::new(DashMap::new()),
             pending_patch_ids: Arc::new(DashMap::new()),
+            chunk_map_self_heal_at: Arc::new(DashMap::new()),
             pending_patch_fold_broadcasts: Arc::new(DashMap::new()),
             fold_result_chunk_ids: Arc::new(dashmap::DashSet::new()),
             chunk_generations: Arc::new(DashMap::new()),
@@ -5437,6 +5522,7 @@ impl Server {
     /// RAM at once — on a node with 535 MB of sled metadata, list_files() was
     /// materialising a 2 GB Vec<FileMetadata> and triggering OOM-like behaviour.
     pub fn rebuild_chunk_map_from_metadata(&self) {
+        let durability_floor = self.durability_floor();
         let chunk_map = self.chunk_map.clone();
         let chunk_to_file = self.chunk_to_file.clone();
         let file_write_seqs = self.file_write_seqs.clone();
@@ -5495,7 +5581,7 @@ impl Server {
                     skipped_no_file_id += 1;
                     return true;
                 };
-                Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, None, file_id, &loc);
+                Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, None, file_id, &loc, durability_floor);
                 // The shared helper seeds a brand-new entry's write_seq field from the
                 // CHUNK's own client_write_seq (chunk-level) — preserve this rebuild's
                 // original semantics of also folding in the FILE's scalar write_seq
@@ -5696,6 +5782,14 @@ impl Server {
     ///
     /// Returns true on a full tie, i.e. "incoming is at least as new" — callers use
     /// this to accept the later-seen of two indistinguishable rows.
+    /// This node's current write-quorum floor, from live configured RF.
+    /// One call so every arbitration site agrees; see write_quorum in dfs-common.
+    pub(crate) fn durability_floor(&self) -> usize {
+        dfs_common::types::write_quorum(
+            self.replication_factor.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn location_supersedes(
         incoming: &ChunkLocation,
         existing: &ChunkLocation,
@@ -5703,6 +5797,12 @@ impl Server {
         existing_is_fold: bool,
         incoming_gen: Option<u64>,
         existing_gen: Option<u64>,
+        // Minimum replica count a non-fold write must have reached to be allowed to
+        // displace a better-replicated record — dfs_common::types::write_quorum(rf).
+        // Passed rather than read from a field because this is an associated fn with
+        // call sites across two modules; threading it explicitly matches how the fold
+        // flags and generations above are already handled.
+        durability_floor: usize,
     ) -> bool {
         // Durability guard (2026-07-27, VM-111 dd EIO investigation): an ORDINARY
         // (non-fold) write must never supersede an existing pointer with FEWER
@@ -5722,7 +5822,38 @@ impl Server {
         // fold's freshly-computed result is a deliberate single-node-then-
         // replicate-forward design (see run_single_fold), not a failure — it
         // legitimately starts under-replicated by intent.
-        if !incoming_is_fold && incoming.nodes.len() < existing.nodes.len() {
+        // CORRECTED 2026-09-10 (VM-108 vm-108-disk-1 chunk_idx 9, a LOST ACKNOWLEDGED
+        // WRITE). The guard above describes its own intent precisely — "a MultiPatch
+        // round that FAILS TO REACH QUORUM" leaving "a chunk that existed on exactly one
+        // node" — but it was implemented as `incoming.nodes.len() < existing.nodes.len()`,
+        // which is not that test. `existing.nodes.len()` is a moving target: raising it
+        // to the replication factor is precisely the healer's job. So the guard behaved
+        // as intended only while the existing record sat at or below quorum, and once a
+        // slot had been healed to 3, EVERY subsequent 2-replica client write to it lost —
+        // deterministically, not as a race. The client acknowledges a patch at
+        // `write_quorum` (2 of RF=3) and moves on, so those were writes the guest had
+        // already been told were durable. Measured on staging: 668 of 1243 registrations
+        // in one VM boot landed at 2 nodes vs 375 at 3.
+        //
+        // The consequence was not merely a rejected pointer. The declined write's patch
+        // token was never adopted and so never folded; patch_state_gc swept its redirect
+        // and the orphan sweep took its bytes, while its CHUNK_TABLE row survived on all
+        // five nodes. The slot ended up naming an identity nothing could resolve, whose
+        // only surviving alternative was the PRE-WRITE base — i.e. the arbiter ranked a
+        // stale-but-well-replicated value above the correct one, and the newer data was
+        // gone.
+        //
+        // Compare against the fixed durability floor instead. This keeps the 2026-07-27
+        // VM-111 protection exactly: that incident's phantom held 1 node, which is below
+        // write_quorum(3)=2, so it is still rejected against a healthy predecessor. What
+        // changes is only the case the original guard never meant to catch — a write that
+        // DID reach quorum, which is now allowed to fall through to the causal ordering
+        // below and win on merit. Folds stay exempt, unchanged: a fold's result is
+        // deliberately single-node-then-replicate-forward.
+        if !incoming_is_fold
+            && incoming.nodes.len() < durability_floor
+            && incoming.nodes.len() < existing.nodes.len()
+        {
             return false;
         }
         // Per-slot generation is the AUTHORITATIVE causal ordering: the client's
@@ -6034,7 +6165,7 @@ impl Server {
                 }
             }
         }
-        let outcome = Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, Some(&self.chunk_generations), file_id, location);
+        let outcome = Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, Some(&self.chunk_generations), file_id, location, self.durability_floor());
         self.meter_slot_merge_outcome(file_id, &outcome);
         outcome
     }
@@ -6119,6 +6250,8 @@ impl Server {
         chunk_generations: Option<&DashMap<ChunkId, u64>>,
         file_id: FileId,
         location: &ChunkLocation,
+        // See location_supersedes' parameter of the same name.
+        durability_floor: usize,
     ) -> SlotMergeOutcome {
         // Use entry() to atomically create-or-get: for brand-new files that have no
         // chunk_map entry yet, this inserts an empty Vec so subsequent logic can push
@@ -6165,6 +6298,7 @@ impl Server {
                 let should_update = loc.chunk_id == location.chunk_id
                     || Self::location_supersedes(
                         location, loc, incoming_is_fold, existing_is_fold, incoming_gen, existing_gen,
+                        durability_floor,
                     );
                 if should_update {
                     chunk_to_file.remove(&loc.chunk_id);
@@ -16264,6 +16398,7 @@ impl Server {
     /// ReconcileMetadata to all followers so they remove stale records that
     /// accumulated from missed deletes. Returns immediately; work is backgrounded.
     async fn handle_trigger_metadata_repair(&self) -> Response {
+        let durability_floor = self.durability_floor();
         let metadata = self.metadata.clone();
         let chunk_map = self.chunk_map.clone();
         let chunk_to_file = self.chunk_to_file.clone();
@@ -16321,7 +16456,7 @@ impl Server {
                         let mut built = 0usize;
                         let scan2 = metadata.scan_chunk_locations(|loc| {
                             let Some(file_id) = loc.file_id else { return true; };
-                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, Some(&chunk_generations), file_id, &loc);
+                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, Some(&chunk_generations), file_id, &loc, durability_floor);
                             let seed_write_seq = file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
                             if let Some(mut entry) = chunk_map.get_mut(&file_id) {
                                 let (_, seq) = entry.value_mut();
@@ -17050,6 +17185,8 @@ impl Server {
         metadata: &MetadataStore,
         fold_result_chunk_ids: &dashmap::DashSet<ChunkId>,
         file_id: dfs_common::FileId,
+        // See location_supersedes' parameter of the same name.
+        durability_floor: usize,
     ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let mut by_idx: std::collections::HashMap<u64, ChunkLocation> = std::collections::HashMap::new();
@@ -17066,6 +17203,7 @@ impl Server {
                             // TODO(fix-S increment 2): pass chunk_generations lookups here.
                             None,
                             None,
+                            durability_floor,
                         ) {
                             e.insert(loc);
                         }
@@ -17099,7 +17237,8 @@ impl Server {
     ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
         let metadata = self.metadata.clone();
         let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
-        tokio::task::spawn_blocking(move || Self::chunk_locations_for_info(&metadata, &fold_result_chunk_ids, file_id))
+        let durability_floor = self.durability_floor();
+        tokio::task::spawn_blocking(move || Self::chunk_locations_for_info(&metadata, &fold_result_chunk_ids, file_id, durability_floor))
             .await
             .context("spawn_blocking panicked in chunk_locations_for_info_async")?
     }
@@ -17118,6 +17257,72 @@ impl Server {
     /// touch chunk_map if the scan comes back empty or fails — same "don't
     /// replace a real cache with an empty one on a possibly-transient scan
     /// issue" caution the code this was extracted from already had.
+    /// Rate-limit gate for handle_get_file_chunk_map's CHUNK_TABLE self-heal — see
+    /// `chunk_map_self_heal_at`. Returns true at most once per interval per file, and
+    /// records the attempt only when it returns true.
+    ///
+    /// Deliberately does NOT depend on whether the previous attempt repaired anything:
+    /// knowing that would require re-running the very scan this bounds.
+    fn claim_chunk_map_self_heal(&self, file_id: FileId) -> bool {
+        /// Long enough that a client stuck in a per-read refresh loop (~7/s observed)
+        /// can't turn this into a full-table scan per request, short enough that a
+        /// genuinely repairable slot heals well inside one VM boot.
+        const CHUNK_MAP_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let now = std::time::Instant::now();
+        match self.chunk_map_self_heal_at.entry(file_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                if now.duration_since(*e.get()) < CHUNK_MAP_SELF_HEAL_INTERVAL {
+                    return false;
+                }
+                e.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(now);
+                true
+            }
+        }
+    }
+
+    /// First slot where `fresh` names a causally OLDER identity than `current` does,
+    /// as `(chunk_idx, current_id, fresh_id)`. `None` when `fresh` reverts nothing.
+    ///
+    /// "Older" is judged on the same signals location_supersedes arbitrates on, minus the
+    /// ones this call site cannot see (fold origin, per-slot generation): a strictly lower
+    /// client_write_seq, or an equal seq with a strictly older written_at. Deliberately
+    /// conservative — anything it cannot prove to be a regression it lets through, so this
+    /// can only ever suppress a substitution, never invent one.
+    fn first_causal_regression(
+        current: &[ChunkLocation],
+        fresh: &[ChunkLocation],
+    ) -> Option<(u64, ChunkId, ChunkId)> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let idx_of = |l: &ChunkLocation| l.file_offset.map(|o| o / CHUNK_SIZE);
+        for f in fresh {
+            let Some(idx) = idx_of(f) else { continue };
+            let Some(c) = current.iter().find(|c| idx_of(c) == Some(idx)) else { continue };
+            if c.chunk_id == f.chunk_id {
+                continue;
+            }
+            let regressed = match (f.client_write_seq, c.client_write_seq) {
+                (Some(fs), Some(cs)) if fs != cs => fs < cs,
+                (Some(_), Some(_)) => match (f.written_at, c.written_at) {
+                    (Some(fw), Some(cw)) => fw < cw,
+                    _ => false,
+                },
+                // A row with no seq losing to one that has it is the legacy case
+                // location_supersedes already treats as older.
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if regressed {
+                return Some((idx, c.chunk_id, f.chunk_id));
+            }
+        }
+        None
+    }
+
     async fn re_derive_and_repair_chunk_map(&self, file_id: FileId) -> (Vec<ChunkLocation>, u64) {
         let fresh_locations = match self.chunk_locations_for_info_async(file_id).await {
             Ok(locs) => locs,
@@ -17361,7 +17566,9 @@ impl Server {
                     idx >= from_chunk && idx < from_chunk.saturating_add(count)
                 })
                 .map(|l| match self.metadata.get_chunk_location(&l.chunk_id) {
-                    Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(l, sled_loc),
+                    Ok(Some(sled_loc)) => {
+                        Self::resolve_chunk_nodes(l, sled_loc)
+                    }
                     Ok(None) => {
                         // The chunk_id itself has no CHUNK_TABLE record at all — not
                         // "node list changed" (that's the Ok(Some) case above), but
@@ -17424,12 +17631,33 @@ impl Server {
             // see the black-hole-node incident memory around lock-across-await).
             drop(entry);
             let response = slice_response(&locations, write_seq);
-            if found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed) {
+            if found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed)
+                && self.claim_chunk_map_self_heal(file_id)
+            {
                 warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
                        no CHUNK_TABLE record — re-deriving from authoritative CHUNK_TABLE truth \
                        instead of serving the stale identity", file_id);
                 let (fresh_locations, fresh_write_seq) = self.re_derive_and_repair_chunk_map(file_id).await;
                 if !fresh_locations.is_empty() {
+                    // NEVER substitute an older generation for a newer one, even when the
+                    // newer one is unreadable. Serving intact-but-superseded bytes in place
+                    // of the current identity is silent data loss from the guest's point of
+                    // view: it wrote, we acknowledged, and then we hand back the pre-write
+                    // content with no error. An unreadable current identity must surface as
+                    // an error instead — the client's read fails on every replica and EIOs,
+                    // which is loud, correct, and recoverable. Stale bytes are none of those.
+                    //
+                    // This invariant is enforced HERE, locally, rather than being left to
+                    // location_supersedes staying correct at a distance. The 2026-09-10
+                    // VM-108 incident was exactly a distant arbiter quietly preferring a
+                    // 3-replica older record over a 2-replica newer one; a local guard is
+                    // what makes that class of regression a test failure instead of a silent
+                    // revert. See dfs_common::types::write_quorum.
+                    if let Some(reverted) = Self::first_causal_regression(&locations, &fresh_locations) {
+                        warn!("GetFileChunkMap: self-heal for file {} would have REVERTED chunk_idx {}                                from {} back to {} — refusing, serving the current identity so an                                unreadable chunk surfaces as an error rather than as stale content",
+                            file_id, reverted.0, reverted.1, reverted.2);
+                        return response;
+                    }
                     return slice_response(&fresh_locations, fresh_write_seq);
                 }
                 warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
@@ -18073,7 +18301,7 @@ mod tests {
         let middle = make_loc("middle-patch", 20);
 
         for loc in [&old, &newest, &middle] {
-            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,loc);
+            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,loc, dfs_common::types::write_quorum(3));
         }
 
         let entry = chunk_map.get(&file_id).unwrap();
@@ -18226,14 +18454,14 @@ mod tests {
         let fold_ids = dashmap::DashSet::new();
         let base = loc(100, b"base-content-for-slot-zero");
         let out = Server::chunk_map_update_location_for_file_sync(
-            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &base);
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &base, dfs_common::types::write_quorum(3));
         assert!(out.applied(), "a first insert must report applied");
         assert_eq!(out.current_chunk_id(), Some(base.chunk_id));
 
         // Strictly newer supersedes: applied, slot moves.
         let newer = loc(101, b"newer-content-supersedes-base");
         let out = Server::chunk_map_update_location_for_file_sync(
-            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &newer);
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &newer, dfs_common::types::write_quorum(3));
         assert!(out.applied(), "a strictly newer seq must supersede");
         assert_eq!(out.current_chunk_id(), Some(newer.chunk_id));
 
@@ -18241,7 +18469,7 @@ mod tests {
         // case (a deferred registration draining after something newer landed).
         let older = loc(99, b"older-content-must-lose-here");
         let out = Server::chunk_map_update_location_for_file_sync(
-            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &older);
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &older, dfs_common::types::write_quorum(3));
         assert!(!out.applied(), "a strictly older seq must be declined");
         assert_eq!(out.current_chunk_id(), Some(newer.chunk_id),
             "a declined merge must report what the slot actually names, so the sender \
@@ -18285,9 +18513,9 @@ mod tests {
         };
 
         Server::chunk_map_update_location_for_file_sync(
-            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &fold);
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &fold, dfs_common::types::write_quorum(3));
         let out = Server::chunk_map_update_location_for_file_sync(
-            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &token);
+            &chunk_map, &chunk_to_file, &fold_ids, None, file_id, &token, dfs_common::types::write_quorum(3));
 
         assert!(!out.applied(), "the fold must win against the token it folded");
         match out {
@@ -18334,7 +18562,7 @@ mod tests {
             for loc in order {
                 let mut l = (*loc).clone();
                 l.file_id = Some(file_id);
-                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l, dfs_common::types::write_quorum(3));
             }
             let entry = chunk_map.get(&file_id).unwrap();
             let (locs, _) = entry.value();
@@ -18376,7 +18604,7 @@ mod tests {
             for &i in &perm {
                 let mut loc = candidates[i].clone();
                 loc.file_id = Some(file_id);
-                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&loc);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&loc, dfs_common::types::write_quorum(3));
             }
             let entry = chunk_map.get(&file_id).unwrap();
             winners.push((perm, entry.value().0[0].chunk_id));
@@ -18445,8 +18673,8 @@ mod tests {
         let earlier = make_loc("racing-write-A", 11, 601505);
         let later = make_loc("racing-write-B", 11, 602084);
 
-        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&later);
-        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&earlier);
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&later, dfs_common::types::write_quorum(3));
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&earlier, dfs_common::types::write_quorum(3));
 
         let entry = chunk_map.get(&file_id).unwrap();
         let (locs, _) = entry.value();
@@ -18491,8 +18719,8 @@ mod tests {
         bump_chunk_generation(&gens, stale.chunk_id, 2);
 
         // Install current, then deliver the reordered stale RCL afterward.
-        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, Some(&gens), file_id, &current);
-        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, Some(&gens), file_id, &stale);
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, Some(&gens), file_id, &current, dfs_common::types::write_quorum(3));
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, Some(&gens), file_id, &stale, dfs_common::types::write_quorum(3));
 
         let entry = chunk_map.get(&file_id).unwrap();
         let (locs, _) = entry.value();
@@ -18506,8 +18734,8 @@ mod tests {
         // stale would win — confirming the fix is generation-gated, not a behavior change.
         let cm2: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
         let ctf2: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
-        Server::chunk_map_update_location_for_file_sync(&cm2, &ctf2, &fold_ids, None, file_id, &current);
-        Server::chunk_map_update_location_for_file_sync(&cm2, &ctf2, &fold_ids, None, file_id, &stale);
+        Server::chunk_map_update_location_for_file_sync(&cm2, &ctf2, &fold_ids, None, file_id, &current, dfs_common::types::write_quorum(3));
+        Server::chunk_map_update_location_for_file_sync(&cm2, &ctf2, &fold_ids, None, file_id, &stale, dfs_common::types::write_quorum(3));
         let e2 = cm2.get(&file_id).unwrap();
         assert_eq!(e2.value().0[0].chunk_id, stale.chunk_id,
             "without generations, the old written_at tiebreak still applies (stale wins) — fix is gen-gated");
@@ -18559,7 +18787,7 @@ mod tests {
             for loc in order {
                 let mut l = loc.clone();
                 l.file_id = Some(file_id);
-                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l, dfs_common::types::write_quorum(3));
             }
             let entry = chunk_map.get(&file_id).unwrap();
             let (locs, _) = entry.value();
@@ -18598,7 +18826,7 @@ mod tests {
         for loc in [&fold_result, &real_write] {
             let mut l = (*loc).clone();
             l.file_id = Some(file_id);
-            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l);
+            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l, dfs_common::types::write_quorum(3));
         }
         let entry = chunk_map.get(&file_id).unwrap();
         let (locs, _) = entry.value();
@@ -18689,7 +18917,7 @@ mod tests {
         // Neither chunk_id is in fold_result_chunk_ids -> both are Client-origin ->
         // falls straight through to the pre-existing written_at comparison.
         let loc_b = ChunkLocation { chunk_id: ChunkId::from_hash(hash_b), written_at: Some(50), ..loc_a.clone() };
-        assert!(Server::location_supersedes(&loc_a, &loc_b, false, false, None, None),
+        assert!(Server::location_supersedes(&loc_a, &loc_b, false, false, None, None, dfs_common::types::write_quorum(3)),
             "with neither side in fold_result_chunk_ids, ordering must fall back to plain written_at comparison");
     }
 
@@ -18735,20 +18963,20 @@ mod tests {
         let stale_gen = Some(2u64);
         let current_gen = Some(5u64);
         assert!(
-            !Server::location_supersedes(&stale, &current, true, true, stale_gen, current_gen),
+            !Server::location_supersedes(&stale, &current, true, true, stale_gen, current_gen, dfs_common::types::write_quorum(3)),
             "a retired-generation fold RCL must NOT supersede the current generation \
              just because clock skew handed it a higher written_at (VM-108 repro)",
         );
         // And the current generation, arriving against the stale one, MUST win.
         assert!(
-            Server::location_supersedes(&current, &stale, true, true, current_gen, stale_gen),
+            Server::location_supersedes(&current, &stale, true, true, current_gen, stale_gen, dfs_common::types::write_quorum(3)),
             "the newer generation must supersede the retired one regardless of written_at",
         );
         // Guard the demotion: with generations ABSENT (legacy/unknown), the old
         // written_at fallback still applies — a higher written_at still wins. This
         // documents that the fix is generation-gated, not a blanket written_at change.
         assert!(
-            Server::location_supersedes(&stale, &current, true, true, None, None),
+            Server::location_supersedes(&stale, &current, true, true, None, None, dfs_common::types::write_quorum(3)),
             "with no generation info, ordering must fall back to the pre-existing written_at rule",
         );
     }
@@ -19021,6 +19249,203 @@ mod tests {
         let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _, _)| *id).collect();
         let read_data = server.read_data(&chunk_ids).await.unwrap();
         assert_eq!(data.as_slice(), read_data.as_slice());
+    }
+
+    /// A peer's FoldReceipt must count as delivery of the fold broadcast.
+    ///
+    /// Regression test for a 27-day silent bug (2026-08-14 075bd00 -> 2026-09-10): the
+    /// peer broadcast in run_single_fold required `Response::Ok`, but
+    /// handle_replicate_patch_fold has returned `Response::FoldReceipt` on every success
+    /// path since 075bd00. Every peer broadcast of every fold therefore reported failure
+    /// on every peer — measured on staging as 436 warnings in one 6-minute window,
+    /// exactly 109 folds x 4 peers, against 0 failures of the sibling
+    /// ReplicateChunkLocation in the same round. Cost: 3 wasted re-sends per peer per
+    /// fold, each re-running a durable metadata write and the receiver's arbitration,
+    /// plus the loss of the genuine lost-announcement signal that warning exists for.
+    #[test]
+    fn peer_fold_receipt_counts_as_delivery() {
+        let real = ChunkId::from_hash([7u8; 32]);
+        let other = ChunkId::from_hash([9u8; 32]);
+
+        // applied:true — the ordinary case, and the one the old code rejected.
+        assert_eq!(
+            OverlayForkCtx::classify_peer_fold_response(&Message::Response(Response::FoldReceipt {
+                applied: true, current_chunk_id: real,
+            })),
+            Some(None),
+            "a peer's applied:true receipt is delivery — requiring Response::Ok here is \
+             what made every fold broadcast look failed for 27 days"
+        );
+
+        // applied:false — still delivery for a NON-LEADER peer: patch_state is durably
+        // flipped to Folded before the receipt is built, and a peer whose chunk_map
+        // legitimately holds a newer identity is best-effort coverage either way. This
+        // is deliberately different from notify_leader_of_fold, where applied:false
+        // means the leader did not move and the obligation is NOT discharged.
+        assert_eq!(
+            OverlayForkCtx::classify_peer_fold_response(&Message::Response(Response::FoldReceipt {
+                applied: false, current_chunk_id: other,
+            })),
+            Some(Some(other)),
+            "a peer's applied:false receipt is still delivery, and must report what the \
+             peer's chunk_map holds instead"
+        );
+
+        // Old-protocol peer mid-rollout.
+        assert_eq!(
+            OverlayForkCtx::classify_peer_fold_response(&Message::Response(Response::Ok { data: None })),
+            Some(None),
+            "a bare Ok from an un-upgraded peer must stay acceptable so a rolling \
+             deploy doesn't look like a cluster-wide broadcast failure"
+        );
+
+        // Negative control: a genuine failure must still be retried, or this fix would
+        // paper over the very dissemination gap the warning exists to surface.
+        assert_eq!(
+            OverlayForkCtx::classify_peer_fold_response(&Message::Response(Response::Error {
+                message: "Failed to record patch fold".to_string(),
+                code: ErrorCode::InternalError,
+            })),
+            None,
+            "an error response is NOT delivery — handle_replicate_patch_fold returns one \
+             when its durable patch_state write fails, which must keep retrying"
+        );
+    }
+
+    /// A write that reached quorum must beat an older, better-replicated record.
+    ///
+    /// THE ROOT CAUSE of the 2026-09-10 VM-108 incident, and a LOST ACKNOWLEDGED WRITE.
+    /// The durability guard's stated intent is to reject a MultiPatch "that fails to reach
+    /// quorum" — the 2026-07-27 VM-111 phantom that existed on exactly one node. It was
+    /// implemented as `incoming.nodes.len() < existing.nodes.len()`, which is a different
+    /// test: `existing.nodes.len()` is a moving target, because raising it to RF is the
+    /// healer's entire job. Once a slot had been healed to 3, every subsequent 2-replica
+    /// client write to it lost — deterministically, not as a race — and the client had
+    /// already told the guest those writes were durable (`write_quorum(3) == 2`).
+    /// Staging measured 668 of 1243 registrations landing at 2 nodes vs 375 at 3.
+    #[test]
+    fn quorum_meeting_write_beats_an_older_better_replicated_record() {
+        let floor = dfs_common::types::write_quorum(3);
+        assert_eq!(floor, 2, "RF=3 acknowledges at 2 replicas — must match the client's \
+            compute_required_replicas, which is the whole point of sharing this function");
+
+        let mk = |hash: u8, nodes: usize, seq: u64, at: u64| ChunkLocation {
+            chunk_id: ChunkId::from_hash([hash; 32]),
+            nodes: (0..nodes).map(|_| NodeId::new()).collect(),
+            size: 4 * 1024 * 1024, checksum: [0u8; 32],
+            file_offset: Some(0), written_at: Some(at),
+            client_write_seq: Some(seq), file_id: Some(FileId::new()),
+        };
+
+        // The real incident's shape: base healed to 3, patch landed on 2, patch 41.7s newer,
+        // same client_write_seq (651) so written_at is the tiebreak.
+        let base  = mk(0x31, 3, 651, 1_788_890_395_302);
+        let token = mk(0xdf, 2, 651, 1_788_890_437_020);
+        assert!(
+            Server::location_supersedes(&token, &base, false, false, None, None, floor),
+            "a 2-of-3 write IS durable by the client's own acknowledgement rule — ranking a \
+             stale 3-replica record above it is what lost the guest's write and left the \
+             slot pointing at a token nothing could resolve"
+        );
+
+        // NEGATIVE CONTROL — the 2026-07-27 VM-111 protection must be intact. That phantom
+        // held exactly ONE node, below quorum, and must still lose to a healthy predecessor
+        // no matter how much newer its seq claims to be. Deleting the guard was never the fix.
+        let phantom = mk(0x99, 1, 999, 1_788_890_999_999);
+        assert!(
+            !Server::location_supersedes(&phantom, &base, false, false, None, None, floor),
+            "a write that reached only 1 of 3 did NOT reach quorum and must never orphan a \
+             fully-replicated chunk — this is the incident the guard exists for (835ecc8)"
+        );
+
+        // Folds stay exempt: single-node-then-replicate-forward is their design.
+        let fold = mk(0xfd, 1, 651, 1_788_890_500_000);
+        assert!(
+            Server::location_supersedes(&fold, &base, true, false, None, None, floor),
+            "a fold result legitimately starts under-replicated by intent and must not be \
+             caught by the durability floor"
+        );
+
+        // Below quorum but not worse-replicated than what it replaces: the guard is about
+        // durability relative to the floor, not about punishing small node lists per se.
+        let one_vs_one = mk(0xa1, 1, 700, 1_788_890_600_000);
+        let existing_one = mk(0xa2, 1, 650, 1_788_890_500_000);
+        assert!(
+            Server::location_supersedes(&one_vs_one, &existing_one, false, false, None, None, floor),
+            "a newer write must still win where it displaces nothing better-replicated"
+        );
+    }
+
+    /// The chunk-map self-heal must never hand back an older generation.
+    ///
+    /// Correctness over availability, deliberately: serving intact-but-superseded bytes in
+    /// place of an unreadable current identity is silent data loss from the guest's point of
+    /// view — it wrote, we acknowledged, and it reads back pre-write content with no error.
+    /// An unreadable current identity has to surface as an error instead. This invariant is
+    /// enforced locally so that a regression in the distant arbiter (which is exactly what
+    /// the 2026-09-10 incident was) fails a test rather than silently reverting a slot.
+    #[test]
+    fn self_heal_refuses_to_revert_a_slot_to_an_older_identity() {
+        let mk = |hash: u8, seq: u64, at: u64| ChunkLocation {
+            chunk_id: ChunkId::from_hash([hash; 32]),
+            nodes: vec![NodeId::new()],
+            size: 4 * 1024 * 1024, checksum: [0u8; 32],
+            file_offset: Some(9 * 4 * 1024 * 1024), written_at: Some(at),
+            client_write_seq: Some(seq), file_id: Some(FileId::new()),
+        };
+
+        let current = vec![mk(0xdf, 651, 1_788_890_437_020)];
+        let older   = vec![mk(0x31, 651, 1_788_890_395_302)];
+        let regression = Server::first_causal_regression(&current, &older)
+            .expect("an equal-seq, strictly-older-written_at substitution IS a revert");
+        assert_eq!(regression.0, 9, "must report the offending chunk_idx");
+        assert_eq!(regression.2, older[0].chunk_id);
+
+        // Strictly-lower seq is the unambiguous case.
+        let much_older = vec![mk(0x20, 400, 1_788_890_000_000)];
+        assert!(Server::first_causal_regression(&current, &much_older).is_some(),
+            "a strictly lower client_write_seq is a revert");
+
+        // NEGATIVE CONTROLS — the self-heal must still be able to do its job. It exists to
+        // escape a stale chunk_map, and over-blocking would reinstate the permanent-EIO bug
+        // it was added for (2026-08-07).
+        let newer = vec![mk(0x77, 652, 1_788_890_500_000)];
+        assert!(Server::first_causal_regression(&current, &newer).is_none(),
+            "a genuinely newer identity must be allowed through — this is the whole purpose \
+             of the self-heal");
+        assert!(Server::first_causal_regression(&current, &current).is_none(),
+            "an unchanged identity is not a revert");
+        assert!(Server::first_causal_regression(&current, &[]).is_none(),
+            "nothing to substitute is not a revert");
+    }
+
+    /// The self-heal's O(CHUNK_TABLE) re-derive must be rate-limited per file.
+    ///
+    /// Unbounded, one bad identity in a hot file's map meant a full-table scan
+    /// (~400k rows on staging) on EVERY request — and the client re-fetched ~7 times a
+    /// second. Safe only while the scan can actually fix the slot; when the CHUNK_TABLE
+    /// winner is itself the dead id the repair is a no-op and the next request scans again.
+    #[tokio::test]
+    async fn chunk_map_self_heal_is_rate_limited_per_file() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let cluster = Arc::new(ClusterManager::new(node_id, "127.0.0.1:8900".parse().unwrap(), 10, 30));
+        let server = Server::new(
+            storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let a = FileId::new();
+        let b = FileId::new();
+        assert!(server.claim_chunk_map_self_heal(a), "first claim for a file must win");
+        assert!(!server.claim_chunk_map_self_heal(a), "second claim inside the interval must be refused");
+        assert!(!server.claim_chunk_map_self_heal(a), "and stay refused");
+        assert!(server.claim_chunk_map_self_heal(b), "the limit is per file, not global — a \
+            different file must not be starved by a hot one");
     }
 
     /// Root-caused 2026-07-17 (staging: sustained 67-99% CPU on all 5 nodes, ~100k/day
@@ -19422,7 +19847,7 @@ mod tests {
             file_id: Some(file_id),
         };
         assert!(
-            Server::location_supersedes(&incoming_loc, &existing_loc, true, false, new_gen, Some(500)),
+            Server::location_supersedes(&incoming_loc, &existing_loc, true, false, new_gen, Some(500), dfs_common::types::write_quorum(3)),
             "the fold's own correctly-consolidated result must supersede the pending \
              patch token it just folded — otherwise the slot is left pointing at a token \
              whose PATCH_STATE_TABLE row was just flipped to Folded (unresolvable as a \

@@ -3178,6 +3178,11 @@ impl HealingManager {
             let pending_snapshot_for_orphans = pending_snapshot.clone();
             let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
             let chunk_generations = self.chunk_generations.clone();
+            // Same write-quorum floor the server's own arbitration uses — discovery must
+            // not pick a different slot winner than GetFileChunkMap would.
+            let durability_floor = dfs_common::types::write_quorum(
+                self.replication_factor.load(Ordering::Relaxed),
+            );
             tokio::task::spawn_blocking(move || {
                 // Combined single CHUNK_TABLE pass (see scan_live_chunk_locations's doc
                 // comment) — was two separate full scans (live_chunk_ids then
@@ -3227,6 +3232,7 @@ impl HealingManager {
                                 fold_result_chunk_ids.contains(&cur.chunk_id),
                                 chunk_generations.get(&loc.chunk_id).map(|v| *v),
                                 chunk_generations.get(&cur.chunk_id).map(|v| *v),
+                                durability_floor,
                             ) {
                                 e.insert(loc);
                             }

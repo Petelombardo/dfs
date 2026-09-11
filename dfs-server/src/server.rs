@@ -1444,6 +1444,13 @@ async fn full_rewrite_chunk(
             let _ = tokio::fs::remove_file(&old_path_for_unlink).await;
             let _ = metadata.delete_chunk_location_async(old_chunk_id).await;
             storage.invalidate_cache(&old_chunk_id);
+            // The file is gone, so this node must stop claiming it. invalidate_cache
+            // above only drops the cached BYTES; the presence index is separate, and it
+            // is the one HasChunks answers from — leaving it stale made this node report
+            // a chunk it had just unlinked as present, which is how a fold came to
+            // publish a ChunkLocation naming a replica that held nothing. Index-only, no
+            // I/O, so it costs the io_guard hold nothing measurable.
+            storage.forget_chunk_in_index(&old_chunk_id);
             drop(io_guard);
         }
     }
@@ -24231,6 +24238,70 @@ mod tests {
                 "the registration must go through the group-commit queue exactly once");
             assert_eq!(count_of("put_chunk_location"), 0,
                 "must NOT open a solo redb write transaction competing with the group committer");
+        }
+
+        /// REGRESSION (2026-09-11, staging file 5f62f6a7 chunk 2816 at 21:47:40Z).
+        ///
+        /// full_rewrite_chunk reclaimed the retired base with a raw
+        /// `tokio::fs::remove_file`, which invalidates the read cache but never removes
+        /// the id from `list_chunks_cache`. `chunks_present_batch` answers purely from
+        /// that index (`index.contains(id)` — no stat fallback anywhere), and
+        /// `handle_has_chunks` routes ordinary ids to it, so the node reported a chunk it
+        /// had just deleted as PRESENT.
+        ///
+        /// That false positive poisons `confirm_chunk_holders`, whose whole purpose is to
+        /// be "ground truth, not metadata" for exactly "a ChunkLocation naming replicas
+        /// that do not have the bytes". A fold then counted a phantom holder, found
+        /// `holders.len() >= 2`, skipped `replicate_folded_bytes` entirely (no
+        /// URGENT_SINGLE_REPLICA logged — the tell), and published a 2-node ChunkLocation
+        /// backed by ONE physical copy. A guest read routed to the phantom holder failed.
+        ///
+        /// The invariant: after a rewrite retires an id, this node must not claim to hold
+        /// it. The index must agree with the disk.
+        #[tokio::test]
+        async fn full_rewrite_chunk_retires_old_id_from_the_presence_index() {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(dir.path().join("storage")).unwrap());
+            let metadata = Arc::new(MetadataStore::new(dir.path().join("metadata")).unwrap());
+            let chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>> = Arc::new(DashMap::new());
+            let file_id = dfs_common::FileId::new();
+            let chunk_file_offset = 0u64;
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id));
+            storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            // Precondition: the index knows about it, which is what makes the stale-entry
+            // failure below meaningful rather than vacuous.
+            assert!(storage.chunks_present_batch(&[original_chunk_id]).unwrap()[0],
+                "precondition: the freshly written chunk must be in the presence index");
+
+            let (new_chunk_id, _size, _buf) = full_rewrite_chunk(
+                storage.clone(), metadata.clone(), chunk_io_locks,
+                Arc::new(ShardedAliasMap::new(16)),
+                file_id, chunk_file_offset, original_chunk_id,
+                vec![(0usize, vec![7u8; 64])], None, NodeId::new(),
+            ).await.unwrap();
+            assert_ne!(new_chunk_id, original_chunk_id,
+                "precondition: the patch must actually change content, or nothing is retired");
+
+            // The rewrite really did unlink the old file...
+            assert!(!storage.get_chunk_path(&original_chunk_id).exists(),
+                "precondition: full_rewrite_chunk must have unlinked the retired base");
+
+            // ...so every way of asking "do you have it" must agree with that.
+            assert!(!storage.chunks_present_batch(&[original_chunk_id]).unwrap()[0],
+                "presence index still claims a chunk whose file was just unlinked — this is what \
+                 HasChunks answers from, so confirm_chunk_holders will name this node as a holder \
+                 of bytes it does not have, and a fold will publish a ChunkLocation with a phantom \
+                 replica");
+            assert!(!storage.has_chunk(&original_chunk_id),
+                "has_chunk must agree with the disk for the retired id");
+
+            // The successor must of course still be there — guards against a fix that
+            // over-corrects by clearing more than the one retired id.
+            assert!(storage.chunks_present_batch(&[new_chunk_id]).unwrap()[0],
+                "the rewrite's own output must remain present in the index");
         }
 
         /// Companion to the test above: a fold running concurrently with a flood of

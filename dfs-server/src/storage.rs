@@ -757,11 +757,35 @@ impl ChunkStorage {
         // update and list_chunks' doc comment for why this is an incremental
         // remove, not a wholesale invalidation. Also a no-op if the index isn't
         // built yet, and harmless if chunk_id was never in it (path didn't exist).
+        self.forget_chunk_in_index(chunk_id);
+
+        Ok(())
+    }
+
+    /// Drop `chunk_id` from the live presence index without touching the filesystem.
+    ///
+    /// For the one caller that retires a chunk's file itself instead of going through
+    /// `delete_chunk`: `full_rewrite_chunk` unlinks the base it has just superseded with
+    /// an async `remove_file` while holding that chunk's io lock, and deliberately must
+    /// not trade that single filesystem op for a `spawn_blocking` hop into this type's
+    /// sync `delete_chunk` (see full_rewrite_chunk's comment on getting that hold down
+    /// from ~438ms, which is what kept mixed read/write load from collapsing).
+    ///
+    /// Omitting this is not cosmetic. `chunks_present_batch` answers purely from this
+    /// index — `index.contains(id)`, with no stat fallback — and that is what
+    /// `handle_has_chunks` reports for ordinary ids. `confirm_chunk_holders` in turn
+    /// treats HasChunks as ground truth precisely because it is guarding against "a
+    /// ChunkLocation naming replicas that do not have the bytes". So a stale entry here
+    /// makes a node claim a chunk it deleted, a fold counts a phantom holder, skips
+    /// `replicate_folded_bytes` because `holders.len() >= 2`, and publishes a two-node
+    /// location backed by one physical copy — which is how a guest read got routed to a
+    /// node holding nothing (2026-09-11, file 5f62f6a7 chunk 2816).
+    ///
+    /// A no-op if the index isn't built yet, and harmless if `chunk_id` was never in it.
+    pub fn forget_chunk_in_index(&self, chunk_id: &ChunkId) {
         if let Some(index) = self.list_chunks_cache.write().as_mut() {
             index.remove(chunk_id);
         }
-
-        Ok(())
     }
 
     /// Insert already-known content into the cache directly, without touching disk.

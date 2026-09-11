@@ -1788,6 +1788,25 @@ impl SlotMergeOutcome {
 
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a patch token this node cannot find a CHUNK_TABLE record for is still
+/// assumed to be live somewhere else in the cluster.
+///
+/// CHUNK_TABLE absence is NODE-LOCAL state, and local absence never means "this
+/// identity is dead". With RF=3 across 5 nodes the leader is not a patch target
+/// roughly 40% of the time; on those rounds it learns a token only when
+/// ReplicateChunkLocation lands, so a perfectly live in-flight token is
+/// indistinguishable by local absence alone from one that died days ago. An age floor
+/// off the chunk_map entry's own `written_at` is the independent discriminator: a
+/// token still naming its slot long after PATCH_DEBOUNCE_IDLE (20s) has genuinely
+/// lost its fold. The staging tokens this rule exists for were 1-2 days old.
+///
+/// Learned the expensive way on 2026-09-10: a sibling fix shipped without an age floor,
+/// passed its own unit tests AND a targeted binding check, then failed T28a (thick-file
+/// md5 mismatch after a patch storm + cold client restart) in the full local suite.
+/// Unit tests construct one slot at a time and cannot see it — only the suite exercises
+/// a leader that is a non-target for a live patch.
+const TOKEN_ASSUMED_LIVE_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Minimum time a Pending patch must have existed before a local "file
 /// doesn't exist" reading is trusted enough to abandon it (see
 /// OverlayForkCtx::abandon_patch_if_file_gone).
@@ -17293,6 +17312,24 @@ impl Server {
     /// client_write_seq, or an equal seq with a strictly older written_at. Deliberately
     /// conservative — anything it cannot prove to be a regression it lets through, so this
     /// can only ever suppress a substitution, never invent one.
+    /// True when substituting `fresh` for `current` at one slot hands back
+    /// causally-older content. A pure ordering predicate: it says nothing about
+    /// whether `current` is still *readable*, and that distinction turns out to be
+    /// the whole ballgame — see merge_self_heal.
+    fn is_causal_regression(current: &ChunkLocation, fresh: &ChunkLocation) -> bool {
+        match (fresh.client_write_seq, current.client_write_seq) {
+            (Some(fs), Some(cs)) if fs != cs => fs < cs,
+            (Some(_), Some(_)) => match (fresh.written_at, current.written_at) {
+                (Some(fw), Some(cw)) => fw < cw,
+                _ => false,
+            },
+            // A row with no seq losing to one that has it is the legacy case
+            // location_supersedes already treats as older.
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
     fn first_causal_regression(
         current: &[ChunkLocation],
         fresh: &[ChunkLocation],
@@ -17305,50 +17342,126 @@ impl Server {
             if c.chunk_id == f.chunk_id {
                 continue;
             }
-            let regressed = match (f.client_write_seq, c.client_write_seq) {
-                (Some(fs), Some(cs)) if fs != cs => fs < cs,
-                (Some(_), Some(_)) => match (f.written_at, c.written_at) {
-                    (Some(fw), Some(cw)) => fw < cw,
-                    _ => false,
-                },
-                // A row with no seq losing to one that has it is the legacy case
-                // location_supersedes already treats as older.
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            if regressed {
+            if Self::is_causal_regression(c, f) {
                 return Some((idx, c.chunk_id, f.chunk_id));
             }
         }
         None
     }
 
-    async fn re_derive_and_repair_chunk_map(&self, file_id: FileId) -> (Vec<ChunkLocation>, u64) {
+    /// Merge an authoritative CHUNK_TABLE re-derive into the current chunk_map, slot
+    /// by slot. Returns the map to serve AND store, plus the slots where the
+    /// never-revert invariant refused the substitution (caller logs those).
+    ///
+    /// Two things this gets right that the previous whole-file guard did not, both
+    /// root-caused 2026-09-11 from VM-108's first boot after the 11515f6 deploy:
+    ///
+    /// 1. **A purged current identity is not something to protect.** The invariant
+    ///    exists so we never hand back pre-write content for a write we acknowledged.
+    ///    But this whole self-heal path only runs when the current chunk_id has NO
+    ///    CHUNK_TABLE record, and the healer only purges one after confirming every
+    ///    replica is empty ("DATA LOSS: ... permanently unrecoverable ... purging").
+    ///    At that point the acknowledged write is already gone cluster-wide — there is
+    ///    nothing left to protect, and refusing the substitution does not preserve it.
+    ///    It only converts an intact older chunk into a PERMANENT EIO. So a slot whose
+    ///    current identity is purged is always repaired; `current_is_purged` is how the
+    ///    caller reports that, straight from CHUNK_TABLE.
+    ///
+    /// 2. **The decision is per slot.** The old guard bailed on the first offending
+    ///    slot and the caller discarded the entire re-derived map, so one bad slot threw
+    ///    away every repair the scan got right — on staging, a whole 4097-slot VM image
+    ///    stayed stale because of one. A genuine revert now costs exactly its own slot.
+    ///
+    /// A slot whose current identity is still resolvable and whose re-derived winner is
+    /// causally older is still refused, unchanged: that is the real 2026-09-10 silent
+    /// data loss case and the reason this invariant is enforced locally at all.
+    fn merge_self_heal(
+        current: &[ChunkLocation],
+        fresh: &[ChunkLocation],
+        now_ms: u64,
+        current_is_purged: impl Fn(&ChunkId) -> bool,
+    ) -> (Vec<ChunkLocation>, Vec<(u64, ChunkId, ChunkId)>) {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let idx_of = |l: &ChunkLocation| l.file_offset.map(|o| o / CHUNK_SIZE);
+        let mut merged = Vec::with_capacity(fresh.len());
+        let mut refused = Vec::new();
+        for f in fresh {
+            let (Some(idx), Some(c)) = (
+                idx_of(f),
+                idx_of(f).and_then(|i| current.iter().find(|c| idx_of(c) == Some(i))),
+            ) else {
+                merged.push(f.clone());
+                continue;
+            };
+            if c.chunk_id == f.chunk_id || !Self::is_causal_regression(c, f) {
+                merged.push(f.clone());
+                continue;
+            }
+            // Taking `fresh` here WOULD hand back causally-older content, so it is
+            // allowed only once the current identity has been adjudicated permanently
+            // gone: purged from CHUNK_TABLE *and* old enough that it cannot still be an
+            // in-flight patch this node simply hasn't been told about yet. Both halves
+            // are load-bearing — see TOKEN_ASSUMED_LIVE_FOR. Age is checked first
+            // because it is free and current_is_purged is a metadata read.
+            let too_young_to_call_dead = !c.written_at.is_some_and(|w| {
+                now_ms.saturating_sub(w) >= TOKEN_ASSUMED_LIVE_FOR.as_millis() as u64
+            });
+            if !too_young_to_call_dead && current_is_purged(&c.chunk_id) {
+                merged.push(f.clone());
+                continue;
+            }
+            refused.push((idx, c.chunk_id, f.chunk_id));
+            merged.push(c.clone());
+        }
+        (merged, refused)
+    }
+
+    /// Scan CHUNK_TABLE for this file's authoritative chunk list. Deliberately does
+    /// NOT mutate chunk_map — callers that want the result installed call
+    /// commit_chunk_map, which lets the self-heal path decide what to install AFTER
+    /// applying the never-revert invariant.
+    ///
+    /// Split out 2026-09-11: the old combined function installed the re-derived map
+    /// before the caller's guard ran, so on a refusal the leader stored the map it had
+    /// just declined to serve. The "refusing" warning was cosmetic and the revert it
+    /// reported declining had already happened — an invariant you cannot enforce from
+    /// the outside is not an invariant.
+    async fn re_derive_chunk_map(&self, file_id: FileId) -> (Vec<ChunkLocation>, u64) {
         let fresh_locations = match self.chunk_locations_for_info_async(file_id).await {
             Ok(locs) => locs,
             Err(e) => {
-                warn!("re_derive_and_repair_chunk_map: CHUNK_TABLE scan for file {} failed: {}", file_id, e);
+                warn!("re_derive_chunk_map: CHUNK_TABLE scan for file {} failed: {}", file_id, e);
                 Vec::new()
             }
         };
         let write_seq = self.chunk_map.get(&file_id).map(|e| e.value().1).unwrap_or(0);
-        if fresh_locations.is_empty() {
-            return (fresh_locations, write_seq);
-        }
-        // Keep chunk_to_file (the reverse index handle_confirm_chunks_live now
-        // trusts as authoritative — see that function's doc comment) in
-        // lockstep: drop the old entry's chunk_ids before adding the
-        // freshly-re-derived ones, same pattern as every other chunk_map
-        // mutation site.
-        let old = self.chunk_map.insert(file_id, (fresh_locations.clone(), write_seq));
+        (fresh_locations, write_seq)
+    }
+
+    /// Install `locations` as this file's chunk_map entry.
+    ///
+    /// Keeps chunk_to_file (the reverse index handle_confirm_chunks_live now trusts as
+    /// authoritative — see that function's doc comment) in lockstep: drop the old
+    /// entry's chunk_ids before adding the new ones, same pattern as every other
+    /// chunk_map mutation site.
+    fn commit_chunk_map(&self, file_id: FileId, locations: Vec<ChunkLocation>, write_seq: u64) {
+        let old = self.chunk_map.insert(file_id, (locations.clone(), write_seq));
         if let Some((old_locs, _)) = old {
             for loc in &old_locs {
                 self.chunk_to_file.remove(&loc.chunk_id);
             }
         }
-        for loc in &fresh_locations {
+        for loc in &locations {
             self.chunk_to_file.insert(loc.chunk_id, file_id);
         }
+    }
+
+    async fn re_derive_and_repair_chunk_map(&self, file_id: FileId) -> (Vec<ChunkLocation>, u64) {
+        let (fresh_locations, write_seq) = self.re_derive_chunk_map(file_id).await;
+        if fresh_locations.is_empty() {
+            return (fresh_locations, write_seq);
+        }
+        self.commit_chunk_map(file_id, fresh_locations.clone(), write_seq);
         (fresh_locations, write_seq)
     }
 
@@ -17637,15 +17750,13 @@ impl Server {
                 warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
                        no CHUNK_TABLE record — re-deriving from authoritative CHUNK_TABLE truth \
                        instead of serving the stale identity", file_id);
-                let (fresh_locations, fresh_write_seq) = self.re_derive_and_repair_chunk_map(file_id).await;
+                let (fresh_locations, fresh_write_seq) = self.re_derive_chunk_map(file_id).await;
                 if !fresh_locations.is_empty() {
-                    // NEVER substitute an older generation for a newer one, even when the
-                    // newer one is unreadable. Serving intact-but-superseded bytes in place
-                    // of the current identity is silent data loss from the guest's point of
-                    // view: it wrote, we acknowledged, and then we hand back the pre-write
-                    // content with no error. An unreadable current identity must surface as
-                    // an error instead — the client's read fails on every replica and EIOs,
-                    // which is loud, correct, and recoverable. Stale bytes are none of those.
+                    // NEVER substitute an older generation for a newer one that is still
+                    // resolvable. Serving intact-but-superseded bytes in place of a live
+                    // current identity is silent data loss from the guest's point of view:
+                    // it wrote, we acknowledged, and then we hand back the pre-write content
+                    // with no error.
                     //
                     // This invariant is enforced HERE, locally, rather than being left to
                     // location_supersedes staying correct at a distance. The 2026-09-10
@@ -17653,12 +17764,26 @@ impl Server {
                     // 3-replica older record over a 2-replica newer one; a local guard is
                     // what makes that class of regression a test failure instead of a silent
                     // revert. See dfs_common::types::write_quorum.
-                    if let Some(reverted) = Self::first_causal_regression(&locations, &fresh_locations) {
-                        warn!("GetFileChunkMap: self-heal for file {} would have REVERTED chunk_idx {}                                from {} back to {} — refusing, serving the current identity so an                                unreadable chunk surfaces as an error rather than as stale content",
-                            file_id, reverted.0, reverted.1, reverted.2);
-                        return response;
+                    //
+                    // It does NOT extend to a slot whose current identity has been purged
+                    // from CHUNK_TABLE — that write is already gone cluster-wide, so
+                    // refusing preserves nothing and only makes readable data permanently
+                    // unreadable. merge_self_heal draws that line, per slot.
+                    let (merged, refused) = Self::merge_self_heal(
+                        &locations,
+                        &fresh_locations,
+                        dfs_common::types::current_timestamp_ms(),
+                        |id| matches!(self.metadata.get_chunk_location(id), Ok(None)),
+                    );
+                    for (idx, current_id, fresh_id) in &refused {
+                        warn!("GetFileChunkMap: self-heal for file {} refused to revert chunk_idx {} \
+                               from {} back to {} — that identity is still resolvable, so serving the \
+                               older one would be silent data loss; keeping the current identity",
+                            file_id, idx, current_id, fresh_id);
                     }
-                    return slice_response(&fresh_locations, fresh_write_seq);
+                    // Store exactly what we serve, never more.
+                    self.commit_chunk_map(file_id, merged.clone(), fresh_write_seq);
+                    return slice_response(&merged, fresh_write_seq);
                 }
                 warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
                        rows — serving the stale response rather than an empty one", file_id);
@@ -22980,6 +23105,310 @@ mod tests {
         assert_eq!(locs[0].chunk_id, current_chunk_id,
             "chunk_map's cached entry must be corrected in place, not just the one response");
     }
+
+    /// Root-caused 2026-09-11 live on staging (VM-108 first boot after the 11515f6 deploy:
+    /// fast, repeated EIOs inside the guest; restartOS fsck then found ZERO errors and a
+    /// second boot was clean — i.e. nothing was actually damaged).
+    ///
+    /// The healer purged 13 patch tokens in one 44ms burst the night before:
+    ///   `DATA LOSS: Chunk <tok> is permanently unrecoverable (2 metadata nodes, all
+    ///    confirmed empty) — purging stale metadata`  (healing.rs)
+    /// That deletes the CHUNK_TABLE record but leaves `chunk_map` naming it, so each such
+    /// slot becomes a dangling pointer. GetFileChunkMap's self-heal is built for exactly
+    /// this, and it correctly re-derived the intact base — then REFUSED to serve it,
+    /// because substituting the (older) base for the (newer) token looked like a causal
+    /// regression to `first_causal_regression`:
+    ///   `self-heal for file 5f62f6a7 would have REVERTED chunk_idx 816 from df7cb9dc...
+    ///    back to 2207ab18... — refusing, serving the current identity so an unreadable
+    ///    chunk surfaces as an error rather than as stale content`
+    ///
+    /// The never-revert invariant is right in general and MUST stay: handing back
+    /// pre-write content for a write we acknowledged is silent data loss. But it cannot
+    /// apply to a slot whose current identity has been *adjudicated permanently gone*.
+    /// The self-heal only ever runs when `get_chunk_location(current) == Ok(None)`, and
+    /// the healer only purges after confirming every replica is empty — so at that point
+    /// there is no newer content left to protect. Refusing preserves nothing; it just
+    /// converts an intact older chunk into a PERMANENT EIO. On staging the slot was only
+    /// rescued per-read, by RevalidateChunkSlot, which never repairs chunk_map — so every
+    /// cold boot paid the whole cost again.
+    ///
+    /// Production numbers below are the real ones for file 5f62f6a7 chunk_idx 816
+    /// (`dfs-admin file raw-location 2207ab18...`).
+    #[tokio::test]
+    async fn purged_token_slot_recovers_to_its_intact_base() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const SLOT_816: u64 = 816 * 4 * 1024 * 1024; // 3422552064, the real offset
+
+        // The purged patch token: NEWER than the base (seq 62387 > 62386), landed on only
+        // 2 replicas, and has NO CHUNK_TABLE record — the healer already declared it
+        // permanently unrecoverable and swept it. chunk_map was never corrected.
+        let dead_hash = compute_chunk_hash(b"df7cb9dc-purged-permanently-unrecoverable");
+        let dead_chunk_id = ChunkId::from_hash(dead_hash);
+        let dead_loc = ChunkLocation {
+            chunk_id: dead_chunk_id,
+            nodes: vec![NodeId::new(), NodeId::new()],
+            size: 4194304,
+            checksum: dead_hash,
+            file_offset: Some(SLOT_816),
+            written_at: Some(1_788_890_437_020),
+            client_write_seq: Some(62387),
+            file_id: Some(file_id),
+        };
+        server.chunk_map.insert(file_id, (vec![dead_loc.clone()], 62387));
+
+        // The intact base for the same slot: OLDER, but alive on 3 replicas. This is the
+        // only readable content that exists for chunk_idx 816.
+        let base_hash = compute_chunk_hash(b"2207ab18-intact-base-three-replicas");
+        let base_chunk_id = ChunkId::from_hash(base_hash);
+        let base_loc = ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id, NodeId::new(), NodeId::new()],
+            size: 4194304,
+            checksum: base_hash,
+            file_offset: Some(SLOT_816),
+            written_at: Some(1_788_890_240_493),
+            client_write_seq: Some(62386),
+            file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&base_loc).unwrap();
+
+        let response = server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await;
+        let served = match response {
+            Response::FileChunkMap { locations, .. } => locations,
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        };
+
+        // (A) The slot must recover. The token is gone cluster-wide and is never coming
+        // back; the base is intact. Serving the token is a permanent EIO for readable data.
+        assert_eq!(served.len(), 1, "expected exactly one slot in the served window");
+        assert_eq!(served[0].chunk_id, base_chunk_id,
+            "a slot whose current identity was PURGED as permanently unrecoverable must \
+             recover to its intact base — the never-revert invariant protects acknowledged \
+             writes, but this write no longer exists anywhere to protect, so refusing only \
+             converts readable data into a permanent EIO");
+
+        // (C) Whatever we decided, the stored map and the served map must agree.
+        // re_derive_and_repair_chunk_map writes chunk_map BEFORE the guard runs, so
+        // pre-fix the leader stores the re-derived map and serves the stale one — the
+        // "refusing" warning is cosmetic and the revert it declined already happened.
+        let stored = server.chunk_map.get(&file_id)
+            .map(|e| e.value().0.clone())
+            .expect("chunk_map entry must still exist");
+        let stored_ids: Vec<_> = stored.iter().map(|l| (l.file_offset, l.chunk_id)).collect();
+        let served_ids: Vec<_> = served.iter().map(|l| (l.file_offset, l.chunk_id)).collect();
+        assert_eq!(stored_ids, served_ids,
+            "chunk_map must hold exactly what was served — storing a map the guard refused \
+             to serve makes the invariant unenforceable and the log line a lie");
+    }
+
+    /// The self-heal's regression guard must be decided PER SLOT, not per file.
+    ///
+    /// `first_causal_regression` returns on the first offending slot and the caller then
+    /// discards the ENTIRE re-derived map — so one genuinely-regressing slot throws away
+    /// every repair the scan got right. On staging that meant a whole 4097-slot VM image
+    /// stayed stale because of a single slot.
+    ///
+    /// Pure-function test: `purged` names the current identities that have no CHUNK_TABLE
+    /// record (adjudicated gone), which is what the caller supplies from metadata.
+    #[test]
+    fn self_heal_regression_guard_is_per_slot_not_per_file() {
+        const NOW_MS: u64 = 1_789_000_000_000;
+        const DAY_OLD: u64 = NOW_MS - 86_400_000;
+        const DAY_OLDER: u64 = NOW_MS - 86_400_001;
+
+        let mk = |hash: u8, idx: u64, seq: u64, at: u64| ChunkLocation {
+            chunk_id: ChunkId::from_hash([hash; 32]),
+            nodes: vec![NodeId::new()],
+            size: 4 * 1024 * 1024, checksum: [0u8; 32],
+            file_offset: Some(idx * 4 * 1024 * 1024), written_at: Some(at),
+            client_write_seq: Some(seq), file_id: Some(FileId::new()),
+        };
+
+        // idx 816: current identity is PURGED and a day old -> repair to the intact base.
+        // idx 900: current identity is ALIVE, fresh is older -> genuine revert, refuse.
+        // idx 950: fresh is strictly newer -> ordinary self-heal, adopt.
+        let current = vec![mk(0xdf, 816, 62387, DAY_OLD), mk(0xaa, 900, 700, DAY_OLD), mk(0xbb, 950, 10, DAY_OLD)];
+        let fresh   = vec![mk(0x22, 816, 62386, DAY_OLDER), mk(0xcc, 900, 699, DAY_OLDER), mk(0xdd, 950, 11, NOW_MS)];
+
+        let purged: std::collections::HashSet<ChunkId> =
+            [current[0].chunk_id].into_iter().collect();
+
+        let (merged, refused) = Server::merge_self_heal(&current, &fresh, NOW_MS, |id| purged.contains(id));
+
+        let at = |idx: u64| merged.iter()
+            .find(|l| l.file_offset == Some(idx * 4 * 1024 * 1024))
+            .unwrap_or_else(|| panic!("idx {} missing from merged map", idx))
+            .chunk_id;
+
+        assert_eq!(at(816), fresh[0].chunk_id,
+            "a purged current identity must be replaced by the intact base");
+        assert_eq!(at(900), current[1].chunk_id,
+            "a LIVE current identity must never be reverted to an older one — this is the \
+             2026-09-10 silent-data-loss invariant and it must survive the per-slot rewrite");
+        assert_eq!(at(950), fresh[2].chunk_id,
+            "a strictly newer identity is the ordinary self-heal case and must be adopted");
+        assert_eq!(merged.len(), 3, "every slot must appear exactly once");
+
+        assert_eq!(refused.len(), 1, "exactly one slot was a genuine revert");
+        assert_eq!(refused[0].0, 900, "and the log must name that slot, not 816");
+    }
+
+    /// A purged current identity is only safe to replace once it is old enough that it
+    /// cannot still be an in-flight patch.
+    ///
+    /// `get_chunk_location() == Ok(None)` is NODE-LOCAL. With RF=3 across 5 nodes the
+    /// leader is not a patch target ~40% of the time, so a live token it simply hasn't
+    /// been told about yet looks exactly like one the healer swept days ago. Without the
+    /// age floor the self-heal would quietly revert that slot to its pre-write base —
+    /// the acknowledged-write data loss this whole guard exists to prevent, reintroduced
+    /// through its own escape hatch. This is the shape that failed T28a on 2026-09-10.
+    #[test]
+    fn a_purged_identity_younger_than_the_age_floor_is_not_treated_as_dead() {
+        const NOW_MS: u64 = 1_789_000_000_000;
+        let mk = |hash: u8, seq: u64, at: u64| ChunkLocation {
+            chunk_id: ChunkId::from_hash([hash; 32]),
+            nodes: vec![NodeId::new()],
+            size: 4 * 1024 * 1024, checksum: [0u8; 32],
+            file_offset: Some(816 * 4 * 1024 * 1024), written_at: Some(at),
+            client_write_seq: Some(seq), file_id: Some(FileId::new()),
+        };
+
+        // 30s old: past PATCH_DEBOUNCE_IDLE (20s), far inside TOKEN_ASSUMED_LIVE_FOR.
+        let current = vec![mk(0xdf, 62387, NOW_MS - 30_000)];
+        let fresh   = vec![mk(0x22, 62386, NOW_MS - 120_000)];
+        let purged: std::collections::HashSet<ChunkId> =
+            [current[0].chunk_id].into_iter().collect();
+
+        let (merged, refused) = Server::merge_self_heal(&current, &fresh, NOW_MS, |id| purged.contains(id));
+        assert_eq!(merged[0].chunk_id, current[0].chunk_id,
+            "a young token absent from THIS node's CHUNK_TABLE may still be a live patch \
+             in flight elsewhere — reverting it is exactly the acknowledged-write data loss \
+             the never-revert invariant exists to prevent");
+        assert_eq!(refused.len(), 1, "and the refusal must be reported");
+
+        // Same slot, same local absence, once it has aged past the floor: now genuinely
+        // dead, and the intact base must be served rather than a permanent EIO.
+        let later = NOW_MS + TOKEN_ASSUMED_LIVE_FOR.as_millis() as u64;
+        let (aged, refused_aged) = Server::merge_self_heal(&current, &fresh, later, |id| purged.contains(id));
+        assert_eq!(aged[0].chunk_id, fresh[0].chunk_id,
+            "past the age floor the token cannot still be in flight, so the slot must \
+             recover to its intact base");
+        assert!(refused_aged.is_empty(), "nothing to refuse once the token is adjudicated dead");
+
+        // A row with no written_at cannot be aged, so it must never be called dead.
+        let mut undateable = current.clone();
+        undateable[0].written_at = None;
+        let (undated, _) = Server::merge_self_heal(&undateable, &fresh, later, |id| purged.contains(id));
+        assert_eq!(undated[0].chunk_id, undateable[0].chunk_id,
+            "no written_at means no age evidence — refuse rather than guess");
+    }
+
+    /// The self-heal must STORE exactly the map it SERVES — including when a slot is refused.
+    ///
+    /// re_derive_and_repair_chunk_map used to install the re-derived map before the caller's
+    /// never-revert guard ran, so on a refusal the leader served the old map and stored the
+    /// new one. The "refusing" warning was cosmetic: the revert it reported declining had
+    /// already happened to in-memory state, and the next request served it with no warning
+    /// at all. A guard you can only observe in a log line is not a guard.
+    ///
+    /// This needs a fixture that BOTH triggers the self-heal (a purged slot) AND produces a
+    /// genuine refusal (a live slot whose CHUNK_TABLE-derived winner is causally older).
+    /// purged_token_slot_recovers_to_its_intact_base cannot show it: with the
+    /// purged-identity rule in place that fixture produces no refusal at all, so stored and
+    /// served agree trivially. Verified binding by restoring the pre-fix ordering.
+    #[tokio::test]
+    async fn self_heal_stores_exactly_the_map_it_serves_when_a_slot_is_refused() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const SLOT_A: u64 = 10 * 4 * 1024 * 1024;
+        const SLOT_B: u64 = 20 * 4 * 1024 * 1024;
+        let old_ms = dfs_common::types::current_timestamp_ms() - 86_400_000;
+
+        let mk = |tag: &[u8], off: u64, seq: u64, at: u64, fid: FileId| {
+            let h = compute_chunk_hash(tag);
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(h), nodes: vec![node_id], size: 4194304,
+                checksum: h, file_offset: Some(off), written_at: Some(at),
+                client_write_seq: Some(seq), file_id: Some(fid),
+            }
+        };
+
+        // Slot A — the 2026-09-11 staging shape: chunk_map names a day-old token the healer
+        // already purged; CHUNK_TABLE holds its intact, causally-older base. Must repair,
+        // and is what sets found_purged_chunk_id and triggers the self-heal at all.
+        let dead_a = mk(b"slotA-purged-token", SLOT_A, 500, old_ms, file_id);
+        let base_a = mk(b"slotA-intact-base", SLOT_A, 499, old_ms - 1000, file_id);
+        server.metadata.put_chunk_location(&base_a).unwrap();
+
+        // Slot B — the 2026-09-10 shape the invariant exists for: the current identity is
+        // still RESOLVABLE, while this file's CHUNK_TABLE scan yields an older generation
+        // for the same offset. Registering the live record under a different file_id is how
+        // the fixture gets "resolvable but not this file's derived winner" in one step.
+        let live_b = mk(b"slotB-live-current", SLOT_B, 800, old_ms, file_id);
+        let mut live_b_record = live_b.clone();
+        live_b_record.file_id = Some(dfs_common::FileId::new());
+        server.metadata.put_chunk_location(&live_b_record).unwrap();
+        let older_b = mk(b"slotB-older-generation", SLOT_B, 799, old_ms - 1000, file_id);
+        server.metadata.put_chunk_location(&older_b).unwrap();
+
+        server.chunk_map.insert(file_id, (vec![dead_a.clone(), live_b.clone()], 800));
+
+        let served = match server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await {
+            Response::FileChunkMap { locations, .. } => locations,
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        };
+        let stored = server.chunk_map.get(&file_id)
+            .map(|e| e.value().0.clone())
+            .expect("chunk_map entry must still exist");
+
+        let key = |ls: &[ChunkLocation]| {
+            let mut v: Vec<_> = ls.iter().map(|l| (l.file_offset, l.chunk_id)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(key(&stored), key(&served),
+            "chunk_map must hold exactly what was served — storing a map the guard refused \
+             to serve leaves the invariant unenforceable and the warning misleading");
+
+        let at = |ls: &[ChunkLocation], off: u64| ls.iter()
+            .find(|l| l.file_offset == Some(off))
+            .unwrap_or_else(|| panic!("offset {} missing", off))
+            .chunk_id;
+        assert_eq!(at(&served, SLOT_A), base_a.chunk_id,
+            "the purged slot must recover to its intact base");
+        assert_eq!(at(&served, SLOT_B), live_b.chunk_id,
+            "a still-resolvable identity must never be reverted to an older generation — \
+             that is the acknowledged-write data loss this guard exists to prevent");
+    }
+
 
     /// Regression test for the 2026-08-10 fix (real ~13min VM-108 read failure on
     /// staging): handle_revalidate_chunk_slot must authoritatively re-derive one

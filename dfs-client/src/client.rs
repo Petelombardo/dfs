@@ -2945,6 +2945,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         // random ops) avoid the 4MB amplification. Sequential reads are fully protected
         // by is_broad_sequential and never take this path regardless of size.
         const RANGE_FETCH_MAX: usize = 1024 * 1024;
+        /// Marker in a range-fetch's aggregate error meaning "no replica served this range,
+        /// and at least one of them failed AMBIGUOUSLY (timed out / connection error)" — as
+        /// opposed to the definitive "missing on all replicas — metadata may be stale", where
+        /// every replica affirmatively denied holding the identity. Both take the refresh +
+        /// retry ladder; only the definitive one may conclude the identity is retired.
+        const RANGE_ALL_UNREADABLE: &str = "unreadable on every replica";
         let use_range_fetch = !bypass_cache && !is_broad_sequential && size <= RANGE_FETCH_MAX && inode > 0;
 
         if use_range_fetch {
@@ -3101,6 +3107,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     return Ok((idx, chunk_start, offset_in_chunk, data));
                                 }
                                 Err(e) => {
+                                    // A replica that answers "I don't have this identity" is
+                                    // EVIDENCE the identity is retired. A timeout or a connection
+                                    // failure is not evidence of anything — it says only that this
+                                    // replica didn't answer in time, which is why it's tracked
+                                    // separately rather than folded into the same verdict.
                                     let msg = e.to_string();
                                     if !msg.contains("Failed to open chunk file")
                                         && !msg.contains("Failed to read chunk range")
@@ -3112,12 +3123,32 @@ leader_addr: Arc::new(RwLock::new(None)),
                             }
                         }
                         client.node_inflight_dec(primary);
-                        if all_not_found && last_err.is_some() {
-                            Err(anyhow::anyhow!(
+                        // Two distinct failure verdicts, because they warrant the same RECOVERY
+                        // but different CONCLUSIONS (see the collection loop below).
+                        //
+                        // 2026-09-11, VM-108 guest I/O error during shutdown on server4: this
+                        // used to return `last_err` verbatim whenever any replica failed
+                        // ambiguously, and the collection loop's catch-all turned that into an
+                        // immediate EIO — skipping the refresh + retry ladder entirely. gluster2
+                        // held the slot's patch token but not the base chunk the token resolves
+                        // against, and its resolve ladder took >2.17s to say so, past this
+                        // client's 1s deadline. So a clean NotFound arrived as a timeout, that
+                        // one timeout cleared `all_not_found` for the whole range, and a read
+                        // whose corrected identity was one refresh away on every node EIO'd the
+                        // guest instead. The other two replicas had given the exact signal that
+                        // would have triggered recovery. A slow replica must not be able to veto
+                        // recovery for the range.
+                        match last_err {
+                            None => Err(anyhow::anyhow!("no replicas")),
+                            // Every replica answered definitively: this identity is retired.
+                            Some(_) if all_not_found => Err(anyhow::anyhow!(
                                 "Range chunk {} missing on all replicas — metadata may be stale", cid
-                            ))
-                        } else {
-                            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no replicas")))
+                            )),
+                            // Nobody served it, but at least one failure was ambiguous, so we
+                            // have NOT proven the identity is gone — only that this read failed.
+                            Some(e) => Err(anyhow::anyhow!(
+                                "Range chunk {} {} (last error: {})", cid, RANGE_ALL_UNREADABLE, e
+                            )),
                         }
                     })
                 }).collect();
@@ -3173,6 +3204,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                             // one (2026-09-08 server4 incident — see
                             // InodeReadEngine::mark_chunk_proven_absent).
                             engine.mark_chunk_proven_absent(rf.cid);
+                            stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk, rf.cid));
+                        }
+                        Err(e) if e.to_string().contains(RANGE_ALL_UNREADABLE) => {
+                            // No replica served the range and at least one failed ambiguously
+                            // (timeout / connection error). Take the SAME refresh + retry ladder
+                            // as the definitive case: if the identity really is retired, the
+                            // refresh corrects it; if the replica was merely slow, the retry
+                            // finds the bytes. Either way this is strictly better than the EIO
+                            // this arm used to surface — an EIO on a VM disk read flips the guest
+                            // read-only, which is the failure the ladder below exists to prevent.
+                            //
+                            // Deliberately NOT mark_chunk_proven_absent: unlike the arm above we
+                            // have no proof this identity is gone, and proven_absent
+                            // suppresses the id in later chunk_map merges. Asserting it on a
+                            // timeout would let one slow replica retire a perfectly live chunk.
+                            warn!("Range chunk {} unreadable on every replica ({}) — refreshing \
+                                   metadata and retrying rather than failing the read", rf.cid, e);
                             stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk, rf.cid));
                         }
                         Err(e) => return Err(e),
@@ -10570,5 +10618,265 @@ mod tests {
             assert!(error_indicates_unsupported_request(e),
                 "{e:?} indicates the peer could not handle the request, so latching is correct");
         }
+    }
+
+    /// How a mock node answers a `ReadChunkRange` for the RETIRED ("dead") chunk id.
+    #[derive(Clone, Copy, PartialEq)]
+    enum DeadIdBehavior {
+        /// Answer promptly with the NotFound-class error a real server sends when a
+        /// patch token's base chunk file is absent on this node
+        /// ("Failed to read chunk range: Failed to open chunk file: ...").
+        NotFound,
+        /// Never answer, then drop the connection. Reproduces gluster2 on 2026-09-11,
+        /// whose resolve ladder (resolve_via_durable_patch_state → resolve_forwarded →
+        /// resolve_by_slot) took >2.17s to conclude "Failed to open chunk file" while
+        /// `read_chunk_range_from_server`'s deadline is 1s — so a clean NotFound reached
+        /// the client as "Timeout reading chunk range from <addr>" instead.
+        Stall,
+    }
+
+    /// Mock storage node for the range-read recovery tests.
+    ///
+    /// Serves `dead_id` from `GetFileChunkMap` until the client has actually attempted a
+    /// `ReadChunkRange` against it, then serves `good_id` — so a refresh AFTER the failed
+    /// read reveals the correction. The switch is keyed on `dead_read_attempted`, a causal
+    /// signal, not a sleep: per feedback_timing_based_concurrency_tests_unreliable, the
+    /// only wall-clock dependence in these tests is the one the bug is actually about
+    /// (a replica that misses the 1s read deadline), and that stall is one-directional.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_range_read_node(
+        addr: SocketAddr,
+        all_nodes: Vec<NodeId>,
+        dead_id: ChunkId,
+        good_id: ChunkId,
+        good_data: Arc<Vec<u8>>,
+        behavior: DeadIdBehavior,
+        // When false the slot is NEVER corrected — the dead id is all any node ever has.
+        // Models a genuinely unresolvable chunk, so a test can prove the recovery ladder
+        // still terminates instead of retrying forever.
+        correctable: bool,
+        dead_read_attempted: Arc<std::sync::atomic::AtomicBool>,
+        chunk_map_calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => return, // port in use by a previous run — the test's own assert will fail loudly
+            };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let all_nodes = all_nodes.clone();
+                let good_data = good_data.clone();
+                let dead_read_attempted = dead_read_attempted.clone();
+                let chunk_map_calls = chunk_map_calls.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let request_id = envelope.request_id;
+                        let Message::Request(req) = envelope.message else { return };
+
+                        // The slot's current identity, from this node's point of view.
+                        let current = || -> (ChunkId, u64) {
+                            if correctable && dead_read_attempted.load(Ordering::SeqCst) { (good_id, 2) } else { (dead_id, 1) }
+                        };
+
+                        match req {
+                            Request::GetFileChunkMap { file_id, .. } => {
+                                chunk_map_calls.fetch_add(1, Ordering::SeqCst);
+                                let (cid, seq) = current();
+                                let loc = ChunkLocation {
+                                    chunk_id: cid, nodes: all_nodes.clone(), size: good_data.len(),
+                                    checksum: cid.hash, file_offset: Some(0),
+                                    written_at: Some(1000 * seq), client_write_seq: Some(seq), file_id: Some(file_id),
+                                };
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id, locations: vec![loc], from_chunk: 0, total_chunks: 1, write_seq: seq,
+                                }).await;
+                            }
+                            Request::RevalidateChunkSlot { file_id, .. } => {
+                                let (cid, seq) = current();
+                                let loc = ChunkLocation {
+                                    chunk_id: cid, nodes: all_nodes.clone(), size: good_data.len(),
+                                    checksum: cid.hash, file_offset: Some(0),
+                                    written_at: Some(1000 * seq), client_write_seq: Some(seq), file_id: Some(file_id),
+                                };
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id, locations: vec![loc], from_chunk: 0, total_chunks: 1, write_seq: seq,
+                                }).await;
+                            }
+                            Request::ReadChunkRange { chunk_id, offset, length, .. } => {
+                                if chunk_id == good_id {
+                                    let start = (offset as usize).min(good_data.len());
+                                    let end = (start + length as usize).min(good_data.len());
+                                    write_chunk_data_response(&mut stream, request_id, chunk_id, &good_data[start..end]).await;
+                                    continue;
+                                }
+                                dead_read_attempted.store(true, Ordering::SeqCst);
+                                match behavior {
+                                    DeadIdBehavior::NotFound => {
+                                        write_envelope(&mut stream, request_id, Response::Error {
+                                            message: "Failed to read chunk range: Failed to open chunk file: \
+                                                      \"/mnt/gluster/dfs/data/chunks/78/4c/784c9aa6\"".to_string(),
+                                            code: ErrorCode::NotFound,
+                                        }).await;
+                                    }
+                                    DeadIdBehavior::Stall => {
+                                        // Outlast the client's 1s deadline, THEN drop the
+                                        // connection — closing early would surface as a
+                                        // connection error rather than the timeout we're
+                                        // reproducing.
+                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            Request::ReadChunk { chunk_id, .. } => {
+                                if chunk_id == good_id {
+                                    write_chunk_data_response(&mut stream, request_id, chunk_id, &good_data).await;
+                                } else {
+                                    dead_read_attempted.store(true, Ordering::SeqCst);
+                                    write_envelope(&mut stream, request_id, Response::Error {
+                                        message: "Failed to open chunk file".to_string(),
+                                        code: ErrorCode::NotFound,
+                                    }).await;
+                                }
+                            }
+                            _ => {
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: "unhandled in mock".to_string(), code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Shared setup for the pair below: three replicas hold a retired chunk id; two always
+    /// answer NotFound for it, the third behaves per `third_node`. A refresh after the
+    /// failed read reveals the corrected id, which every node can serve.
+    async fn run_range_read_recovery(
+        base_port: u16,
+        third_node: DeadIdBehavior,
+        correctable: bool,
+    ) -> (Result<Vec<u8>>, usize, Vec<u8>) {
+        // Mirror the production read that EIO'd: a 64KiB QEMU cluster read at a random,
+        // non-zero offset inside a 4MiB chunk. The offset matters — read_file only takes
+        // the range-fetch path when `!is_broad_sequential`, i.e. NOT at offset 0, and
+        // when size <= 1MiB. 2031616 is the exact intra-chunk offset of the 2026-09-11
+        // failure (file offset 11813191680, chunk_idx 2816).
+        const CHUNK: usize = 4 * 1024 * 1024;
+        const READ_OFF: usize = 2031616;
+        const READ_LEN: usize = 65536;
+        let good_data = Arc::new((0..CHUNK).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let expected = good_data[READ_OFF..READ_OFF + READ_LEN].to_vec();
+
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+            .collect();
+        let node_ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+        let file_id = FileId::new();
+        let dead_id = chunk_id_with_hash0(0xDE);
+        let good_id = chunk_id_with_hash0(0x60);
+
+        let dead_read_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chunk_map_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for (i, &addr) in addrs.iter().enumerate() {
+            let behavior = if i == 2 { third_node } else { DeadIdBehavior::NotFound };
+            spawn_range_read_node(
+                addr, node_ids.clone(), dead_id, good_id, good_data.clone(), behavior,
+                correctable, dead_read_attempted.clone(), chunk_map_calls.clone(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let client = DfsClient::new(addrs.clone()).unwrap();
+        *client.leader_addr.write().await = Some(addrs[0]);
+        {
+            let mut m = client.addr_to_node_id.write().await;
+            for (&addr, &node_id) in addrs.iter().zip(node_ids.iter()) {
+                m.insert(addr, node_id);
+            }
+        }
+        *client.cluster_nodes.write().await = addrs.clone();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.read_file(1, CHUNK as u64, file_id, "/range-recovery-test", READ_OFF, READ_LEN, false, None),
+        ).await.expect("read_file must not hang");
+
+        (result, chunk_map_calls.load(Ordering::SeqCst), expected)
+    }
+
+    /// CONTROL. Every replica answers the retired id with a prompt NotFound, so
+    /// `all_not_found` stays true, the failure is classified "metadata may be stale", and
+    /// read_file's refresh + retry ladder runs and completes the read. This is the
+    /// behavior the timeout case below is measured against — it isolates the replica
+    /// timeout as the single variable between the two tests.
+    #[tokio::test]
+    async fn range_read_recovers_when_every_replica_answers_not_found() {
+        let (result, refreshes, expected) = run_range_read_recovery(19601, DeadIdBehavior::NotFound, true).await;
+        let data = result.expect("all-NotFound must be classified as stale metadata and recover");
+        assert_eq!(data, expected,
+            "the recovery ladder must complete the read using the corrected identity");
+        assert!(refreshes >= 2,
+            "must have refreshed the chunk map after the failed read (got {refreshes} GetFileChunkMap calls)");
+    }
+
+    /// Guards the cost side of the fix above. Routing ambiguous failures into the refresh +
+    /// retry ladder means a read that is genuinely unrecoverable now spends the ladder's
+    /// bounded budget before failing, instead of erroring immediately — so prove the budget
+    /// really is bounded and a dead chunk still surfaces an error rather than hanging the
+    /// guest forever. Worst case on purpose: the slot is never corrected AND one replica
+    /// burns the full 1s deadline on every attempt.
+    #[tokio::test]
+    async fn range_read_still_fails_bounded_when_slot_is_genuinely_unresolvable() {
+        let started = std::time::Instant::now();
+        let (result, _refreshes, _expected) =
+            run_range_read_recovery(19621, DeadIdBehavior::Stall, false).await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(),
+            "a chunk no replica can resolve, and that never gets corrected, must still fail");
+        assert!(elapsed < std::time::Duration::from_secs(25),
+            "the recovery ladder must stay bounded — took {elapsed:?}");
+    }
+
+    /// REGRESSION (2026-09-11, VM-108 guest I/O error during shutdown on server4).
+    ///
+    /// Identical to the control except ONE of the three replicas misses the 1s deadline
+    /// instead of answering NotFound. That single timeout clears read_file's `all_not_found`
+    /// latch, so the aggregate error is no longer "metadata may be stale" and the
+    /// `Err(e) => return Err(e)` arm surfaces EIO to FUSE without ever running the refresh +
+    /// retry ladder — the ladder whose own comment reads "An EIO on a VM disk read flips the
+    /// guest read-only, so a rare few hundred ms of latency is vastly the better trade".
+    ///
+    /// The other two replicas gave the exact signal that would have triggered recovery, and
+    /// the corrected identity was one refresh away on every node. A slow replica must not be
+    /// able to veto recovery for the whole range.
+    #[tokio::test]
+    async fn range_read_must_recover_when_one_replica_times_out() {
+        let (result, refreshes, expected) = run_range_read_recovery(19611, DeadIdBehavior::Stall, true).await;
+        let data = match result {
+            Ok(d) => d,
+            // Report the refresh count in the failure: 1 means only read_file's cold-start
+            // refresh ran and the recovery ladder was never entered at all, which is the
+            // specific defect — as opposed to a ladder that ran and legitimately failed.
+            Err(e) => panic!(
+                "one replica missing the read deadline must not bypass the stale-metadata \
+                 recovery ladder and EIO the guest — got: {e}; chunk-map refreshes={refreshes} \
+                 (1 = cold start only, i.e. the ladder never ran)"),
+        };
+        assert_eq!(data, expected,
+            "the recovery ladder must complete the read using the corrected identity");
+        assert!(refreshes >= 2,
+            "must have refreshed the chunk map after the failed read (got {refreshes} GetFileChunkMap calls)");
     }
 }

@@ -8898,6 +8898,67 @@ impl Server {
     /// This prevents the cycle: write broadcasts {A,B} → healer heals to {A,B,C} →
     /// stale write broadcast arrives, replaces with {A,B} → healer heals to {A,B,D}
     /// → accumulate nodes D,E,... = over-replication.
+
+    /// True when `location` names a patch-token identity this node can PROVE the slot
+    /// has already moved past — a superseded generation being (re)broadcast.
+    ///
+    /// Closes the resurrection hole `merge_replicated_chunk_location`'s own doc comment
+    /// describes but cannot fix from where it stands: "a chunk_id whose CHUNK_TABLE row
+    /// was just swept ... and is now resurrecting via a stale rebroadcast — the two are
+    /// structurally indistinguishable at this call site". For a content-addressed id they
+    /// genuinely are indistinguishable. For a PATCH TOKEN they are not: the slot table
+    /// (PATCH_STATE_SLOT_TABLE) records which token the slot currently resolves through,
+    /// and patch seqs are strictly increasing per slot.
+    ///
+    /// Why this matters (2026-09-13, VM-108): retirement of a token's ChunkLocation happens
+    /// in exactly ONE place — apply_patch's slide — and it is one-shot per generation. A
+    /// location broadcast that lands after that slide recreates the row, and no later slide
+    /// will ever revisit that generation to remove it again. Measured on staging: ~23% of
+    /// the retired tokens minted during one VM boot still held a CHUNK_TABLE row afterwards,
+    /// and those rows are what later get served to readers as unresolvable identities.
+    ///
+    /// Deliberately provable-only, because a false decline drops a real registration:
+    ///   - not token-shaped            -> accept (a real chunk; we have no slot authority)
+    ///   - no slot record on this node -> accept (non-participant; we know nothing)
+    ///   - slot already on this token  -> accept (it IS current)
+    ///   - state is Folded             -> accept (no seq to compare; a brand-new token on a
+    ///                                    node that hasn't seen its Pending row yet would
+    ///                                    otherwise be wrongly declined)
+    ///   - seq missing on either side  -> accept
+    /// Only a strictly OLDER seq against a different current token is declined.
+    async fn is_superseded_token_location(&self, location: &ChunkLocation) -> bool {
+        if !location.chunk_id.looks_like_patch_token() {
+            return false;
+        }
+        let (Some(file_id), Some(offset)) = (location.file_id, location.file_offset) else {
+            return false;
+        };
+        let Some(incoming_seq) = location.client_write_seq else {
+            return false;
+        };
+        let chunk_idx = offset / self.chunker.chunk_size() as u64;
+        let slot = match self.metadata.get_patch_state_for_slot_async(file_id, chunk_idx).await {
+            Ok(Some(s)) => s,
+            _ => return false,
+        };
+        let (current_token, state) = slot;
+        if current_token == location.chunk_id {
+            return false;
+        }
+        let PatchState::Pending { client_write_seq: Some(current_seq), .. } = state else {
+            return false;
+        };
+        if incoming_seq >= current_seq {
+            return false;
+        }
+        warn!("Declining ChunkLocation for retired patch token {} (file {} chunk_idx {}, seq {}): \
+               this slot has already advanced to {} at seq {}. Registering it would recreate a \
+               CHUNK_TABLE row that apply_patch's one-shot slide has already retired and will \
+               never revisit — an orphan identity that outlives its bytes.",
+            location.chunk_id, file_id, chunk_idx, incoming_seq, current_token, current_seq);
+        true
+    }
+
     fn merge_replicated_chunk_location(
         location: ChunkLocation,
         existing: Option<ChunkLocation>,
@@ -9055,6 +9116,14 @@ impl Server {
                 .unwrap_or_default()
                 .as_millis() as u64;
             self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // A superseded patch-token generation must not be allowed back in — see
+        // is_superseded_token_location. Checked before the merge because the merge is
+        // identity-blind by construction and cannot tell a resurrection from a first
+        // registration.
+        if self.is_superseded_token_location(&location).await {
+            return Response::Ok { data: None };
         }
 
         // Merge rules live in merge_replicated_chunk_location, shared with the
@@ -9925,6 +9994,12 @@ impl Server {
         };
         let mut pending: std::collections::HashMap<ChunkId, ChunkLocation> = std::collections::HashMap::new();
         for location in locations {
+            // Same retirement guard as the single handler. This is the path the leak was
+            // actually observed on: it logs nothing per chunk, so a resurrected row here
+            // leaves no trace at all beyond the row itself.
+            if self.is_superseded_token_location(&location).await {
+                continue;
+            }
             let existing = match pending.get(&location.chunk_id) {
                 Some(p) => Some(p.clone()),
                 None => existing_locations.get(&location.chunk_id).cloned(),
@@ -14635,7 +14710,17 @@ impl Server {
                     warn!("apply_patch: failed to register {} in metadata: {}", public_token, e);
                 }
             }
-            let _ = self.metadata.delete_chunk_location_async(base_chunk_id).await;
+            // Not `let _ =`: this delete is the ONLY thing that retires the base's
+            // CHUNK_TABLE row, and it is one-shot — nothing revisits this generation
+            // later. Swallowing a failure here leaks a row that outlives its bytes and
+            // eventually gets served to a reader as an unresolvable identity (the
+            // 2026-09-13 VM-108 boot EIOs). If this ever fires, the orphan it leaves is
+            // the thing to go looking for.
+            if let Err(e) = self.metadata.delete_chunk_location_async(base_chunk_id).await {
+                warn!("apply_patch: failed to retire base ChunkLocation {} for file {} chunk_idx {} \
+                       after minting {} — this leaks an orphan CHUNK_TABLE row that nothing else \
+                       reclaims: {}", base_chunk_id, file_id, cidx, public_token, e);
+            }
         } else {
             // Slide the existing ChunkLocation (registered under the now-retired
             // previous token) forward to the new token, updating size in case
@@ -14655,7 +14740,13 @@ impl Server {
                     warn!("apply_patch: failed to slide {} -> {} in metadata: {}", chunk_id, public_token, e);
                 }
             }
-            let _ = self.metadata.delete_chunk_location_async(chunk_id).await;
+            // See the sibling delete in the !is_merge branch above for why this is
+            // not `let _ =`. Same one-shot retirement, same orphan if it fails.
+            if let Err(e) = self.metadata.delete_chunk_location_async(chunk_id).await {
+                warn!("apply_patch: failed to retire previous token ChunkLocation {} for file {} \
+                       chunk_idx {} after sliding to {} — this leaks an orphan CHUNK_TABLE row \
+                       that nothing else reclaims: {}", chunk_id, file_id, cidx, public_token, e);
+            }
         }
         // Live snapshot, taken strictly before update_chunk_map_after_patch below
         // overwrites it — see DirtyPatchSlot::prior_chunk_id's doc comment. Only
@@ -17472,6 +17563,171 @@ impl Server {
         (fresh_locations, write_seq)
     }
 
+    /// Of `tokens`, the ones NO node in the cluster can resolve — i.e. genuinely
+    /// dangling identities, not merely ones this node happens not to know about.
+    ///
+    /// Added 2026-09-13 (VM-108 restart: 22 guest EIOs, file 5f62f6a7, 53 slots pinned
+    /// to 39 tokens whose bytes were absent from every node's `df/7c` shard while their
+    /// CHUNK_TABLE rows survived — see
+    /// `dangling_patch_token_with_a_surviving_chunk_table_row_recovers_to_its_base`).
+    ///
+    /// **Why this cannot be answered locally.** The tempting test is "the row is here but
+    /// PATCH_STATE has nothing for it, so it is dead". That is wrong in the one direction
+    /// that costs data: a client's MultiPatch registers the token's ChunkLocation with the
+    /// LEADER while the patch_state rows live only on the nodes that actually applied the
+    /// patch. With RF=3 over 5 nodes the leader is not a participant ~40% of the time, so
+    /// "row present, no local patch_state" is ALSO the ordinary state of a perfectly live
+    /// in-flight patch. Reverting such a slot to its base is exactly the acknowledged-write
+    /// data loss the never-revert invariant exists to stop, and the shape that failed T28a
+    /// on 2026-09-10 — see
+    /// [[feedback_20260910_node_local_state_is_not_a_cluster_wide_liveness_signal]].
+    ///
+    /// So ask the cluster. `handle_has_chunks` routes a token-shaped id through
+    /// PATCH_STATE_TABLE rather than raw file presence (Pending resolves via base+delta,
+    /// Folded via its redirect), so a HasChunks answer for a token means precisely "can
+    /// you resolve this". A live patch is held by its participants and they say yes.
+    ///
+    /// Conservative by construction, in both directions:
+    ///   - a token is returned ONLY if every node that ANSWERED said no;
+    ///   - and only if at least `write_quorum` nodes answered at all, so a partition or a
+    ///     timeout storm can never make a healthy cluster look uniformly empty.
+    /// Anything unconfirmed is simply left alone and re-evaluated on the next pass —
+    /// never destroy the last pointer to something on an unconfirmed guess, the same rule
+    /// `start_patch_state_gc_loop` already follows before pruning a Folded row.
+    async fn confirm_tokens_unresolvable(
+        &self,
+        tokens: Vec<ChunkId>,
+    ) -> std::collections::HashSet<ChunkId> {
+        use std::collections::HashSet;
+        let mut out: HashSet<ChunkId> = HashSet::new();
+        if tokens.is_empty() {
+            return out;
+        }
+
+        const HAS_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let local_id = self.cluster.local_node_id();
+
+        // This node's own answer, asked the way a token must be asked. has_chunk() is
+        // raw file presence and is ALWAYS false for a token by design, so using it here
+        // would count the leader as a "no" vote it never earned.
+        let locally_resolvable: HashSet<ChunkId> = self
+            .metadata
+            .get_patch_states_present_batch(&tokens)
+            .unwrap_or_default();
+        let mut answered = 1usize;
+        let mut resolvable_somewhere = locally_resolvable;
+
+        // Sized against every node the cluster KNOWS, not just the ones currently
+        // online: "4 of my 5 peers are down" must not be allowed to look like "I am a
+        // one-node cluster and my own answer is the whole truth". A genuinely small
+        // cluster (a single-node deployment, a unit test) is the only case where one
+        // answer legitimately is the whole cluster.
+        let all_nodes = self.cluster.get_all_nodes().await;
+        let known = all_nodes.len().max(1);
+        let peers: Vec<_> = all_nodes
+            .into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .collect();
+
+        let tasks: Vec<_> = peers.into_iter()
+            .map(|node| {
+                let client = self.client.clone();
+                let ids = tokens.clone();
+                tokio::spawn(async move {
+                    let req = Request::HasChunks { chunk_ids: ids };
+                    let result = tokio::time::timeout(
+                        HAS_CHUNK_TIMEOUT,
+                        client.send_message(node.addr, Message::Request(req)),
+                    ).await;
+                    match result {
+                        Ok(Ok(envelope)) => match envelope.message {
+                            Message::Response(Response::BoolVec { values }) => Some(values),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            // A node that did not answer is not a vote either way.
+            let Ok(Some(values)) = task.await else { continue };
+            if values.len() != tokens.len() {
+                continue;
+            }
+            answered += 1;
+            for (id, present) in tokens.iter().zip(values) {
+                if present {
+                    resolvable_somewhere.insert(*id);
+                }
+            }
+        }
+
+        if answered < self.durability_floor().min(known) {
+            return out;
+        }
+        for id in tokens {
+            if !resolvable_somewhere.contains(&id) {
+                out.insert(id);
+            }
+        }
+        out
+    }
+
+
+    /// Physically retire the CHUNK_TABLE rows of tokens the cluster has confirmed nobody
+    /// can resolve, here and on every peer.
+    ///
+    /// The backstop that did not exist (2026-09-13). Retirement of a token's ChunkLocation
+    /// happened in exactly one place — apply_patch's slide — and that is one-shot per
+    /// generation, so any row that survived it survived forever. `PurgeChunkLocations`
+    /// was built for precisely this ("Sent by the leader after an orphan purge sweep",
+    /// protocol.rs) and had ZERO callers cluster-wide; this is that caller.
+    ///
+    /// Only ever reached for ids `confirm_tokens_unresolvable` has already proven no node
+    /// can resolve, AND that the freshly-merged map no longer serves — deleting a row the
+    /// map still points at would strand the slot instead of repairing it. Demand-driven
+    /// (it rides the self-heal, which is rate-limited per file) rather than a new
+    /// O(CHUNK_TABLE) background scan: the rows that cause harm are exactly the rows on
+    /// files somebody reads.
+    async fn reclaim_unresolvable_token_rows(&self, file_id: FileId, tokens: Vec<ChunkId>) {
+        if tokens.is_empty() {
+            return;
+        }
+        let mut reclaimed = 0usize;
+        for token in &tokens {
+            match self.metadata.delete_chunk_location_async(*token).await {
+                Ok(()) => reclaimed += 1,
+                Err(e) => warn!("reclaim_unresolvable_token_rows: failed to delete local \
+                                 CHUNK_TABLE row for {} (file {}): {}", token, file_id, e),
+            }
+        }
+        info!("Reclaimed {}/{} orphan patch-token CHUNK_TABLE row(s) for file {} — rows whose \
+               bytes no node could resolve; broadcasting the purge to peers",
+            reclaimed, tokens.len(), file_id);
+
+        let local_id = self.cluster.local_node_id();
+        let peers: Vec<_> = self.cluster.get_all_nodes().await
+            .into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .collect();
+        const PURGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        for node in peers {
+            let client = self.client.clone();
+            let ids = tokens.clone();
+            // Fire-and-forget: a peer that misses this keeps a harmless orphan row and
+            // will be told again the next time its own self-heal confirms the same ids.
+            tokio::spawn(async move {
+                let req = Request::PurgeChunkLocations { chunk_ids: ids };
+                let _ = tokio::time::timeout(
+                    PURGE_TIMEOUT,
+                    client.send_message(node.addr, Message::Request(req)),
+                ).await;
+            });
+        }
+    }
+
     /// Handler for Request::RevalidateChunkSlot — see that variant's doc
     /// comment in dfs-common/src/protocol.rs for the full incident this
     /// closes. The client sends this after a real read failure (every replica
@@ -17751,12 +18007,69 @@ impl Server {
             // see the black-hole-node incident memory around lock-across-await).
             drop(entry);
             let response = slice_response(&locations, write_seq);
-            if found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed)
-                && self.claim_chunk_map_self_heal(file_id)
+
+            // A dangling patch token is the OTHER way a slot's identity dies, and the
+            // Ok(None) test above is blind to it: the token's CHUNK_TABLE row outlives
+            // its bytes, so the record looks perfectly healthy while nothing anywhere
+            // can resolve it (2026-09-13, VM-108 — see confirm_tokens_unresolvable).
+            // Candidates are free to spot: token-shaped by marker, and past the same
+            // TOKEN_ASSUMED_LIVE_FOR age floor merge_self_heal already applies, so an
+            // in-flight patch is never a candidate in the first place. Only if some
+            // exist do we pay the cluster round trip that decides it.
+            let now_ms = dfs_common::types::current_timestamp_ms();
+            let token_candidates: Vec<ChunkId> = locations.iter()
+                .filter(|l| l.chunk_id.looks_like_patch_token())
+                .filter(|l| l.written_at.is_some_and(|w| {
+                    now_ms.saturating_sub(w) >= TOKEN_ASSUMED_LIVE_FOR.as_millis() as u64
+                }))
+                .map(|l| l.chunk_id)
+                .collect();
+            // Narrow to the ones worth asking the cluster about, locally and for free.
+            // A healthy folded slot keeps its TOKEN as the chunk_map identity
+            // (resolve_chunk_location_for_info swaps only the nodes), so without this
+            // pre-filter an ordinary VM image would broadcast HasChunks for hundreds of
+            // perfectly live tokens on every self-heal window. A token this node can
+            // still resolve is definitionally not dangling, and patch_state GC only
+            // prunes a Folded row once the leader has confirmed the slot moved OFF the
+            // token — so a row still being here is exactly the signal we want to keep.
+            // The fan-out below is still what DECIDES; this only avoids asking when the
+            // answer is already known to be "resolvable".
+            let suspect_tokens: Vec<ChunkId> = if token_candidates.is_empty() {
+                Vec::new()
+            } else {
+                let locally_resolvable = self.metadata
+                    .get_patch_states_present_batch(&token_candidates)
+                    .unwrap_or_default();
+                token_candidates.into_iter()
+                    .filter(|id| !locally_resolvable.contains(id))
+                    .collect()
+            };
+            // Claim the rate limit BEFORE the fan-out, not after: the confirmation is
+            // the expensive half, and an unthrottled one would hand a client refetching
+            // this file several times a second a HasChunks broadcast per request.
+            let self_heal_claimed = (found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed)
+                || !suspect_tokens.is_empty())
+                && self.claim_chunk_map_self_heal(file_id);
+            let dangling_tokens = if self_heal_claimed && !suspect_tokens.is_empty() {
+                self.confirm_tokens_unresolvable(suspect_tokens).await
+            } else {
+                std::collections::HashSet::new()
+            };
+            if self_heal_claimed
+                && (found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed)
+                    || !dangling_tokens.is_empty())
             {
-                warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
-                       no CHUNK_TABLE record — re-deriving from authoritative CHUNK_TABLE truth \
-                       instead of serving the stale identity", file_id);
+                if !dangling_tokens.is_empty() {
+                    warn!("GetFileChunkMap: file {} has {} slot(s) pinned to a patch token no \
+                           node in the cluster can resolve — its CHUNK_TABLE row outlived its \
+                           bytes; re-deriving from authoritative CHUNK_TABLE truth",
+                        file_id, dangling_tokens.len());
+                }
+                if found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed) {
+                    warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
+                           no CHUNK_TABLE record — re-deriving from authoritative CHUNK_TABLE truth \
+                           instead of serving the stale identity", file_id);
+                }
                 let (fresh_locations, fresh_write_seq) = self.re_derive_chunk_map(file_id).await;
                 if !fresh_locations.is_empty() {
                     // NEVER substitute an older generation for a newer one that is still
@@ -17776,11 +18089,16 @@ impl Server {
                     // from CHUNK_TABLE — that write is already gone cluster-wide, so
                     // refusing preserves nothing and only makes readable data permanently
                     // unreadable. merge_self_heal draws that line, per slot.
+                    // "Adjudicated permanently gone" means unresolvable, not
+                    // record-less. Both shapes qualify: no CHUNK_TABLE row at all (the
+                    // healer swept it), or a surviving row for a token the whole cluster
+                    // just told us it cannot resolve.
                     let (merged, refused) = Self::merge_self_heal(
                         &locations,
                         &fresh_locations,
                         dfs_common::types::current_timestamp_ms(),
-                        |id| matches!(self.metadata.get_chunk_location(id), Ok(None)),
+                        |id| dangling_tokens.contains(id)
+                            || matches!(self.metadata.get_chunk_location(id), Ok(None)),
                     );
                     for (idx, current_id, fresh_id) in &refused {
                         warn!("GetFileChunkMap: self-heal for file {} refused to revert chunk_idx {} \
@@ -17790,6 +18108,19 @@ impl Server {
                     }
                     // Store exactly what we serve, never more.
                     self.commit_chunk_map(file_id, merged.clone(), fresh_write_seq);
+                    // Now that the map no longer points at them, retire the orphan rows
+                    // themselves — cluster-wide. Restricted to tokens the merged map
+                    // actually moved off: a token the merge KEPT (because the guard
+                    // refused, or because the re-derive offered nothing for that slot) is
+                    // still the served identity, and deleting its row would strand the
+                    // slot rather than repair it.
+                    let still_served: std::collections::HashSet<ChunkId> =
+                        merged.iter().map(|l| l.chunk_id).collect();
+                    let reclaimable: Vec<ChunkId> = dangling_tokens.iter()
+                        .copied()
+                        .filter(|id| !still_served.contains(id))
+                        .collect();
+                    self.reclaim_unresolvable_token_rows(file_id, reclaimable).await;
                     return slice_response(&merged, fresh_write_seq);
                 }
                 warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
@@ -23221,6 +23552,354 @@ mod tests {
         assert_eq!(stored_ids, served_ids,
             "chunk_map must hold exactly what was served — storing a map the guard refused \
              to serve makes the invariant unenforceable and the log line a lie");
+    }
+
+    /// Root-caused 2026-09-13 live on staging (VM-108 shut down and restarted: 22 guest
+    /// EIOs on the primary disk during boot, `failed_rd_operations: 22` on scsi0, then a
+    /// slow but eventually successful boot).
+    ///
+    /// This is the ORPHAN-ROW sibling of `purged_token_slot_recovers_to_its_intact_base`
+    /// above, and the difference is the whole bug. There the healer had swept the token's
+    /// CHUNK_TABLE record, so `get_chunk_location(token) == Ok(None)` and the self-heal
+    /// both triggered and was allowed to repair. Here the record SURVIVES while the bytes
+    /// do not — the exact end state `dfs_common::types::write_quorum`'s doc comment
+    /// describes: a below-quorum patch write is declined, never adopted, never folded, its
+    /// patch_state is GC'd and its bytes swept, "while its CHUNK_TABLE row survived on all
+    /// five nodes".
+    ///
+    /// Measured on staging 2026-09-13 for file 5f62f6a7 chunk_idx 781
+    /// (`dfs-admin file raw-location df7c3e9c...`): the row is present and names ONE node,
+    /// `written_at` 2026-09-05, and the token's bytes are absent from the `df/7c` shard of
+    /// all five nodes. 53 slots on that one image were in this state, 39 distinct tokens.
+    ///
+    /// Both halves of the self-heal are blind to it, for the same reason:
+    ///   - the TRIGGER only fires on `Ok(None)`, and the row is present, so for a file
+    ///     whose every rotted slot is of this shape the self-heal never runs at all;
+    ///   - the GUARD's `current_is_purged` predicate asks "is the row gone?" rather than
+    ///     "can anyone resolve this?", so even when some other slot triggers the scan it
+    ///     REFUSES the repair — 309 `refused to revert` lines for this one file today.
+    ///
+    /// The leader therefore serves an identity no replica can resolve, forever. The slot
+    /// is rescued only per-read by RevalidateChunkSlot, so every cold boot pays it again.
+    ///
+    /// A patch token that is (a) past the `TOKEN_ASSUMED_LIVE_FOR` age floor and (b) has
+    /// no PATCH_STATE row is dangling: `Pending` would name a base+delta to resolve
+    /// through and `Folded` would redirect to a real chunk, so with neither there is
+    /// nothing that can ever make it readable again. That — not the presence of a
+    /// CHUNK_TABLE row — is what "adjudicated permanently gone" has to mean.
+    #[tokio::test]
+    async fn dangling_patch_token_with_a_surviving_chunk_table_row_recovers_to_its_base() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const SLOT_781: u64 = 781 * 4 * 1024 * 1024; // 3275751424, the real offset
+        let now_ms = dfs_common::types::current_timestamp_ms();
+        // Staging's row is 8 days old; anything past TOKEN_ASSUMED_LIVE_FOR (5 min) is
+        // the case under test. Deliberately not "now - 5min - 1ms" — the age floor has
+        // its own dedicated test and this one must not double as a boundary check.
+        let eight_days_ago = now_ms - 8 * 86_400_000;
+
+        // The dangling token. A REAL token identity (so looks_like_patch_token holds —
+        // see PATCH_TOKEN_MARKER), newer than the base, and landed on only ONE node:
+        // below write_quorum(3) == 2, which is why the write was declined and why
+        // location_supersedes lets the 3-replica base win the CHUNK_TABLE re-derive.
+        let delta_id = ChunkId::from_hash(compute_chunk_hash(b"df7c3e9c-delta-never-folded"));
+        let token_id = ChunkId::patch_token_identity(delta_id);
+        assert!(token_id.looks_like_patch_token(),
+            "sanity: the repro must use an identity the marker check recognizes");
+        let token_loc = ChunkLocation {
+            chunk_id: token_id,
+            nodes: vec![NodeId::new()],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(SLOT_781),
+            written_at: Some(eight_days_ago),
+            client_write_seq: Some(41030),
+            file_id: Some(file_id),
+        };
+        // THE DIFFERENCE FROM THE TEST ABOVE: the row survives the bytes. No
+        // patch_state row is written for the token — nothing can resolve it.
+        server.metadata.put_chunk_location(&token_loc).unwrap();
+        server.chunk_map.insert(file_id, (vec![token_loc.clone()], 41030));
+
+        // The intact pre-write base for the same slot: older, alive on 3 replicas, and
+        // the only readable content that exists for chunk_idx 781.
+        let base_hash = compute_chunk_hash(b"1ec7ac3b-intact-base-three-replicas");
+        let base_chunk_id = ChunkId::from_hash(base_hash);
+        let base_loc = ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id, NodeId::new(), NodeId::new()],
+            size: 4194304,
+            checksum: base_hash,
+            file_offset: Some(SLOT_781),
+            written_at: Some(eight_days_ago - 1000),
+            client_write_seq: Some(41029),
+            file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&base_loc).unwrap();
+
+        let response = server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await;
+        let served = match response {
+            Response::FileChunkMap { locations, .. } => locations,
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        };
+
+        assert_eq!(served.len(), 1, "expected exactly one slot in the served window");
+        assert_eq!(served[0].chunk_id, base_chunk_id,
+            "a slot pinned to a patch token that is past the age floor and has no \
+             PATCH_STATE row must recover to its intact base: nothing can ever resolve \
+             that token again, so a surviving CHUNK_TABLE row is not evidence the write \
+             still exists — it is the orphan the row-based purge check cannot see, and \
+             serving it is a permanent EIO for data that is sitting right there");
+
+        // The repair must stick, or every cold boot re-pays it via RevalidateChunkSlot.
+        let stored = server.chunk_map.get(&file_id)
+            .map(|e| e.value().0.clone())
+            .expect("chunk_map entry must still exist");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].chunk_id, base_chunk_id,
+            "chunk_map must be corrected in place — a per-read rescue that never repairs \
+             the map is what made this cost the guest a full retry storm on every boot");
+    }
+
+
+    /// A location broadcast naming a patch-token generation the slot has already moved
+    /// past must not be able to recreate that generation's CHUNK_TABLE row.
+    ///
+    /// Root-caused 2026-09-13 on staging. Retirement of a token's ChunkLocation happens in
+    /// exactly ONE place — apply_patch's slide — and it is one-shot per generation: once
+    /// the slide for generation N has run, nothing revisits N. So a location broadcast that
+    /// lands after that slide recreates the row permanently. Measured: file 5f62f6a7 slot
+    /// 1245 took 7 token generations in 2m17s during one VM boot and generations 2, 3 and 4
+    /// all still held rows afterwards; ~23% of all tokens retired during that boot leaked a
+    /// row. Those rows are what later get served to a reader as an unresolvable identity.
+    ///
+    /// `merge_replicated_chunk_location` cannot close this itself and says so: "a chunk_id
+    /// whose CHUNK_TABLE row was just swept ... is now resurrecting via a stale rebroadcast
+    /// — the two are structurally indistinguishable at this call site". For a
+    /// content-addressed id that is true. For a patch token it is not: PATCH_STATE_SLOT_TABLE
+    /// records the slot's current token and patch seqs are strictly increasing per slot
+    /// (90394 -> 90580 across one observed generation on staging).
+    #[tokio::test]
+    async fn a_retired_patch_token_generation_cannot_be_reregistered_by_a_late_broadcast() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const CHUNK_IDX: u64 = 1245;
+        const SLOT: u64 = CHUNK_IDX * 4 * 1024 * 1024;
+        let now_ms = dfs_common::types::current_timestamp_ms();
+
+        let base = ChunkId::from_hash(compute_chunk_hash(b"1245-base"));
+        let old_delta = ChunkId::from_hash(compute_chunk_hash(b"1245-delta-gen-N"));
+        let new_delta = ChunkId::from_hash(compute_chunk_hash(b"1245-delta-gen-N+1"));
+        let retired_token = ChunkId::patch_token_identity(old_delta);
+        let current_token = ChunkId::patch_token_identity(new_delta);
+
+        // The slot has advanced to the newer generation — exactly what apply_patch's
+        // put_patch_state_pending records when it slides forward.
+        server.metadata.put_patch_state_pending(
+            file_id, CHUNK_IDX, &current_token, base, new_delta, 4194304, now_ms, Some(90580),
+        ).unwrap();
+
+        let mk = |chunk_id: ChunkId, seq: u64| ChunkLocation {
+            chunk_id,
+            nodes: vec![NodeId::new()],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(SLOT),
+            written_at: Some(now_ms),
+            client_write_seq: Some(seq),
+            file_id: Some(file_id),
+        };
+
+        // The late rebroadcast of the ALREADY-RETIRED generation.
+        let _ = server.handle_replicate_chunk_location(mk(retired_token, 90394), Some(file_id), None).await;
+        assert!(
+            matches!(server.metadata.get_chunk_location(&retired_token), Ok(None)),
+            "a broadcast for a patch-token generation this slot has already advanced past \
+             must not recreate its CHUNK_TABLE row — apply_patch's slide is one-shot and \
+             will never retire it a second time, so the row would outlive its bytes forever"
+        );
+
+        // Control 1: the slot's CURRENT token must still register normally.
+        let _ = server.handle_replicate_chunk_location(mk(current_token, 90580), Some(file_id), None).await;
+        assert!(
+            matches!(server.metadata.get_chunk_location(&current_token), Ok(Some(_))),
+            "the slot's current token is not retired and must register"
+        );
+
+        // Control 2: a strictly NEWER generation must register even though it differs
+        // from the slot's recorded token — this node may simply not have seen its
+        // patch_state yet, and declining it would drop a live registration.
+        let newer_token = ChunkId::patch_token_identity(
+            ChunkId::from_hash(compute_chunk_hash(b"1245-delta-gen-N+2")));
+        let _ = server.handle_replicate_chunk_location(mk(newer_token, 90999), Some(file_id), None).await;
+        assert!(
+            matches!(server.metadata.get_chunk_location(&newer_token), Ok(Some(_))),
+            "a newer-seq token must never be declined — a non-participant node legitimately \
+             learns of a generation it has no patch_state for"
+        );
+
+        // Control 3: an ordinary content-addressed chunk is never subject to this guard,
+        // whatever its seq — we have no slot authority over a real chunk id.
+        let real_chunk = ChunkId::from_hash(compute_chunk_hash(b"1245-ordinary-content"));
+        let _ = server.handle_replicate_chunk_location(mk(real_chunk, 1), Some(file_id), None).await;
+        assert!(
+            matches!(server.metadata.get_chunk_location(&real_chunk), Ok(Some(_))),
+            "a content-addressed chunk id must be unaffected by patch-token retirement"
+        );
+    }
+
+    /// The backstop: rows proven unresolvable get physically retired, so a leak by ANY
+    /// route is eventually collected instead of living forever.
+    ///
+    /// Before 2026-09-13 nothing did this. `PurgeChunkLocations` existed for exactly this
+    /// purpose ("Sent by the leader after an orphan purge sweep") and had zero callers, so
+    /// the only reclamation in the system was apply_patch's one-shot inline delete.
+    #[tokio::test]
+    async fn confirmed_unresolvable_token_rows_are_physically_reclaimed() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        let now_ms = dfs_common::types::current_timestamp_ms();
+        let orphan = ChunkId::patch_token_identity(
+            ChunkId::from_hash(compute_chunk_hash(b"orphan-row-with-no-bytes")));
+        let loc = ChunkLocation {
+            chunk_id: orphan,
+            nodes: vec![NodeId::new()],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(781 * 4 * 1024 * 1024),
+            written_at: Some(now_ms - 8 * 86_400_000),
+            client_write_seq: Some(41030),
+            file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&loc).unwrap();
+        assert!(matches!(server.metadata.get_chunk_location(&orphan), Ok(Some(_))),
+            "sanity: the orphan row exists before reclamation");
+
+        server.reclaim_unresolvable_token_rows(file_id, vec![orphan]).await;
+
+        assert!(matches!(server.metadata.get_chunk_location(&orphan), Ok(None)),
+            "a row the cluster has confirmed nobody can resolve must be physically retired \
+             — leaving it is what turns a one-shot missed delete into a permanent orphan");
+    }
+
+    /// Negative control for the test above: the age floor and the PATCH_STATE row are
+    /// each independently load-bearing, and neither may be dropped in the name of
+    /// clearing orphans faster.
+    ///
+    /// A token with a live `Pending` patch_state is resolvable by construction (it names
+    /// the base and delta to apply), so it must be protected no matter how old it is.
+    /// Treating it as dangling would revert the slot to its pre-write base — the
+    /// acknowledged-write data loss the never-revert invariant exists to prevent, and the
+    /// shape that failed T28a on 2026-09-10.
+    #[tokio::test]
+    async fn an_old_patch_token_with_a_live_patch_state_is_never_treated_as_dangling() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const SLOT_781: u64 = 781 * 4 * 1024 * 1024;
+        let now_ms = dfs_common::types::current_timestamp_ms();
+        let eight_days_ago = now_ms - 8 * 86_400_000;
+
+        let base_hash = compute_chunk_hash(b"1ec7ac3b-intact-base-three-replicas");
+        let base_chunk_id = ChunkId::from_hash(base_hash);
+        let delta_id = ChunkId::from_hash(compute_chunk_hash(b"df7c3e9c-delta-still-pending"));
+        let token_id = ChunkId::patch_token_identity(delta_id);
+
+        let token_loc = ChunkLocation {
+            chunk_id: token_id,
+            nodes: vec![NodeId::new()],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(SLOT_781),
+            written_at: Some(eight_days_ago),
+            client_write_seq: Some(41030),
+            file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&token_loc).unwrap();
+        server.chunk_map.insert(file_id, (vec![token_loc.clone()], 41030));
+
+        let base_loc = ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id, NodeId::new(), NodeId::new()],
+            size: 4194304,
+            checksum: base_hash,
+            file_offset: Some(SLOT_781),
+            written_at: Some(eight_days_ago - 1000),
+            client_write_seq: Some(41029),
+            file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&base_loc).unwrap();
+
+        // The one difference from the repro: this token is still resolvable.
+        server.metadata.put_patch_state_pending(
+            file_id, 781, &token_id, base_chunk_id, delta_id, 4194304,
+            eight_days_ago, Some(41030),
+        ).unwrap();
+
+        let response = server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await;
+        let served = match response {
+            Response::FileChunkMap { locations, .. } => locations,
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        };
+
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].chunk_id, token_id,
+            "a token with a live Pending patch_state resolves through base+delta, so it \
+             is current content however old it is — reverting it to the base would hand \
+             back pre-write data for a write we acknowledged");
     }
 
     /// The self-heal's regression guard must be decided PER SLOT, not per file.

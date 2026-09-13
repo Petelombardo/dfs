@@ -18136,22 +18136,45 @@ impl Server {
         // the file's chunk list from a scan filtered to this file_id rather than reading
         // the (now permanently empty) embedded array. write_seq still comes from the
         // FileMetadata scalar field, which persistence never touches.
+        //
+        // ARBITRATED, not raw (fixed 2026-09-13). This scan used to push EVERY
+        // CHUNK_TABLE row for the file straight into chunk_map. A raw scan is NOT one
+        // row per slot -- superseded patch/rotation generations linger at an
+        // already-covered file_offset until swept -- and chunk_locations_for_info's own
+        // doc comment has warned since 2026-07-16 that "every caller here is written
+        // expecting one row per slot, and handing them raw rows breaks them in ways that
+        // are not obviously about chunk_locations at all".
+        //
+        // chunk_map is exactly such a caller, and this is the hole every dead patch-token
+        // identity climbed through: one cache miss (a leader restart is enough) loaded
+        // the map with each slot's live row AND its retired generations. Everything
+        // downstream then had to cope with a map that could name an identity no one could
+        // resolve -- which is what the read path, the self-heal and its never-revert
+        // guard have all been patched to tolerate. Observed on staging right after the
+        // 14:50 leader restart: 36 slots of file 5f62f6a7 pinned to retired tokens, held
+        // constant from that moment, because nothing evicts a live file's chunk_map entry
+        // (every chunk_map_remove call site is a delete-file path).
+        //
+        // chunk_locations_for_info_async already does this correctly: one row per slot by
+        // location_supersedes, each resolved through its patch_state. Use it, and the
+        // multiple-generations-in-chunk_map case stops existing rather than being
+        // defended against.
         let metadata_store = self.metadata.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let file = metadata_store.get_file(&file_id)?;
-            let write_seq = match &file {
-                Some(f) => f.write_seq,
-                None => return Ok::<_, anyhow::Error>(None),
-            };
-            let mut locations: Vec<ChunkLocation> = Vec::new();
-            metadata_store.scan_chunk_locations(|loc| {
-                if loc.file_id == Some(file_id) {
-                    locations.push(loc);
-                }
-                true
-            })?;
-            Ok(Some((locations, write_seq)))
+        let fid_for_seq = file_id;
+        let write_seq_result = tokio::task::spawn_blocking(move || {
+            metadata_store.get_file(&fid_for_seq).map(|f| f.map(|f| f.write_seq))
         }).await;
+        let result = match write_seq_result {
+            Ok(Ok(Some(write_seq))) => {
+                match self.chunk_locations_for_info_async(file_id).await {
+                    Ok(locations) => Ok(Ok(Some((locations, write_seq)))),
+                    Err(e) => Ok(Err(e)),
+                }
+            }
+            Ok(Ok(None)) => Ok(Ok(None)),
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(e) => Err(e),
+        };
         match result {
             Ok(Ok(Some((locations, write_seq)))) if !locations.is_empty() => {
                 // Populate cache for future lookups. Keep chunk_to_file in lockstep —
@@ -23675,6 +23698,117 @@ mod tests {
              the map is what made this cost the guest a full retry storm on every boot");
     }
 
+
+
+    /// A chunk_map cache miss must install ONE row per slot, not every generation.
+    ///
+    /// Root-caused 2026-09-13 on staging, and this is the substrate the whole
+    /// dangling-patch-token family grew out of. The cache-miss path in
+    /// handle_get_file_chunk_map used to push every CHUNK_TABLE row for the file straight
+    /// into chunk_map via a raw scan_chunk_locations. A raw scan is NOT one row per slot:
+    /// superseded patch and rotation generations linger at an already-covered file_offset
+    /// until something sweeps them. chunk_locations_for_info's doc comment has warned
+    /// since 2026-07-16 that "every caller here is written expecting one row per slot, and
+    /// handing them raw rows breaks them in ways that are not obviously about
+    /// chunk_locations at all" -- chunk_map is exactly such a caller.
+    ///
+    /// Consequence measured live: one leader restart was enough. The first GetFileChunkMap
+    /// for file 5f62f6a7 missed the cache, the raw scan loaded the retired generations
+    /// alongside the live ones, and 36 slots sat pinned to tokens no node could resolve --
+    /// held at exactly 36 from that moment on, because nothing evicts a live file's
+    /// chunk_map entry (every chunk_map_remove call site is a delete-file path). Reads of
+    /// those slots then cost seconds each, rescued one at a time by RevalidateChunkSlot.
+    ///
+    /// Fixing it here is worth more than defending against it downstream: the read path,
+    /// the self-heal trigger and its never-revert guard had each been taught to tolerate a
+    /// map that names an unresolvable identity. Keep the map correct and that case stops
+    /// existing.
+    #[tokio::test]
+    async fn a_chunk_map_cache_miss_installs_one_arbitrated_row_per_slot() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const SLOT: u64 = 770 * 4 * 1024 * 1024; // the real staging slot
+        let now_ms = dfs_common::types::current_timestamp_ms();
+
+        let mut file = dfs_common::FileMetadata::new(
+            "/images/108/vm-108-disk-0.qcow2".to_string(),
+            dfs_common::FileType::RegularFile,
+        );
+        file.id = file_id;
+        file.size = SLOT + 4194304;
+        file.write_seq = 500;
+        server.metadata.put_file(&file).unwrap();
+
+        // The slot's LIVE identity: an ordinary content chunk on 3 replicas.
+        let live_hash = compute_chunk_hash(b"slot-770-live-content");
+        let live_id = ChunkId::from_hash(live_hash);
+        server.metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: live_id,
+            nodes: vec![node_id, NodeId::new(), NodeId::new()],
+            size: 4194304,
+            checksum: live_hash,
+            file_offset: Some(SLOT),
+            written_at: Some(now_ms - 60_000),
+            client_write_seq: Some(500),
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // A RETIRED generation still sitting at the same file_offset -- exactly what a
+        // raw scan would hand back as a second row for this one slot.
+        let retired = ChunkId::patch_token_identity(
+            ChunkId::from_hash(compute_chunk_hash(b"slot-770-retired-delta")));
+        server.metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: retired,
+            nodes: vec![NodeId::new()],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(SLOT),
+            written_at: Some(now_ms - 8 * 86_400_000),
+            client_write_seq: Some(400),
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Cache miss by construction: nothing has populated chunk_map for this file.
+        assert!(server.chunk_map.get(&file_id).is_none(), "sanity: must start as a miss");
+
+        let response = server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await;
+        let served = match response {
+            Response::FileChunkMap { locations, .. } => locations,
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        };
+
+        let at_slot: Vec<_> = served.iter().filter(|l| l.file_offset == Some(SLOT)).collect();
+        assert_eq!(at_slot.len(), 1,
+            "a slot must be served as exactly ONE row; serving its retired generations \
+             alongside the live one is what let an unresolvable identity reach readers");
+        assert_eq!(at_slot[0].chunk_id, live_id,
+            "and that row must be the arbitrated winner, not a superseded generation");
+
+        // The cached map itself must be clean too -- this is the part that persisted for
+        // hours on staging, because nothing evicts a live file's chunk_map entry.
+        let cached = server.chunk_map.get(&file_id)
+            .map(|e| e.value().0.clone())
+            .expect("cache miss must populate chunk_map");
+        let cached_at_slot: Vec<_> = cached.iter().filter(|l| l.file_offset == Some(SLOT)).collect();
+        assert_eq!(cached_at_slot.len(), 1,
+            "chunk_map must hold one row per slot; a second, retired row here is a \
+             dangling identity that survives until the file is deleted");
+        assert_eq!(cached_at_slot[0].chunk_id, live_id,
+            "the cached row must be the live identity");
+    }
 
     /// A location broadcast naming a patch-token generation the slot has already moved
     /// past must not be able to recreate that generation's CHUNK_TABLE row.

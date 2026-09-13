@@ -428,7 +428,9 @@ pub struct Server {
     /// Rate-limiting rather than one-shot-latching deliberately: the condition is
     /// genuinely repairable in the common case (that is the whole point), so this must
     /// keep retrying — just not once per read.
-    chunk_map_self_heal_at: Arc<DashMap<FileId, std::time::Instant>>,
+    /// Per file: (last self-heal attempt, current backoff interval). See
+    /// `claim_chunk_map_self_heal` for why the interval grows.
+    chunk_map_self_heal_at: Arc<DashMap<FileId, (std::time::Instant, std::time::Duration)>>,
 
     /// Retry backstop for the ReplicateChunkLocation/ReplicatePatchFold broadcast
     /// run_single_fold sends immediately after a fold completes. That broadcast
@@ -17375,6 +17377,33 @@ impl Server {
     /// replace a real cache with an empty one on a possibly-transient scan
     /// issue" caution the code this was extracted from already had.
     /// Rate-limit gate for handle_get_file_chunk_map's CHUNK_TABLE self-heal — see
+    /// Floor for the per-file self-heal interval: a genuinely repairable slot must
+    /// still heal well inside one VM boot.
+    const SELF_HEAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Ceiling once a file's self-heal keeps coming up empty. Each attempt costs a FULL
+    /// CHUNK_TABLE scan (chunk_locations_for_info is O(all rows), ~400k on staging), so
+    /// an unrepairable file polled at the floor forever is a self-inflicted denial of
+    /// service on whichever node is leader -- exactly what took gluster1 off the cluster
+    /// on 2026-09-13. Widening the trigger to fire on "this file has old patch tokens"
+    /// made that condition permanently true for any actively-patched VM image, so the
+    /// scan ran every 5s per image indefinitely.
+    const SELF_HEAL_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Record whether a self-heal pass actually changed anything, and re-pace the file
+    /// accordingly: reset to the floor when it did, double up to the ceiling when it did
+    /// not. Polling is only worth its cost while it is still producing repairs.
+    fn note_self_heal_outcome(&self, file_id: FileId, repaired: bool) {
+        if let Some(mut e) = self.chunk_map_self_heal_at.get_mut(&file_id) {
+            let (last, interval) = *e.value();
+            let next = if repaired {
+                Self::SELF_HEAL_MIN_INTERVAL
+            } else {
+                std::cmp::min(interval * 2, Self::SELF_HEAL_MAX_INTERVAL)
+            };
+            *e.value_mut() = (last, next);
+        }
+    }
+
     /// `chunk_map_self_heal_at`. Returns true at most once per interval per file, and
     /// records the attempt only when it returns true.
     ///
@@ -17384,19 +17413,18 @@ impl Server {
         /// Long enough that a client stuck in a per-read refresh loop (~7/s observed)
         /// can't turn this into a full-table scan per request, short enough that a
         /// genuinely repairable slot heals well inside one VM boot.
-        const CHUNK_MAP_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
         let now = std::time::Instant::now();
         match self.chunk_map_self_heal_at.entry(file_id) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                if now.duration_since(*e.get()) < CHUNK_MAP_SELF_HEAL_INTERVAL {
+                let (last, interval) = *e.get();
+                if now.duration_since(last) < interval {
                     return false;
                 }
-                e.insert(now);
+                e.insert((now, interval));
                 true
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                e.insert(now);
+                e.insert((now, Self::SELF_HEAL_MIN_INTERVAL));
                 true
             }
         }
@@ -17610,9 +17638,18 @@ impl Server {
         // This node's own answer, asked the way a token must be asked. has_chunk() is
         // raw file presence and is ALWAYS false for a token by design, so using it here
         // would count the leader as a "no" vote it never earned.
+        // spawn_blocking, NOT the sync call. This is a redb read transaction that loops
+        // every token, and it runs from an async handler on a Tokio worker. Calling the
+        // sync form here wedged gluster1 on 2026-09-13: it stopped answering every
+        // request including heartbeats, peers marked it Failed, while the OS stayed
+        // healthy and the process kept running -- the identical signature to the
+        // 2026-07-16 incident that took gluster2 and gluster3 down, described in
+        // chunk_locations_for_info's doc comment. Leader-only, because that is where
+        // this path runs hot.
         let locally_resolvable: HashSet<ChunkId> = self
             .metadata
-            .get_patch_states_present_batch(&tokens)
+            .get_patch_states_present_batch_async(tokens.clone())
+            .await
             .unwrap_or_default();
         let mut answered = 1usize;
         let mut resolvable_somewhere = locally_resolvable;
@@ -17691,10 +17728,15 @@ impl Server {
     /// (it rides the self-heal, which is rate-limited per file) rather than a new
     /// O(CHUNK_TABLE) background scan: the rows that cause harm are exactly the rows on
     /// files somebody reads.
-    async fn reclaim_unresolvable_token_rows(&self, file_id: FileId, tokens: Vec<ChunkId>) {
-        if tokens.is_empty() {
+    async fn reclaim_unresolvable_token_rows(
+        &self,
+        file_id: FileId,
+        slots: Vec<(ChunkId, Option<u64>)>,
+    ) {
+        if slots.is_empty() {
             return;
         }
+        let tokens: Vec<ChunkId> = slots.iter().map(|(t, _)| *t).collect();
         let mut reclaimed = 0usize;
         for token in &tokens {
             match self.metadata.delete_chunk_location_async(*token).await {
@@ -17703,9 +17745,22 @@ impl Server {
                                  CHUNK_TABLE row for {} (file {}): {}", token, file_id, e),
             }
         }
+        // Name them. Without this the line said only "Reclaimed 36/36" and three separate
+        // theories about what recreates these rows died to evidence that was never
+        // captured — the reclaim ran ~every 10s for hours and no log anywhere said WHICH
+        // ids it had just deleted, so nothing could be correlated against the broadcast
+        // and patch paths. One compact line per pass, not one per row.
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let named: Vec<String> = slots.iter()
+            .map(|(t, off)| match off {
+                Some(o) => format!("{}@{}", &format!("{}", t)[..16], o / CHUNK_SIZE),
+                None => format!("{}@?", &format!("{}", t)[..16]),
+            })
+            .collect();
         info!("Reclaimed {}/{} orphan patch-token CHUNK_TABLE row(s) for file {} — rows whose \
-               bytes no node could resolve; broadcasting the purge to peers",
-            reclaimed, tokens.len(), file_id);
+               bytes no node could resolve; broadcasting the purge to peers. Reclaimed \
+               (token@chunk_idx): {}",
+            reclaimed, tokens.len(), file_id, named.join(" "));
 
         let local_id = self.cluster.local_node_id();
         let peers: Vec<_> = self.cluster.get_all_nodes().await
@@ -18037,8 +18092,13 @@ impl Server {
             let suspect_tokens: Vec<ChunkId> = if token_candidates.is_empty() {
                 Vec::new()
             } else {
+                // spawn_blocking, NOT the sync call -- see confirm_tokens_unresolvable
+                // for the wedge this caused. This site is the worse of the two: it runs
+                // on EVERY GetFileChunkMap cache hit, which a booting VM drives at
+                // hundreds per minute.
                 let locally_resolvable = self.metadata
-                    .get_patch_states_present_batch(&token_candidates)
+                    .get_patch_states_present_batch_async(token_candidates.clone())
+                    .await
                     .unwrap_or_default();
                 token_candidates.into_iter()
                     .filter(|id| !locally_resolvable.contains(id))
@@ -18060,10 +18120,19 @@ impl Server {
                     || !dangling_tokens.is_empty())
             {
                 if !dangling_tokens.is_empty() {
+                    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                    let named: Vec<String> = locations.iter()
+                        .filter(|l| dangling_tokens.contains(&l.chunk_id))
+                        .map(|l| match l.file_offset {
+                            Some(o) => format!("{}@{}", &format!("{}", l.chunk_id)[..16], o / CHUNK_SIZE),
+                            None => format!("{}@?", &format!("{}", l.chunk_id)[..16]),
+                        })
+                        .collect();
                     warn!("GetFileChunkMap: file {} has {} slot(s) pinned to a patch token no \
                            node in the cluster can resolve — its CHUNK_TABLE row outlived its \
-                           bytes; re-deriving from authoritative CHUNK_TABLE truth",
-                        file_id, dangling_tokens.len());
+                           bytes; re-deriving from authoritative CHUNK_TABLE truth. \
+                           Dangling (token@chunk_idx): {}",
+                        file_id, dangling_tokens.len(), named.join(" "));
                 }
                 if found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed) {
                     warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
@@ -18093,12 +18162,28 @@ impl Server {
                     // record-less. Both shapes qualify: no CHUNK_TABLE row at all (the
                     // healer swept it), or a surviving row for a token the whole cluster
                     // just told us it cannot resolve.
+                    // Resolve "has a CHUNK_TABLE row" for every current identity in ONE
+                    // batched, spawn_blocking lookup instead of a synchronous point read
+                    // per slot inside the predicate.
+                    //
+                    // The old closure did `self.metadata.get_chunk_location(id)` inline,
+                    // which is a blocking redb read on a Tokio worker, executed once per
+                    // slot -- ~1047 of them for a VM image, every time this ran. That was
+                    // survivable only because the self-heal used to fire rarely; widening
+                    // its trigger made it run every 5s per file and turned a latent cost
+                    // into the wedge that took gluster1 off the cluster on 2026-09-13
+                    // (accepting TCP, answering nothing, heartbeats included). Same class
+                    // as the 2026-07-16 outage in chunk_locations_for_info's doc comment.
+                    let current_ids: Vec<ChunkId> = locations.iter().map(|l| l.chunk_id).collect();
+                    let present_rows = self.metadata
+                        .get_chunk_locations_batch_async(current_ids)
+                        .await
+                        .unwrap_or_default();
                     let (merged, refused) = Self::merge_self_heal(
                         &locations,
                         &fresh_locations,
                         dfs_common::types::current_timestamp_ms(),
-                        |id| dangling_tokens.contains(id)
-                            || matches!(self.metadata.get_chunk_location(id), Ok(None)),
+                        |id| dangling_tokens.contains(id) || !present_rows.contains_key(id),
                     );
                     for (idx, current_id, fresh_id) in &refused {
                         warn!("GetFileChunkMap: self-heal for file {} refused to revert chunk_idx {} \
@@ -18116,13 +18201,27 @@ impl Server {
                     // slot rather than repair it.
                     let still_served: std::collections::HashSet<ChunkId> =
                         merged.iter().map(|l| l.chunk_id).collect();
-                    let reclaimable: Vec<ChunkId> = dangling_tokens.iter()
-                        .copied()
-                        .filter(|id| !still_served.contains(id))
+                    let reclaimable: Vec<(ChunkId, Option<u64>)> = locations.iter()
+                        .filter(|l| dangling_tokens.contains(&l.chunk_id))
+                        .filter(|l| !still_served.contains(&l.chunk_id))
+                        .map(|l| (l.chunk_id, l.file_offset))
                         .collect();
+                    // Did this pass earn its keep? A repair is a slot whose served
+                    // identity actually changed, or an orphan row physically retired.
+                    // If neither, this file's self-heal is spinning and gets paced back
+                    // -- see SELF_HEAL_MAX_INTERVAL for the outage that taught us the
+                    // cost of polling a full-table scan forever.
+                    let changed_a_slot = merged.iter().any(|m| {
+                        locations.iter().any(|l| {
+                            l.file_offset == m.file_offset && l.chunk_id != m.chunk_id
+                        })
+                    });
+                    let repaired = changed_a_slot || !reclaimable.is_empty();
+                    self.note_self_heal_outcome(file_id, repaired);
                     self.reclaim_unresolvable_token_rows(file_id, reclaimable).await;
                     return slice_response(&merged, fresh_write_seq);
                 }
+                self.note_self_heal_outcome(file_id, false);
                 warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
                        rows — serving the stale response rather than an empty one", file_id);
             }
@@ -23700,6 +23799,76 @@ mod tests {
 
 
 
+
+    /// A self-heal that keeps finding nothing must stop paying for itself.
+    ///
+    /// Each attempt costs a FULL CHUNK_TABLE scan — chunk_locations_for_info is O(all
+    /// rows) and its own doc comment measures that at ~400k rows on staging. The 5s
+    /// per-file rate limit was sized to stop a client's per-read refresh loop turning
+    /// that into a scan per request; it was never meant to be a steady-state poll.
+    ///
+    /// f010232 widened the self-heal trigger to also fire on "this file has old patch
+    /// tokens", which for any actively-patched VM image is permanently true. That turned
+    /// the floor into the steady state: a full-table scan every 5s per image, forever, on
+    /// whichever node was leader. On 2026-09-13 gluster1 held ~36 minutes as leader and
+    /// then stopped answering every request including heartbeats -- peers marked it
+    /// Failed while the OS stayed healthy and the process kept running.
+    ///
+    /// So pace it by results: reset to the floor whenever a pass actually repairs
+    /// something, and back off toward SELF_HEAL_MAX_INTERVAL when it does not. A
+    /// genuinely repairable slot still heals inside one boot; a permanently unrepairable
+    /// file stops costing anything.
+    #[test]
+    fn self_heal_backs_off_when_a_file_stops_yielding_repairs() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        let interval_of = |f: FileId| server.chunk_map_self_heal_at.get(&f).map(|e| e.value().1);
+
+        assert!(server.claim_chunk_map_self_heal(file_id), "first claim must win");
+        assert_eq!(interval_of(file_id), Some(Server::SELF_HEAL_MIN_INTERVAL),
+            "a file starts at the floor");
+
+        // Three unproductive passes: the interval must grow each time.
+        server.note_self_heal_outcome(file_id, false);
+        assert_eq!(interval_of(file_id), Some(Server::SELF_HEAL_MIN_INTERVAL * 2));
+        server.note_self_heal_outcome(file_id, false);
+        assert_eq!(interval_of(file_id), Some(Server::SELF_HEAL_MIN_INTERVAL * 4));
+        server.note_self_heal_outcome(file_id, false);
+        assert_eq!(interval_of(file_id), Some(Server::SELF_HEAL_MIN_INTERVAL * 8),
+            "an unproductive file must keep backing off, not sit at the floor scanning \
+             the whole CHUNK_TABLE every 5s");
+
+        // A pass that repairs something makes the file responsive again immediately.
+        server.note_self_heal_outcome(file_id, true);
+        assert_eq!(interval_of(file_id), Some(Server::SELF_HEAL_MIN_INTERVAL),
+            "a productive pass must reset to the floor — backing off must never make a \
+             genuinely repairable slot wait minutes to heal");
+
+        // And the backoff is bounded.
+        for _ in 0..40 {
+            server.note_self_heal_outcome(file_id, false);
+        }
+        assert_eq!(interval_of(file_id), Some(Server::SELF_HEAL_MAX_INTERVAL),
+            "backoff must saturate at the ceiling, not grow without bound");
+
+        // Per file, not global: a second file is unaffected by the first's backoff.
+        let other = dfs_common::FileId::new();
+        assert!(server.claim_chunk_map_self_heal(other), "a different file claims freely");
+        assert_eq!(interval_of(other), Some(Server::SELF_HEAL_MIN_INTERVAL),
+            "backoff is per file — one spinning file must not slow another file's repair");
+    }
+
     /// A chunk_map cache miss must install ONE row per slot, not every generation.
     ///
     /// Root-caused 2026-09-13 on staging, and this is the substrate the whole
@@ -23949,7 +24118,8 @@ mod tests {
         assert!(matches!(server.metadata.get_chunk_location(&orphan), Ok(Some(_))),
             "sanity: the orphan row exists before reclamation");
 
-        server.reclaim_unresolvable_token_rows(file_id, vec![orphan]).await;
+        server.reclaim_unresolvable_token_rows(
+            file_id, vec![(orphan, Some(781 * 4 * 1024 * 1024))]).await;
 
         assert!(matches!(server.metadata.get_chunk_location(&orphan), Ok(None)),
             "a row the cluster has confirmed nobody can resolve must be physically retired \

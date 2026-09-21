@@ -3507,7 +3507,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let client = self.clone();
                 let eng = engine.clone();
                 tokio::spawn(async move {
-                    let result = client.fetch_chunk_with_fallback(la_cid, primary, &fallbacks, None).await;
+                    let result = client.fetch_chunk_with_fallback(la_cid, primary, &fallbacks, None, Some((file_id, la_idx as u64))).await;
                     client.node_inflight_dec(primary);
                     match result {
                         Ok(data) => {
@@ -3543,20 +3543,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let fallbacks = fallbacks.clone();
                     let loc = chunk_map.get(idx).cloned();
                     tokio::spawn(async move {
+                        let slot = Some((file_id, idx as u64));
                         let data = if STRIPED_READ_ENABLED {
                             if let Some(loc) = loc {
                                 if loc.nodes.len() >= 2 && loc.size == 4 * 1024 * 1024 {
                                     let file_offset = loc.file_offset.unwrap_or(0);
-                                    client.read_chunk_striped(cid, &loc, file_offset).await
+                                    client.read_chunk_striped(cid, &loc, file_offset, slot).await
                                 } else {
-                                    client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
+                                    client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None, slot).await
                                 }
                             } else {
-                                client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
+                                client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None, slot).await
                             }
                         } else {
                             let _ = loc;
-                            client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
+                            client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None, slot).await
                         };
                         client.node_inflight_dec(primary);
                         (idx, cid, data)
@@ -3577,7 +3578,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let primary = *primary;
                     let fallbacks = fallbacks.clone();
                     tokio::spawn(async move {
-                        let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await;
+                        let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None, Some((file_id, idx as u64))).await;
                         client.node_inflight_dec(primary);
                         (idx, cid, data)
                     })
@@ -3704,7 +3705,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 .unwrap_or_else(|| fresh_nodes[selector as usize % fresh_nodes.len()]);
                             let fallback_rest: Vec<SocketAddr> = fallbacks.iter()
                                 .skip(1).copied().collect();
-                            match self.fetch_chunk_with_fallback(local_cid, primary, &fallback_rest, None).await {
+                            match self.fetch_chunk_with_fallback(local_cid, primary, &fallback_rest, None, Some((file_id, idx as u64))).await {
                                 Ok(data) => {
                                     let arc = Arc::new(data);
                                     if !bypass_cache {
@@ -3760,7 +3761,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                 (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
                                             }
                                         };
-                                        match self.fetch_chunk_with_fallback(revalidated_cid, fp, &ffb, None).await {
+                                        match self.fetch_chunk_with_fallback(revalidated_cid, fp, &ffb, None, Some((file_id, idx as u64))).await {
                                             Ok(data) => {
                                                 let arc = Arc::new(data);
                                                 if !bypass_cache {
@@ -3822,7 +3823,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
                                 }
                             };
-                            match self.fetch_chunk_with_fallback(fresh_cid, fp, &ffb, None).await {
+                            match self.fetch_chunk_with_fallback(fresh_cid, fp, &ffb, None, Some((file_id, idx as u64))).await {
                                 Ok(data) => {
                                     let arc = Arc::new(data);
                                     if !bypass_cache {
@@ -3937,7 +3938,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             if stagger_ms > 0 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(stagger_ms)).await;
                             }
-                            let swarm_result = client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None).await;
+                            let swarm_result = client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None, Some((file_id, idx_copy as u64))).await;
                             client.node_inflight_dec(primary);
                             match swarm_result {
                                 Ok(data) => {
@@ -3970,7 +3971,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                         let chain_client = client.clone();
                                                         let chain_eng = eng.clone();
                                                         tokio::spawn(async move {
-                                                            let chain_result = chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await;
+                                                            let chain_result = chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None, Some((file_id, next_idx as u64))).await;
                                                             chain_client.node_inflight_dec(next_primary);
                                                             match chain_result {
                                                                 Ok(chain_data) => {
@@ -4190,16 +4191,28 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// Fetch with primary then fallbacks sequentially.
     /// Connect timeout is 1s so a dead node fails fast without wasting bandwidth.
+    ///
+    /// `slot` is the (file_id, chunk_idx) this read is logically for. It MUST be passed
+    /// whenever it is known: it is the only thing that lets the server fall back to
+    /// `resolve_by_slot` when `cid` is an identity a fold already retired. Root-caused
+    /// 2026-09-21 (VM-108, `ino=19029 offset=1785856`): every caller here passed `None`,
+    /// so a slot whose real content was sitting on three replicas EIO'd the guest.
+    /// gluster1 logged `resolve_by_slot: served current chunk af56e4f1… — slot backstop
+    /// hit #1049` 11 ms before answering `not found on this node` to this path's read of
+    /// the very same chunk — the backstop worked, it just was not reachable from here.
+    /// Same defect, same parameter, as the 2026-08-01 write-path fix documented on
+    /// `read_chunk_from_server`.
     async fn fetch_chunk_with_fallback(
         &self,
         cid: ChunkId,
         primary: SocketAddr,
         fallbacks: &[SocketAddr],
         client_write_seq: Option<u64>,
+        slot: Option<(FileId, u64)>,
     ) -> Result<Vec<u8>> {
         let mut all_not_found = true;
         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
-            match self.read_chunk_from_server(addr, cid, client_write_seq, None).await {
+            match self.read_chunk_from_server(addr, cid, client_write_seq, slot).await {
                 Ok(d) => {
                     self.node_health.record_success(addr).await;
                     return Ok(d);
@@ -4288,7 +4301,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // data, so the cache_put below caches under the id that's really readable, matching
         // what the stale-retry paths above already do (they cache under the revalidated id,
         // not the stale one).
-        let (landing_cid, raw) = match self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await {
+        let (landing_cid, raw) = match self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None, Some((file_id, chunk_idx))).await {
             Ok(d) => (cid, d),
             Err(orig_err) => {
                 // The fetcher we were waiting on used `cid`, and it's now confirmed missing
@@ -4319,7 +4332,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 };
                 let (rp, rf) = InodeReadEngine::resolve_primary(&new_loc, &nim, &nodes, 0)
                     .unwrap_or_else(|| (primary, fallbacks.clone()));
-                let d = self.fetch_chunk_with_fallback(new_cid, rp, &rf, None).await?;
+                let d = self.fetch_chunk_with_fallback(new_cid, rp, &rf, None, Some((file_id, chunk_idx))).await?;
                 (new_cid, d)
             }
         };
@@ -4539,11 +4552,16 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// start_chunk_idx: Index in all_file_chunks where chunk_ids[0] is located
     /// inode: File inode for byte-range caching (optional, 0 to disable)
     /// chunk_offsets: File byte offset for each chunk in chunk_ids (for byte-range caching)
+    /// `file_id` is threaded through to every request this issues so the server can fall
+    /// back to `resolve_by_slot` when an advertised identity has been retired — see
+    /// `fetch_chunk_with_fallback`'s doc comment for the 2026-09-21 incident. Before that,
+    /// this whole path (including `sequential_pipeline_read`) hardcoded the slot to `None`.
     pub async fn read_data(
         &self,
         read_hints: &[ChunkReadHint],
         all_file_chunks: &[ChunkId],
         inode: u64,
+        file_id: FileId,
         chunk_locations: &[dfs_common::ChunkLocation],
     ) -> Result<Vec<u8>> {
         if read_hints.is_empty() {
@@ -4605,8 +4623,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Also track in-flight reads to prevent duplicate concurrent fetches
         // CRITICAL: Use separate lock acquisitions to reduce contention on fast CPUs
         let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
-        let mut chunks_to_fetch: Vec<(usize, ChunkId, u64, bool)> = Vec::new(); // (idx, chunk_id, file_offset, pipeline_only)
-        let mut chunks_to_wait_for: Vec<(usize, ChunkId, u64)> = Vec::new(); // chunks being fetched by another request
+        let mut chunks_to_fetch: Vec<(usize, ChunkId, u64, bool, u64)> = Vec::new(); // (idx, chunk_id, file_offset, pipeline_only, file_chunk_idx)
+        let mut chunks_to_wait_for: Vec<(usize, ChunkId, u64, u64)> = Vec::new(); // (hint idx, chunk_id, file_offset, file chunk idx) — being fetched by another request
 
         for (idx, chunk_id) in chunk_ids.iter().enumerate() {
             let mut found = false;
@@ -4655,7 +4673,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 if is_in_flight {
                     let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
                     info!("Chunk {} already being fetched by another request - will wait", chunk_id);
-                    chunks_to_wait_for.push((idx, *chunk_id, file_offset));
+                    chunks_to_wait_for.push((idx, *chunk_id, file_offset, read_hints[idx].chunk_idx as u64));
                     found = true;
                 }
             }
@@ -4664,7 +4682,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             if !found {
                 let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
                 info!("Cache MISS for chunk {} (inode={}, offset={}) - will fetch", chunk_id, inode, file_offset);
-                chunks_to_fetch.push((idx, *chunk_id, file_offset, false));
+                chunks_to_fetch.push((idx, *chunk_id, file_offset, false, read_hints[idx].chunk_idx as u64));
 
                 // Mark as in-flight to prevent other concurrent requests from fetching
                 {
@@ -4687,14 +4705,18 @@ leader_addr: Arc::new(RwLock::new(None)),
             let lookahead_needed = depth.saturating_sub(chunk_ids.len());
 
             if lookahead_needed > 0 {
-                let mut pipeline_chunks: Vec<ChunkId> = Vec::with_capacity(lookahead_needed);
+                // Carry each lookahead chunk's FILE index alongside its id: it is the
+                // chunk_idx half of the slot hint, and these speculative reads are the
+                // ones running furthest ahead of the chunk map, so they are the most
+                // likely of all to be chasing an identity a fold has already retired.
+                let mut pipeline_chunks: Vec<(usize, ChunkId)> = Vec::with_capacity(lookahead_needed);
                 {
                     let in_flight = self.prefetch_in_flight.lock().await;
                     let mut file_idx = last_required_file_idx + 1;
                     while pipeline_chunks.len() < lookahead_needed && file_idx < all_file_chunks.len() {
                         let cid = all_file_chunks[file_idx];
                         if self.chunk_cache.get(&cid).is_none() && !in_flight.contains(&cid) {
-                            pipeline_chunks.push(cid);
+                            pipeline_chunks.push((file_idx, cid));
                         }
                         file_idx += 1;
                     }
@@ -4702,23 +4724,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Mark pipeline chunks as in-flight and add to fetch list
                 {
                     let mut in_flight = self.prefetch_in_flight.lock().await;
-                    for cid in &pipeline_chunks {
+                    for (_, cid) in &pipeline_chunks {
                         in_flight.insert(*cid);
                     }
                 }
-                for cid in pipeline_chunks {
-                    chunks_to_fetch.push((usize::MAX, cid, 0, true));
+                for (file_idx, cid) in pipeline_chunks {
+                    chunks_to_fetch.push((usize::MAX, cid, 0, true, file_idx as u64));
                 }
             }
         }
 
         let t2 = start.elapsed(); // after cache lookup loop
         let cache_hits = cached_chunks.len();
-        let cache_misses = chunks_to_fetch.iter().filter(|(_, _, _, po)| !po).count();
+        let cache_misses = chunks_to_fetch.iter().filter(|(_, _, _, po, _)| !po).count();
 
         info!("Reading {} chunks: {} cached, {} to fetch ({} pipeline lookahead) (chunk_ids: {:?})",
               chunk_ids.len(), cache_hits, cache_misses,
-              chunks_to_fetch.iter().filter(|(_, _, _, po)| *po).count(),
+              chunks_to_fetch.iter().filter(|(_, _, _, po, _)| *po).count(),
               chunk_ids);
 
         // Fast path: all chunks were in cache, skip all fetch machinery.
@@ -4747,6 +4769,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             use_partial_read: bool,
             primary: SocketAddr,
             fallbacks: Vec<SocketAddr>, // other replicas, excluding primary
+            /// The chunk's index within its FILE (not within this read's hint list) —
+            /// half of the (file_id, chunk_idx) slot every request below must carry.
+            file_chunk_idx: u64,
         }
 
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
@@ -4755,11 +4780,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
         let mut resolved: Vec<ResolvedFetch> = Vec::with_capacity(chunks_to_fetch.len());
 
-        for (idx, chunk_id, file_offset, pipeline_only) in &chunks_to_fetch {
+        for (idx, chunk_id, file_offset, pipeline_only, file_chunk_idx) in &chunks_to_fetch {
             let idx = *idx;
             let chunk_id = *chunk_id;
             let file_offset = *file_offset;
             let pipeline_only = *pipeline_only;
+            let file_chunk_idx = *file_chunk_idx;
 
             // Resolve replica list from chunk_locations (fast, no network).
             let mut replicas = if let Some(loc) = chunk_loc_map.get(&chunk_id) {
@@ -4813,7 +4839,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 .collect();
 
             resolved.push(ResolvedFetch { idx, chunk_id, file_offset, pipeline_only,
-                                          use_partial_read, primary, fallbacks });
+                                          use_partial_read, primary, fallbacks, file_chunk_idx });
         }
 
         // --- Step 2: fetch chunks. ---
@@ -4825,8 +4851,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         let fetch_results: Vec<Result<(usize, ChunkId, u64, Arc<Vec<u8>>, bool, bool)>> =
         if !has_partial && !all_file_chunks.is_empty() {
             // Build ordered list for the pipeline (primary node per chunk).
-            let pipeline_input: Vec<(ChunkId, SocketAddr)> = resolved.iter()
-                .map(|r| (r.chunk_id, r.primary))
+            let pipeline_input: Vec<(ChunkId, SocketAddr, Option<(FileId, u64)>)> = resolved.iter()
+                .map(|r| (r.chunk_id, r.primary, Some((file_id, r.file_chunk_idx))))
                 .collect();
 
             let pipeline_results = self.sequential_pipeline_read(pipeline_input).await;
@@ -4843,7 +4869,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             let mut fallback_data = None;
                             let mut last_err = e;
                             for &fb_addr in &r.fallbacks {
-                                match client.read_chunk_from_server(fb_addr, r.chunk_id, None, None).await {
+                                match client.read_chunk_from_server(fb_addr, r.chunk_id, None, Some((file_id, r.file_chunk_idx))).await {
                                     Ok(d) => { fallback_data = Some(d); break; }
                                     Err(e) => { last_err = e; }
                                 }
@@ -4883,13 +4909,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                             info!("PARTIAL READ: chunk {} offset={} length={}", r.chunk_id, hint.offset_in_chunk, hint.length);
                             client.read_chunk_range_from_server(node_addr, r.chunk_id,
                                 hint.offset_in_chunk as u64, hint.length as u64, None,
-                                // read_data (sequential/full-chunk path) does not thread
-                                // file_id; this partial-read branch is not the one that errors
-                                // under mixed load. TODO: carry file_id via
-                                // ResolvedFetch to give this the slot backstop too.
-                                None).await
+                                // Resolved 2026-09-21: ResolvedFetch now carries the file
+                                // chunk index, so both branches give the server the slot
+                                // backstop. The old TODO here reasoned that this branch was
+                                // "not the one that errors under mixed load" — true of the
+                                // incident it was written for, and irrelevant to whether the
+                                // hint should be sent: it costs two Option fields and is the
+                                // only recovery available when the advertised id is retired.
+                                Some((file_id, r.file_chunk_idx))).await
                         } else {
-                            client.read_chunk_from_server(node_addr, r.chunk_id, None, None).await
+                            client.read_chunk_from_server(node_addr, r.chunk_id, None, Some((file_id, r.file_chunk_idx))).await
                         };
                         match result {
                             Ok(d) => {
@@ -4961,7 +4990,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Remove from in-flight now that fetches are complete.
         {
             let mut in_flight = self.prefetch_in_flight.lock().await;
-            for (_, chunk_id, _, _) in &chunks_to_fetch {
+            for (_, chunk_id, _, _, _) in &chunks_to_fetch {
                 in_flight.remove(chunk_id);
             }
         }
@@ -4973,7 +5002,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         if !chunks_to_wait_for.is_empty() {
             info!("Waiting for {} chunks already being fetched by other requests", chunks_to_wait_for.len());
 
-            for (idx, chunk_id, file_offset) in chunks_to_wait_for {
+            for (idx, chunk_id, file_offset, file_chunk_idx) in chunks_to_wait_for {
                 let wait_start = std::time::Instant::now();
                 let mut data_found = false;
 
@@ -5015,7 +5044,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         .chain(replicas.iter().filter(|&n| n != &selected_replica))
                         .enumerate()
                     {
-                        match self.read_chunk_from_server(*node_addr, chunk_id, None, None).await {
+                        match self.read_chunk_from_server(*node_addr, chunk_id, None, Some((file_id, file_chunk_idx))).await {
                             Ok(data) => {
                                 if i > 0 {
                                     debug!("Fetched chunk {} from fallback replica {} after timeout", chunk_id, node_addr);
@@ -5714,11 +5743,21 @@ leader_addr: Arc::new(RwLock::new(None)),
         server_addr: SocketAddr,
         chunk_id: ChunkId,
         client_write_seq: Option<u64>,
+        slot: Option<(FileId, u64)>,
     ) -> Result<(TcpStream, usize)> {
         // Look up write_seq from cache if not explicitly provided
         let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
-        let request = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: ws, file_id: None, chunk_idx: None };
+        // Carries the slot for the same reason read_chunk_from_server does — this is the
+        // sequential-readahead path, so it is the single largest source of reads against
+        // identities that a background fold may have retired since the map was fetched.
+        let request = Request::ReadChunk {
+            chunk_id,
+            sequential_hint: None,
+            client_write_seq: ws,
+            file_id: slot.map(|s| s.0),
+            chunk_idx: slot.map(|s| s.1),
+        };
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
         let encoded = envelope.to_bytes().context("serialize")?;
@@ -5845,7 +5884,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// back to the normal `read_chunk_from_server` path for that chunk.
     pub async fn sequential_pipeline_read(
         &self,
-        chunks: Vec<(ChunkId, SocketAddr)>,
+        chunks: Vec<(ChunkId, SocketAddr, Option<(FileId, u64)>)>,
     ) -> Vec<Result<Vec<u8>>> {
         if chunks.is_empty() {
             return Vec::new();
@@ -5857,30 +5896,30 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Kick off Phase 1 for the first chunk immediately.
         let mut pending: Option<(SocketAddr, P1Handle)> = {
-            let (cid, addr) = chunks[0]; // ChunkId and SocketAddr are Copy
+            let (cid, addr, slot) = chunks[0]; // ChunkId, SocketAddr and the slot are Copy
             let client = self.clone();
             Some((addr, tokio::spawn(async move {
-                client.open_chunk_request(addr, cid, None).await
+                client.open_chunk_request(addr, cid, None, slot).await
             })))
         };
 
         for i in 0..chunks.len() {
-            let (cid, addr) = chunks[i];
+            let (cid, addr, slot) = chunks[i];
 
             let (p1_addr, p1_handle) = match pending.take() {
                 Some(p) => p,
                 None => {
-                    results.push(self.read_chunk_from_server(addr, cid, None, None).await);
+                    results.push(self.read_chunk_from_server(addr, cid, None, slot).await);
                     continue;
                 }
             };
 
             // Concurrently start Phase 1 for the next chunk while we await drain of this one.
             let next_pending: Option<(SocketAddr, P1Handle)> = if i + 1 < chunks.len() {
-                let (next_cid, next_addr) = chunks[i + 1];
+                let (next_cid, next_addr, next_slot) = chunks[i + 1];
                 let client = self.clone();
                 Some((next_addr, tokio::spawn(async move {
-                    client.open_chunk_request(next_addr, next_cid, None).await
+                    client.open_chunk_request(next_addr, next_cid, None, next_slot).await
                 })))
             } else {
                 None
@@ -5893,7 +5932,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
                 Ok(Err(e)) => {
                     warn!("Pipeline Phase-1 failed for chunk {:?} on {}: {}", cid, p1_addr, e);
-                    self.read_chunk_from_server(addr, cid, None, None).await
+                    self.read_chunk_from_server(addr, cid, None, slot).await
                 }
                 Err(e) => Err(anyhow::anyhow!("Phase-1 task panicked: {}", e)),
             };
@@ -5945,11 +5984,17 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Read chunk using striped multi-replica approach (parallel byte ranges from multiple nodes)
+    ///
+    /// `slot` is threaded into every request this makes — both striped halves and the
+    /// whole-chunk fallback — for the reason on `fetch_chunk_with_fallback`. This is a
+    /// sequential-read path, so it reads exactly the identities most likely to have been
+    /// retired by a background fold since the chunk map was fetched.
     async fn read_chunk_striped(
         &self,
         chunk_id: ChunkId,
         location: &dfs_common::ChunkLocation,
         file_offset: u64,
+        slot: Option<(FileId, u64)>,
     ) -> Result<Vec<u8>> {
         let _ = file_offset;
         let chunk_size = location.size;
@@ -5975,7 +6020,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let mut last_err: Option<anyhow::Error> = None;
                 for addr in replicas.iter().copied().chain(cluster_nodes.iter().copied()) {
                     if !tried.insert(addr) { continue; }
-                    match client.read_chunk_from_server(addr, chunk_id, None, None).await {
+                    match client.read_chunk_from_server(addr, chunk_id, None, slot).await {
                         Ok(data) => return Ok(data),
                         Err(e) => {
                             debug!("Whole-chunk fallback: {} failed for chunk {}: {}", addr, chunk_id, e);
@@ -6016,11 +6061,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         let client2 = self.clone();
 
         let task1 = tokio::spawn(async move {
-            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64, None, None).await
+            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64, None, slot).await
         });
 
         let task2 = tokio::spawn(async move {
-            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64, None, None).await
+            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64, None, slot).await
         });
 
         let (result1, result2) = tokio::join!(task1, task2);
@@ -10879,4 +10924,340 @@ mod tests {
         assert!(refreshes >= 2,
             "must have refreshed the chunk map after the failed read (got {refreshes} GetFileChunkMap calls)");
     }
+
+    /// Mock storage node for the slot-backstop tests below.
+    ///
+    /// Models the 2026-09-21 staging state exactly: the node's own `chunk_map` for the
+    /// slot is CORRECT and its content is present, but every metadata route the client
+    /// can ask — `GetFileChunkMap` and `RevalidateChunkSlot` alike — keeps handing back
+    /// `retired_id`, the token a fold already consumed. That is not a contrived setup:
+    /// gluster1 advertised exactly one such token for slot 0 of VM-108's disk for 35
+    /// hours (fold at 2026-09-19T18:30:13Z, still advertised at 2026-09-21T05:03Z).
+    ///
+    /// So the read cannot be rescued by refreshing — the corrected identity is not
+    /// obtainable from anywhere. The ONLY thing that can serve it is the server's
+    /// `resolve_by_slot` backstop, which the real `handle_read_chunk` consults *only when
+    /// the request carries the `(file_id, chunk_idx)` slot hint*. This mock reproduces
+    /// that gate faithfully:
+    ///   - request carries the matching slot  -> serve the content (backstop hit)
+    ///   - request omits it                   -> "Chunk ... not found on this node"
+    ///
+    /// Both counters are returned so a test can prove which arm the client actually took
+    /// rather than inferring it from success alone.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_slot_backstop_node(
+        addr: SocketAddr,
+        all_nodes: Vec<NodeId>,
+        file_id: FileId,
+        chunk_idx: u64,
+        retired_id: ChunkId,
+        content: Arc<Vec<u8>>,
+        reads_with_slot: Arc<std::sync::atomic::AtomicUsize>,
+        reads_without_slot: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => return, // port in use by a previous run — the test's own assert fails loudly
+            };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let all_nodes = all_nodes.clone();
+                let content = content.clone();
+                let reads_with_slot = reads_with_slot.clone();
+                let reads_without_slot = reads_without_slot.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let request_id = envelope.request_id;
+                        let Message::Request(req) = envelope.message else { return };
+
+                        // The poisoned answer every metadata route gives, forever.
+                        let poisoned_loc = || ChunkLocation {
+                            chunk_id: retired_id,
+                            nodes: all_nodes.clone(),
+                            size: content.len(),
+                            checksum: retired_id.hash,
+                            file_offset: Some(chunk_idx * 4 * 1024 * 1024),
+                            written_at: Some(1000),
+                            client_write_seq: Some(1),
+                            file_id: Some(file_id),
+                        };
+                        // Does this request carry the slot hint the real server needs to
+                        // reach resolve_by_slot?
+                        let has_slot = |f: Option<FileId>, c: Option<u64>| {
+                            f == Some(file_id) && c == Some(chunk_idx)
+                        };
+
+                        match req {
+                            Request::GetFileChunkMap { file_id: f, .. } => {
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id: f,
+                                    locations: vec![poisoned_loc()],
+                                    from_chunk: 0,
+                                    total_chunks: 1,
+                                    write_seq: 1,
+                                }).await;
+                            }
+                            Request::RevalidateChunkSlot { file_id: f, .. } => {
+                                // Authoritative re-derivation returns the SAME retired id:
+                                // the leader genuinely believes it is current. This is the
+                                // state that made the production EIO unrecoverable.
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id: f,
+                                    locations: vec![poisoned_loc()],
+                                    from_chunk: 0,
+                                    total_chunks: 1,
+                                    write_seq: 1,
+                                }).await;
+                            }
+                            Request::ReadChunk { chunk_id, file_id: f, chunk_idx: c, .. } => {
+                                if chunk_id == retired_id && has_slot(f, c) {
+                                    reads_with_slot.fetch_add(1, Ordering::SeqCst);
+                                    write_chunk_data_response(&mut stream, request_id, chunk_id, &content).await;
+                                } else {
+                                    reads_without_slot.fetch_add(1, Ordering::SeqCst);
+                                    write_envelope(&mut stream, request_id, Response::Error {
+                                        message: format!("Chunk {} not found on this node", chunk_id),
+                                        code: ErrorCode::NotFound,
+                                    }).await;
+                                }
+                            }
+                            Request::ReadChunkRange { chunk_id, offset, length, file_id: f, chunk_idx: c, .. } => {
+                                if chunk_id == retired_id && has_slot(f, c) {
+                                    reads_with_slot.fetch_add(1, Ordering::SeqCst);
+                                    let start = (offset as usize).min(content.len());
+                                    let end = (start + length as usize).min(content.len());
+                                    write_chunk_data_response(&mut stream, request_id, chunk_id, &content[start..end]).await;
+                                } else {
+                                    reads_without_slot.fetch_add(1, Ordering::SeqCst);
+                                    write_envelope(&mut stream, request_id, Response::Error {
+                                        message: "Failed to read chunk range: Failed to open chunk file".to_string(),
+                                        code: ErrorCode::NotFound,
+                                    }).await;
+                                }
+                            }
+                            _ => {
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: "unhandled in mock".to_string(), code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Shared driver: three replicas, all in the state described on
+    /// `spawn_slot_backstop_node`. Returns the read result plus the two request counters.
+    async fn run_slot_backstop_read(
+        base_port: u16,
+        read_off: usize,
+        read_len: usize,
+    ) -> (Result<Vec<u8>>, usize, usize, Vec<u8>) {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        let content = Arc::new((0..CHUNK).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let expected = content[read_off..read_off + read_len].to_vec();
+
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+            .collect();
+        let node_ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+        let file_id = FileId::new();
+        let retired_id = chunk_id_with_hash0(0xDF);
+
+        let reads_with_slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_without_slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for &addr in addrs.iter() {
+            spawn_slot_backstop_node(
+                addr, node_ids.clone(), file_id, 0, retired_id, content.clone(),
+                reads_with_slot.clone(), reads_without_slot.clone(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let client = DfsClient::new(addrs.clone()).unwrap();
+        *client.leader_addr.write().await = Some(addrs[0]);
+        {
+            let mut m = client.addr_to_node_id.write().await;
+            for (&addr, &node_id) in addrs.iter().zip(node_ids.iter()) {
+                m.insert(addr, node_id);
+            }
+        }
+        *client.cluster_nodes.write().await = addrs.clone();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.read_file(1, CHUNK as u64, file_id, "/slot-backstop-test", read_off, read_len, false, None),
+        ).await.expect("read_file must not hang");
+
+        (
+            result,
+            reads_with_slot.load(Ordering::SeqCst),
+            reads_without_slot.load(Ordering::SeqCst),
+            expected,
+        )
+    }
+
+    /// REGRESSION (2026-09-21, VM-108 guest I/O error at 05:03:13Z on server4).
+    ///
+    /// `ERROR FUSE read error: ino=19029, offset=1785856: Chunk df7cc8a8… missing on all
+    /// replicas`. The data was never lost: slot 0's real content sat on three replicas the
+    /// whole time, and gluster1 logged `resolve_by_slot: served current chunk af56e4f1… —
+    /// slot backstop hit #1049` at 05:03:07.288879Z — **11 ms before** it answered
+    /// `not found on this node` to a *different* read of the same chunk in the same second.
+    ///
+    /// The difference between the two was the `(file_id, chunk_idx)` hint. `read_file`'s
+    /// full-chunk path reaches the network through `fetch_chunk_with_fallback`, which
+    /// passed `None` for the slot, so `handle_read_chunk` could never consult
+    /// `resolve_by_slot` and 404'd an identity whose content it was holding.
+    ///
+    /// This is a sequential read at offset 0, which is what `is_broad_sequential` routes
+    /// down the full-chunk path. Note `read_chunk_from_server` has carried a `slot`
+    /// parameter since the 2026-08-01 fix of this same defect on the write path — its doc
+    /// comment even says "Pass None only where a slot genuinely isn't known at the call
+    /// site". Every caller in the read path knew it.
+    #[tokio::test]
+    async fn sequential_read_must_send_the_slot_hint_so_the_server_backstop_can_run() {
+        let (result, with_slot, without_slot, expected) =
+            run_slot_backstop_read(19641, 0, 131072).await;
+        let data = match result {
+            Ok(d) => d,
+            Err(e) => panic!(
+                "the full-chunk read path EIO'd a slot whose content every replica was \
+                 holding and would have served if asked with the slot hint — got: {e}; \
+                 ReadChunk/ReadChunkRange with slot={with_slot}, without slot={without_slot} \
+                 (without>0 and with==0 is the defect: the server's resolve_by_slot \
+                 backstop was never reachable)"),
+        };
+        assert_eq!(data, expected, "the backstop must serve the slot's real content");
+        assert!(with_slot > 0,
+            "the read path must carry (file_id, chunk_idx) — without it the server cannot \
+             reach resolve_by_slot no matter how stale the advertised id is");
+        assert_eq!(without_slot, 0,
+            "EVERY request this path emits must carry the slot, not just the one that \
+             happened to succeed: {without_slot} went out without it, and each of those is \
+             a wasted round-trip that 404s against a replica holding the data");
+    }
+
+    /// CONTROL for the test above, and a guard against regressing the other direction.
+    ///
+    /// An intra-chunk offset under 1MiB takes `read_file`'s range-fetch path, which has
+    /// passed `Some((file_id, idx))` on every one of its `read_chunk_range_from_server`
+    /// calls since it was written — so this test passed BEFORE the 2026-09-21 fix as well
+    /// as after. That is the point: it isolates the slot hint as the only variable between
+    /// the two paths. Identical mock, identical poisoned metadata, opposite outcome,
+    /// and the difference was two `Option` fields on the request.
+    #[tokio::test]
+    async fn random_read_sends_the_slot_hint_and_is_served_by_the_backstop() {
+        let (result, with_slot, without_slot, expected) =
+            run_slot_backstop_read(19651, 1785856, 65536).await;
+        let data = match result {
+            Ok(d) => d,
+            Err(e) => panic!(
+                "the range-read path EIO'd a slot whose content every replica was holding: \
+                 {e}; with slot={with_slot}, without slot={without_slot}"),
+        };
+        assert_eq!(data, expected, "the backstop must serve the slot's real content");
+        assert!(with_slot > 0, "the range-read path must carry (file_id, chunk_idx) too");
+        assert_eq!(without_slot, 0, "no request on this path may omit the slot either");
+    }
+
+
+    /// REGRESSION, same 2026-09-21 defect on the OTHER read entry point.
+    ///
+    /// `read_data` — used by the read-modify-write and truncate paths — reaches the
+    /// network through `sequential_pipeline_read`, whose input tuple was
+    /// `(ChunkId, SocketAddr)`: the slot was not merely passed as `None`, it could not be
+    /// expressed at all, and `open_chunk_request` hardcoded
+    /// `file_id: None, chunk_idx: None`. So every pipelined sequential read — the bulk of
+    /// readahead traffic — was unable to reach `resolve_by_slot`.
+    ///
+    /// `full_chunk: true` on the hint is what routes this down the pipeline branch rather
+    /// than the partial-read one.
+    #[tokio::test]
+    async fn read_data_pipeline_must_send_the_slot_hint() {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        let content = Arc::new((0..CHUNK).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|i| format!("127.0.0.1:{}", 19661 + i).parse().unwrap())
+            .collect();
+        let node_ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+        let file_id = FileId::new();
+        let chunk_idx = 7u64;
+        let retired_id = chunk_id_with_hash0(0xDF);
+
+        let reads_with_slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_without_slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for &addr in addrs.iter() {
+            spawn_slot_backstop_node(
+                addr, node_ids.clone(), file_id, chunk_idx, retired_id, content.clone(),
+                reads_with_slot.clone(), reads_without_slot.clone(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let client = DfsClient::new(addrs.clone()).unwrap();
+        *client.leader_addr.write().await = Some(addrs[0]);
+        {
+            let mut m = client.addr_to_node_id.write().await;
+            for (&addr, &node_id) in addrs.iter().zip(node_ids.iter()) {
+                m.insert(addr, node_id);
+            }
+        }
+        *client.cluster_nodes.write().await = addrs.clone();
+
+        let hints = vec![ChunkReadHint {
+            chunk_idx: chunk_idx as usize,
+            chunk_id: retired_id,
+            full_chunk: true,
+            offset_in_chunk: 0,
+            length: CHUNK,
+            file_offset: chunk_idx * CHUNK as u64,
+        }];
+        let locations = vec![ChunkLocation {
+            chunk_id: retired_id,
+            nodes: node_ids.clone(),
+            size: CHUNK,
+            checksum: retired_id.hash,
+            file_offset: Some(chunk_idx * CHUNK as u64),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        }];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.read_data(&hints, &[retired_id], 1, file_id, &locations),
+        ).await.expect("read_data must not hang");
+
+        let with_slot = reads_with_slot.load(Ordering::SeqCst);
+        let without_slot = reads_without_slot.load(Ordering::SeqCst);
+        let data = match result {
+            Ok(d) => d,
+            Err(e) => panic!(
+                "read_data's pipeline EIO'd a slot every replica was holding — got: {e}; \
+                 with slot={with_slot}, without slot={without_slot}"),
+        };
+        assert_eq!(data.len(), CHUNK, "the full chunk must come back");
+        assert_eq!(data, *content, "the backstop must serve the slot's real content");
+        assert!(with_slot > 0, "the backstop must actually have been the thing that served it");
+        // The strict assertion, and the one that isolates `open_chunk_request`: a read that
+        // omits the slot and then recovers via a fallback that includes it still *works*,
+        // so success alone does not prove the pipeline was fixed. Every request must carry
+        // the hint — otherwise the pipeline is silently burning a failed round-trip per
+        // chunk against a healthy replica, and is one unlucky fallback away from the EIO.
+        assert_eq!(without_slot, 0,
+            "every ReadChunk the pipeline emits must carry (file_id, chunk_idx);              {without_slot} did not");
+    }
+
 }

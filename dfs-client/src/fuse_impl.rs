@@ -7524,7 +7524,7 @@ impl Filesystem for DfsFilesystem {
                             current_offset += chunk_size as u64;
                         }
 
-                        let affected_data = match client.read_data(&read_hints, &all_chunk_ids, cache_inode, &metadata.chunk_locations).await {
+                        let affected_data = match client.read_data(&read_hints, &all_chunk_ids, cache_inode, metadata.id, &metadata.chunk_locations).await {
                             Ok(data) => data,
                             Err(e) => {
                                 error!("Failed to read affected chunks {}-{}: {}", first_idx, last_idx, e);
@@ -9028,7 +9028,7 @@ impl Filesystem for DfsFilesystem {
                             }];
 
                             let last_chunk_data = match self.block_on(async {
-                                client.read_data(&read_hint, &all_chunk_ids, ino, &metadata.chunk_locations).await
+                                client.read_data(&read_hint, &all_chunk_ids, ino, metadata.id, &metadata.chunk_locations).await
                             }) {
                                 Ok(data) => data,
                                 Err(e) => {

@@ -6006,7 +6006,9 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let size_high_water = self.size_high_water.clone();
 
-        self.read_runtime.spawn(async move {
+        // Traced so a slow or never-completing guest read is reported at WARN with
+        // every network step it took — see read_trace.rs for the incident.
+        self.read_runtime.spawn(crate::read_trace::run(ino, offset, size, async move {
             let start = std::time::Instant::now();
             debug!("FUSE read: ino={}, offset={}, size={}", ino, offset, size);
 
@@ -6015,6 +6017,7 @@ impl Filesystem for DfsFilesystem {
                 Some(m) => (m.size, m.file_type, m.path.clone(), m.id, Some(m.write_seq)),
                 None => { reply.error(libc::ENOENT); return; }
             };
+            crate::read_trace::set_label(&file_path);
 
             if file_type != FileType::RegularFile {
                 reply.error(libc::EISDIR);
@@ -6091,6 +6094,10 @@ impl Filesystem for DfsFilesystem {
                         shard.lock(),
                     ).await;
                     let shard_waited = shard_wait_start.elapsed();
+                    crate::read_trace::record("write-buffer-shard-lock", None, shard_wait_start, || {
+                        if lock_result.is_err() { format!("chunk={} TIMED OUT, falling through to network", chunk_idx) }
+                        else { format!("chunk={}", chunk_idx) }
+                    });
                     if shard_waited.as_millis() >= 20 {
                         debug!("RDSTALL shard-lock ino={} chunk={} waited_ms={}",
                             ino, chunk_idx, shard_waited.as_millis());
@@ -6258,7 +6265,12 @@ impl Filesystem for DfsFilesystem {
                 }
                 last_metadata_update.insert(ino, std::time::Instant::now());
 
-                match client.get_file_metadata(&file_path).await {
+                let eof_refresh_start = std::time::Instant::now();
+                let eof_refresh = client.get_file_metadata(&file_path).await;
+                crate::read_trace::record("eof-metadata-refresh", None, eof_refresh_start, || {
+                    match &eof_refresh { Ok(_) => "ok".to_string(), Err(e) => format!("ERR {}", e) }
+                });
+                match eof_refresh {
                     Ok(Some(mut fresh)) => {
                         // Never let a stale server size shrink the cached logical size.
                         if let Some(cached) = metadata_cache.get(&ino) {
@@ -6344,7 +6356,7 @@ impl Filesystem for DfsFilesystem {
                     reply.error(libc::EIO);
                 }
             }
-        });
+        }));
     }
 
     fn readdir(

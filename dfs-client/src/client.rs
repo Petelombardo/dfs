@@ -858,6 +858,37 @@ type ChunkLocationSlotKey = (Option<dfs_common::FileId>, Option<u64>);
 /// Conservative by construction: anything connection-shaped is NOT unsupported, and an
 /// absent error (every attempt timed out, so nothing was ever recorded) is NOT
 /// unsupported either.
+/// How long a whole-chunk read waits on one replica before also asking the next
+/// (see fetch_chunk_with_fallback and sequential_pipeline_read). Same budget the
+/// byte-range path already gives a replica (read_chunk_range_from_server's 1 s),
+/// and far above a healthy 4 MiB read, so it only fires on a stalled node.
+const REPLICA_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Step name for a read trace (see read_trace.rs). Explicit, not `{:?}`: a Debug
+/// render of a write-bearing request would copy its whole payload.
+fn traced_request_name(request: &Request) -> &'static str {
+    match request {
+        Request::ReadChunk { .. } => "ReadChunk",
+        Request::ReadChunkRange { .. } => "ReadChunkRange",
+        Request::GetFileChunkMap { .. } => "GetFileChunkMap",
+        Request::RevalidateChunkSlot { .. } => "RevalidateChunkSlot",
+        Request::GetFileMetadata { .. } => "GetFileMetadata",
+        Request::GetFileMetadataByPath { .. } => "GetFileMetadataByPath",
+        Request::HasChunks { .. } => "HasChunks",
+        Request::GetClusterStatus { .. } => "GetClusterStatus",
+        _ => "OtherRequest",
+    }
+}
+
+/// Outcome text for a read-trace step. Errors are kept whole — "not found",
+/// "penalized" and "timeout" are exactly what a slow-read report must distinguish.
+fn trace_outcome<T>(result: &Result<T>) -> String {
+    match result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("ERR {}", e),
+    }
+}
+
 fn error_indicates_unsupported_request(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     !(e.contains("connect")
@@ -1740,6 +1771,16 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
+        if !crate::read_trace::active() {
+            return self.send_request_untraced(addr, request).await;
+        }
+        let step = crate::read_trace::step(traced_request_name(&request), Some(addr));
+        let result = self.send_request_untraced(addr, request).await;
+        step.finish(|| trace_outcome(&result));
+        result
+    }
+
+    async fn send_request_untraced(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         // Fail instantly against a node already known to be bad, instead of paying a
         // full connect-attempt + retry-connect-attempt + timeout cycle on every single
         // request to it. NodeHealthTracker already records every failure from this
@@ -3081,7 +3122,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let ws = write_seq; // Capture for async block
                     let inode = inode; // Capture for async block
                     let file_id = file_id; // Capture for the (file_id, chunk_idx) slot backstop
-                    tokio::spawn(async move {
+                    crate::read_trace::spawn_in_current(async move {
                         // Try primary then fallbacks.
                         let mut last_err = None;
                         let mut all_not_found = true;
@@ -3542,7 +3583,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let primary = *primary;
                     let fallbacks = fallbacks.clone();
                     let loc = chunk_map.get(idx).cloned();
-                    tokio::spawn(async move {
+                    crate::read_trace::spawn_in_current(async move {
                         let slot = Some((file_id, idx as u64));
                         let data = if STRIPED_READ_ENABLED {
                             if let Some(loc) = loc {
@@ -3577,7 +3618,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let cid = *cid;
                     let primary = *primary;
                     let fallbacks = fallbacks.clone();
-                    tokio::spawn(async move {
+                    crate::read_trace::spawn_in_current(async move {
                         let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None, Some((file_id, idx as u64))).await;
                         client.node_inflight_dec(primary);
                         (idx, cid, data)
@@ -4210,9 +4251,44 @@ leader_addr: Arc::new(RwLock::new(None)),
         client_write_seq: Option<u64>,
         slot: Option<(FileId, u64)>,
     ) -> Result<Vec<u8>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        // Hedged, not strictly sequential: if the replica being asked hasn't answered
+        // within REPLICA_HEDGE_AFTER, ask the next one too and take the first success.
+        // Sequential fallback meant a stalled-but-connected replica cost its full read
+        // timeout before a healthy one was even asked — reproduced locally 2026-09-24
+        // (scripts/repro_read_during_single_replica_fold.sh, folder-stall mode): 21 s
+        // for one read against a SIGSTOPped node, served in 5 ms by the next replica.
+        // On staging the leader stalled 26.5 s during VM-108's boot, which is the same
+        // shape against the guest's 30 s SCSI timeout. A healthy replica answers well
+        // inside the budget, so the common case never sends a second request.
+        let order: Vec<SocketAddr> = std::iter::once(primary).chain(fallbacks.iter().copied()).collect();
+        let mut next = 0usize;
+        let mut inflight = FuturesUnordered::new();
+        let launch = |addr: SocketAddr| async move {
+            (addr, self.read_chunk_from_server(addr, cid, client_write_seq, slot).await)
+        };
         let mut all_not_found = true;
-        for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
-            match self.read_chunk_from_server(addr, cid, client_write_seq, slot).await {
+        loop {
+            if inflight.is_empty() {
+                if next >= order.len() {
+                    break;
+                }
+                inflight.push(launch(order[next]));
+                next += 1;
+            }
+            let (addr, result) = if next < order.len() {
+                tokio::select! {
+                    done = inflight.next() => done.expect("inflight is non-empty"),
+                    _ = tokio::time::sleep(REPLICA_HEDGE_AFTER) => {
+                        inflight.push(launch(order[next]));
+                        next += 1;
+                        continue;
+                    }
+                }
+            } else {
+                inflight.next().await.expect("inflight is non-empty")
+            };
+            match result {
                 Ok(d) => {
                     self.node_health.record_success(addr).await;
                     return Ok(d);
@@ -4231,7 +4307,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                     if msg.contains("permanently missing") || msg.contains("location not found") {
                         anyhow::bail!("Chunk {} is permanently missing", cid);
                     }
-                    // "blocklisted" or "temporarily unavailable" — try next replica.
+                    // "blocklisted" or "temporarily unavailable" — try next replica
+                    // now rather than waiting out the hedge timer.
+                    if next < order.len() {
+                        inflight.push(launch(order[next]));
+                        next += 1;
+                    }
                 }
             }
         }
@@ -4257,6 +4338,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Arm the notified() future BEFORE checking the cache so we never miss
         // a notify_waiters() that fires between the check and the wait.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+        let wait_start = std::time::Instant::now();
         loop {
             let notified = self.chunk_landed.notified();
             tokio::pin!(notified);
@@ -4264,6 +4346,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             notified.as_mut().enable();
 
             if let Some(data) = self.chunk_cache.get(&cid) {
+                crate::read_trace::record("wait-concurrent-fetch", None, wait_start, || format!("chunk={} served by other fetcher", cid));
                 return Ok(data);
             }
             if !engine.in_flight.contains(&cid) {
@@ -4285,6 +4368,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         // Fall back — fetch ourselves using only the chunk's actual holders.
+        crate::read_trace::record("wait-concurrent-fetch", None, wait_start, || format!("chunk={} gave up, fetching directly", cid));
         warn!("Timeout waiting for concurrent fetch of chunk {}, fetching directly", cid);
         let nim = {
             let m = self.addr_to_node_id.read().await;
@@ -4375,9 +4459,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             // check and serve zeros for a real, non-sparse file (2026-07-09,
             // found via T28: concurrent cold-cache reads on a freshly restarted
             // client all race this exchange on the first read of a file).
-            if tokio::time::timeout(std::time::Duration::from_secs(10), notified).await.is_err() {
+            let waited_from = std::time::Instant::now();
+            let timed_out = tokio::time::timeout(std::time::Duration::from_secs(10), notified).await.is_err();
+            if timed_out {
                 warn!("refresh_engine: inode={} timed out waiting for a concurrent refresh to finish", engine.inode);
             }
+            crate::read_trace::record("wait-concurrent-chunk-map-refresh", None, waited_from, || {
+                if timed_out { "TIMED OUT (10s)".to_string() } else { "ok".to_string() }
+            });
             return;
         }
         self.refresh_engine_flagged(engine, file_id, file_size, from_chunk).await;
@@ -4404,7 +4493,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         // outside the previously fetched window. One full fetch covers all positions.
         const CHUNK_MAP_WINDOW: u32 = u32::MAX;
         let rpc_start = std::time::Instant::now();
-        match self.get_file_chunk_map(file_id, 0, CHUNK_MAP_WINDOW).await {
+        let chunk_map_result = self.get_file_chunk_map(file_id, 0, CHUNK_MAP_WINDOW).await;
+        crate::read_trace::record("chunk-map-refresh", None, rpc_start, || trace_outcome(&chunk_map_result));
+        match chunk_map_result {
             // A real answer from the server — including a legitimate "zero chunks"
             // (total_chunks == 0) response — is a CONFIRMED result, not a failure.
             // Previously this arm required `!locs.is_empty()`, so a genuinely empty
@@ -4851,8 +4942,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         let fetch_results: Vec<Result<(usize, ChunkId, u64, Arc<Vec<u8>>, bool, bool)>> =
         if !has_partial && !all_file_chunks.is_empty() {
             // Build ordered list for the pipeline (primary node per chunk).
-            let pipeline_input: Vec<(ChunkId, SocketAddr, Option<(FileId, u64)>)> = resolved.iter()
-                .map(|r| (r.chunk_id, r.primary, Some((file_id, r.file_chunk_idx))))
+            let pipeline_input: Vec<(ChunkId, SocketAddr, Vec<SocketAddr>, Option<(FileId, u64)>)> = resolved.iter()
+                .map(|r| (r.chunk_id, r.primary, r.fallbacks.clone(), Some((file_id, r.file_chunk_idx))))
                 .collect();
 
             let pipeline_results = self.sequential_pipeline_read(pipeline_input).await;
@@ -4866,17 +4957,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                         Err(e) => {
                             warn!("Pipeline read failed for chunk {}, trying {} fallback(s): {}",
                                   r.chunk_id, r.fallbacks.len(), e);
-                            let mut fallback_data = None;
-                            let mut last_err = e;
-                            for &fb_addr in &r.fallbacks {
-                                match client.read_chunk_from_server(fb_addr, r.chunk_id, None, Some((file_id, r.file_chunk_idx))).await {
-                                    Ok(d) => { fallback_data = Some(d); break; }
-                                    Err(e) => { last_err = e; }
-                                }
-                            }
-                            match fallback_data {
-                                Some(d) => d,
-                                None => {
+                            // The pipeline already tried every replica (hedged); this is one
+                            // more hedged pass for a failure that may have been transient.
+                            let retry = match r.fallbacks.split_first() {
+                                Some((&first, rest)) => client.fetch_chunk_with_fallback(r.chunk_id, first, rest, None, Some((file_id, r.file_chunk_idx))).await,
+                                None => Err(e),
+                            };
+                            match retry {
+                                Ok(d) => d,
+                                Err(last_err) => {
                                     client.node_inflight_dec(r.primary);
                                     return Err(last_err.context(format!("pipeline read chunk {} (all replicas failed)", r.chunk_id)));
                                 }
@@ -4895,7 +4984,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let semaphore = max_concurrent_fetches.clone();
                 let read_hint = hints_map.get(&r.chunk_id).copied().cloned();
 
-                tokio::spawn(async move {
+                crate::read_trace::spawn_in_current(async move {
                     let _permit = semaphore.acquire().await.unwrap();
                     let all_nodes = std::iter::once(r.primary)
                         .chain(r.fallbacks.iter().copied());
@@ -5561,6 +5650,13 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// any replica" EIOs on a slot whose fold result was sitting on every replica the
     /// whole time. Pass None only where a slot genuinely isn't known at the call site.
     async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId, client_write_seq: Option<u64>, slot: Option<(FileId, u64)>) -> Result<Vec<u8>> {
+        let step = crate::read_trace::step("ReadChunk", Some(server_addr));
+        let result = self.read_chunk_from_server_untraced(server_addr, chunk_id, client_write_seq, slot).await;
+        step.finish(|| format!("chunk={} slot={:?} {}", chunk_id, slot.map(|s| s.1), trace_outcome(&result)));
+        result
+    }
+
+    async fn read_chunk_from_server_untraced(&self, server_addr: SocketAddr, chunk_id: ChunkId, client_write_seq: Option<u64>, slot: Option<(FileId, u64)>) -> Result<Vec<u8>> {
         // Look up write_seq from cache if not explicitly provided
         let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
@@ -5717,8 +5813,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // Connection failed - don't return to pool
                     warn!("Connection to {} failed (attempt {}): {}", server_addr, attempt, e);
 
-                    // Retry once with new connection if this was a pooled connection
-                    if attempt == 1 {
+                    // Retry once with a new connection — for a pooled connection the
+                    // server closed under us, which fails fast (EOF/reset). NOT after a
+                    // timeout: that is a live-but-stalled node, and retrying it just
+                    // doubled the wait (2 x 10 s on the same node, reproduced 2026-09-24)
+                    // while a healthy replica sat unasked. Return so the caller moves on.
+                    if attempt == 1 && e.kind() != std::io::ErrorKind::TimedOut {
                         debug!("Retrying with new connection to {}", server_addr);
                         continue;
                     } else {
@@ -5739,6 +5839,19 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// By running Phase 1 for chunk N+1 concurrently with draining chunk N we hide
     /// TCP connection setup + server processing latency behind the data transfer.
     async fn open_chunk_request(
+        &self,
+        server_addr: SocketAddr,
+        chunk_id: ChunkId,
+        client_write_seq: Option<u64>,
+        slot: Option<(FileId, u64)>,
+    ) -> Result<(TcpStream, usize)> {
+        let step = crate::read_trace::step("ReadChunk(pipeline-open)", Some(server_addr));
+        let result = self.open_chunk_request_untraced(server_addr, chunk_id, client_write_seq, slot).await;
+        step.finish(|| format!("chunk={} slot={:?} {}", chunk_id, slot.map(|s| s.1), trace_outcome(&result)));
+        result
+    }
+
+    async fn open_chunk_request_untraced(
         &self,
         server_addr: SocketAddr,
         chunk_id: ChunkId,
@@ -5823,6 +5936,18 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn drain_chunk_response(
         &self,
         server_addr: SocketAddr,
+        stream: TcpStream,
+        body_len: usize,
+    ) -> Result<Vec<u8>> {
+        let step = crate::read_trace::step("ReadChunk(pipeline-drain)", Some(server_addr));
+        let result = self.drain_chunk_response_untraced(server_addr, stream, body_len).await;
+        step.finish(|| format!("bytes={} {}", body_len, trace_outcome(&result)));
+        result
+    }
+
+    async fn drain_chunk_response_untraced(
+        &self,
+        server_addr: SocketAddr,
         mut stream: TcpStream,
         body_len: usize,
     ) -> Result<Vec<u8>> {
@@ -5880,11 +6005,19 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// chunk's body has finished transferring.  Eliminates per-chunk TCP + RTT latency
     /// from the critical path.
     ///
-    /// Returns chunk data in the same order as `chunks`.  On any Phase-1 error falls
-    /// back to the normal `read_chunk_from_server` path for that chunk.
+    /// Each chunk is `(chunk_id, primary, fallbacks, slot)`. Returns chunk data in the
+    /// same order as `chunks`.
+    ///
+    /// A chunk's primary gets REPLICA_HEDGE_AFTER to answer Phase 1; past that the
+    /// chunk is also fetched from its fallbacks and the first success wins. On a
+    /// Phase-1 error the chunk goes straight to its fallbacks. Before 2026-09-24 the
+    /// pipeline only ever knew the primary: a stalled primary cost up to 30 s (header
+    /// timeout) plus 2 x 10 s re-reading the SAME node, per chunk, and the caller only
+    /// tried other replicas after the whole pipeline returned — a sequential guest read
+    /// over a few chunks on a stalled node could block for minutes.
     pub async fn sequential_pipeline_read(
         &self,
-        chunks: Vec<(ChunkId, SocketAddr, Option<(FileId, u64)>)>,
+        chunks: Vec<(ChunkId, SocketAddr, Vec<SocketAddr>, Option<(FileId, u64)>)>,
     ) -> Vec<Result<Vec<u8>>> {
         if chunks.is_empty() {
             return Vec::new();
@@ -5893,48 +6026,64 @@ leader_addr: Arc::new(RwLock::new(None)),
         let mut results: Vec<Result<Vec<u8>>> = Vec::with_capacity(chunks.len());
 
         type P1Handle = tokio::task::JoinHandle<Result<(TcpStream, usize)>>;
+        let spawn_phase1 = |cid: ChunkId, addr: SocketAddr, slot: Option<(FileId, u64)>| -> P1Handle {
+            let client = self.clone();
+            tokio::spawn(crate::read_trace::in_current(async move {
+                client.open_chunk_request(addr, cid, None, slot).await
+            }))
+        };
 
         // Kick off Phase 1 for the first chunk immediately.
         let mut pending: Option<(SocketAddr, P1Handle)> = {
-            let (cid, addr, slot) = chunks[0]; // ChunkId, SocketAddr and the slot are Copy
-            let client = self.clone();
-            Some((addr, tokio::spawn(async move {
-                client.open_chunk_request(addr, cid, None, slot).await
-            })))
+            let (cid, addr, _, slot) = &chunks[0];
+            Some((*addr, spawn_phase1(*cid, *addr, *slot)))
         };
 
         for i in 0..chunks.len() {
-            let (cid, addr, slot) = chunks[i];
+            let (cid, addr, fallbacks, slot) = &chunks[i];
+            let (cid, addr, slot) = (*cid, *addr, *slot);
 
-            let (p1_addr, p1_handle) = match pending.take() {
+            let (p1_addr, mut p1_handle) = match pending.take() {
                 Some(p) => p,
                 None => {
-                    results.push(self.read_chunk_from_server(addr, cid, None, slot).await);
+                    results.push(self.fetch_chunk_with_fallback(cid, addr, fallbacks, None, slot).await);
                     continue;
                 }
             };
 
             // Concurrently start Phase 1 for the next chunk while we await drain of this one.
-            let next_pending: Option<(SocketAddr, P1Handle)> = if i + 1 < chunks.len() {
-                let (next_cid, next_addr, next_slot) = chunks[i + 1];
-                let client = self.clone();
-                Some((next_addr, tokio::spawn(async move {
-                    client.open_chunk_request(next_addr, next_cid, None, next_slot).await
-                })))
-            } else {
-                None
-            };
+            let next_pending: Option<(SocketAddr, P1Handle)> = chunks.get(i + 1)
+                .map(|(next_cid, next_addr, _, next_slot)| (*next_addr, spawn_phase1(*next_cid, *next_addr, *next_slot)));
 
-            // Await Phase 1 completion then drain the body.
-            let chunk_result = match p1_handle.await {
-                Ok(Ok((stream, body_len))) => {
-                    self.drain_chunk_response(p1_addr, stream, body_len).await
+            // Await Phase 1, hedging to the fallbacks if the primary is slow.
+            let chunk_result = match tokio::time::timeout(REPLICA_HEDGE_AFTER, &mut p1_handle).await {
+                Ok(joined) => self.finish_pipeline_chunk(joined, p1_addr, cid, fallbacks, slot).await,
+                Err(_) if fallbacks.is_empty() => {
+                    let joined = p1_handle.await;
+                    self.finish_pipeline_chunk(joined, p1_addr, cid, fallbacks, slot).await
                 }
-                Ok(Err(e)) => {
-                    warn!("Pipeline Phase-1 failed for chunk {:?} on {}: {}", cid, p1_addr, e);
-                    self.read_chunk_from_server(addr, cid, None, slot).await
+                Err(_) => {
+                    let hedge = self.fetch_chunk_with_fallback(cid, fallbacks[0], &fallbacks[1..], None, slot);
+                    tokio::pin!(hedge);
+                    tokio::select! {
+                        joined = &mut p1_handle => match joined {
+                            Ok(Ok((stream, body_len))) => self.drain_chunk_response(p1_addr, stream, body_len).await,
+                            // Primary failed after all — the hedge is already running.
+                            _ => hedge.await,
+                        },
+                        hedged = &mut hedge => match hedged {
+                            Ok(d) => {
+                                p1_handle.abort();
+                                Ok(d)
+                            }
+                            // Fallbacks failed — the primary is the last one left.
+                            Err(hedge_err) => match p1_handle.await {
+                                Ok(Ok((stream, body_len))) => self.drain_chunk_response(p1_addr, stream, body_len).await,
+                                _ => Err(hedge_err),
+                            },
+                        },
+                    }
                 }
-                Err(e) => Err(anyhow::anyhow!("Phase-1 task panicked: {}", e)),
             };
 
             results.push(chunk_result);
@@ -5942,6 +6091,31 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         results
+    }
+
+    /// A pipeline chunk's Phase-1 outcome → its bytes: drain the body on success,
+    /// otherwise fetch from the chunk's other replicas (never the one that just
+    /// failed — see sequential_pipeline_read's doc comment).
+    async fn finish_pipeline_chunk(
+        &self,
+        joined: std::result::Result<Result<(TcpStream, usize)>, tokio::task::JoinError>,
+        p1_addr: SocketAddr,
+        cid: ChunkId,
+        fallbacks: &[SocketAddr],
+        slot: Option<(FileId, u64)>,
+    ) -> Result<Vec<u8>> {
+        match joined {
+            Ok(Ok((stream, body_len))) => self.drain_chunk_response(p1_addr, stream, body_len).await,
+            Ok(Err(e)) => {
+                warn!("Pipeline Phase-1 failed for chunk {:?} on {}: {}", cid, p1_addr, e);
+                match fallbacks.split_first() {
+                    Some((&first, rest)) => self.fetch_chunk_with_fallback(cid, first, rest, None, slot).await,
+                    // No other replica known — the primary is the only option left.
+                    None => self.read_chunk_from_server(p1_addr, cid, None, slot).await,
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!("Phase-1 task panicked: {}", e)),
+        }
     }
 
     /// Send prefetch hint to server (fire-and-forget, non-blocking)
@@ -6060,11 +6234,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         let client1 = self.clone();
         let client2 = self.clone();
 
-        let task1 = tokio::spawn(async move {
+        let task1 = crate::read_trace::spawn_in_current(async move {
             client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64, None, slot).await
         });
 
-        let task2 = tokio::spawn(async move {
+        let task2 = crate::read_trace::spawn_in_current(async move {
             client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64, None, slot).await
         });
 
@@ -11171,6 +11345,172 @@ mod tests {
         assert_eq!(without_slot, 0, "no request on this path may omit the slot either");
     }
 
+
+    /// A node that is up (TCP accepts, requests are read) but never answers — the
+    /// shape of gluster1 during its 2026-09-24 stall, and of a SIGSTOPped server in
+    /// scripts/repro_read_during_single_replica_fold.sh. Deliberately not a closed
+    /// port: connection-refused fails instantly and would never exercise a timeout.
+    fn spawn_stalled_node(addr: SocketAddr, requests_seen: Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        tokio::spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::bind(addr).await else { return };
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let requests_seen = requests_seen.clone();
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 4];
+                    while stream.read_exact(&mut len_buf).await.is_ok() {
+                        let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        requests_seen.fetch_add(1, Ordering::SeqCst);
+                        // Never respond; hold the connection open.
+                    }
+                });
+            }
+        });
+    }
+
+    /// A healthy replica: serves `content` for any ReadChunk, errors on anything else.
+    fn spawn_serving_node(addr: SocketAddr, content: Arc<Vec<u8>>, reads_served: Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        tokio::spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::bind(addr).await else { return };
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let content = content.clone();
+                let reads_served = reads_served.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        match envelope.message {
+                            Message::Request(Request::ReadChunk { chunk_id, .. }) => {
+                                reads_served.fetch_add(1, Ordering::SeqCst);
+                                write_chunk_data_response(&mut stream, envelope.request_id, chunk_id, &content).await;
+                            }
+                            _ => {
+                                write_envelope(&mut stream, envelope.request_id, Response::Error {
+                                    message: "mock: unsupported".to_string(),
+                                    code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// REGRESSION, 2026-09-24. A whole-chunk read whose first replica is stalled must
+    /// be served by the healthy replica promptly, not after waiting the stalled one out.
+    ///
+    /// Reproduced locally first (repro_read_during_single_replica_fold.sh, folder-stall
+    /// mode): one read took 21 s — 1 s waiting on a prefetch stuck on the frozen node,
+    /// then read_chunk_from_server timed out on that same node TWICE (10 s + 10 s, the
+    /// retry meant for a dead pooled connection), and only then asked the next replica,
+    /// which answered in 5 ms. Against the guest's 30 s SCSI timeout that is the
+    /// VM-108 hung boot.
+    #[tokio::test]
+    async fn whole_chunk_read_does_not_wait_out_a_stalled_replica() {
+        let content = Arc::new((0..4 * 1024 * 1024).map(|i| (i % 253) as u8).collect::<Vec<u8>>());
+        let stalled: SocketAddr = "127.0.0.1:19681".parse().unwrap();
+        let healthy: SocketAddr = "127.0.0.1:19682".parse().unwrap();
+        let stalled_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let healthy_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        spawn_stalled_node(stalled, stalled_requests.clone());
+        spawn_serving_node(healthy, content.clone(), healthy_reads.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let client = DfsClient::new(vec![stalled, healthy]).unwrap();
+        let cid = chunk_id_with_hash0(0x5A);
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.fetch_chunk_with_fallback(cid, stalled, &[healthy], None, None),
+        ).await.expect("read must not hang past 60 s");
+        let took = start.elapsed();
+
+        let data = result.expect("the healthy replica holds the chunk");
+        assert_eq!(data, *content);
+        assert!(stalled_requests.load(Ordering::SeqCst) >= 1, "sanity: the stalled node was asked first");
+        assert!(healthy_reads.load(Ordering::SeqCst) >= 1, "the healthy replica must have served it");
+        assert!(took < std::time::Duration::from_secs(3),
+            "read took {:?} with a healthy replica available — a stalled replica must cost \
+             about REPLICA_HEDGE_AFTER, not its full read timeout (pre-fix: 2 x 10 s)", took);
+    }
+
+    /// Same defect on the sequential pipeline (read_data's full-chunk branch), where it
+    /// was worse: the pipeline only knew each chunk's primary — up to 30 s waiting for
+    /// the response header, then a Phase-1 fallback that re-read the SAME node
+    /// (2 x 10 s) — and other replicas were only tried after the whole pipeline returned.
+    #[tokio::test]
+    async fn read_data_pipeline_does_not_wait_out_a_stalled_primary() {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        let content = Arc::new((0..CHUNK).map(|i| (i % 241) as u8).collect::<Vec<u8>>());
+        // Two stalled nodes and one healthy one, so whichever replica the client picks
+        // as primary, it is more likely than not a stalled one — and the assertion is
+        // on the stalled node having been asked, so a run that never hits one fails
+        // loudly instead of passing vacuously.
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|i| format!("127.0.0.1:{}", 19691 + i).parse().unwrap())
+            .collect();
+        let node_ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+        let stalled_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let healthy_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        spawn_stalled_node(addrs[0], stalled_requests.clone());
+        spawn_stalled_node(addrs[1], stalled_requests.clone());
+        spawn_serving_node(addrs[2], content.clone(), healthy_reads.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let client = DfsClient::new(addrs.clone()).unwrap();
+        {
+            let mut m = client.addr_to_node_id.write().await;
+            for (&addr, &node_id) in addrs.iter().zip(node_ids.iter()) {
+                m.insert(addr, node_id);
+            }
+        }
+        *client.cluster_nodes.write().await = addrs.clone();
+
+        let file_id = FileId::new();
+        let chunk_idx = 3u64;
+        let cid = chunk_id_with_hash0(0x6B);
+        let hints = vec![ChunkReadHint {
+            chunk_idx: chunk_idx as usize,
+            chunk_id: cid,
+            full_chunk: true,
+            offset_in_chunk: 0,
+            length: CHUNK,
+            file_offset: chunk_idx * CHUNK as u64,
+        }];
+        let locations = vec![ChunkLocation {
+            chunk_id: cid,
+            nodes: node_ids.clone(),
+            size: CHUNK,
+            checksum: cid.hash,
+            file_offset: Some(chunk_idx * CHUNK as u64),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        }];
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            client.read_data(&hints, &[cid], 1, file_id, &locations),
+        ).await.expect("read_data must not hang past 120 s");
+        let took = start.elapsed();
+
+        let data = result.expect("the healthy replica holds the chunk");
+        assert_eq!(data, *content);
+        assert!(stalled_requests.load(Ordering::SeqCst) >= 1,
+            "test setup: the pipeline never asked a stalled node, so this run tested nothing");
+        assert!(took < std::time::Duration::from_secs(5),
+            "pipelined read took {:?} with a healthy replica available (pre-fix: 30 s header \
+             timeout + same-node retries before any other replica was tried)", took);
+    }
 
     /// REGRESSION, same 2026-09-21 defect on the OTHER read entry point.
     ///

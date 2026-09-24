@@ -1449,11 +1449,24 @@ impl HealingManager {
 
         // Prune stalled entries for chunks that have been deleted/purged — they won't
         // come back, and discovery won't clean them up since it only sees live chunks.
-        {
-            let mut stalled = self.stalled_healing.write().await;
-            stalled.retain(|chunk_id| {
-                self.metadata.get_chunk_location(chunk_id).ok().flatten().is_some()
-            });
+        // Batched and off-lock, for the same reason as run_discovery_pass's
+        // alive_nodes_cache prune: this used to be a synchronous redb read per
+        // entry on the healer's single IDLE-priority worker, under
+        // stalled_healing.write() — which every client MultiPatch's
+        // evict_from_pending also needs.
+        let stalled_ids: Vec<ChunkId> = self.stalled_healing.read().await.iter().copied().collect();
+        if !stalled_ids.is_empty() {
+            match self.metadata.get_chunk_locations_batch_async(stalled_ids.clone()).await {
+                Ok(found) => {
+                    let gone: HashSet<ChunkId> = stalled_ids.into_iter()
+                        .filter(|id| !found.contains_key(id))
+                        .collect();
+                    if !gone.is_empty() {
+                        self.stalled_healing.write().await.retain(|id| !gone.contains(id));
+                    }
+                }
+                Err(e) => warn!("cleanup_stale_pending: stalled prune lookup failed, skipping this cycle: {}", e),
+            }
         }
 
         Ok(())
@@ -3964,14 +3977,39 @@ impl HealingManager {
             for (chunk_id, _status, confirmed_alive) in &work {
                 cache.insert(*chunk_id, confirmed_alive.clone());
             }
-            // Prune entries for chunks that are now Ok (pending removed above) or
-            // have been purged as orphans, so the cache doesn't grow unboundedly.
-            cache.retain(|chunk_id, _| {
-                self.metadata.get_chunk_location(chunk_id)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            });
+        }
+        // Prune entries for chunks that are now Ok (pending removed above) or
+        // have been purged as orphans, so the cache doesn't grow unboundedly.
+        //
+        // The location lookups run in ONE batched read, off-lock and off this
+        // runtime's worker; the write lock is held only to apply the result.
+        // This used to be `cache.retain(|id| get_chunk_location(id))` — one
+        // synchronous redb read per entry, on the healer runtime's single worker
+        // thread (IOPRIO_CLASS_IDLE, so under client I/O each read waits for the
+        // disk to go idle), with the write lock held throughout. Caught in gdb on
+        // gluster1 2026-09-24; under VM-boot load it ran 27-32 s. drain_heal_queue
+        // queues on this lock while holding pending_healing, so every client
+        // MultiPatch's evict_from_pending stalled behind it: requests held 26.5 s,
+        // all released at "Discovery complete" — the VM-108 hung boot.
+        //
+        // An entry dropped here whose chunk regains a location between the
+        // lookup and the retain costs nothing: drain_heal_queue treats a missing
+        // entry as a cache miss and probes that chunk directly.
+        let cached_ids: Vec<ChunkId> = self.alive_nodes_cache.read().await.keys().copied().collect();
+        if !cached_ids.is_empty() {
+            match self.metadata.get_chunk_locations_batch_async(cached_ids.clone()).await {
+                Ok(found) => {
+                    let gone: HashSet<ChunkId> = cached_ids.into_iter()
+                        .filter(|id| !found.contains_key(id))
+                        .collect();
+                    if !gone.is_empty() {
+                        self.alive_nodes_cache.write().await.retain(|id, _| !gone.contains(id));
+                    }
+                }
+                // Skip this pass's prune rather than treat a failed read as
+                // "every location is gone" — the next pass retries.
+                Err(e) => warn!("run_discovery_pass: alive_nodes_cache prune lookup failed, skipping this pass: {}", e),
+            }
         }
 
         // Batch-broadcast all chunk location updates accumulated during this pass.
@@ -4224,27 +4262,35 @@ impl HealingManager {
         };
 
         let work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = {
-            let pending   = self.pending_healing.read().await;
-            let cache     = self.alive_nodes_cache.read().await;
-            let in_flight = self.in_flight_healing.read().await;
-            let stalled   = self.stalled_healing.read().await;
+            // Snapshot each map under its own lock, one at a time — never hold one
+            // of these guards while awaiting another. This used to take all four
+            // together, so while pending_healing.read() was held here this task
+            // could sit queued on alive_nodes_cache behind a slow writer (discovery's
+            // prune, 27-32 s on gluster1 2026-09-24), and every client MultiPatch's
+            // evict_from_pending — pending_healing.write() — queued behind that.
+            // The snapshots can be momentarily inconsistent with each other; that is
+            // harmless: dispatch re-checks and claims in_flight_healing atomically,
+            // and a chunk that turned stalled in between costs one failed attempt.
+            let heal_delay = Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed));
+            let due: Vec<ChunkId> = self.pending_healing.read().await.iter()
+                .filter(|(_, detected_at)| detected_at.elapsed() >= heal_delay)
+                .map(|(chunk_id, _)| *chunk_id)
+                .collect();
+            let due: Vec<ChunkId> = {
+                let in_flight = self.in_flight_healing.read().await;
+                due.into_iter().filter(|id| !in_flight.contains(id)).collect()
+            };
+            // Skip stalled — no source available; discovery promotes when a node returns.
+            let due: Vec<ChunkId> = {
+                let stalled = self.stalled_healing.read().await;
+                due.into_iter().filter(|id| !stalled.contains(id)).collect()
+            };
+            let cache = self.alive_nodes_cache.read().await;
             let replication_factor = self.replication_factor.load(Ordering::Relaxed);
 
             let mut v = Vec::new();
             let mut cache_misses = Vec::new();
-            for (chunk_id, detected_at) in pending.iter() {
-                if detected_at.elapsed() < Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed)) {
-                    continue;
-                }
-                // Skip already in-flight.
-                if in_flight.contains(chunk_id) {
-                    continue;
-                }
-                // Skip stalled — no source available; discovery promotes when a node returns.
-                if stalled.contains(chunk_id) {
-                    continue;
-                }
-
+            for chunk_id in due.iter() {
                 let confirmed_alive = match cache.get(chunk_id) {
                     Some(nodes) => nodes.clone(),
                     None => {
@@ -4267,10 +4313,7 @@ impl HealingManager {
 
                 v.push((*chunk_id, status, confirmed_alive));
             }
-            drop(pending);
             drop(cache);
-            drop(in_flight);
-            drop(stalled);
 
             if !cache_misses.is_empty() {
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
@@ -6837,6 +6880,60 @@ mod tests {
         assert!(elapsed < Duration::from_secs(10),
             "drain_heal_queue took {:?} for 8 cache-miss chunks — expected roughly one \
              probe's worth of wall time (concurrent), not ~8x that (sequential)", elapsed);
+    }
+
+    /// REGRESSION, 2026-09-24 VM-108 hung boot. drain_heal_queue used to take
+    /// pending_healing.read() and then await alive_nodes_cache.read() with the first
+    /// guard still held. While discovery's prune held alive_nodes_cache.write() (27-32 s
+    /// on gluster1 under VM-boot load), drain sat queued holding pending_healing — and
+    /// every client MultiPatch's evict_from_pending needs pending_healing.write(), so
+    /// client writes stalled 26.5 s and all released at "Discovery complete".
+    ///
+    /// Holding alive_nodes_cache.write() here stands in for that slow writer. A running
+    /// drain must not stop pending_healing.write() being taken meanwhile.
+    #[tokio::test]
+    async fn drain_heal_queue_waiting_on_alive_nodes_cache_must_not_hold_pending_healing() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8903".parse().unwrap();
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = Arc::new(HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client, Arc::new(AtomicUsize::new(3)),
+            0, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 16, 8, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        // A due entry (zero-second healing delay), so drain has real work to scan.
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"held-behind-slow-prune"));
+        healing.mark_pending(chunk_id).await;
+
+        // The slow prune: hold the cache's write lock for the whole test body.
+        let prune_guard = healing.alive_nodes_cache.write().await;
+
+        let drainer = healing.clone();
+        let drain = tokio::spawn(async move { drainer.drain_heal_queue().await });
+        // Let drain run up to wherever it parks on the held cache lock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!drain.is_finished(), "sanity: drain must be parked on the held alive_nodes_cache lock");
+
+        // What every client MultiPatch's evict_from_pending needs.
+        let client_write = tokio::time::timeout(Duration::from_secs(1), healing.pending_healing.write()).await;
+        assert!(client_write.is_ok(),
+            "pending_healing.write() blocked while drain_heal_queue waited on alive_nodes_cache — \
+             drain is holding pending_healing across that await, so a slow discovery prune \
+             stalls every client write (the 2026-09-24 26.5 s leader stall)");
+        drop(client_write);
+
+        drop(prune_guard);
+        tokio::time::timeout(Duration::from_secs(10), drain).await
+            .expect("drain must finish once the cache lock is released")
+            .unwrap()
+            .unwrap();
     }
 
     /// Counts HasChunks arrivals and answers every id present — stands in for a

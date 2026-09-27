@@ -1302,7 +1302,15 @@ async fn full_rewrite_chunk(
             dfs_common::compute_chunk_hash_at(&buf, chunk_file_offset, file_id)
         );
 
-        if new_chunk_id != old_chunk_id {
+        // A byte-identical fold (new == old) has nothing new to write — but only if
+        // the base's bytes are actually on this node's disk. `prefetched` can supply
+        // the base from chunk_ring alone (seeded from a peer read), and the
+        // registration below names this node as a holder of new_chunk_id
+        // unconditionally. Skipping the write in that case advertised a phantom
+        // replica: 2026-09-27 VM-108 disk-1 chunk 9, gluster1 folded a294+delta->a294
+        // from RAM without ever holding a294, and its next fold of that slot found no
+        // base and abandoned a live patch — permanent guest EIO.
+        if new_chunk_id != old_chunk_id || !old_path.exists() {
             // Write the full patched buffer under a fresh, uniquely-named temp file
             // and atomically rename it into place (ChunkStorage::write_chunk) —
             // old_chunk_id's own file is never opened for writing. A crash at any
@@ -2318,6 +2326,65 @@ fn backfill_chunk_generations_from_chunk_seq_table(
     info!("backfill_chunk_generations_from_chunk_seq_table: seeded {} chunk_generations entries from CHUNK_SEQ_TABLE", seeded);
 }
 
+/// Shared body of `Server::pull_chunk_from_peers` (see its doc comment) — a free
+/// function so the fold path (`OverlayForkCtx`, which has no `Server`) can
+/// recover a locally-missing base from peers before concluding it is gone.
+async fn pull_chunk_from_peers_impl(
+    cluster: &ClusterManager,
+    client: &NetworkClient,
+    storage: &Arc<ChunkStorage>,
+    chunk_id: ChunkId,
+    candidate_nodes: &[dfs_common::NodeId],
+    file_id: FileId,
+    file_offset: u64,
+) -> Option<Arc<Vec<u8>>> {
+    let local_id = cluster.local_node_id();
+    let nodes = cluster.get_all_nodes().await;
+    for &node_id in candidate_nodes {
+        if node_id == local_id {
+            continue;
+        }
+        let Some(node) = nodes.iter().find(|n| n.id == node_id) else { continue };
+        if node.status != dfs_common::NodeStatus::Online {
+            continue;
+        }
+        let req = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: None, file_id: None, chunk_idx: None };
+        let resp = match client.send_message(node.addr, Message::Request(req)).await {
+            Ok(envelope) => envelope.message,
+            Err(e) => {
+                warn!("pull_chunk_from_peers: failed to reach {} for chunk {}: {}", node.addr, chunk_id, e);
+                continue;
+            }
+        };
+        let data = match resp {
+            Message::Response(Response::ChunkData { arc_data: Some(arc), .. }) => arc,
+            Message::Response(Response::ChunkData { data, arc_data: None, .. }) => Arc::new(data),
+            _ => continue,
+        };
+        let actual_hash = dfs_common::compute_chunk_hash_at(&data, file_offset, file_id);
+        if actual_hash != chunk_id.hash {
+            warn!("pull_chunk_from_peers: chunk {} from {} failed content hash verification — ignoring",
+                chunk_id, node.addr);
+            continue;
+        }
+        let storage = storage.clone();
+        let data_for_write = data.clone();
+        // Foreground durability: this self-heal is reached from apply_patch (a
+        // client patch that needs a locally-missing base chunk), so a client is
+        // blocked on it — it must NOT linger. The authoritative background heal
+        // path is handle_write_chunk's `background` branch, not this one.
+        let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data_for_write))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        if write_ok {
+            info!("pull_chunk_from_peers: self-healed chunk {} from {}", chunk_id, node.addr);
+            return Some(data);
+        }
+    }
+    None
+}
+
 impl OverlayForkCtx {
     /// Abandon and clean up a Pending patch whose base or delta chunk is
     /// confirmed gone cluster-wide — not just missing on this node's local
@@ -2341,6 +2408,28 @@ impl OverlayForkCtx {
         missing_chunk_id: ChunkId,
         which: &str,
     ) {
+        // A missing CHUNK_TABLE row is NOT proof the base is gone: apply_patch
+        // deliberately retires the base's row the moment an accumulator starts on
+        // it, so every live Pending base normally has no row on any replica. Ask
+        // for the bytes themselves first. A base is content-addressed by
+        // (file_id, offset, bytes), so a hash-verified copy from any peer is
+        // exactly the base this patch was built on; with it on disk the fold's
+        // retry succeeds. 2026-09-27 VM-108 disk-1 chunk 9: gluster1 abandoned
+        // a live patch as "unrecoverable" while gluster3 and gluster4 both held
+        // a294 — the guest's slot pointed at nothing from then on.
+        if which == "base" && !self.storage.has_chunk(&missing_chunk_id) {
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            let peers: Vec<dfs_common::NodeId> = self.cluster.get_all_nodes().await
+                .into_iter().map(|n| n.id).collect();
+            if pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, missing_chunk_id,
+                &peers, file_id, chunk_idx * CHUNK_SIZE).await.is_some()
+            {
+                warn!("single fold: base chunk {} for file {} chunk_idx {} was missing locally but recovered \
+                       from a peer — leaving patch {} Pending for the fold to retry, not abandoning",
+                    missing_chunk_id, file_id, chunk_idx, public_token);
+                return;
+            }
+        }
         match self.metadata.get_chunk_location_async(missing_chunk_id).await {
             Ok(None) => {
                 warn!("single fold: {} chunk {} for file {} chunk_idx {} has no CHUNK_TABLE record anywhere \
@@ -13832,51 +13921,7 @@ impl Server {
         file_id: FileId,
         file_offset: u64,
     ) -> Option<Arc<Vec<u8>>> {
-        let local_id = self.cluster.local_node_id();
-        let nodes = self.cluster.get_all_nodes().await;
-        for &node_id in candidate_nodes {
-            if node_id == local_id {
-                continue;
-            }
-            let Some(node) = nodes.iter().find(|n| n.id == node_id) else { continue };
-            if node.status != dfs_common::NodeStatus::Online {
-                continue;
-            }
-            let req = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: None, file_id: None, chunk_idx: None };
-            let resp = match self.client.send_message(node.addr, Message::Request(req)).await {
-                Ok(envelope) => envelope.message,
-                Err(e) => {
-                    warn!("pull_chunk_from_peers: failed to reach {} for chunk {}: {}", node.addr, chunk_id, e);
-                    continue;
-                }
-            };
-            let data = match resp {
-                Message::Response(Response::ChunkData { arc_data: Some(arc), .. }) => arc,
-                Message::Response(Response::ChunkData { data, arc_data: None, .. }) => Arc::new(data),
-                _ => continue,
-            };
-            let actual_hash = dfs_common::compute_chunk_hash_at(&data, file_offset, file_id);
-            if actual_hash != chunk_id.hash {
-                warn!("pull_chunk_from_peers: chunk {} from {} failed content hash verification — ignoring",
-                    chunk_id, node.addr);
-                continue;
-            }
-            let storage = self.storage.clone();
-            let data_for_write = data.clone();
-            // Foreground durability: this self-heal is reached from apply_patch (a
-            // client patch that needs a locally-missing base chunk), so a client is
-            // blocked on it — it must NOT linger. The authoritative background heal
-            // path is handle_write_chunk's `background` branch, not this one.
-            let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data_for_write))
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
-            if write_ok {
-                info!("pull_chunk_from_peers: self-healed chunk {} from {}", chunk_id, node.addr);
-                return Some(data);
-            }
-        }
-        None
+        pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, chunk_id, candidate_nodes, file_id, file_offset).await
     }
 
     /// Ask candidate_nodes what a given identifier actually resolves to in
@@ -20958,6 +21003,71 @@ mod tests {
              corruption: chunk_idx 222 reverted from df7cc814... back to ddd4f48d... this way)");
     }
 
+    /// 2026-09-27 VM-108 disk-1 chunk 9: abandon_patch_if_base_gone read "no local
+    /// CHUNK_TABLE row" as "base gone cluster-wide" and discarded a live patch — but
+    /// apply_patch retires a base's row the moment an accumulator starts on it, so a
+    /// live Pending base normally has NO row on any replica. gluster3 and gluster4
+    /// both still held the base's bytes; gluster1 (missing them locally) abandoned
+    /// anyway and the slot was left pointing at a token nobody held. The fold must
+    /// recover the base from a peer that has it instead of abandoning.
+    ///
+    /// Two real Server instances with real networking: the peer holds the base's
+    /// bytes with no CHUNK_TABLE row anywhere, exactly the prod state.
+    #[tokio::test]
+    async fn abandon_base_gone_recovers_base_from_peer_instead_of_abandoning() {
+        use crate::network::NetworkServer;
+        use dfs_common::NodeInfo;
+
+        let peer_temp_storage = TempDir::new().unwrap();
+        let peer_temp_metadata = TempDir::new().unwrap();
+        let peer_temp_metadata_dir = TempDir::new().unwrap();
+        let peer_storage = Arc::new(ChunkStorage::new(peer_temp_storage.path().to_path_buf()).unwrap());
+        let peer_metadata = Arc::new(MetadataStore::new(peer_temp_metadata.path().to_path_buf()).unwrap());
+        let peer_node_id = NodeId::from_bytes([0x00u8; 16]);
+        let peer_addr: SocketAddr = "127.0.0.1:19341".parse().unwrap();
+        let peer_cluster = Arc::new(ClusterManager::new(peer_node_id, peer_addr, 10, 30));
+        let peer_server = Arc::new(Server::new(
+            peer_storage.clone(), peer_metadata.clone(), 4 * 1024 * 1024, peer_cluster.clone(), 3,
+            peer_temp_metadata_dir.path().to_path_buf(), peer_temp_metadata_dir.path().join("config.toml"), true,
+        ));
+        let peer_listen = crate::network::peer_port_addr(peer_addr);
+        let mut peer_net_server = NetworkServer::new(peer_listen, peer_server.clone(), 10);
+        tokio::spawn(async move { peer_net_server.start().await.ok(); });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let file_id = FileId::new();
+        let chunk_idx = 9u64;
+        let chunk_file_offset = chunk_idx * 4 * 1024 * 1024;
+        let base_content = vec![0x5au8; 64 * 1024];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id));
+        // The peer has the bytes; its row was retired when its own accumulator started.
+        peer_storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+
+        let h = make_overlay_test_harness();
+        let ctx = h.server.overlay_ctx();
+        h.server.cluster().add_node(NodeInfo::new(peer_node_id, peer_addr, None)).await.unwrap();
+
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"node-local-delta"));
+        let public_token = ChunkId::patch_token_identity(delta_chunk_id);
+        h.metadata.put_patch_state_pending(
+            file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id,
+            base_content.len(), dfs_common::types::current_timestamp(), Some(1),
+        ).unwrap();
+
+        assert!(!h.storage.has_chunk(&base_chunk_id), "precondition: base missing on this node");
+        assert!(h.metadata.get_chunk_location(&base_chunk_id).unwrap().is_none(),
+            "precondition: no CHUNK_TABLE row for the base on this node");
+
+        ctx.abandon_patch_if_base_gone(file_id, chunk_idx, public_token, base_chunk_id, "base").await;
+
+        assert!(matches!(h.metadata.get_patch_state(&public_token).unwrap(), Some(PatchState::Pending { .. })),
+            "BUG REPRODUCED: a live patch was abandoned as unrecoverable while a peer still held \
+             its base's bytes — the slot is left naming a token no node holds (permanent EIO)");
+        assert_eq!(h.storage.read_chunk(&base_chunk_id).unwrap(), base_content,
+            "the base must now be on this node's disk, verified, so the fold's retry succeeds");
+    }
+
     /// 2026-08-09: fold_slot_now used to acquire chunk_patch_locks for a slot FIRST,
     /// then call run_single_fold, which only THEN queued for fold_hash_semaphore —
     /// so a background fold stuck waiting for a permit was blocking every OTHER
@@ -25285,6 +25395,48 @@ mod tests {
             // over-corrects by clearing more than the one retired id.
             assert!(storage.chunks_present_batch(&[new_chunk_id]).unwrap()[0],
                 "the rewrite's own output must remain present in the index");
+        }
+
+        /// 2026-09-27 VM-108 disk-1 chunk 9: a byte-identical fold (output id == base
+        /// id) whose base came only from chunk_ring (`prefetched`), never from this
+        /// node's disk, skipped the write and still registered this node as a holder —
+        /// a phantom replica. A later fold of the slot on that node then found no base
+        /// and abandoned a live patch. The fold's output must be on disk whenever it
+        /// registers this node as holding it.
+        #[tokio::test]
+        async fn full_rewrite_chunk_noop_fold_from_ram_only_base_persists_the_chunk() {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(dir.path().join("storage")).unwrap());
+            let metadata = Arc::new(MetadataStore::new(dir.path().join("metadata")).unwrap());
+            let chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>> = Arc::new(DashMap::new());
+            let file_id = dfs_common::FileId::new();
+            let chunk_file_offset = 9 * 4 * 1024 * 1024u64;
+            let mut base = vec![0u8; 4 * 1024 * 1024];
+            base[1511424..1511432].copy_from_slice(b"qcow2ref");
+            let base_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base, chunk_file_offset, file_id));
+            // The guest rewrites a block with the bytes it already holds.
+            let same_bytes = base[1536000..1536000 + 4096].to_vec();
+            let local_node = NodeId::new();
+
+            assert!(!storage.get_chunk_path(&base_id).exists(), "precondition: base is NOT on this node's disk");
+
+            let (new_chunk_id, _size, _buf) = full_rewrite_chunk(
+                storage.clone(), metadata.clone(), chunk_io_locks,
+                Arc::new(ShardedAliasMap::new(16)),
+                file_id, chunk_file_offset, base_id,
+                vec![(1536000usize, same_bytes)], Some(Arc::new(base.clone())), local_node,
+            ).await.unwrap();
+            assert_eq!(new_chunk_id, base_id, "precondition: the fold must be a content no-op");
+
+            let loc = metadata.get_chunk_location_async(new_chunk_id).await.unwrap()
+                .expect("precondition: the fold registers its output");
+            assert!(loc.nodes.contains(&local_node), "precondition: this node is registered as a holder");
+
+            assert!(storage.get_chunk_path(&new_chunk_id).exists(),
+                "fold registered this node as holding {} but never wrote it to disk — phantom replica",
+                new_chunk_id);
+            assert_eq!(storage.read_chunk(&new_chunk_id).unwrap(), base,
+                "the persisted chunk must be exactly the folded content");
         }
 
         /// Companion to the test above: a fold running concurrently with a flood of

@@ -986,6 +986,16 @@ pub enum Request {
     ReplicateChunkLocationsWithReceipts {
         locations: Vec<ChunkLocation>,
     },
+
+    /// Fault injection for partition tests (SLOT-OWNERSHIP-PLAN.md §8, Phase 0):
+    /// replaces this node's `PeerFilter` wholesale. An empty filter heals every
+    /// link. Honored only when the server was started with `DFS_FAULT_INJECTION=1`;
+    /// otherwise it's refused, so a stray admin command can't partition production.
+    /// Always answered, even while `refuse_clients` is set, so a test can undo
+    /// what it did. APPENDED at end to preserve wire compatibility.
+    SetPeerFilter {
+        filter: PeerFilter,
+    },
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1735,4 +1745,29 @@ mod tests {
 
         assert_eq!(envelope.request_id, decoded.request_id);
     }
+}
+
+/// How an injected link failure behaves. See `Request::SetPeerFilter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PeerFilterMode {
+    /// The link is down: sends fail immediately, like a refused connection.
+    #[default]
+    Refuse,
+    /// The peer is a black hole: sends hang until the caller's own timeout,
+    /// like a node that is up but not answering (gray failure).
+    BlackHole,
+}
+
+/// A node's injected link failures (test-only; see `Request::SetPeerFilter`).
+/// Outbound only: to cut A↔B, set it on both A and B. Setting it on one side
+/// gives an asymmetric link.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerFilter {
+    /// Peers (by their client-port address, as cluster membership lists them)
+    /// that this node can no longer reach.
+    pub drop_to: Vec<std::net::SocketAddr>,
+    /// When true, this node's client-facing listener stops answering (every request
+    /// except `SetPeerFilter`): clients can't reach it, peers still can.
+    pub refuse_clients: bool,
+    pub mode: PeerFilterMode,
 }

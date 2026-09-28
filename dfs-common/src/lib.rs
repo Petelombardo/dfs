@@ -13,7 +13,7 @@ pub use types::{
 };
 pub use protocol::{
     ChunkLocationReceipt, ClusterMessage, DeleteQueueEntry, ErrorCode, FoldReleaseOutcome, Message, MessageEnvelope,
-    MetadataOperation, PendingHealingEntry, ProposeFoldOutcome, RemotePatchState, Request,
+    MetadataOperation, PeerFilter, PeerFilterMode, PendingHealingEntry, ProposeFoldOutcome, RemotePatchState, Request,
     RequestId, Response,
 };
 pub use hash::{compute_chunk_hash, compute_chunk_hash_at, verify_chunk_hash, ConsistentHashRing};

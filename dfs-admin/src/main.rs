@@ -73,6 +73,31 @@ enum Commands {
         #[arg(long)]
         watch: bool,
     },
+
+    /// Inject link failures for partition tests. Applies to every node given in
+    /// --cluster. Refused unless that node runs with DFS_FAULT_INJECTION=1.
+    Fault {
+        #[command(subcommand)]
+        cmd: FaultCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum FaultCommands {
+    /// Replace the node's filter: it can no longer reach --drop-to peers.
+    Set {
+        /// Peer addresses (client port, as cluster status lists them) to cut off
+        #[arg(long, value_delimiter = ',')]
+        drop_to: Vec<SocketAddr>,
+        /// Also stop answering clients on this node's client port
+        #[arg(long)]
+        refuse_clients: bool,
+        /// Hang instead of failing fast (a node that is up but not answering)
+        #[arg(long)]
+        black_hole: bool,
+    },
+    /// Heal every injected link failure on the node.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -269,6 +294,7 @@ async fn main() -> Result<()> {
         Commands::Delete { cmd } => handle_delete_command(cmd, &cluster_addrs, json_output).await?,
         Commands::Stats { watch } => handle_stats_command(&cluster_addrs, watch).await?,
         Commands::RpcStats { watch } => handle_rpc_stats_command(&cluster_addrs, watch).await?,
+        Commands::Fault { cmd } => handle_fault_command(cmd, &cluster_addrs).await?,
     }
 
     Ok(())
@@ -1590,6 +1616,25 @@ fn parse_file_id(s: &str) -> Result<FileId> {
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) -> Result<()> {
+    let filter = match cmd {
+        FaultCommands::Set { drop_to, refuse_clients, black_hole } => dfs_common::PeerFilter {
+            drop_to,
+            refuse_clients,
+            mode: if black_hole { dfs_common::PeerFilterMode::BlackHole } else { dfs_common::PeerFilterMode::Refuse },
+        },
+        FaultCommands::Clear => dfs_common::PeerFilter::default(),
+    };
+    for &addr in cluster_addrs {
+        match send_request(addr, Request::SetPeerFilter { filter: filter.clone() }).await? {
+            Response::Ok { .. } => println!("{}: filter set", addr),
+            Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+            other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+        }
+    }
+    Ok(())
+}
 
 async fn send_request(addr: SocketAddr, request: Request) -> Result<Response> {
     tokio::time::timeout(

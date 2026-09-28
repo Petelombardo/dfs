@@ -113,7 +113,7 @@ cd "$REPO" && cargo build --release 2>&1 | tail -2
 echo "=== Starting 5-node cluster ==="
 bash "$REPO/scripts/setup-cluster.sh" 5 2>/dev/null
 for i in 1 2 3 4 5; do
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
         > "$LOG/server${i}.log" 2>&1 &
 done
 sleep 3
@@ -2872,7 +2872,7 @@ echo "  Rolling restart of all 5 server nodes (one at a time)..."
 for i in 1 2 3 4 5; do
     pkill -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true
     sleep 0.5
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
         >> "$LOG/server${i}.log" 2>&1 &
     sleep 2
 done
@@ -3391,7 +3391,7 @@ check "T45b healing set persisted to config.toml on all 5 nodes" "$T45_CONFIG_OK
 echo "  T45: restarting node1 to confirm tuned values survive (not reverted to defaults)..."
 pkill -f "dfs-server start --config $BASE/node1/config.toml" 2>/dev/null || true
 sleep 0.5
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node1/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node1/config.toml" \
     >> "$LOG/server1.log" 2>&1 &
 
 # Poll for a full 5-node rejoin, not just node1's RPC listener being up — Part B below
@@ -3484,7 +3484,7 @@ grep -q "replication_factor = 3" "$BASE/node5/config.toml" || T45_NODE5_STALE_OK
 check "T45f node5 config still stale (=3) while down — confirms no silent cross-node update" "$T45_NODE5_STALE_OK"
 
 echo "  T45: restarting node5 — expect it to self-reconcile replication_factor to 4 on rejoin..."
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
     >> "$LOG/server5.log" 2>&1 &
 
 T45_DEADLINE=$(( $(date +%s) + 30 ))
@@ -3960,7 +3960,7 @@ pkill -9 -f "dfs-server start --config $BASE/node${T51_LEADER_NODE}/config.toml"
 # repeatedly, the same way the real incident's ~16s leader outage did.
 sleep 3
 
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" \
     >> "$LOG/server${T51_LEADER_NODE}.log" 2>&1 &
 
 # Storm keeps running through the outage and recovery — that's the whole
@@ -4233,7 +4233,7 @@ sleep 2
 echo "  Killing node$T52_VICTIM_NUM ($T52_VICTIM_NODE) mid-storm (SIGKILL, matching a real abrupt outage)..."
 pkill -9 -f "dfs-server start --config $BASE/node${T52_VICTIM_NUM}/config.toml" 2>/dev/null || true
 sleep 3
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${T52_VICTIM_NUM}/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T52_VICTIM_NUM}/config.toml" \
     >> "$LOG/server${T52_VICTIM_NUM}.log" 2>&1 &
 
 sleep $(( T52_DURATION - 2 ))
@@ -4763,6 +4763,49 @@ echo "  T55: $T55_PUT_COUNT metadata PUTs over ${T55_ELAPSED}s wall time (bound:
 
 rm -f "$T55_FILE"
 fi # should_run T55
+
+if should_run T56; then
+snapshot_log T56
+echo ""
+echo "=== T56: fault-injection filter cuts real links and heals (SLOT-OWNERSHIP-PLAN Phase 0) ==="
+# Every later ownership phase proves its failure-matrix rows with this filter, so
+# it must demonstrably act on real inter-node traffic, not just on a unit-test socket.
+T56_NODE=127.0.0.1:8904
+T56_PEERS=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903
+T56_LOG="$LOG/server5.log"
+T56_BEFORE=$(grep -c "first dropped send to" "$T56_LOG" 2>/dev/null || true)
+
+"$BIN/dfs-admin" --cluster "$T56_NODE" fault set --drop-to "$T56_PEERS" >/dev/null 2>&1 \
+    && check "T56a fault set accepted on a DFS_FAULT_INJECTION=1 node" PASS \
+    || check "T56a fault set refused on a DFS_FAULT_INJECTION=1 node" FAIL
+# Heartbeats go out every 5s locally; each one to a cut peer must fail with the injected error.
+T56_HITS=0
+for _ in $(seq 1 16); do
+    T56_HITS=$(( $(grep -c "first dropped send to" "$T56_LOG" 2>/dev/null || true) - T56_BEFORE ))
+    [ "$T56_HITS" -gt 0 ] && break
+    sleep 0.5
+done
+[ "$T56_HITS" -gt 0 ] \
+    && check "T56b cut node's own peer traffic hits the filter ($T56_HITS of 4 links)" PASS \
+    || check "T56b no peer traffic from the cut node hit the filter within 8s" FAIL
+
+"$BIN/dfs-admin" --cluster "$T56_NODE" fault set --refuse-clients >/dev/null 2>&1
+timeout 5 "$BIN/dfs-admin" --cluster "$T56_NODE" cluster status >/dev/null 2>&1 \
+    && check "T56c refuse_clients: client port still answered" FAIL \
+    || check "T56c refuse_clients: client port stops answering" PASS
+"$BIN/dfs-admin" --cluster "$T56_NODE" fault clear >/dev/null 2>&1 \
+    && check "T56d fault clear gets through a refuse_clients node" PASS \
+    || check "T56d fault clear blocked by refuse_clients -- a test could never heal" FAIL
+timeout 5 "$BIN/dfs-admin" --cluster "$T56_NODE" cluster status >/dev/null 2>&1 \
+    && check "T56e client port answers again after clear" PASS \
+    || check "T56e client port still dead after clear" FAIL
+T56_AFTER=$(grep -c "first dropped send to" "$T56_LOG" 2>/dev/null || true)
+sleep 6
+T56_LATE=$(( $(grep -c "first dropped send to" "$T56_LOG" 2>/dev/null || true) - T56_AFTER ))
+[ "$T56_LATE" -eq 0 ] \
+    && check "T56f peer links healed after clear (no injected failures in the next heartbeat)" PASS \
+    || check "T56f $T56_LATE injected failures after clear -- filter not cleared" FAIL
+fi # should_run T56
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

@@ -1160,7 +1160,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ListAllFiles
         | Request::GetNodeStats
         | Request::GetRpcClassCounts
-        | Request::GetPendingHealingSample { .. } => Admin,
+        | Request::GetPendingHealingSample { .. }
+        | Request::SetPeerFilter { .. } => Admin,
     }
 }
 
@@ -7536,6 +7537,10 @@ impl Server {
             Request::ReplicateChunkLocationsWithReceipts { locations } => {
                 self.handle_replicate_chunk_locations(locations, true).await
             }
+            Request::SetPeerFilter { filter } => match crate::network::set_peer_filter(filter) {
+                Ok(()) => Response::Ok { data: None },
+                Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::PermissionDenied },
+            },
             Request::ReplicateChunkLocationsV2 { locations } => {
                 self.handle_replicate_chunk_locations_v2(locations).await
             }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
-use dfs_common::{Message, MessageEnvelope, Request, RequestId, Response, ErrorCode, ClusterMessage};
+use dfs_common::{Message, MessageEnvelope, Request, RequestId, Response, ErrorCode, ClusterMessage, PeerFilter, PeerFilterMode};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,6 +132,60 @@ pub fn peer_port_addr(addr: SocketAddr) -> SocketAddr {
 /// port (capacity RESERVED_PEER_CONNECTIONS, see its doc comment). Neither
 /// instance does any per-connection classification; which listener accepted a
 /// connection already says everything needed.
+/// Injected link failures for partition tests (SLOT-OWNERSHIP-PLAN.md §8). Process-wide
+/// because a node has several `NetworkClient`s (Server's, ClusterManager's heartbeats)
+/// and a real dead link cuts all of them at once.
+static PEER_FILTER: std::sync::RwLock<Option<PeerFilter>> = std::sync::RwLock::new(None);
+
+/// Fault injection is only ever honored when the operator opted in at process start.
+/// Production nodes never set this, so no admin command can partition them.
+pub fn fault_injection_allowed() -> bool {
+    std::env::var("DFS_FAULT_INJECTION").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Replace this node's filter. An empty filter heals every link.
+pub fn set_peer_filter(filter: PeerFilter) -> Result<()> {
+    if !fault_injection_allowed() {
+        anyhow::bail!("fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)");
+    }
+    warn!("FAULT INJECTION: peer filter now {:?}", filter);
+    install_peer_filter(filter);
+    Ok(())
+}
+
+/// `set_peer_filter` without the opt-in gate — for unit tests, which can't safely
+/// flip a process-wide env var while other tests run in parallel.
+fn install_peer_filter(filter: PeerFilter) {
+    let empty = filter.drop_to.is_empty() && !filter.refuse_clients;
+    *PEER_FILTER.write().unwrap() = if empty { None } else { Some(filter) };
+    FAULT_DROP_LOGGED.lock().unwrap().clear();
+}
+
+/// Targets whose first injected drop since the last install has been logged — so a
+/// partition test's log shows each cut link acting on real traffic exactly once,
+/// without one line per heartbeat.
+static FAULT_DROP_LOGGED: std::sync::Mutex<Vec<SocketAddr>> = std::sync::Mutex::new(Vec::new());
+
+fn outbound_fault(target: SocketAddr) -> Option<PeerFilterMode> {
+    let mode = {
+        let guard = PEER_FILTER.read().unwrap();
+        let f = guard.as_ref()?;
+        f.drop_to.contains(&target).then_some(f.mode)?
+    };
+    let mut logged = FAULT_DROP_LOGGED.lock().unwrap();
+    if !logged.contains(&target) {
+        logged.push(target);
+        warn!("FAULT INJECTION: first dropped send to {} ({:?})", target, mode);
+    }
+    Some(mode)
+}
+
+fn client_fault() -> Option<PeerFilterMode> {
+    let guard = PEER_FILTER.read().unwrap();
+    let f = guard.as_ref()?;
+    f.refuse_clients.then_some(f.mode)
+}
+
 pub struct NetworkServer<H: MessageHandler> {
     /// Address to listen on
     listen_addr: SocketAddr,
@@ -153,6 +207,10 @@ pub struct NetworkServer<H: MessageHandler> {
     /// conn_semaphore's configured capacity — needed alongside
     /// available_permits() to compute in-use counts for logging.
     capacity: usize,
+
+    /// False for the peer-only listener (see `peer_listener`). Decides whether an
+    /// injected `refuse_clients` fault applies to this listener.
+    client_facing: bool,
 }
 
 impl<H: MessageHandler + 'static> NetworkServer<H> {
@@ -165,7 +223,14 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
             handler,
             conn_semaphore: Arc::new(tokio::sync::Semaphore::new(capacity)),
             capacity,
+            client_facing: true,
         }
+    }
+
+    /// Mark this as the peer-only listener (PEER_PORT_OFFSET), which clients never use.
+    pub fn peer_listener(mut self) -> Self {
+        self.client_facing = false;
+        self
     }
 
     /// conn_semaphore's configured capacity — exposed so Server can record it
@@ -225,6 +290,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                             }
                             let handler = self.handler.clone();
                             let sem = semaphore.clone();
+                            let client_facing = self.client_facing;
 
                             // Try to acquire a permit without blocking the accept loop.
                             // If at capacity, send a busy error and close immediately so
@@ -237,7 +303,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                                     }
                                     tokio::spawn(async move {
                                         let _permit = permit; // released on drop
-                                        if let Err(e) = handle_connection(stream, peer_addr, handler).await {
+                                        if let Err(e) = handle_connection(stream, peer_addr, handler, client_facing).await {
                                             error!("Connection error from {}: {}", peer_addr, e);
                                         }
                                     });
@@ -297,6 +363,7 @@ async fn handle_connection<H: MessageHandler>(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     handler: Arc<H>,
+    client_facing: bool,
 ) -> Result<()> {
     let mut read_buf = BytesMut::with_capacity(8192); // 8KB buffer (SBC-friendly)
 
@@ -367,6 +434,18 @@ async fn handle_connection<H: MessageHandler>(
                     Message::Cluster(msg) => crate::server::classify_cluster_message(msg),
                     Message::Response(_) => crate::stats::RpcClass::Admin,
                 };
+                // Injected "clients can't reach this node" (test-only, see PeerFilter).
+                // SetPeerFilter itself always gets through so a test can heal the link.
+                if client_facing && !matches!(&envelope.message, Message::Request(Request::SetPeerFilter { .. })) {
+                    match client_fault() {
+                        Some(PeerFilterMode::Refuse) => break,
+                        Some(PeerFilterMode::BlackHole) => {
+                            tokio::time::sleep(HANDLER_TIMEOUT).await;
+                            break;
+                        }
+                        None => {}
+                    }
+                }
                 let dispatch_start = std::time::Instant::now();
                 let response = match tokio::time::timeout(
                     HANDLER_TIMEOUT,
@@ -719,6 +798,16 @@ impl NetworkClient {
         message: Message,
         response_timeout: std::time::Duration,
     ) -> Result<MessageEnvelope> {
+        match outbound_fault(target) {
+            Some(PeerFilterMode::Refuse) => {
+                anyhow::bail!("Failed to connect to {}: link down (fault injection)", target);
+            }
+            Some(PeerFilterMode::BlackHole) => {
+                tokio::time::sleep(response_timeout).await;
+                anyhow::bail!("Timeout reading message frame from {} (fault injection)", target);
+            }
+            None => {}
+        }
         let request_id = self.next_request_id();
         let envelope = MessageEnvelope::new(request_id, message);
 
@@ -952,7 +1041,7 @@ mod tests {
         let handler = Arc::new(TestHandler);
         tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, handler).await.ok();
+            handle_connection(stream, peer, handler, true).await.ok();
         });
 
         // Give server time to start
@@ -973,6 +1062,53 @@ mod tests {
             }
             _ => panic!("Expected Bool response"),
         }
+    }
+
+    /// Production nodes never opt in, so the admin RPC must be refused there —
+    /// otherwise one stray `dfs-admin fault set` could partition staging. No test in
+    /// this binary sets DFS_FAULT_INJECTION (they use install_peer_filter directly).
+    #[test]
+    fn peer_filter_refused_without_opt_in() {
+        assert!(std::env::var("DFS_FAULT_INJECTION").is_err(), "precondition: test env has no opt-in");
+        let err = set_peer_filter(PeerFilter { drop_to: vec![], refuse_clients: true, mode: PeerFilterMode::Refuse })
+            .unwrap_err();
+        assert!(err.to_string().contains("disabled"), "got: {}", err);
+        assert!(client_fault().is_none(), "a refused request must not have installed anything");
+    }
+
+    /// SLOT-OWNERSHIP-PLAN.md Phase 0: the partition tests for every later phase
+    /// rest on this filter, so pin its three behaviors. Filtering on the target's
+    /// own address keeps this from affecting any other test in the binary. (The
+    /// refuse_clients switch is process-wide, so it's exercised in the local suite
+    /// instead, where each node is its own process.)
+    #[tokio::test]
+    async fn peer_filter_refuses_black_holes_and_heals() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = listener.accept().await.unwrap();
+                tokio::spawn(handle_connection(stream, peer, Arc::new(TestHandler), true));
+            }
+        });
+        let client = NetworkClient::new();
+        let ask = || Message::Request(Request::HasChunk { chunk_id: ChunkId::from_hash([1u8; 32]) });
+        assert!(client.send_message(target, ask()).await.is_ok(), "precondition: link works");
+
+        install_peer_filter(PeerFilter { drop_to: vec![target], refuse_clients: false, mode: PeerFilterMode::Refuse });
+        let t = std::time::Instant::now();
+        let err = client.send_message(target, ask()).await.unwrap_err();
+        assert!(t.elapsed() < std::time::Duration::from_millis(200), "Refuse must fail fast, took {:?}", t.elapsed());
+        assert!(err.to_string().contains("fault injection"), "got: {}", err);
+
+        install_peer_filter(PeerFilter { drop_to: vec![target], refuse_clients: false, mode: PeerFilterMode::BlackHole });
+        let t = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(300);
+        assert!(client.send_message_timeout(target, ask(), timeout).await.is_err());
+        assert!(t.elapsed() >= timeout, "BlackHole must hang for the caller's full timeout, took {:?}", t.elapsed());
+
+        install_peer_filter(PeerFilter::default());
+        assert!(client.send_message(target, ask()).await.is_ok(), "clearing the filter must heal the link");
     }
 
     // --- Reserved peer connection pool via a derived peer port (2026-08-05) ---

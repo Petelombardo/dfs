@@ -415,7 +415,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         .unwrap_or(network::RESERVED_PEER_CONNECTIONS);
     let mut peer_net_server = network::NetworkServer::new(
         network::peer_port_addr(config.node.listen_addr), server.clone(), peer_capacity,
-    );
+    ).peer_listener();
     server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
 
     server.clone().start_conn_pressure_watchdog();
@@ -800,7 +800,7 @@ async fn run_planned_offline_compaction(
         .unwrap_or(network::RESERVED_PEER_CONNECTIONS);
     let mut peer_net_server = network::NetworkServer::new(
         network::peer_port_addr(listen_addr), server.clone(), peer_capacity,
-    );
+    ).peer_listener();
     server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
 
     *server_handle = tokio::spawn(async move {

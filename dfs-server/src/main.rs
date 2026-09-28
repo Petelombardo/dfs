@@ -7,6 +7,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod chunker;
 mod cluster;
 mod healing;
+mod lease;
 mod metadata;
 mod metadata_sql;
 mod network;
@@ -420,6 +421,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     server.clone().start_conn_pressure_watchdog();
     server.clone().start_slot_audit();
+    server.start_leases();
     let mut server_handle = tokio::spawn(async move {
         let (client_result, peer_result) = tokio::join!(net_server.start(), peer_net_server.start());
         if let Err(e) = client_result {

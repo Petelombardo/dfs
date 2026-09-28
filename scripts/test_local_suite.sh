@@ -39,6 +39,10 @@ export DFS_SLOT_AUDIT_INTERVAL_SECS=2
 export DFS_SLOT_AUDIT_QUIET_SECS=3
 export DFS_SLOT_AUDIT_REAUDIT_SECS=20
 export DFS_SLOT_AUDIT_CONFIRM_SECS=10
+# Short leases (Phase 1) so T58 observes grants, lapses and takeovers in seconds.
+export DFS_LEASE_MS=3000
+export DFS_LEASE_MARGIN_MS=500
+export DFS_LEASE_CLUSTER_SIZE=5   # fresh cluster: no membership history yet
 
 # If test filter args given, only run those tests (e.g. T7 T23).
 RUN_TESTS="${*:-ALL}"
@@ -4871,6 +4875,81 @@ T57_ALL_TRANSIENT=$(cat "$LOG"/server*.log 2>/dev/null | grep -c "\[DIVERGENCE-T
 echo "  (informational) across this whole run: $T57_ALL_DIV confirmed [DIVERGENCE], $T57_ALL_TRANSIENT transient (cleared within the confirm delay)"
 rm -f "$MOUNT/t57_clean.bin" "$MOUNT/t57_phantom.bin"
 fi # should_run T57
+
+if should_run T58; then
+snapshot_log T58
+echo ""
+echo "=== T58: node leases fence an isolated node before the leader declares it expired (SLOT-OWNERSHIP-PLAN Phase 1) ==="
+T58_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
+t58_status() { "$BIN/dfs-admin" --cluster "$(IFS=,; echo "${T58_NODES[*]}")" lease status 2>/dev/null; }
+t58_holders() { t58_status | python3 -c "import json,sys; print(sum(1 for l in sys.stdin if json.loads(l).get('holds_lease')))"; }
+t58_partition() {   # t58_partition <victim-addr>: cut every link between victim and the rest
+    local v="$1" others=""
+    for n in "${T58_NODES[@]}"; do [ "$n" = "$v" ] && continue; others="${others:+$others,}$n"
+        "$BIN/dfs-admin" --cluster "$n" fault set --drop-to "$v" >/dev/null 2>&1 || true; done
+    "$BIN/dfs-admin" --cluster "$v" fault set --drop-to "$others" >/dev/null 2>&1 || true
+}
+t58_heal() { for n in "${T58_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done; }
+t58_wait_holders() {   # t58_wait_holders <count> <max-seconds>
+    for _ in $(seq 1 $(( $2 * 2 ))); do [ "$(t58_holders)" = "$1" ] && return 0; sleep 0.5; done; return 1
+}
+
+# T58a: steady state.
+t58_wait_holders 5 20 || true
+T58_STATUS=$(t58_status)
+T58A=$(echo "$T58_STATUS" | python3 -c "
+import json,sys
+r=[json.loads(l) for l in sys.stdin]
+leaders=[x for x in r if x.get('leader_term')]
+terms={x['granted_term'] for x in r}
+ok=len(leaders)==1 and leaders[0]['leader_has_majority'] and all(x['holds_lease'] for x in r) and len(terms)==1
+print('PASS' if ok else 'FAIL', len(leaders), sorted(terms), sum(1 for x in r if x['holds_lease']))
+")
+echo "  T58a: $T58A"
+check "T58a exactly one established leader with a majority; all 5 nodes hold a lease under one term" "${T58A%% *}"
+T58_LEADER_ADDR=$(echo "$T58_STATUS" | python3 -c "
+import json,sys
+for l in sys.stdin:
+    x=json.loads(l)
+    if x.get('leader_term'): print(x['addr'])")
+T58_LEADER_LOG="$LOG/server$(( ${T58_LEADER_ADDR##*:} - 8899 )).log"
+
+# T58b: isolate a non-leader completely.
+T58_VICTIM=127.0.0.1:8904; [ "$T58_LEADER_ADDR" = "$T58_VICTIM" ] && T58_VICTIM=127.0.0.1:8903
+T58_VICTIM_LOG="$LOG/server$(( ${T58_VICTIM##*:} - 8899 )).log"
+T58_VICTIM_ID=$(t58_status | python3 -c "
+import json,sys
+for l in sys.stdin:
+    x=json.loads(l)
+    if x['addr']=='$T58_VICTIM': print(x['node'])")
+T58_LOST_BEFORE=$(grep -c "LEASE own: lost" "$T58_VICTIM_LOG" || true)
+T58_EXP_BEFORE=$(grep -c "LEASE leader: node $T58_VICTIM_ID Expired" "$T58_LEADER_LOG" || true)
+t58_partition "$T58_VICTIM"
+for _ in $(seq 1 40); do   # lease 3s + margin + a renewal period, with slack
+    [ "$(grep -c "LEASE leader: node $T58_VICTIM_ID Expired" "$T58_LEADER_LOG" || true)" -gt "$T58_EXP_BEFORE" ] && break
+    sleep 0.5
+done
+T58_ENDED=$(grep "LEASE own: lost; it ended at wall_ms" "$T58_VICTIM_LOG" | tail -n +$((T58_LOST_BEFORE + 1)) | head -1 | grep -oP 'wall_ms \K[0-9]+' || true)
+T58_EXPIRED=$(grep "LEASE leader: node $T58_VICTIM_ID Expired at wall_ms" "$T58_LEADER_LOG" | tail -n +$((T58_EXP_BEFORE + 1)) | head -1 | grep -oP 'wall_ms \K[0-9]+' || true)
+echo "  T58b: victim=$T58_VICTIM own lease ended at ${T58_ENDED:-?}, leader declared Expired at ${T58_EXPIRED:-?}"
+[ -n "$T58_ENDED" ] && [ -n "$T58_EXPIRED" ] && [ "$T58_EXPIRED" -gt "$T58_ENDED" ] \
+    && check "T58b isolated node's lease ended $(( T58_EXPIRED - T58_ENDED ))ms before the leader declared it Expired (no overlap)" PASS \
+    || check "T58b lease fencing order wrong or missing (ended=${T58_ENDED:-none}, expired=${T58_EXPIRED:-none})" FAIL
+t58_heal
+t58_wait_holders 5 20 \
+    && check "T58b healed node re-acquires its lease" PASS \
+    || check "T58b healed node did not re-acquire its lease within 20s ($(t58_holders)/5 hold)" FAIL
+
+# T58c: isolate the leader: it loses its majority, so nobody can hold a lease.
+t58_partition "$T58_LEADER_ADDR"
+t58_wait_holders 0 20 \
+    && check "T58c leader cut off from its majority: every lease in the cluster lapses (fencing, not split-brain)" PASS \
+    || check "T58c $(t58_holders) node(s) still hold a lease 20s after the leader lost its majority" FAIL
+t58_heal
+t58_wait_holders 5 30 \
+    && check "T58c all 5 nodes re-acquire leases once the leader's links heal" PASS \
+    || check "T58c only $(t58_holders)/5 nodes hold a lease 30s after healing" FAIL
+fi # should_run T58
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

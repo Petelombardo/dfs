@@ -48,6 +48,10 @@ pub struct Server {
     /// Network client for talking to other nodes
     client: Arc<NetworkClient>,
 
+    /// Leader terms and node leases (SLOT-OWNERSHIP-PLAN.md Phase 1). Has its own
+    /// network client and locks so nothing else on this node can stall a renewal.
+    lease: Arc<crate::lease::LeaseRuntime>,
+
     /// Replication factor. `Arc<AtomicUsize>` — the same instance is handed to
     /// `HealingManager` at construction (see `replication_factor_handle()`), so a live
     /// `dfs-admin cluster set --replication-factor` change or rejoin reconciliation is
@@ -1112,7 +1116,10 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetPendingPatchChunkIds { .. }
         | Request::GetOrphanAuthInfo
         | Request::GetPatchState { .. }
-        | Request::AuditSlots { .. } => PeerOther,
+        | Request::AuditSlots { .. }
+        | Request::GetLeaseTerm
+        | Request::PromiseLeaseTerm { .. }
+        | Request::RenewNodeLease { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -1163,7 +1170,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetNodeStats
         | Request::GetRpcClassCounts
         | Request::GetPendingHealingSample { .. }
-        | Request::SetPeerFilter { .. } => Admin,
+        | Request::SetPeerFilter { .. }
+        | Request::GetLeaseStatus => Admin,
     }
 }
 
@@ -5411,6 +5419,9 @@ impl Server {
                 metadata_batch_drain_enabled,
             ))));
 
+        let lease = Arc::new(crate::lease::LeaseRuntime::new(
+            cluster.local_node_id(), cluster.clone(), Arc::new(NetworkClient::new_for_peers()), &metadata_dir,
+        ));
         let server = Self {
             storage,
             metadata: metadata.clone(),
@@ -5418,6 +5429,7 @@ impl Server {
             chunker: Arc::new(Chunker::new(chunk_size)),
             cluster,
             client: Arc::new(NetworkClient::new_for_peers()),
+            lease,
             replication_factor,
             metadata_dir,
             config_path,
@@ -7596,6 +7608,10 @@ impl Server {
                 self.handle_replicate_chunk_locations(locations, true).await
             }
             Request::AuditSlots { entries } => self.handle_audit_slots(entries).await,
+            Request::GetLeaseTerm => self.lease.handle_get_term(),
+            Request::PromiseLeaseTerm { term, leader } => self.lease.handle_promise(term, leader).await,
+            Request::RenewNodeLease { node, promised_term } => self.lease.handle_renew(node, promised_term),
+            Request::GetLeaseStatus => Response::LeaseStatus { report: self.lease.status() },
             Request::SetPeerFilter { filter } => match crate::network::set_peer_filter(filter) {
                 Ok(()) => Response::Ok { data: None },
                 Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::PermissionDenied },
@@ -10845,6 +10861,10 @@ impl Server {
     /// Start the background slot audit. DFS_SLOT_AUDIT_INTERVAL_SECS (default 60, 0 = off),
     /// DFS_SLOT_AUDIT_QUIET_SECS (default 30), DFS_SLOT_AUDIT_REAUDIT_SECS (default 3600),
     /// DFS_SLOT_AUDIT_CONFIRM_SECS (default 60), DFS_SLOT_AUDIT_MAX_PER_PASS (default 2000).
+    pub fn start_leases(&self) {
+        self.lease.clone().start();
+    }
+
     pub fn start_slot_audit(self: Arc<Self>) {
         let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         let interval = env_u64("DFS_SLOT_AUDIT_INTERVAL_SECS", 60);

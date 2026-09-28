@@ -27,14 +27,14 @@ everything else.
 
 ## 2. Principles (constraints on the design)
 
-1. **Leader stays off the data path.** The leader's job is appointing owners and changing
-   configuration, never per-write work. Its state must scale with *nodes*, not chunks or
-   writes. (gluster1 stalled 26 s on 2026-09-24. Anything per-write on the leader would have
-   stalled every guest.)
+1. **No leader on any write-critical path.** Leases, takeovers and ISR exclusions are all
+   decided by majorities, never by the leader, so a dead or stalled leader costs no write
+   availability. The leader keeps placement policy and auditing only. (gluster1 stalled 26 s on
+   2026-09-24; its leader role must not be able to stall a guest.)
 2. **No extra hop on the hot path by default.** Client write latency must stay within noise
    of today's.
-3. **Clients never cause a promotion.** Only the leader decides a failover, based on its own
-   reachability plus lease expiry. A client's view of the network is advisory.
+3. **Clients never cause a promotion.** A failover happens only when a majority of nodes has
+   voted the primary's lease expired. A client's view of the network is advisory.
 4. **The client writes exactly 2 replicas; replicas 3..n are backfilled.** With RF = n > 2,
    every client write, full or patch, goes to exactly 2 nodes (primary + secondary). The
    remaining n−2 copies are filled afterwards by the primary (Phase 4; the healer until then),
@@ -59,11 +59,12 @@ everything else.
 
 ## 4. Roles and vocabulary
 
-- **Leader**: existing role (lowest NodeId with majority view). Gains a **term**: a
-  monotonic number, persisted on a majority, bumped on each leadership change.
-- **Node lease**: a time-bounded grant from the leader to a node: "you may act as primary
-  until T". There is **one lease per node** (5 leases on staging), not one per chunk. Renewed
-  by a cheap heartbeat.
+- **Leader**: existing role (lowest NodeId with majority view). Keeps placement policy and
+  auditing; has **no role** in leases, takeovers or ISR changes.
+- **Node lease**: "you may act as primary until T", held while a **majority** of nodes keeps
+  acknowledging your renewals. **One lease per node** (5 on staging), not one per chunk.
+- **Incarnation**: a per-node counter carried by its renewals. A majority that votes a node
+  expired fences that incarnation; the node rejoins under a higher one.
 - **Slot**: `(file_id, chunk_idx)`.
 - **ISR (in-sync replica list)**: per slot, the *ordered* list of nodes guaranteed to hold
   every acknowledged write. Normally `[primary, secondary]`. Order matters, and it is a
@@ -85,11 +86,12 @@ placement groups would force a data migration. Instead:
 
 - Placement stays **per chunk**, as today. The client picks 2 nodes when a slot is created,
   and that ordered pair becomes the slot's initial ISR: `[P, S]`.
-- The leader only tracks **node leases** (N entries) and **node-pair exclusions** (see §6.3).
-- When node P's lease lapses, *every* slot where P was primary fails over to its secondary
-  at once. There is no per-slot leader work: each node derives the new primary locally.
+- Lease state is O(nodes) per node (each node's ack and fence records), and exclusions are
+  O(node pairs) (see §6.3). Nothing scales with chunks or writes.
+- When a majority votes node P expired, *every* slot where P was primary fails over to its
+  secondary at once. Nothing is done per slot: each node derives the new primary locally.
 
-Leader state is O(nodes + node pairs). Hot-path cost is zero leader RPCs.
+Hot-path cost is zero extra RPCs; renewals are a few small messages per node per second.
 
 ### ISR order: recorded, versioned, never derived from the holder list
 
@@ -123,39 +125,48 @@ fan-out from all holders to P+S** (a behavior change, Phase 3).
 
 ## 6. Mechanisms
 
-### 6.1 Leader term (prerequisite)
-- When a node becomes leader, it reads `max_term` from a majority, sets `term = max + 1`, and
-  persists it to a majority before granting anything.
-- Nodes reject lease grants and config changes carrying a term lower than the highest they've seen.
-- This orders the two-leaders-with-overlapping-views case that the min-ID rule alone allows.
+### 6.1 Majority leases (built: Phase 1, `dfs-server/src/lease.rs`)
+Guarantee: **once a majority has voted node P expired at incarnation i, P holds no lease at
+any incarnation <= i.**
+- **Renewal:** every `L/3`, P asks every peer in parallel. Each voter records the ack at its
+  receive time. P holds its lease until `sent + L − margin` if a majority (P included) acked a
+  renewal sent at `sent`. Counting from the send and ending a margin early errs toward P
+  stopping sooner. Defaults: `L` = 3 s, margin = 500 ms (`DFS_LEASE_MS`, `DFS_LEASE_MARGIN_MS`).
+- **Expiry vote:** a voter votes P expired only after `L + margin` without acking P. It then
+  refuses P's renewals at or below that incarnation, persisting the fence before answering.
+  Any majority that kept P's lease alive and any majority that voted P out share a voter, and
+  that voter can't do both inside the forbidden window.
+- **Stale-incarnation guard:** each vote answer carries the highest incarnation that voter has
+  seen from P. If any is newer than the one being voted, the vote fails.
+- **Restarts:** fences are durable; a restarted voter casts no expiry vote for `L + margin`
+  (it may have acked P just before crashing).
+- **Majority size:** counted over a persisted membership high-water mark, never over the
+  membership a node happens to know (a just-started node knows only itself; on the first run
+  of the leader-lease version, all five nodes each counted "1 of 1").
+- **Isolation:** the lease runtime has its own locks and network client, and never touches the
+  metadata DB, healer, chunk_map or membership lock, so a stall in those can't cost a lease.
+- **Self-fence rule for Phase 3:** once lapsed, a primary refuses both writes **and** reads for
+  its slots with `NotPrimary { epoch, hint }`.
+- **Failover time:** about `L − margin` for the lease to lapse, plus `L + margin` of voter
+  silence, which overlaps it: about 4 s locally, measured (T58b). Well inside the guest's
+  30 s SCSI timeout.
+- (Superseded design: leader-granted leases with leader terms, commit e77f956. Leader death
+  meant 30–50 s with no writes, and a guest can hit an I/O error well before that.)
 
-### 6.2 Node leases
-- Duration `L` (start at 10 s; tune against observed stalls). The node renews every `L/3`.
-- **Primary self-fence rule:** a node acts as primary only while
-  `now_mono < renew_request_sent_at + L − margin`. It measures from when it *sent* the renewal,
-  so its own clock is the conservative one. Once lapsed, it refuses both writes **and** reads
-  for slots it's primary of, returning `NotPrimary { epoch, hint }`.
-- **Leader re-appoint rule:** the leader treats a lease as expired only after `L + margin` since
-  it last *granted* it. Because it waits longer than the holder can act, a lapsed primary has
-  stopped before its replacement starts. Only bounded clock *drift* is assumed, not synchronized clocks.
-- Renewal runs on a **dedicated lightweight task and connection**. It must not wait on the
-  metadata committer, healer locks, or compaction. A long stall of the node's own storage
-  stack should *correctly* cost it its lease, and a stall of unrelated subsystems must not.
-- Optional (Phase 1b): relayed renewal. If P can't reach L but can reach S, S may forward P's
-  renewal. This avoids a failover for a single broken P–L link.
-
-### 6.3 ISR changes (configuration, via leader, O(node pairs))
+### 6.3 ISR changes (configuration, recorded on a majority, O(node pairs))
 Failures are node-granular, so ISR changes are expressed per node pair:
-- `Exclude { primary: P, excluded: S, since_epoch }`, recorded by the leader under its term.
-  Meaning: S is out of sync for slots where P is primary and S is secondary. S cannot be
-  promoted for them until it catches up.
-- Before acking any write without S, P must first get the exclusion recorded. That is exactly
-  one leader RPC per (P, S) pair per failure, not per slot and not per write.
+- `Exclude { primary: P, excluded: S, since_epoch }`, recorded on a **majority** of nodes
+  (durably, like lease fences). Meaning: S is out of sync for slots where P is primary and S is
+  secondary. S cannot be promoted for them until it catches up.
+- Before acking any write without S, P must get the exclusion onto a majority: one round per
+  (P, S) pair per failure, not per slot and not per write, and no leader involved.
+- Before taking over P's slots, S reads exclusions from a majority. The two majorities
+  intersect, so S always sees an exclusion of itself and won't promote itself past it.
 - P then recruits a replacement secondary per slot (placement chosen by P from the capacity
   view, or by leader policy). It copies the slot at a version, then appends the new node to the
   slot's ISR under a bumped slot epoch. Writes stall only for the catch-up window.
   **They are never acked with fewer than 2 copies when RF ≥ 2**; the existing durability floor is kept.
-- Re-admitting S (after it heals): P catches S up, then asks the leader to clear the exclusion.
+- Re-admitting S (after it heals): P catches S up, then clears the exclusion on a majority.
 
 ### 6.4 Write path (patches and full writes)
 Default design (keeps today's parallel fan-out):
@@ -207,31 +218,32 @@ This is a Phase 3 decision point with numbers.
 ### 6.8 Reads
 - Reads can go to any ISR member that is at the slot's current version. The client knows the
   version from its last write or open.
-- A lapsed primary must not serve reads for its slots (§6.2). Otherwise, after failover, it
+- A lapsed primary must not serve reads for its slots (§6.1). Otherwise, after failover, it
   would serve pre-failover data as current.
 - Hedged reads (2854db0) stay. The hedge targets the other ISR member.
 
 ## 7. Failure decision tree
 
-Actors: **P** (primary), **S** (secondary), **L** (leader), **C** (client). "✗" = link down.
+Actors: **P** (primary), **S** (secondary), **L** (leader), **C** (client), **M** (a majority of
+nodes). "✗" = link down. The leader appears only to show it doesn't matter.
 
 | # | Situation | Decision |
 |---|---|---|
 | 1 | All links up | Normal. |
-| 2 | P–S ✗; P–L ok; S–L ok | **No promotion.** P is leased and alive. P gets `Exclude{P,S}` recorded, recruits a replacement secondary, and catches it up. S is re-admitted after the link heals and it catches up. Promoting S here would create two primaries. |
-| 3 | P–S ✗; S–L ✗; P–L ok | S is isolated. Same as #2. |
-| 4 | P–L ✗; P–S ok; S–L ok | P can't renew. With relayed renewal (6.2 option), S forwards it and nothing changes. Without it, P self-fences at lease lapse, L waits `L+margin`, then S becomes primary (it is ISR, so it has every acked write). P rejoins as secondary after catch-up. |
-| 5 | **P reachable only by C** (P–S ✗, P–L ✗, C–P ok). This was your open case. | P's lease lapses and **P fences itself**: it refuses writes and reads with `NotPrimary`. It can't have acked anything since then, because acks need S (principle 5). L waits `L+margin` and promotes S. C's retries against P get `NotPrimary`, so C refreshes and moves to S. No split-brain: the old primary stops before the new one starts. |
-| 6 | S–P ✗; S–L ok; S–C ok (your promotion case) | Promote S **only if L also can't reach P and P's lease has expired.** If L can reach P, this is #2 and S is excluded instead. S's own view never triggers promotion. |
+| 2 | P–S ✗; P and S each reach M | **No promotion.** P still holds its lease (M acks it), so no majority can vote it out. P gets `Exclude{P,S}` onto M, recruits a replacement secondary, and catches it up. S is re-admitted after the link heals and it catches up. |
+| 3 | S isolated from everyone | Same as #2 from P's side. S's own lease lapses, so S acts as primary for nothing. |
+| 4 | P–L ✗ only | **Nothing happens.** The leader plays no part in leases. (Tested: T58c.) |
+| 5 | **P reachable only by C** (P cut off from M) | P can't renew, so its lease lapses and **P fences itself**: it refuses writes and reads with `NotPrimary`. It acked nothing after that, because acks need S (principle 5). M's voters have been silent about P for `L + margin`, so they vote it expired; S takes over. C's retries get `NotPrimary` and move to S. The old primary stops before the new one starts. (Tested: T58b, the lease ended 1.5 s before the vote.) |
+| 6 | S–P ✗; S reaches M and C | S may take over **only after M votes P expired**. If M still hears P (it's #2), the vote fails and S is excluded instead. S's own view never triggers promotion. |
 | 7 | C–P ✗, everything else ok | Not a failover. C sends via S, which relays to P, or C retries. Clients never cause promotion (principle 3). |
-| 8 | L fails / L loses majority | Existing quorum gate: the old L stops being leader. The new leader bumps the term, learns the lease table from a majority, and **must not re-appoint any node until that node's last lease could have expired.** Primaries keep serving on their unexpired leases, so a leader change alone causes no write outage. |
-| 9 | L was also P for some slots, and it fails | Your case: the new leader is elected (#8), waits out the old L's lease, then its slots derive S as primary. If the old L is alive but partitioned, it is #5 for its slots (it self-fences). |
+| 8 | L dies, stalls, or loses its majority | **No effect on leases or writes.** Membership elects a new leader in its own time; only placement policy and auditing wait for it. (Tested: T58c, the other 4 nodes had zero lease lapses.) |
+| 9 | L was also P for some slots, and it dies | It's #5 for its slots (a primary dying). That it was leader is irrelevant. |
 | 10 | P and S both down | Slots are unavailable for writes. RF ≥ 3: followers are not promotable (they may lack acked writes). Wait for an ISR member. An operator-only "accept data loss" override (unclean promotion of the most-caught-up follower) exists, **off by default, never automatic.** |
-| 11 | Old P returns after failover | Its epoch is stale, so all its slot messages are rejected. It rejoins as follower/secondary via catch-up from the new P. Anything it holds past the last acked version was never acked, so it is discarded. |
-| 12 | Gray failure (P slow, not dead; e.g. the 26 s stalls) | Renewal on a dedicated path (6.2) means that a stall in unrelated subsystems doesn't cost the lease, and a real storage stall does. Clients hedge reads to S. Tune `L` against observed stall durations. |
-| 13 | Flapping node / membership churn | Minimum dwell time between re-appointments of the same node, with backoff. The Exclude/re-admit cycle is rate-limited per node pair. |
-| 14 | Asymmetric link (P→L works, L→P doesn't) | Renewal is a P-initiated request/response. The lease only counts if the *response* arrives. If it doesn't, this is #4. |
-| 15 | Network partition splits the cluster (e.g. {g1,g2} \| {g3,g4,g5}) | The minority side has no leader (quorum gate). Its primaries self-fence at lease lapse. The majority leader re-appoints after expiry. Slots whose entire ISR sits in the minority stay unavailable (#10) and are not lost. |
+| 11 | Old P returns after failover | Its renewals are refused at the fenced incarnation, so it rejoins under a new one, holding no slots it lost. Its slot epoch is stale, so its slot messages are rejected. It rejoins as follower/secondary via catch-up. Anything it holds past the last acked version was never acked, so it's discarded. |
+| 12 | Gray failure (P slow, not dead; e.g. the 26 s stalls) | Renewal on its own path means a stall in unrelated subsystems doesn't cost the lease. A whole-process or network stall longer than `L − margin` does, and then S takes over within about 4 s instead of the guest waiting out the stall. Clients hedge reads to S. |
+| 13 | Flapping node / membership churn | Minimum dwell time before a node that just rejoined can be primary again, with backoff. The Exclude/re-admit cycle is rate-limited per node pair. |
+| 14 | Asymmetric link (P→M works, M→P doesn't) | Renewal is P-initiated request/response; an ack counts only if the *response* arrives. P loses its lease, and M's voters, having received renewals, don't vote it out until they go silent too. The system is safe: P fenced itself. Takeover waits until M stops hearing P, so availability suffers, not safety. |
+| 15 | Partition, e.g. {g1,g2} \| {g3,g4,g5} | The 2-node side can't reach a majority, so its nodes' leases lapse and they fence. The 3-node side keeps its leases, votes the other side out, and takes over their slots where the ISR partner is on its side. Slots whose entire ISR sits in the minority stay unavailable (#10) and are not lost. (Tested: T58d.) |
 
 ## 8. Phases
 
@@ -270,31 +282,30 @@ one side for an asymmetric link. This makes #2–#15 deterministic on the local 
   produce it. That confirms (or refutes) that replica drift explains our incident load before
   we commit to Phase 3.
 
-**Phase 1 — Terms and node leases**
-- Leader term (§6.1), node leases (§6.2), and a lease table persisted on a majority.
-- `NotPrimary` responses exist, but the write path doesn't consult them yet.
-- Local tests: #4, #5, #8, #9, #11, #14, #15 via the filter, asserting who *would* be primary
-  and that no two nodes ever both believe they hold the lease for the same interval.
-- Gate: a chaos run on the local cluster (random filters, kill/restart) with zero overlapping
-  leases. Staging soak with leases shadowed.
-- **Gate: leader-stall resilience.** Leases add a new failure mode. A leader that stalls
-  longer than `L` stops renewals, every primary fences itself, and writes stop cluster-wide.
-  Today a leader stall only hurts part of the system. So:
-  - The leader's renewal handling runs on its own task and connection, sharing no lock with
-    the metadata committer, the healer (`evict_pending`, discovery), compaction, or
-    chunk_map. This is the set that stalled gluster1 for 26 s on 2026-09-24.
-  - A test-only **stall injector** (next to the fault filter, same `DFS_FAULT_INJECTION`
-    opt-in) holds a named subsystem on one node for N seconds: metadata committer, healer
-    pending/stalled maps, compaction quiesce.
-  - Test A (partial stall): stall each of those subsystems on the leader for 3×`L`. Pass =
-    zero lease lapses and zero failovers anywhere, and client writes keep completing.
-  - Test B (whole leader gone): black-hole the leader completely for 3×`L`. Pass = writes
-    resume within a measured bound (leader failure detection + `L` + margin). That bound is
-    recorded, and it drives the choice of `L` and of the failure-detection timeout (today
-    `failure_timeout_secs` is 30 s in production and 120 s locally, which would make this
-    window far too long; Phase 1 has to bring leader-failure detection down to near `L`).
-  - `L` is chosen from Phase 0's measured stall distribution, comfortably above the worst
-    observed partial stall.
+**Phase 1 — Majority node leases** (1a built: majority leases, shadow only)
+- §6.1. Leases are held, lost, fenced and voted on, but nothing consults them yet.
+- Done in 1a: the state machines plus a seeded randomized simulation (5 nodes, random delays
+  and partitions, invariant checked every step, mutation-checked), and T58 on the real
+  cluster: isolated node fences before the majority vote (#5), the leader cut off costs the
+  others nothing (#4/#8), a 2|3 split fences exactly the minority (#15), heal and rejoin (#11).
+- Still to do in Phase 1:
+  - **Stall resilience.** A test-only **stall injector** (same `DFS_FAULT_INJECTION` opt-in as
+    the fault filter) holds a named subsystem on one node for N seconds: metadata committer,
+    healer pending/stalled maps, compaction quiesce. These are what stalled gluster1 for 26 s
+    on 2026-09-24. Pass = holding each for 3×`L` costs zero lease lapses anywhere. A
+    whole-process freeze (SIGSTOP) *should* cost that node its lease within `L − margin`,
+    and the majority vote it out: the gray-failure takeover of #12.
+  - **Asymmetric link (#14)** and **voter restart** (fences survive; abstention window) on the
+    real cluster.
+  - **Chaos gate:** random partitions, black-holes and kill/restart for several minutes. Every
+    majority expiry declaration is checked against the target's own lease end, both logged in
+    wall-clock ms: zero overlaps.
+  - **Flap guard (#13):** a minimum dwell time before a rejoined node counts as live again,
+    with backoff.
+  - `L` confirmed against Phase 0's staging `PEER RTT` numbers: comfortably above the worst
+    observed whole-process stall, or a deliberate choice to fail over through it.
+- Gate: all of the above plus the standard protocol (§8a). Staging soak with leases shadowed,
+  watching for spurious lapses.
 
 **Phase 2 — Primary-owned folds**
 - §6.5. Only the derived primary folds. The others fold on `FoldAt` and verify hashes.
@@ -365,8 +376,9 @@ until then.
 - Rollback: `enforce → shadow` is always safe because tokens keep working until Phase 5.
 
 ## 10. Risks
-- **Leader stall becomes a cluster-wide write stall** unless renewals are isolated. See the
-  Phase 1 leader-stall gate; this is the largest new risk leases introduce.
+- **Spurious failovers from short leases.** A 3 s lease means a node whose process or network
+  stalls for more than about 2.5 s gives up its slots. Failing over beats a hung guest, but
+  flapping is a risk: the Phase 1 stall and flap work and Phase 0's staging measurements decide `L`.
 - **Lease tuning vs stalls:** too short means spurious failovers during the known stalls;
   too long means slow failover. Mitigated by the dedicated renewal path, the measured stall
   distribution, and relayed renewal.

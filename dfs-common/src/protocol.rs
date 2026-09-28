@@ -1006,25 +1006,21 @@ pub enum Request {
         entries: Vec<SlotAuditEntry>,
     },
 
-    /// Leader-term discovery (SLOT-OWNERSHIP-PLAN.md Phase 1): a node about to lead
-    /// asks a majority for the highest term they have promised, then proposes one
-    /// higher. APPENDED at end to preserve wire compatibility.
-    GetLeaseTerm,
-
-    /// Ask this node to promise `term` to `leader`. Accepted only if newer than any
-    /// promise it has made (or the same term again from the same leader), and stored
-    /// durably before the answer. APPENDED at end to preserve wire compatibility.
-    PromiseLeaseTerm {
-        term: u64,
-        leader: NodeId,
-    },
-
-    /// A node renewing its own lease with the leader. `promised_term` lets a
-    /// deposed leader learn it has been superseded. APPENDED at end to preserve wire
-    /// compatibility.
+    /// A node renewing its lease (SLOT-OWNERSHIP-PLAN.md Phase 1, majority leases): the
+    /// receiver acks unless it has voted this incarnation of the node expired.
+    /// APPENDED at end to preserve wire compatibility.
     RenewNodeLease {
         node: NodeId,
-        promised_term: u64,
+        incarnation: u64,
+    },
+
+    /// Ask the receiver to vote `target` expired at `incarnation`: granted only if it
+    /// has not acked the target for lease + margin and knows no newer incarnation. A
+    /// grant fences that incarnation there, durably, before the answer.
+    /// APPENDED at end to preserve wire compatibility.
+    VoteLeaseExpired {
+        target: NodeId,
+        incarnation: u64,
     },
 
     /// This node's lease state, for dfs-admin and the local suite. APPENDED at end
@@ -1584,27 +1580,20 @@ pub enum Response {
         mismatches: Vec<SlotAuditMismatch>,
     },
 
-    /// Answer to `Request::GetLeaseTerm`. APPENDED at end to preserve wire compatibility.
-    LeaseTerm {
-        promised_term: u64,
-        promised_leader: Option<NodeId>,
+    /// Answer to `Request::RenewNodeLease`. `fenced` is the highest incarnation of the
+    /// renewing node this receiver has voted expired; a refused node rejoins above it.
+    /// APPENDED at end to preserve wire compatibility.
+    LeaseAck {
+        acked: bool,
+        fenced: u64,
     },
 
-    /// Answer to `Request::PromiseLeaseTerm`. APPENDED at end to preserve wire compatibility.
-    LeaseTermPromise {
-        accepted: bool,
-        promised_term: u64,
-    },
-
-    /// Answer to `Request::RenewNodeLease`. `granted` is false when the answering node
-    /// isn't an established leader or has lost its majority; the caller's lease is then
-    /// left to run out. `view` is the leader's view of every node's lease. APPENDED at
-    /// end to preserve wire compatibility.
-    NodeLeaseGrant {
+    /// Answer to `Request::VoteLeaseExpired`. `highest_seen` lets the asker abort a vote
+    /// on an incarnation that has already been superseded. APPENDED at end to preserve
+    /// wire compatibility.
+    LeaseExpiryVote {
         granted: bool,
-        term: u64,
-        leader: NodeId,
-        view: Vec<(NodeId, NodeLeaseState)>,
+        highest_seen: u64,
     },
 
     /// Answer to `Request::GetLeaseStatus`. APPENDED at end to preserve wire compatibility.
@@ -1867,16 +1856,15 @@ pub struct SlotAuditMismatch {
     pub finding: SlotAuditFinding,
 }
 
-/// The leader's view of one node's lease (SLOT-OWNERSHIP-PLAN.md Phase 1).
+/// How one node sees another's lease (SLOT-OWNERSHIP-PLAN.md Phase 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeLeaseState {
-    /// The node may be acting as primary.
+    /// Acked recently: the node may be acting as primary.
     Valid,
-    /// The node has certainly stopped acting as primary. Only this lets another
-    /// node take over its slots.
+    /// Voted expired by this node (and fenced here). Only a majority of these lets
+    /// another node take over its slots.
     Expired,
-    /// Can't say yet (a new leader waiting out the previous term's leases). Never
-    /// safe to take over from.
+    /// Silent, but not voted out: never safe to take over from.
     Unknown,
 }
 
@@ -1884,15 +1872,12 @@ pub enum NodeLeaseState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseStatusReport {
     pub node: NodeId,
-    pub promised_term: u64,
-    pub promised_leader: Option<NodeId>,
+    pub incarnation: u64,
     pub holds_lease: bool,
     pub lease_remaining_ms: u64,
-    pub granted_term: u64,
-    pub granted_by: Option<NodeId>,
-    /// The leader's view of every node, as of this node's last grant.
+    /// Acks (this node included) in its latest renewal round, and how many it needs.
+    pub acks_last_round: u64,
+    pub majority: u64,
+    /// How this node sees every other node it has heard from.
     pub view: Vec<(NodeId, NodeLeaseState)>,
-    /// Set only on a node that is an established leader.
-    pub leader_term: Option<u64>,
-    pub leader_has_majority: bool,
 }

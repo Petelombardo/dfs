@@ -48,8 +48,8 @@ pub struct Server {
     /// Network client for talking to other nodes
     client: Arc<NetworkClient>,
 
-    /// Leader terms and node leases (SLOT-OWNERSHIP-PLAN.md Phase 1). Has its own
-    /// network client and locks so nothing else on this node can stall a renewal.
+    /// Majority node leases (SLOT-OWNERSHIP-PLAN.md Phase 1). Has its own network
+    /// client and locks so nothing else on this node can stall a renewal.
     lease: Arc<crate::lease::LeaseRuntime>,
 
     /// Replication factor. `Arc<AtomicUsize>` — the same instance is handed to
@@ -1117,9 +1117,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetOrphanAuthInfo
         | Request::GetPatchState { .. }
         | Request::AuditSlots { .. }
-        | Request::GetLeaseTerm
-        | Request::PromiseLeaseTerm { .. }
-        | Request::RenewNodeLease { .. } => PeerOther,
+        | Request::RenewNodeLease { .. }
+        | Request::VoteLeaseExpired { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -7608,9 +7607,8 @@ impl Server {
                 self.handle_replicate_chunk_locations(locations, true).await
             }
             Request::AuditSlots { entries } => self.handle_audit_slots(entries).await,
-            Request::GetLeaseTerm => self.lease.handle_get_term(),
-            Request::PromiseLeaseTerm { term, leader } => self.lease.handle_promise(term, leader).await,
-            Request::RenewNodeLease { node, promised_term } => self.lease.handle_renew(node, promised_term),
+            Request::RenewNodeLease { node, incarnation } => self.lease.handle_renew(node, incarnation),
+            Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
             Request::GetLeaseStatus => Response::LeaseStatus { report: self.lease.status() },
             Request::SetPeerFilter { filter } => match crate::network::set_peer_filter(filter) {
                 Ok(()) => Response::Ok { data: None },

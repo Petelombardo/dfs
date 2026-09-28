@@ -81,7 +81,7 @@ enum Commands {
         cmd: FaultCommands,
     },
 
-    /// Leader terms and node leases (one JSON line per node given in --cluster).
+    /// Majority node leases (one JSON line per node given in --cluster).
     Lease {
         #[command(subcommand)]
         cmd: LeaseCommands,
@@ -90,7 +90,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum LeaseCommands {
-    /// Each node's promised term, its own lease, and the leader's view it last received.
+    /// Each node's incarnation, its own lease, and how it sees every other node.
     Status,
 }
 
@@ -313,16 +313,13 @@ async fn main() -> Result<()> {
                     Ok(Response::LeaseStatus { report }) => println!("{}", serde_json::json!({
                         "addr": addr.to_string(),
                         "node": report.node.to_string(),
-                        "promised_term": report.promised_term,
-                        "promised_leader": report.promised_leader.map(|n| n.to_string()),
+                        "incarnation": report.incarnation,
                         "holds_lease": report.holds_lease,
                         "lease_remaining_ms": report.lease_remaining_ms,
-                        "granted_term": report.granted_term,
-                        "granted_by": report.granted_by.map(|n| n.to_string()),
+                        "acks_last_round": report.acks_last_round,
+                        "majority": report.majority,
                         "view": report.view.iter().map(|(n, st)| (n.to_string(), format!("{:?}", st)))
                             .collect::<std::collections::BTreeMap<_, _>>(),
-                        "leader_term": report.leader_term,
-                        "leader_has_majority": report.leader_has_majority,
                     })),
                     Ok(other) => println!("{}", serde_json::json!({"addr": addr.to_string(), "error": format!("{:?}", other)})),
                     Err(e) => println!("{}", serde_json::json!({"addr": addr.to_string(), "error": e.to_string()})),

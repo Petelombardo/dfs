@@ -1,27 +1,31 @@
-//! Leader terms and node leases (SLOT-OWNERSHIP-PLAN.md Phase 1).
+//! Majority node leases (SLOT-OWNERSHIP-PLAN.md Phase 1).
 //!
-//! A node may act as primary for its slots only while it holds a lease from the
-//! leader. The whole scheme exists to guarantee one thing: **a node the leader has
-//! declared expired has already stopped acting as primary.** Everything below is
-//! arranged so that each side's clock errs in the safe direction:
+//! A node may act as primary for its slots only while it holds a lease, and it holds
+//! a lease only while a **majority** of the cluster keeps acknowledging its renewals.
+//! No leader is involved, so a leader's death costs no write availability; only the
+//! death or isolation of a node costs that node's slots, after about `lease + margin`.
 //!
-//! - The holder counts its lease from when it *sent* the renewal, not when the
-//!   grant arrived, and gives up `margin` early. So it stops no later than
-//!   `sent + lease - margin`.
-//! - The leader counts from when it *received* the renewal, which is after the send,
-//!   and adds `margin`. So it declares expiry no earlier than `recv + lease + margin`.
+//! The guarantee everything below serves: **once a majority has voted node P expired
+//! at incarnation i, P holds no lease at any incarnation <= i.**
 //!
-//! Leadership changes are ordered by terms. A leader must win a promise for a new
-//! term from a majority before granting anything, and may grant only while a
-//! majority keeps renewing with it under that term. A deposed leader on the minority
-//! side of a partition therefore loses the ability to grant within one lease period.
-//! Its last grant can run one more lease period, so a new leader treats every node
-//! as `Unknown` (never `Expired`) for `2 * lease + margin` after establishing its
-//! term. That wait replaces a replicated lease table: nothing about old leases has
-//! to survive a leadership change.
+//! - Renewal: P asks every peer. Each ack is recorded by the voter at its receive time.
+//!   P holds its lease until `sent + lease - margin` if a majority (P included) acked a
+//!   renewal it sent at `sent`. Counting from the send and giving up a margin early
+//!   errs toward P stopping sooner.
+//! - Expiry vote: a voter votes P expired only if it has not acked P for
+//!   `lease + margin`. Once it votes, it refuses P's renewals at or below that
+//!   incarnation. Any majority that kept P's lease alive shares at least one voter with
+//!   any majority that voted P out, and that voter can do neither inside the other's
+//!   window. After a vote, every majority P could reach contains a voter that refuses it.
+//! - A vote names the incarnation it expires. Each voter answers with the highest
+//!   incarnation it has seen from P, and the vote fails if any voter has seen a newer
+//!   one: P's latest lease came from a majority, so some voter in any majority knows it.
+//! - A voter persists its fences before answering, and casts no expiry vote for
+//!   `lease + margin` after starting, because it may have acked P just before a crash.
+//! - A fenced node rejoins by renewing under a higher incarnation.
 //!
 //! All decision logic takes `now` as a parameter and does no I/O, so the safety
-//! properties are tested deterministically rather than by racing real clocks.
+//! properties are tested deterministically, including a seeded randomized simulation.
 
 use dfs_common::NodeId;
 use serde::{Deserialize, Serialize};
@@ -36,12 +40,14 @@ pub struct LeaseConfig {
 }
 
 impl LeaseConfig {
-    /// DFS_LEASE_MS (default 10000) and DFS_LEASE_MARGIN_MS (default 1000).
+    /// DFS_LEASE_MS (default 3000) and DFS_LEASE_MARGIN_MS (default 500). Short on
+    /// purpose: a primary's failover takes about lease + margin, and it has to fit well
+    /// inside a guest's 30 s SCSI timeout.
     pub fn from_env() -> Self {
         let ms = |k: &str, d: u64| {
             Duration::from_millis(std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d))
         };
-        Self { lease: ms("DFS_LEASE_MS", 10_000), margin: ms("DFS_LEASE_MARGIN_MS", 1_000) }
+        Self { lease: ms("DFS_LEASE_MS", 3_000), margin: ms("DFS_LEASE_MARGIN_MS", 500) }
     }
 
     /// How often a holder renews: three chances per lease period.
@@ -49,107 +55,55 @@ impl LeaseConfig {
         self.lease / 3
     }
 
-    /// How long a newly established leader treats every node as `Unknown`.
-    pub fn takeover_wait(&self) -> Duration {
-        self.lease * 2 + self.margin
+    /// How long a voter must not have acked a node before voting it expired, and how
+    /// long a restarted voter abstains.
+    pub fn silence(&self) -> Duration {
+        self.lease + self.margin
     }
 }
 
-/// The leader's view of one node's lease, as published to every node.
+/// How one node sees another's lease, for status reports and (from Phase 3) primary
+/// takeover. Only `Expired` makes it safe to act in that node's place.
 pub use dfs_common::NodeLeaseState as LeaseState;
 
 // ---------------------------------------------------------------------------
-// Leader side
+// Holder side
 // ---------------------------------------------------------------------------
 
-/// State kept only by the node that currently believes it is leader.
+/// A node's own lease.
 #[derive(Debug)]
-pub struct LeaderState {
-    pub term: u64,
-    established_at: Instant,
-    /// When each node's latest renewal under this term arrived.
-    last_renewal: HashMap<NodeId, Instant>,
-}
-
-impl LeaderState {
-    /// Called once a majority has promised `term`.
-    pub fn established(term: u64, now: Instant) -> Self {
-        Self { term, established_at: now, last_renewal: HashMap::new() }
-    }
-
-    /// Record a renewal from `node` that arrived at `now`, and answer it. The
-    /// leader's own renewals come through here too; they count toward its majority.
-    /// Returns false (no grant) unless the leader still has a majority behind it.
-    pub fn renew(&mut self, node: NodeId, now: Instant, cluster_size: usize, cfg: &LeaseConfig) -> bool {
-        self.last_renewal.insert(node, now);
-        self.has_majority(now, cluster_size, cfg)
-    }
-
-    /// Every node that has renewed under this term.
-    pub fn known_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.last_renewal.keys().copied()
-    }
-
-    /// A majority of the cluster (the leader included) has renewed within the last
-    /// lease period. Without it this leader may already be deposed, so it grants nothing.
-    pub fn has_majority(&self, now: Instant, cluster_size: usize, cfg: &LeaseConfig) -> bool {
-        let fresh = self.last_renewal.values()
-            .filter(|t| now.saturating_duration_since(**t) < cfg.lease)
-            .count();
-        fresh >= cluster_size / 2 + 1
-    }
-
-    /// This leader's view of `node`'s lease. `Expired` only once the node has
-    /// provably stopped: `lease + margin` past its last renewal's arrival, and the
-    /// takeover wait for leases from earlier terms has passed.
-    pub fn state_of(&self, node: NodeId, now: Instant, cfg: &LeaseConfig) -> LeaseState {
-        if let Some(t) = self.last_renewal.get(&node) {
-            if now.saturating_duration_since(*t) < cfg.lease + cfg.margin {
-                return LeaseState::Valid;
-            }
-        }
-        if now.saturating_duration_since(self.established_at) < cfg.takeover_wait() {
-            LeaseState::Unknown
-        } else {
-            LeaseState::Expired
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Holder side (every node, the leader included)
-// ---------------------------------------------------------------------------
-
-/// A node's own lease, plus the latest lease view the leader sent it.
-#[derive(Debug, Default)]
 pub struct HolderState {
-    /// End of this node's own lease, already shortened by `margin`.
+    pub incarnation: u64,
     valid_until: Option<Instant>,
-    /// Term and leader of the grant behind `valid_until`.
-    pub granted_term: u64,
-    pub granted_by: Option<NodeId>,
-    /// The leader's view of every node, as of the last grant.
-    pub view: HashMap<NodeId, LeaseState>,
 }
 
 impl HolderState {
-    /// A grant arrived for a renewal this node sent at `sent_at`.
-    pub fn on_grant(&mut self, sent_at: Instant, term: u64, leader: NodeId,
-                    view: HashMap<NodeId, LeaseState>, cfg: &LeaseConfig) {
-        let until = sent_at + cfg.lease.saturating_sub(cfg.margin);
-        // Never let an older term's grant, or a reordered earlier grant, move the
-        // lease around: keep the latest end within the highest term seen.
-        if term > self.granted_term || self.valid_until.is_none_or(|u| until > u) {
-            self.valid_until = Some(until);
-        }
-        if term >= self.granted_term {
-            self.granted_term = term;
-            self.granted_by = Some(leader);
-            self.view = view;
+    pub fn new(incarnation: u64) -> Self {
+        Self { incarnation, valid_until: None }
+    }
+
+    /// A renewal round sent at `sent` got `acks` acknowledgements, this node included.
+    pub fn on_round(&mut self, sent: Instant, acks: usize, majority: usize, cfg: &LeaseConfig) {
+        if acks >= majority {
+            let until = sent + cfg.lease.saturating_sub(cfg.margin);
+            if self.valid_until.is_none_or(|u| until > u) {
+                self.valid_until = Some(until);
+            }
         }
     }
 
-    /// Whether this node may act as primary right now.
+    /// A voter said this node is fenced at `fenced`: drop the lease and rejoin above it.
+    /// Returns true if the incarnation changed (the caller persists it before renewing).
+    pub fn on_fenced(&mut self, fenced: u64) -> bool {
+        if fenced >= self.incarnation {
+            self.incarnation = fenced + 1;
+            self.valid_until = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn holds_lease(&self, now: Instant) -> bool {
         self.valid_until.is_some_and(|u| now < u)
     }
@@ -159,24 +113,113 @@ impl HolderState {
     }
 }
 
-/// The primary for a slot with in-sync replica list `isr` (ordered; see the plan's
-/// "ISR order"): its first member whose lease is live. `me` is judged by its own
-/// lease, everyone else by the leader's published view, where only `Expired` lets
-/// the next member take over. Returns None if the first live-or-unknown member is
-/// not provably the primary (a member ahead of it is `Unknown`).
-pub fn primary_of(isr: &[NodeId], me: NodeId, holder: &HolderState, now: Instant) -> Option<NodeId> {
-    for &n in isr {
-        let live = if n == me {
-            holder.holds_lease(now)
+// ---------------------------------------------------------------------------
+// Voter side (every node, about every other node)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ack {
+    pub acked: bool,
+    /// Highest incarnation of the renewing node this voter has fenced.
+    pub fenced: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vote {
+    pub granted: bool,
+    /// Highest incarnation of the target this voter has seen renew.
+    pub highest_seen: u64,
+}
+
+/// What this node knows about other nodes' leases. `fences` must be persisted
+/// before a granted vote is reported (see `LeaseStateFile`).
+#[derive(Debug)]
+pub struct VoterState {
+    started_at: Instant,
+    /// Last ack given to each node: when (receive time) and the highest incarnation seen.
+    last_ack: HashMap<NodeId, (Instant, u64)>,
+    /// Highest incarnation of each node this voter has voted expired.
+    pub fences: HashMap<NodeId, u64>,
+}
+
+impl VoterState {
+    pub fn new(started_at: Instant, fences: HashMap<NodeId, u64>) -> Self {
+        Self { started_at, last_ack: HashMap::new(), fences }
+    }
+
+    pub fn on_renew(&mut self, node: NodeId, incarnation: u64, now: Instant) -> Ack {
+        let fenced = self.fences.get(&node).copied().unwrap_or(0);
+        if self.fences.contains_key(&node) && incarnation <= fenced {
+            return Ack { acked: false, fenced };
+        }
+        let seen = self.last_ack.get(&node).map_or(incarnation, |(_, i)| (*i).max(incarnation));
+        self.last_ack.insert(node, (now, seen));
+        Ack { acked: true, fenced }
+    }
+
+    /// Whether this voter could vote `target` expired now: it has been silent about
+    /// the target for long enough, and it isn't still in its post-restart abstention.
+    pub fn could_vote(&self, target: NodeId, now: Instant, cfg: &LeaseConfig) -> bool {
+        if now.saturating_duration_since(self.started_at) < cfg.silence() {
+            return false;
+        }
+        self.last_ack.get(&target).is_none_or(|(t, _)| now.saturating_duration_since(*t) >= cfg.silence())
+    }
+
+    /// Whether this voter has ever acked or fenced `target`. A node nobody here has
+    /// heard from holds no lease this voter helped grant, so there is nothing to expire.
+    pub fn has_seen(&self, target: NodeId) -> bool {
+        self.last_ack.contains_key(&target) || self.fences.contains_key(&target)
+    }
+
+    pub fn highest_seen(&self, target: NodeId) -> u64 {
+        let acked = self.last_ack.get(&target).map_or(0, |(_, i)| *i);
+        acked.max(self.fences.get(&target).copied().unwrap_or(0))
+    }
+
+    /// Vote `target` expired at `incarnation`. A grant fences the target here (the
+    /// caller must persist `fences` before reporting it).
+    pub fn on_vote(&mut self, target: NodeId, incarnation: u64, now: Instant, cfg: &LeaseConfig) -> Vote {
+        let highest_seen = self.highest_seen(target);
+        let granted = highest_seen <= incarnation && self.could_vote(target, now, cfg);
+        if granted {
+            let f = self.fences.entry(target).or_insert(incarnation);
+            *f = (*f).max(incarnation);
+        }
+        Vote { granted, highest_seen }
+    }
+
+    /// How this voter sees `node` right now.
+    pub fn state_of(&self, node: NodeId, now: Instant, cfg: &LeaseConfig) -> LeaseState {
+        let highest = self.highest_seen(node);
+        if self.fences.get(&node).is_some_and(|f| *f >= highest) {
+            LeaseState::Expired
+        } else if self.last_ack.get(&node).is_some_and(|(t, _)| now.saturating_duration_since(*t) < cfg.silence()) {
+            LeaseState::Valid
         } else {
-            match holder.view.get(&n) {
-                Some(LeaseState::Valid) => true,
-                Some(LeaseState::Expired) => false,
-                // Unknown, or not in the view at all: can't skip past it safely.
-                Some(LeaseState::Unknown) | None => return None,
-            }
-        };
-        if live {
+            LeaseState::Unknown
+        }
+    }
+
+    pub fn known_nodes(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self.last_ack.keys().chain(self.fences.keys()).copied().collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+}
+
+/// The primary for a slot with in-sync replica list `isr` (ordered, see the plan's
+/// "ISR order"): its first member that isn't provably out. `me` is judged by its own
+/// lease. Any other member can be skipped only once a majority has voted it expired
+/// (`expired` answers that); anything less means it may still be acting as primary.
+pub fn primary_of(isr: &[NodeId], me: NodeId, holds_own_lease: bool,
+                  expired: impl Fn(NodeId) -> bool) -> Option<NodeId> {
+    for &n in isr {
+        if n == me {
+            return holds_own_lease.then_some(me);
+        }
+        if !expired(n) {
             return Some(n);
         }
     }
@@ -184,37 +227,54 @@ pub fn primary_of(isr: &[NodeId], me: NodeId, holder: &HolderState, now: Instant
 }
 
 // ---------------------------------------------------------------------------
-// Promised term (durable, every node)
+// Persistence
 // ---------------------------------------------------------------------------
 
-/// The highest term this node has promised, and to whom. Durable: a node that
-/// forgot its promise across a restart could help two leaders win the same term.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Promise {
-    pub term: u64,
-    pub leader: Option<NodeId>,
+/// This node's durable lease state: its own incarnation and the fences it has voted.
+/// A voter that forgot its fences across a restart could ack a node it had voted
+/// out, and let that node renew after another took over its slots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableLeaseState {
+    pub incarnation: u64,
+    pub fences: HashMap<NodeId, u64>,
 }
 
-impl Promise {
-    /// Accept `term` from `leader` if it's newer than anything promised, or the same
-    /// term again from the same leader (a retry). Returns whether it was accepted.
-    pub fn offer(&mut self, term: u64, leader: NodeId) -> bool {
-        if term > self.term || (term == self.term && self.leader == Some(leader)) {
-            self.term = term;
-            self.leader = Some(leader);
-            true
-        } else {
-            false
+pub struct LeaseStateFile {
+    path: PathBuf,
+}
+
+impl LeaseStateFile {
+    pub fn new(dir: &Path) -> Self {
+        Self { path: dir.join("lease_state.json") }
+    }
+
+    pub fn load(&self) -> DurableLeaseState {
+        std::fs::read(&self.path).ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write-then-rename with fsync, so a crash leaves either the old or the new state.
+    pub fn store(&self, s: &DurableLeaseState) -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = self.path.with_extension("json.tmp");
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec(s).expect("lease state serializes"))?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(dir) = self.path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
         }
+        Ok(())
     }
 }
 
 /// The largest cluster membership this node has ever seen, persisted. Majorities are
 /// counted over at least this many nodes. Counting over the membership a node happens
 /// to know right now is unsound: a node that has just started knows only itself, and
-/// on the first local run of this code all five nodes each won "1 of 1" and led term 1
+/// on the first local run of the leader-lease version all five nodes each won "1 of 1"
 /// at once. A permanently removed node keeps the majority at the old size until this
-/// is lowered, which makes leases harder to win, never easier.
+/// is lowered, which makes leases harder to hold, never easier.
 pub struct MembershipFile {
     path: PathBuf,
 }
@@ -238,73 +298,41 @@ impl MembershipFile {
     }
 }
 
-pub struct PromiseFile {
-    path: PathBuf,
-}
-
-impl PromiseFile {
-    pub fn new(dir: &Path) -> Self {
-        Self { path: dir.join("lease_promise.json") }
-    }
-
-    pub fn load(&self) -> Promise {
-        std::fs::read(&self.path).ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
-    }
-
-    /// Write-then-rename with fsync, so a crash leaves either the old or the new promise.
-    pub fn store(&self, p: &Promise) -> std::io::Result<()> {
-        use std::io::Write;
-        let tmp = self.path.with_extension("json.tmp");
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&serde_json::to_vec(p).expect("Promise always serializes"))?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            std::fs::File::open(dir)?.sync_all()?;
-        }
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Runtime: the loops and request handlers that drive the state machines above
+// Runtime: the loop and request handlers that drive the state machines above
 // ---------------------------------------------------------------------------
 
 use crate::cluster::ClusterManager;
 use crate::network::NetworkClient;
 use dfs_common::{LeaseStatusReport, Message, Request, Response};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Owns all lease state for this node. Deliberately isolated: its locks are its own
-/// std Mutexes, held only for in-memory updates, and the renewal handler never
-/// touches the metadata DB, the healer, chunk_map or the cluster membership lock.
-/// A stall in any of those must not cost anyone a lease (plan: Phase 1 leader-stall gate).
+/// std Mutexes, held only for in-memory updates; it has its own network client; and
+/// the renewal handler never touches the metadata DB, the healer, chunk_map or the
+/// cluster membership lock. A stall in any of those must not cost anyone a lease.
 pub struct LeaseRuntime {
     cfg: LeaseConfig,
     me: NodeId,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
-    promise_file: PromiseFile,
-    promise: Mutex<Promise>,
-    leader: Mutex<Option<LeaderState>>,
-    holder: Mutex<HolderState>,
-    /// The size majorities are counted over: max(membership known now, persisted
-    /// high-water mark, DFS_LEASE_CLUSTER_SIZE). Refreshed by the loop so the renewal
-    /// handler never takes the cluster membership lock.
-    cluster_size: std::sync::atomic::AtomicUsize,
+    state_file: LeaseStateFile,
     membership_file: MembershipFile,
-    /// Whether this node held its lease at the end of the previous tick.
-    held_last_tick: std::sync::atomic::AtomicBool,
-    /// Nodes already logged as Expired (each transition is logged once).
-    expired_logged: Mutex<std::collections::BTreeSet<NodeId>>,
-    /// Wall-clock end of the lease this node last held, for the "lost" log line.
+    holder: Mutex<HolderState>,
+    voter: Mutex<VoterState>,
+    /// The size majorities are counted over: max(membership known now, persisted
+    /// high-water mark, DFS_LEASE_CLUSTER_SIZE). Refreshed by the loop.
+    cluster_size: AtomicUsize,
+    held_last_tick: AtomicBool,
     last_until_wall_ms: Mutex<Option<u128>>,
+    acks_last_round: AtomicUsize,
+    /// (node, incarnation) this node has already seen voted expired by a majority.
+    declared: Mutex<HashMap<NodeId, u64>>,
 }
 
-/// Wall-clock milliseconds for an `Instant`, for logs that a test compares across processes.
+/// Wall-clock milliseconds for an `Instant`, for logs that tests compare across processes.
 fn wall_ms(at: Instant) -> u128 {
     let now_i = Instant::now();
     let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -317,8 +345,8 @@ fn wall_ms(at: Instant) -> u128 {
 
 impl LeaseRuntime {
     pub fn new(me: NodeId, cluster: Arc<ClusterManager>, client: Arc<NetworkClient>, dir: &Path) -> Self {
-        let promise_file = PromiseFile::new(dir);
-        let promise = promise_file.load();
+        let state_file = LeaseStateFile::new(dir);
+        let durable = state_file.load();
         let membership_file = MembershipFile::new(dir);
         let floor = std::env::var("DFS_LEASE_CLUSTER_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize);
         let size = membership_file.load().max(floor).max(1);
@@ -327,407 +355,414 @@ impl LeaseRuntime {
             me,
             cluster,
             client,
-            promise_file,
-            promise: Mutex::new(promise),
-            leader: Mutex::new(None),
-            holder: Mutex::new(HolderState::default()),
-            cluster_size: std::sync::atomic::AtomicUsize::new(size),
+            state_file,
             membership_file,
-            held_last_tick: std::sync::atomic::AtomicBool::new(false),
-            expired_logged: Mutex::new(std::collections::BTreeSet::new()),
+            holder: Mutex::new(HolderState::new(durable.incarnation)),
+            voter: Mutex::new(VoterState::new(Instant::now(), durable.fences)),
+            cluster_size: AtomicUsize::new(size),
+            held_last_tick: AtomicBool::new(false),
             last_until_wall_ms: Mutex::new(None),
+            acks_last_round: AtomicUsize::new(0),
+            declared: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn start(self: Arc<Self>) {
-        let rt = self.clone();
+        info!("LEASE: started (lease {:?}, margin {:?}, majority of {})",
+            self.cfg.lease, self.cfg.margin, self.cluster_size.load(Ordering::Relaxed));
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(rt.cfg.renew_every());
+            let mut tick = tokio::time::interval(self.cfg.renew_every());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                rt.refresh_cluster_size().await;
-                rt.lead_if_leader().await;
-                rt.renew_own_lease().await;
+                let peers = self.refresh_peers().await;
+                self.renew_round(&peers).await;
+                self.expire_silent_peers(&peers).await;
             }
         });
-        info!("LEASE: started (lease {:?}, margin {:?})", self.cfg.lease, self.cfg.margin);
-    }
-
-    async fn refresh_cluster_size(&self) {
-        let known = self.cluster.get_all_nodes().await.len();
-        let current = self.cluster_size.load(std::sync::atomic::Ordering::Relaxed);
-        if known > current {
-            // Grow only. Persist before using it, so a restart can't forget a larger cluster.
-            let file = MembershipFile { path: self.membership_file.path.clone() };
-            if matches!(tokio::task::spawn_blocking(move || file.store(known)).await, Ok(Ok(()))) {
-                self.cluster_size.store(known, std::sync::atomic::Ordering::Relaxed);
-                info!("LEASE: membership high-water now {} (majority {})", known, known / 2 + 1);
-            }
-        }
     }
 
     fn majority(&self) -> usize {
-        self.cluster_size.load(std::sync::atomic::Ordering::Relaxed) / 2 + 1
+        self.cluster_size.load(Ordering::Relaxed) / 2 + 1
     }
 
-    /// Become an established leader (win a term from a majority) if membership says
-    /// this node leads, or drop leader state if it no longer does.
-    async fn lead_if_leader(&self) {
-        let should_lead = self.cluster.is_leader().await;
-        let leading = self.leader.lock().unwrap().is_some();
-        if !should_lead {
-            if leading {
-                *self.leader.lock().unwrap() = None;
-                info!("LEASE: no longer leader; stopped granting");
-            }
-            return;
-        }
-        if leading {
-            return;
-        }
-        // Discover the highest term a majority has promised.
-        let peers: Vec<_> = self.cluster.get_all_nodes().await.into_iter()
-            .filter(|n| n.id != self.me && n.status == dfs_common::NodeStatus::Online)
-            .collect();
-        let mut max_term = self.promise.lock().unwrap().term;
-        let mut answered = 1; // this node
-        for p in &peers {
-            if let Some(Response::LeaseTerm { promised_term, .. }) = self.ask(p.addr, Request::GetLeaseTerm).await {
-                answered += 1;
-                max_term = max_term.max(promised_term);
+    /// Every other known member (their status doesn't matter: renewals to a dead node
+    /// just fail), and grow the persisted membership high-water mark if needed.
+    async fn refresh_peers(&self) -> Vec<(NodeId, std::net::SocketAddr)> {
+        let nodes = self.cluster.get_all_nodes().await;
+        let known = nodes.len();
+        if known > self.cluster_size.load(Ordering::Relaxed) {
+            let file = MembershipFile { path: self.membership_file.path.clone() };
+            if matches!(tokio::task::spawn_blocking(move || file.store(known)).await, Ok(Ok(()))) {
+                self.cluster_size.store(known, Ordering::Relaxed);
+                info!("LEASE: membership high-water now {} (majority {})", known, known / 2 + 1);
             }
         }
-        if answered < self.majority() {
-            debug!("LEASE: term discovery reached {} of {} needed", answered, self.majority());
-            return;
-        }
-        let term = max_term + 1;
-        if !self.accept_promise(term, self.me).await {
-            return;
-        }
-        let mut accepted = 1;
-        for p in &peers {
-            if let Some(Response::LeaseTermPromise { accepted: true, .. }) =
-                self.ask(p.addr, Request::PromiseLeaseTerm { term, leader: self.me }).await
-            {
-                accepted += 1;
-            }
-        }
-        if accepted >= self.majority() {
-            *self.leader.lock().unwrap() = Some(LeaderState::established(term, Instant::now()));
-            info!("LEASE: established as leader for term {} ({} of {} promised); every node Unknown for {:?}",
-                term, accepted, self.cluster_size.load(std::sync::atomic::Ordering::Relaxed), self.cfg.takeover_wait());
-        } else {
-            info!("LEASE: term {} won only {} promises (need {}); will retry", term, accepted, self.majority());
-        }
+        nodes.into_iter().filter(|n| n.id != self.me).map(|n| (n.id, n.addr)).collect()
     }
 
-    async fn ask(&self, addr: std::net::SocketAddr, req: Request) -> Option<Response> {
-        match self.client.send_message_timeout(addr, Message::Request(req), self.cfg.renew_every()).await {
-            Ok(env) => match env.message {
-                Message::Response(r) => Some(r),
-                _ => None,
-            },
-            Err(e) => {
-                debug!("LEASE: {} unreachable: {}", addr, e);
-                None
-            }
-        }
-    }
-
-    /// Promise `term` to `leader` if allowed, persisting before answering. A promise
-    /// that isn't on disk doesn't count: a restart must not forget it.
-    async fn accept_promise(&self, term: u64, leader: NodeId) -> bool {
-        let mut next = *self.promise.lock().unwrap();
-        if !next.offer(term, leader) {
-            return false;
-        }
-        let file = PromiseFile { path: self.promise_file.path.clone() };
-        let stored = tokio::task::spawn_blocking(move || file.store(&next)).await;
-        if !matches!(stored, Ok(Ok(()))) {
-            warn!("LEASE: failed to persist promise of term {} to {}: {:?}", term, leader, stored);
-            return false;
-        }
-        let mut p = self.promise.lock().unwrap();
-        if next.term >= p.term {
-            *p = next;
-        }
-        // Promising a newer term to someone else deposes any leadership held here.
-        let mut l = self.leader.lock().unwrap();
-        if l.as_ref().is_some_and(|s| s.term < term) && leader != self.me {
-            *l = None;
-            info!("LEASE: promised term {} to {}; stepped down", term, leader);
-        }
-        true
-    }
-
-    /// Renew this node's own lease with whoever membership says leads.
-    async fn renew_own_lease(&self) {
-        let sent = Instant::now();
-        let promised_term = self.promise.lock().unwrap().term;
-        let leader_addr = self.cluster.get_leader_addr().await;
-        let answer = if leader_addr == Some(self.cluster.local_addr()) {
-            Some(self.handle_renew(self.me, promised_term))
-        } else if let Some(addr) = leader_addr {
-            self.ask(addr, Request::RenewNodeLease { node: self.me, promised_term }).await
-        } else {
-            None
+    async fn persist(&self) -> bool {
+        let durable = DurableLeaseState {
+            incarnation: self.holder.lock().unwrap().incarnation,
+            fences: self.voter.lock().unwrap().fences.clone(),
         };
-        if let Some(Response::NodeLeaseGrant { granted: true, term, leader, view }) = answer {
-            if term < self.promise.lock().unwrap().term {
-                debug!("LEASE: ignoring grant from term {} (promised a newer one)", term);
-            } else {
-                let mut h = self.holder.lock().unwrap();
-                let old_view = std::mem::take(&mut h.view);
-                h.on_grant(sent, term, leader, view.into_iter().collect(), &self.cfg);
-                for (n, st) in &h.view {
-                    if old_view.get(n) != Some(st) {
-                        info!("LEASE view: node {} is {:?} (term {})", n, st, term);
+        let file = LeaseStateFile { path: self.state_file.path.clone() };
+        match tokio::task::spawn_blocking(move || file.store(&durable)).await {
+            Ok(Ok(())) => true,
+            other => {
+                warn!("LEASE: failed to persist lease state: {:?}", other);
+                false
+            }
+        }
+    }
+
+    async fn ask_all(&self, peers: &[(NodeId, std::net::SocketAddr)], req: Request) -> Vec<(NodeId, Response)> {
+        let timeout = self.cfg.renew_every();
+        let calls = peers.iter().map(|(id, addr)| {
+            let client = self.client.clone();
+            let req = req.clone();
+            let (id, addr) = (*id, *addr);
+            async move {
+                match client.send_message_timeout(addr, Message::Request(req), timeout).await {
+                    Ok(env) => match env.message {
+                        Message::Response(r) => Some((id, r)),
+                        _ => None,
+                    },
+                    Err(e) => {
+                        debug!("LEASE: {} ({}) unreachable: {}", id, addr, e);
+                        None
                     }
                 }
             }
+        });
+        futures::future::join_all(calls).await.into_iter().flatten().collect()
+    }
+
+    async fn renew_round(&self, peers: &[(NodeId, std::net::SocketAddr)]) {
+        let sent = Instant::now();
+        let incarnation = self.holder.lock().unwrap().incarnation;
+        let replies = self.ask_all(peers, Request::RenewNodeLease { node: self.me, incarnation }).await;
+        let mut acks = 1; // this node
+        let mut fenced_at = None;
+        for (_, r) in &replies {
+            if let Response::LeaseAck { acked, fenced } = r {
+                if *acked {
+                    acks += 1;
+                } else {
+                    fenced_at = Some(fenced_at.unwrap_or(0).max(*fenced));
+                }
+            }
         }
-        let h = self.holder.lock().unwrap();
+        self.acks_last_round.store(acks, Ordering::Relaxed);
+        if let Some(f) = fenced_at {
+            let bumped = self.holder.lock().unwrap().on_fenced(f);
+            if bumped && self.persist().await {
+                info!("LEASE own: fenced at incarnation {}; rejoining as {}", f, f + 1);
+            }
+        }
+        let majority = self.majority();
+        self.holder.lock().unwrap().on_round(sent, acks, majority, &self.cfg);
+
         let now = Instant::now();
-        let has = h.holds_lease(now);
-        // Compare with the previous tick, not with the send time: a refused renewal fails
-        // instantly, so the lease usually lapses between ticks rather than during one.
-        let had = self.held_last_tick.swap(has, std::sync::atomic::Ordering::Relaxed);
+        let (has, remaining, inc) = {
+            let h = self.holder.lock().unwrap();
+            (h.holds_lease(now), h.remaining(now), h.incarnation)
+        };
+        // Compare with the previous tick, not the send time: a refused renewal fails
+        // instantly, so a lease usually lapses between ticks rather than during one.
+        let had = self.held_last_tick.swap(has, Ordering::Relaxed);
         if has && !had {
-            info!("LEASE own: acquired (term {}, until_wall_ms {})", h.granted_term, wall_ms(now + h.remaining(now)));
-        } else if has {
-            debug!("LEASE own: renewed, until_wall_ms {}", wall_ms(now + h.remaining(now)));
-        } else if had {
-            // The exact end, so a test can check it precedes the leader's Expired declaration.
-            info!("LEASE own: lost; it ended at wall_ms {}",
+            info!("LEASE own: acquired (incarnation {}, {} of {} acked, until_wall_ms {})",
+                inc, acks, self.cluster_size.load(Ordering::Relaxed), wall_ms(now + remaining));
+        } else if !has && had {
+            // The exact end, so a test can check it precedes any expiry declaration.
+            info!("LEASE own: lost ({} acks, need {}); it ended at wall_ms {}", acks, majority,
                 self.last_until_wall_ms.lock().unwrap().map_or("?".to_string(), |w| w.to_string()));
         }
         if has {
-            *self.last_until_wall_ms.lock().unwrap() = Some(wall_ms(now + h.remaining(now)));
+            *self.last_until_wall_ms.lock().unwrap() = Some(wall_ms(now + remaining));
         }
     }
 
-    /// Leader-side answer to a renewal. Pure in-memory work under this runtime's own locks.
-    pub fn handle_renew(&self, node: NodeId, promised_term: u64) -> Response {
+    /// Ask a majority to vote expired any peer this node has heard nothing from for
+    /// `lease + margin`. In Phase 1 the result is only logged; from Phase 3 it's what
+    /// lets a secondary take over the silent node's slots.
+    async fn expire_silent_peers(&self, peers: &[(NodeId, std::net::SocketAddr)]) {
         let now = Instant::now();
-        let size = self.cluster_size.load(std::sync::atomic::Ordering::Relaxed);
-        let mut guard = self.leader.lock().unwrap();
-        let Some(state) = guard.as_mut() else {
-            return Response::NodeLeaseGrant { granted: false, term: 0, leader: self.me, view: vec![] };
-        };
-        if promised_term > state.term {
-            // The renewing node has promised a newer term: this leadership is over.
-            info!("LEASE: node {} promised term {} > ours {}; stepping down", node, promised_term, state.term);
-            *guard = None;
-            return Response::NodeLeaseGrant { granted: false, term: promised_term, leader: self.me, view: vec![] };
-        }
-        let granted = state.renew(node, now, size, &self.cfg);
-        let term = state.term;
-        let view = self.view_of(state, now);
-        Response::NodeLeaseGrant { granted, term, leader: self.me, view }
-    }
-
-    fn view_of(&self, state: &LeaderState, now: Instant) -> Vec<(NodeId, LeaseState)> {
-        let mut ids: Vec<NodeId> = state.known_nodes().collect();
-        ids.sort();
-        let mut out = Vec::with_capacity(ids.len());
-        let mut logged = self.expired_logged.lock().unwrap();
-        for id in ids {
-            let st = state.state_of(id, now, &self.cfg);
-            if st == LeaseState::Expired && logged.insert(id) {
-                info!("LEASE leader: node {} Expired at wall_ms {} (term {})", id, wall_ms(now), state.term);
-            } else if st != LeaseState::Expired {
-                logged.remove(&id);
+        let ids: Vec<NodeId> = peers.iter().map(|(id, _)| *id).collect();
+        for (target, inc) in self.expiry_candidates(&ids, now) {
+            let mine = self.voter.lock().unwrap().on_vote(target, inc, now, &self.cfg);
+            if !mine.granted || !self.persist().await {
+                continue;
             }
-            out.push((id, st));
+            let replies = self.ask_all(peers, Request::VoteLeaseExpired { target, incarnation: inc }).await;
+            let mut votes = 1;
+            let mut newer = None;
+            for (_, r) in &replies {
+                if let Response::LeaseExpiryVote { granted, highest_seen } = r {
+                    if *highest_seen > inc {
+                        newer = Some(*highest_seen);
+                    } else if *granted {
+                        votes += 1;
+                    }
+                }
+            }
+            if let Some(n) = newer {
+                debug!("LEASE: vote on {} at incarnation {} saw newer incarnation {}; not declared", target, inc, n);
+            } else if votes >= self.majority() {
+                self.declared.lock().unwrap().insert(target, inc);
+                info!("LEASE takeover: node {} incarnation {} expired by majority ({} of {} votes) at wall_ms {}",
+                    target, inc, votes, self.cluster_size.load(Ordering::Relaxed), wall_ms(Instant::now()));
+            }
         }
-        out
     }
 
-    pub fn handle_get_term(&self) -> Response {
-        let p = *self.promise.lock().unwrap();
-        Response::LeaseTerm { promised_term: p.term, promised_leader: p.leader }
+    /// Peers this node should ask a majority to expire: heard from before, silent here
+    /// for lease + margin, and not already declared at their latest incarnation.
+    fn expiry_candidates(&self, peers: &[NodeId], now: Instant) -> Vec<(NodeId, u64)> {
+        let v = self.voter.lock().unwrap();
+        let declared = self.declared.lock().unwrap();
+        peers.iter()
+            .map(|id| (*id, v.highest_seen(*id)))
+            .filter(|(id, inc)| v.could_vote(*id, now, &self.cfg) && declared.get(id) != Some(inc))
+            // Never heard from here: nothing to expire. (Incarnations start at 0, so the
+            // incarnation number can't stand in for "seen".)
+            .filter(|(id, _)| v.has_seen(*id))
+            .collect()
     }
 
-    pub async fn handle_promise(&self, term: u64, leader: NodeId) -> Response {
-        let accepted = self.accept_promise(term, leader).await;
-        Response::LeaseTermPromise { accepted, promised_term: self.promise.lock().unwrap().term }
+    pub fn handle_renew(&self, node: NodeId, incarnation: u64) -> Response {
+        let ack = self.voter.lock().unwrap().on_renew(node, incarnation, Instant::now());
+        Response::LeaseAck { acked: ack.acked, fenced: ack.fenced }
+    }
+
+    pub async fn handle_vote(&self, target: NodeId, incarnation: u64) -> Response {
+        let vote = self.voter.lock().unwrap().on_vote(target, incarnation, Instant::now(), &self.cfg);
+        // A fence that isn't on disk doesn't count: a restart must not forget it.
+        let granted = vote.granted && self.persist().await;
+        Response::LeaseExpiryVote { granted, highest_seen: vote.highest_seen }
     }
 
     pub fn status(&self) -> LeaseStatusReport {
         let now = Instant::now();
-        let p = *self.promise.lock().unwrap();
-        let h = self.holder.lock().unwrap();
-        let l = self.leader.lock().unwrap();
-        let mut view: Vec<_> = h.view.iter().map(|(k, v)| (*k, *v)).collect();
-        view.sort_by_key(|(k, _)| *k);
+        let (holds, remaining, incarnation) = {
+            let h = self.holder.lock().unwrap();
+            (h.holds_lease(now), h.remaining(now), h.incarnation)
+        };
+        let v = self.voter.lock().unwrap();
+        let view = v.known_nodes().into_iter().map(|n| (n, v.state_of(n, now, &self.cfg))).collect();
         LeaseStatusReport {
             node: self.me,
-            promised_term: p.term,
-            promised_leader: p.leader,
-            holds_lease: h.holds_lease(now),
-            lease_remaining_ms: h.remaining(now).as_millis() as u64,
-            granted_term: h.granted_term,
-            granted_by: h.granted_by,
+            incarnation,
+            holds_lease: holds,
+            lease_remaining_ms: remaining.as_millis() as u64,
+            acks_last_round: self.acks_last_round.load(Ordering::Relaxed) as u64,
+            majority: self.majority() as u64,
             view,
-            leader_term: l.as_ref().map(|s| s.term),
-            leader_has_majority: l.as_ref().is_some_and(|s| {
-                s.has_majority(now, self.cluster_size.load(std::sync::atomic::Ordering::Relaxed), &self.cfg)
-            }),
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg() -> LeaseConfig {
-        LeaseConfig { lease: Duration::from_secs(10), margin: Duration::from_secs(1) }
+        LeaseConfig { lease: Duration::from_secs(3), margin: Duration::from_millis(500) }
     }
     fn ids(n: usize) -> Vec<NodeId> {
         (0..n).map(|i| NodeId::from_bytes([i as u8 + 1; 16])).collect()
     }
-    fn s(x: u64) -> Duration { Duration::from_secs(x) }
+    fn ms(x: u64) -> Duration { Duration::from_millis(x) }
 
-    /// The core safety property: at every instant where the leader calls a node
-    /// Expired, that node already considers its own lease gone. Checked over a
-    /// sweep of renewal-send times, network delays and observation times.
+    /// Tiny deterministic PRNG so the simulation is reproducible without a dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0
+        }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// The core safety property, simulated: five nodes run renewal rounds and expiry
+    /// votes over a network with random delays and random partitions. At every step,
+    /// no node holds a lease at an incarnation a majority has already voted expired.
     #[test]
-    fn leader_never_declares_expired_while_holder_still_holds() {
+    fn simulated_cluster_never_overlaps_a_lease_with_its_expiry() {
         let c = cfg();
-        let n = ids(3);
-        let t0 = Instant::now();
-        for delay_ms in [0u64, 1, 250, 900, 2_500] {
-            let mut leader = LeaderState::established(1, t0);
-            let mut holder = HolderState::default();
-            let sent = t0 + s(30); // well past the takeover wait
-            let recv = sent + Duration::from_millis(delay_ms);
-            leader.renew(n[0], recv, 3, &c);
-            leader.renew(n[1], recv, 3, &c);
-            leader.renew(n[2], recv, 3, &c);
-            holder.on_grant(sent, 1, n[1], HashMap::new(), &c);
-            for step_ms in (0..40_000u64).step_by(50) {
-                let now = sent + Duration::from_millis(step_ms);
-                if leader.state_of(n[0], now, &c) == LeaseState::Expired {
-                    assert!(!holder.holds_lease(now),
-                        "overlap at +{}ms with {}ms delay: leader says Expired, holder still holds", step_ms, delay_ms);
+        let n = ids(5);
+        let maj = 3;
+        let (mut expirations, mut held) = (0u64, 0u64);
+        for seed in 1..=40u64 {
+            let mut rng = Rng(seed * 0x9E37_79B9_7F4A_7C15);
+            let t0 = Instant::now();
+            let mut holders: Vec<HolderState> = (0..5).map(|_| HolderState::new(0)).collect();
+            let mut voters: Vec<VoterState> = (0..5).map(|_| VoterState::new(t0, HashMap::new())).collect();
+            // declared[target] = highest incarnation a majority voted expired.
+            let mut declared: HashMap<usize, u64> = HashMap::new();
+            // cut[a][b]: a can't reach b.
+            let mut cut = [[false; 5]; 5];
+            let mut now = t0;
+            for step in 0..600 {
+                now += ms(100 + rng.below(250));
+                if step % 40 == 0 {
+                    for a in 0..5 { for b in 0..5 { cut[a][b] = a != b && rng.below(5) == 0; } }
+                }
+                let a = rng.below(5) as usize;
+                if rng.below(2) == 0 {
+                    // Renewal round by a, sent now, each ack arriving after a random delay.
+                    let inc = holders[a].incarnation;
+                    let mut acks = 1;
+                    let mut fenced = None;
+                    for b in 0..5 {
+                        if b == a || cut[a][b] || cut[b][a] { continue; }
+                        let ack = voters[b].on_renew(n[a], inc, now + ms(rng.below(400)));
+                        if ack.acked { acks += 1 } else { fenced = Some(ack.fenced) }
+                    }
+                    if let Some(f) = fenced { holders[a].on_fenced(f); }
+                    holders[a].on_round(now, acks, maj, &c);
+                } else {
+                    // a asks everyone to vote some target expired.
+                    let t = rng.below(5) as usize;
+                    if t == a { continue; }
+                    let inc = voters[a].highest_seen(n[t]);
+                    let mut votes = 0;
+                    let mut newer = false;
+                    for b in 0..5 {
+                        if b == t || (b != a && (cut[a][b] || cut[b][a])) { continue; }
+                        let v = voters[b].on_vote(n[t], inc, now + ms(rng.below(400)), &c);
+                        if v.highest_seen > inc { newer = true; } else if v.granted { votes += 1; }
+                    }
+                    if !newer && votes >= maj {
+                        expirations += 1;
+                        let d = declared.entry(t).or_insert(inc);
+                        *d = (*d).max(inc);
+                    }
+                }
+                for t in 0..5 {
+                    held += holders[t].holds_lease(now) as u64;
+                    if let Some(d) = declared.get(&t) {
+                        assert!(!(holders[t].holds_lease(now) && holders[t].incarnation <= *d),
+                            "seed {} step {}: node {} holds a lease at incarnation {} after a majority expired incarnation {}",
+                            seed, step, t, holders[t].incarnation, d);
+                    }
                 }
             }
         }
+        // Not vacuous: leases were held and majorities did expire nodes.
+        assert!(held > 10_000 && expirations > 100, "simulation too quiet: held={} expirations={}", held, expirations);
     }
 
-    /// A new leader must not call anyone Expired until leases from the previous
-    /// term can't still be running, even for nodes it has never heard from.
     #[test]
-    fn new_leader_waits_out_previous_terms_leases() {
+    fn minority_acks_give_no_lease() {
         let c = cfg();
-        let n = ids(3);
+        let mut h = HolderState::new(0);
         let t0 = Instant::now();
-        let leader = LeaderState::established(2, t0);
-        assert_eq!(leader.state_of(n[2], t0 + c.takeover_wait() - Duration::from_millis(1), &c), LeaseState::Unknown);
-        assert_eq!(leader.state_of(n[2], t0 + c.takeover_wait(), &c), LeaseState::Expired);
-
-        // Worst case for the old term: its last grant went out the instant before the
-        // new term formed, from an old leader that still (just) had its majority.
-        let mut holder = HolderState::default();
-        holder.on_grant(t0, 1, n[0], HashMap::new(), &c);
-        for step_ms in (0..40_000u64).step_by(50) {
-            let now = t0 + Duration::from_millis(step_ms);
-            if leader.state_of(n[2], now, &c) == LeaseState::Expired {
-                assert!(!holder.holds_lease(now), "old-term lease outlived the takeover wait at +{}ms", step_ms);
-            }
-        }
+        h.on_round(t0, 2, 3, &c);
+        assert!(!h.holds_lease(t0));
+        h.on_round(t0, 3, 3, &c);
+        assert!(h.holds_lease(t0));
+        assert!(!h.holds_lease(t0 + c.lease - c.margin), "the lease ends a margin early");
     }
 
-    /// A leader cut off from its majority stops granting within one lease period,
-    /// which is what bounds how long an old term's grants keep appearing.
+    /// A voter votes only after lease + margin of silence, and never while a newer
+    /// incarnation is known; once it votes, it refuses the fenced incarnation.
     #[test]
-    fn leader_without_majority_stops_granting() {
+    fn voter_rules() {
         let c = cfg();
-        let n = ids(5);
+        let n = ids(2);
         let t0 = Instant::now();
-        let mut leader = LeaderState::established(1, t0);
-        for id in &n { assert!(leader.renew(*id, t0, 5, &c) || id != &n[4]); }
-        assert!(leader.has_majority(t0, 5, &c));
-        // Partition: only the leader and one other keep renewing.
-        let later = t0 + c.lease + s(1);
-        assert!(!leader.renew(n[0], later, 5, &c), "2 of 5 fresh is not a majority");
-        assert!(!leader.renew(n[1], later, 5, &c));
-        assert!(!leader.has_majority(later, 5, &c));
+        let mut v = VoterState::new(t0, HashMap::new());
+        let later = t0 + c.silence(); // past the post-start abstention
+        assert!(v.on_renew(n[0], 1, later).acked);
+        assert!(!v.on_vote(n[0], 1, later + c.silence() - ms(1), &c).granted, "too soon after the last ack");
+        assert!(!v.on_vote(n[0], 0, later + c.silence(), &c).granted, "a newer incarnation (1) is known");
+        let vote = v.on_vote(n[0], 1, later + c.silence(), &c);
+        assert!(vote.granted);
+        let ack = v.on_renew(n[0], 1, later + c.silence() + ms(1));
+        assert_eq!(ack, Ack { acked: false, fenced: 1 }, "a fenced incarnation is refused");
+        assert!(v.on_renew(n[0], 2, later + c.silence() + ms(2)).acked, "a rejoin above the fence is accepted");
     }
 
-    /// 2026-09-28 local T58: every node, just started and knowing only itself, won
-    /// "1 of 1" and established itself leader for term 1, five leaders at once. A node
-    /// that has ever seen a 5-node cluster must need 3 promises, whatever it knows now.
+    /// A restarted voter forgot whom it acked, so it abstains for lease + margin; and it
+    /// must not forget whom it fenced, so fences come back from disk.
+    #[test]
+    fn restarted_voter_abstains_and_keeps_its_fences() {
+        let c = cfg();
+        let n = ids(1);
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = LeaseStateFile::new(dir.path());
+        let mut fences = HashMap::new();
+        fences.insert(n[0], 4);
+        file.store(&DurableLeaseState { incarnation: 2, fences }).unwrap();
+
+        let restarted = Instant::now();
+        let loaded = LeaseStateFile::new(dir.path()).load();
+        assert_eq!(loaded.incarnation, 2);
+        let mut v = VoterState::new(restarted, loaded.fences);
+        assert!(!v.on_vote(n[0], 4, restarted + c.silence() - ms(1), &c).granted, "abstains right after a restart");
+        assert!(!v.on_renew(n[0], 4, restarted).acked, "fence survived the restart");
+        assert!(v.on_renew(n[0], 5, restarted).acked);
+    }
+
+    #[test]
+    fn fenced_holder_drops_its_lease_and_rejoins_higher() {
+        let c = cfg();
+        let t0 = Instant::now();
+        let mut h = HolderState::new(3);
+        h.on_round(t0, 3, 3, &c);
+        assert!(h.on_fenced(3));
+        assert_eq!(h.incarnation, 4);
+        assert!(!h.holds_lease(t0), "a fenced node stops immediately, whatever its lease said");
+        assert!(!h.on_fenced(2), "an older fence changes nothing");
+    }
+
+    /// 2026-09-28 local T58 (leader-lease version): every node, just started and
+    /// knowing only itself, counted 1 of 1 as a majority. A node that has ever seen a
+    /// 5-node cluster needs 3, whatever it knows now.
     #[tokio::test]
-    async fn restarted_node_alone_cannot_establish_a_term() {
+    async fn restarted_node_alone_needs_the_remembered_majority() {
         let dir = tempfile::TempDir::new().unwrap();
         MembershipFile::new(dir.path()).store(5).unwrap();
         let me = ids(1)[0];
         let cluster = Arc::new(ClusterManager::new(me, "127.0.0.1:19350".parse().unwrap(), 10, 30));
-        assert!(cluster.is_leader().await, "precondition: membership alone says this node leads (1 of 1)");
         let rt = LeaseRuntime::new(me, cluster, Arc::new(NetworkClient::new()), dir.path());
-        rt.refresh_cluster_size().await;
-        rt.lead_if_leader().await;
-        assert!(rt.leader.lock().unwrap().is_none(),
-            "a node that has seen 5 members established a term on its own: split-brain");
+        let peers = rt.refresh_peers().await;
+        assert!(peers.is_empty(), "precondition: it knows no peers");
+        rt.renew_round(&peers).await;
+        assert!(!rt.holder.lock().unwrap().holds_lease(Instant::now()),
+            "a node that has seen 5 members granted itself a lease on its own ack");
         assert_eq!(rt.majority(), 3);
     }
 
-    #[test]
-    fn promise_accepts_only_newer_terms_or_same_leader_retry() {
-        let n = ids(2);
-        let mut p = Promise::default();
-        assert!(p.offer(3, n[0]));
-        assert!(p.offer(3, n[0]), "same term, same leader: a retry");
-        assert!(!p.offer(3, n[1]), "same term, other leader: two leaders must not both win it");
-        assert!(!p.offer(2, n[1]), "older term");
-        assert!(p.offer(4, n[1]));
-    }
-
-    #[test]
-    fn promise_survives_a_restart() {
+    /// First local T58 run: no expiry vote was ever started, because "never heard from"
+    /// was tested as incarnation == 0, and every node starts at incarnation 0.
+    #[tokio::test]
+    async fn silent_peer_at_incarnation_zero_is_an_expiry_candidate() {
         let dir = tempfile::TempDir::new().unwrap();
-        let f = PromiseFile::new(dir.path());
-        assert_eq!(f.load(), Promise::default());
-        let p = Promise { term: 7, leader: Some(ids(1)[0]) };
-        f.store(&p).unwrap();
-        assert_eq!(PromiseFile::new(dir.path()).load(), p);
+        let n = ids(3);
+        let cluster = Arc::new(ClusterManager::new(n[0], "127.0.0.1:19351".parse().unwrap(), 10, 30));
+        let rt = LeaseRuntime::new(n[0], cluster, Arc::new(NetworkClient::new()), dir.path());
+        let c = rt.cfg;
+        let t0 = Instant::now();
+        *rt.voter.lock().unwrap() = VoterState::new(t0, HashMap::new());
+        rt.voter.lock().unwrap().on_renew(n[1], 0, t0);
+        let later = t0 + c.silence() + ms(1);
+        assert_eq!(rt.expiry_candidates(&[n[1], n[2]], later), vec![(n[1], 0)],
+            "a peer acked at incarnation 0 then silent must be a candidate; one never heard from must not");
+        assert!(rt.expiry_candidates(&[n[1]], t0 + ms(100)).is_empty(), "not while it's still renewing");
     }
 
-    /// Takeover happens only past a member the leader has declared Expired, never
-    /// past Unknown, and the holder judges itself by its own lease.
+    /// Takeover goes only past a member a majority has voted expired, never past one
+    /// merely silent, and a node judges itself by its own lease.
     #[test]
-    fn primary_follows_isr_order_and_needs_expired_to_skip() {
-        let c = cfg();
+    fn primary_needs_a_majority_expiry_to_skip() {
         let n = ids(2);
-        let t0 = Instant::now();
         let isr = [n[0], n[1]];
-        let mut view = HashMap::new();
-
-        // Seen from S (n[1]): P valid -> P is primary.
-        let mut s_holder = HolderState::default();
-        view.insert(n[0], LeaseState::Valid);
-        s_holder.on_grant(t0, 1, n[0], view.clone(), &c);
-        assert_eq!(primary_of(&isr, n[1], &s_holder, t0), Some(n[0]));
-
-        // P unknown (new leader waiting): nobody may take over.
-        view.insert(n[0], LeaseState::Unknown);
-        s_holder.on_grant(t0, 2, n[0], view.clone(), &c);
-        assert_eq!(primary_of(&isr, n[1], &s_holder, t0), None);
-
-        // P expired: S takes over, but only while S's own lease is live.
-        view.insert(n[0], LeaseState::Expired);
-        s_holder.on_grant(t0, 2, n[0], view.clone(), &c);
-        assert_eq!(primary_of(&isr, n[1], &s_holder, t0), Some(n[1]));
-        assert_eq!(primary_of(&isr, n[1], &s_holder, t0 + c.lease), None, "S's own lease ran out");
-
-        // Seen from P itself: primary exactly while its own lease holds.
-        let mut p_holder = HolderState::default();
-        p_holder.on_grant(t0, 1, n[0], HashMap::new(), &c);
-        assert_eq!(primary_of(&isr, n[0], &p_holder, t0), Some(n[0]));
-        assert!(primary_of(&isr, n[0], &p_holder, t0 + c.lease).is_none());
+        assert_eq!(primary_of(&isr, n[1], true, |_| false), Some(n[0]));
+        assert_eq!(primary_of(&isr, n[1], true, |x| x == n[0]), Some(n[1]));
+        assert_eq!(primary_of(&isr, n[1], false, |x| x == n[0]), None, "S without its own lease");
+        assert_eq!(primary_of(&isr, n[0], true, |_| false), Some(n[0]));
+        assert_eq!(primary_of(&isr, n[0], false, |_| false), None, "P without its own lease");
     }
 }

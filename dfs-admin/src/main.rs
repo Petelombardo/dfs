@@ -110,6 +110,13 @@ enum FaultCommands {
     },
     /// Heal every injected link failure on the node.
     Clear,
+    /// Hold one subsystem's lock for a while: metadata-db, healer-maps or cluster-membership.
+    Stall {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        millis: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1649,6 +1656,22 @@ fn parse_file_id(s: &str) -> Result<FileId> {
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) -> Result<()> {
+    if let FaultCommands::Stall { target, millis } = &cmd {
+        let target = match target.as_str() {
+            "metadata-db" => dfs_common::StallTarget::MetadataDb,
+            "healer-maps" => dfs_common::StallTarget::HealerMaps,
+            "cluster-membership" => dfs_common::StallTarget::ClusterMembership,
+            other => anyhow::bail!("unknown stall target {} (metadata-db, healer-maps, cluster-membership)", other),
+        };
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectStall { target, millis: *millis }).await? {
+                Response::Ok { .. } => println!("{}: stalling {:?} for {}ms", addr, target, millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     let filter = match cmd {
         FaultCommands::Set { drop_to, refuse_clients, black_hole } => dfs_common::PeerFilter {
             drop_to,
@@ -1656,6 +1679,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
             mode: if black_hole { dfs_common::PeerFilterMode::BlackHole } else { dfs_common::PeerFilterMode::Refuse },
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
+        FaultCommands::Stall { .. } => unreachable!("handled above"),
     };
     for &addr in cluster_addrs {
         match send_request(addr, Request::SetPeerFilter { filter: filter.clone() }).await? {

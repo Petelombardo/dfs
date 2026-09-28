@@ -603,6 +603,13 @@ impl ClusterManager {
 
     /// Pause/resume outgoing heartbeats — see heartbeat_paused's field doc
     /// comment. Both are cheap no-ops if called when already in that state.
+    /// Fault injection only (see `Request::InjectStall`): hold the membership lock, so
+    /// heartbeats, gossip merges and leader checks on this node wait.
+    pub async fn hold_membership_lock_for(&self, d: std::time::Duration) {
+        let _guard = self.nodes.write().await;
+        tokio::time::sleep(d).await;
+    }
+
     pub fn pause_heartbeats(&self) {
         self.heartbeat_paused.store(true, std::sync::atomic::Ordering::Relaxed);
     }

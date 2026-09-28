@@ -556,6 +556,14 @@ impl HealOutcome {
 }
 
 impl HealingManager {
+    /// Fault injection only (see `Request::InjectStall`): hold the pending and stalled
+    /// healing maps, the locks behind the 2026-09-24 26 s `evict_pending` stall.
+    pub async fn hold_maps_for(&self, d: std::time::Duration) {
+        let _p = self.pending_healing.write().await;
+        let _s = self.stalled_healing.write().await;
+        tokio::time::sleep(d).await;
+    }
+
     /// Create a new healing manager
     #[allow(clippy::too_many_arguments)]
     pub fn new(

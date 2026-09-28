@@ -1170,7 +1170,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetRpcClassCounts
         | Request::GetPendingHealingSample { .. }
         | Request::SetPeerFilter { .. }
-        | Request::GetLeaseStatus => Admin,
+        | Request::GetLeaseStatus
+        | Request::InjectStall { .. } => Admin,
     }
 }
 
@@ -7610,6 +7611,7 @@ impl Server {
             Request::RenewNodeLease { node, incarnation } => self.lease.handle_renew(node, incarnation),
             Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
             Request::GetLeaseStatus => Response::LeaseStatus { report: self.lease.status() },
+            Request::InjectStall { target, millis } => self.handle_inject_stall(target, millis).await,
             Request::SetPeerFilter { filter } => match crate::network::set_peer_filter(filter) {
                 Ok(()) => Response::Ok { data: None },
                 Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::PermissionDenied },
@@ -10859,6 +10861,34 @@ impl Server {
     /// Start the background slot audit. DFS_SLOT_AUDIT_INTERVAL_SECS (default 60, 0 = off),
     /// DFS_SLOT_AUDIT_QUIET_SECS (default 30), DFS_SLOT_AUDIT_REAUDIT_SECS (default 3600),
     /// DFS_SLOT_AUDIT_CONFIRM_SECS (default 60), DFS_SLOT_AUDIT_MAX_PER_PASS (default 2000).
+    async fn handle_inject_stall(&self, target: dfs_common::StallTarget, millis: u64) -> Response {
+        if !crate::network::fault_injection_allowed() {
+            return Response::Error {
+                message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                code: ErrorCode::PermissionDenied,
+            };
+        }
+        let d = std::time::Duration::from_millis(millis);
+        warn!("FAULT INJECTION: stalling {:?} for {:?}", target, d);
+        match target {
+            dfs_common::StallTarget::MetadataDb => {
+                let metadata = self.metadata.clone();
+                tokio::task::spawn_blocking(move || metadata.hold_db_lock_for(d));
+            }
+            dfs_common::StallTarget::HealerMaps => {
+                let Some(healing) = self.healing.read().await.clone() else {
+                    return Response::Error { message: "healer not running on this node".into(), code: ErrorCode::InvalidRequest };
+                };
+                tokio::spawn(async move { healing.hold_maps_for(d).await });
+            }
+            dfs_common::StallTarget::ClusterMembership => {
+                let cluster = self.cluster.clone();
+                tokio::spawn(async move { cluster.hold_membership_lock_for(d).await });
+            }
+        }
+        Response::Ok { data: None }
+    }
+
     pub fn start_leases(&self) {
         self.lease.clone().start();
     }
@@ -21443,7 +21473,13 @@ mod tests {
         h.metadata.put_file(&file_meta).unwrap();
         // Ownership is per slot (rendezvous hash), so pick a peer id that leaves the
         // harness node owning all five slots under test.
-        let peer_node_id = (0..=255u8).map(|b| NodeId::from_bytes([b; 16]))
+        // Each candidate works with probability 1/32; 65536 of them make a miss impossible
+        // in practice (256 missed about once in 3000 runs).
+        let peer_node_id = (0..=u16::MAX).map(|k| {
+                let mut b = [0xabu8; 16];
+                b[..2].copy_from_slice(&k.to_le_bytes());
+                NodeId::from_bytes(b)
+            })
             .find(|p| (0..5).all(|i| slot_audit_owner(file_id, i, &[owner, *p]) == Some(owner)))
             .expect("some peer id leaves the harness owning all five slots");
         let peer_addr: SocketAddr = "127.0.0.1:19342".parse().unwrap();

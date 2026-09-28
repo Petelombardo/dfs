@@ -282,37 +282,37 @@ one side for an asymmetric link. This makes #2–#15 deterministic on the local 
   produce it. That confirms (or refutes) that replica drift explains our incident load before
   we commit to Phase 3.
 
-**Phase 1 — Majority node leases** (1a built: majority leases, shadow only)
+**Phase 1 — Majority node leases** (built, shadow only; local gate passed)
 - §6.1. Leases are held, lost, fenced and voted on, but nothing consults them yet.
-- Done in 1a: the state machines plus a seeded randomized simulation (5 nodes, random delays
-  and partitions, invariant checked every step, mutation-checked), and T58 on the real
-  cluster: isolated node fences before the majority vote (#5), the leader cut off costs the
-  others nothing (#4/#8), a 2|3 split fences exactly the minority (#15), heal and rejoin (#11).
-- Still to do in Phase 1:
-  - **Stall resilience.** A test-only **stall injector** (same `DFS_FAULT_INJECTION` opt-in as
-    the fault filter) holds a named subsystem on one node for N seconds: metadata committer,
-    healer pending/stalled maps, compaction quiesce. These are what stalled gluster1 for 26 s
-    on 2026-09-24. Pass = holding each for 3×`L` costs zero lease lapses anywhere. A
-    whole-process freeze (SIGSTOP) *should* cost that node its lease within `L − margin`,
-    and the majority vote it out: the gray-failure takeover of #12.
-  - **Asymmetric link (#14)** and **voter restart** (fences survive; abstention window) on the
-    real cluster.
-  - **Chaos gate:** random partitions, black-holes and kill/restart for several minutes. Every
-    majority expiry declaration is checked against the target's own lease end, both logged in
-    wall-clock ms: zero overlaps.
-  - **Flap guard (#13):** a minimum dwell time before a rejoined node counts as live again,
-    with backoff.
-  - `L` confirmed against Phase 0's staging `PEER RTT` numbers: comfortably above the worst
-    observed whole-process stall, or a deliberate choice to fail over through it.
-- Gate: all of the above plus the standard protocol (§8a). Staging soak with leases shadowed,
-  watching for spurious lapses.
+- State machines with explicit clocks, plus a seeded randomized simulation: 5 nodes, random
+  delays and partitions, the invariant checked at every step. Mutating any voter rule
+  (fence check, silence window, self-vote) breaks it within the first seed.
+- Suite, real 5-process cluster:
+  - T58: an isolated node fences before the majority vote (#5); cutting the leader off costs
+    the others nothing (#4/#8); a 2|3 split fences exactly the minority (#15); heal and rejoin (#11).
+  - T59: holding the metadata DB lock, the healer maps, or the membership lock for 3×`L`
+    costs no lease anywhere. A frozen process (SIGSTOP) loses its lease and is voted out
+    only after its lease ended: the gray-failure takeover of #12.
+  - T60 chaos: random partitions, black-holes, one-way cuts (#14) and freezes; every majority
+    expiry is checked against the target's logged lease extensions. 0 overlaps across 141
+    expiries in 300 s.
+- Bugs these tests caught before any enforcement existed: majority counted over current
+  membership (startup split-brain); "never heard from" tested as incarnation 0 (no votes ever
+  ran); the lease loop blocking on the membership lock; **a node voting itself expired**
+  (40 overlaps in the first chaos run: the simulation had modeled the rule but the runtime
+  didn't have it; the rule now lives in the voter state machine, and the simulation asks the
+  target too).
+- Moved to Phase 3: the **flap guard (#13).** A rejoining node never takes its old slots back,
+  so flapping costs nothing until takeovers start rewriting ISRs.
+- `L` stays at the local default (3 s, margin 500 ms). It is confirmed against real
+  `PEER RTT` numbers at the branch's final staging validation (see "Staging policy" below).
 
 **Phase 2 — Primary-owned folds**
 - §6.5. Only the derived primary folds. The others fold on `FoldAt` and verify hashes.
 - Retire fold_lock_grants / outbound_fold_claims / uncoordinated fallback.
 - Gate: T53-style storm with zero REPLICA DISAGREEMENT and zero divergence alarms. VM-108 soak.
 
-**Phase 3 — Versioned writes, ISR, catch-up**
+**Phase 3 — Versioned writes, ISR, catch-up** (includes the flap guard, #13)
 - §6.3 + §6.4: the client narrows patch fan-out to P+S with `(epoch, base_version)`, and
   primary-driven catch-up. This is the parallel fan-out vs primary relay decision, made with
   latency numbers (kdiskmark RND4K Q1T1/Q32T1 before and after).
@@ -359,11 +359,19 @@ until then.
    The known rename flake (T13b/T14a/T14b together) is re-run in isolation before being dismissed.
 4. **Phase-specific local tests.** The failure-matrix rows the phase claims, run via the
    fault-injection filter, deterministically (no wall-clock races).
-5. **Staging, only with explicit go-ahead each time:** deploy, then the phase's soak (at minimum
+5. **Staging: not per phase** (see "Staging policy"). Deferred to one final validation of the
+   whole branch, with explicit go-ahead then: deploy, then the phase's soak (at minimum
    VM-108 normal use, and kdiskmark RND4K Q1T1/Q32T1 before and after for any write-path phase).
    Watch the `[DIVERGENCE]` counters and guest EIOs.
 6. **Rollback checked:** flip `ownership_mode` back one step on the local cluster and re-run the
    suite, proving the phase can be backed out live.
+
+### Staging policy (2026-09-28)
+The branch stays **off staging** until it is proven stable as a whole, observe-only phases
+included. Each phase is proven locally: unit tests, the seeded simulation, the suite, and the
+chaos gate. Staging is used once, for a final validation of the stable branch, and only with
+explicit go-ahead then. Parameters meant to be tuned from staging data (lease length from
+`PEER RTT`, divergence rates, lag distribution) keep their local defaults until then.
 
 ## 9. Compatibility and rollout
 - New `Request`/`Response` variants are **appended at the end** of the bincode enums

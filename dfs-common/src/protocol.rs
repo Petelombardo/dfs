@@ -1026,6 +1026,15 @@ pub enum Request {
     /// This node's lease state, for dfs-admin and the local suite. APPENDED at end
     /// to preserve wire compatibility.
     GetLeaseStatus,
+
+    /// Fault injection (test-only, same DFS_FAULT_INJECTION opt-in as SetPeerFilter):
+    /// hold one subsystem's lock on this node for `millis`, reproducing the stalls
+    /// that froze gluster1 on 2026-09-24. Answered immediately; the hold runs in the
+    /// background. APPENDED at end to preserve wire compatibility.
+    InjectStall {
+        target: StallTarget,
+        millis: u64,
+    },
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1880,4 +1889,15 @@ pub struct LeaseStatusReport {
     pub majority: u64,
     /// How this node sees every other node it has heard from.
     pub view: Vec<(NodeId, NodeLeaseState)>,
+}
+
+/// A subsystem `Request::InjectStall` can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StallTarget {
+    /// The metadata store's database lock (every metadata read and write waits).
+    MetadataDb,
+    /// The healer's pending and stalled maps (the 2026-09-24 `evict_pending` stall).
+    HealerMaps,
+    /// The cluster membership lock (heartbeats, gossip, leader checks wait).
+    ClusterMembership,
 }

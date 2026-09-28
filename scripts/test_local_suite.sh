@@ -43,6 +43,7 @@ export DFS_SLOT_AUDIT_CONFIRM_SECS=10
 export DFS_LEASE_MS=3000
 export DFS_LEASE_MARGIN_MS=500
 export DFS_LEASE_CLUSTER_SIZE=5   # fresh cluster: no membership history yet
+export DFS_LEASE_TRACE=1   # log every lease extension: T60 checks none outlives its expiry vote
 
 # If test filter args given, only run those tests (e.g. T7 T23).
 RUN_TESTS="${*:-ALL}"
@@ -4916,14 +4917,16 @@ T58_VICTIM=127.0.0.1:8904
 T58_VICTIM_ID=$(t58_id "$T58_VICTIM")
 T58_LOST_BEFORE=$(grep -c "LEASE own: lost" "$(t58_log $T58_VICTIM)" || true)
 T58_DECL_BEFORE=$(cat "$LOG"/server*.log | grep -c "LEASE takeover: node $T58_VICTIM_ID" || true)
+T58_CUT_MS=$(date +%s%3N)
 t58_cut "$T58_VICTIM"
 for _ in $(seq 1 40); do
     [ "$(cat "$LOG"/server*.log | grep -c "LEASE takeover: node $T58_VICTIM_ID" || true)" -gt "$T58_DECL_BEFORE" ] && break
     sleep 0.5
 done
 T58_ENDED=$(grep "LEASE own: lost" "$(t58_log $T58_VICTIM)" | tail -n +$((T58_LOST_BEFORE + 1)) | head -1 | grep -oP 'wall_ms \K[0-9]+' || true)
-T58_EXPIRED=$(cat "$LOG"/server*.log | grep "LEASE takeover: node $T58_VICTIM_ID" | tail -n +$((T58_DECL_BEFORE + 1)) \
-    | grep -oP 'at wall_ms \K[0-9]+' | sort -n | head -1 || true)
+# Filter by time, not by line count: the five logs are concatenated, not interleaved.
+T58_EXPIRED=$(cat "$LOG"/server*.log | grep "LEASE takeover: node $T58_VICTIM_ID" \
+    | grep -oP 'at wall_ms \K[0-9]+' | awk -v t="$T58_CUT_MS" '$1 >= t' | sort -n | head -1 || true)
 echo "  T58b: victim=$T58_VICTIM own lease ended at ${T58_ENDED:-?}, first majority expiry at ${T58_EXPIRED:-?}"
 [ -n "$T58_ENDED" ] && [ -n "$T58_EXPIRED" ] && [ "$T58_EXPIRED" -gt "$T58_ENDED" ] \
     && check "T58b isolated node's lease ended $(( T58_EXPIRED - T58_ENDED ))ms before a majority voted it expired (no overlap)" PASS \
@@ -4973,6 +4976,157 @@ t58_wait_holders 5 20 \
     && check "T58d all 5 hold leases again after the split heals" PASS \
     || check "T58d only $(t58_holders)/5 hold leases 20s after healing" FAIL
 fi # should_run T58
+
+if should_run T59; then
+snapshot_log T59
+echo ""
+echo "=== T59: subsystem stalls don't cost leases; a frozen process does, safely (SLOT-OWNERSHIP-PLAN Phase 1) ==="
+T59_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
+T59_ALL="$(IFS=,; echo "${T59_NODES[*]}")"
+t59_lost() { cat "$LOG"/server*.log 2>/dev/null | grep -c "LEASE own: lost" || true; }
+t59_holders() { "$BIN/dfs-admin" --cluster "$T59_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; print(sum(1 for l in sys.stdin if json.loads(l).get('holds_lease')))" || echo 0; }
+t59_wait5() { for _ in $(seq 1 40); do [ "$(t59_holders)" = 5 ] && return 0; sleep 0.5; done; return 1; }
+t59_wait5 || true
+
+# T59a-c: hold a subsystem for 9s (3x the 3s lease) on one node; nobody may lose a lease.
+T59_LEADER_PREFIX=$("$BIN/dfs-admin" --cluster "$T59_ALL" cluster status 2>/dev/null | grep -oP 'Leader:\s+\K\S+' | head -1 || true)
+T59_LEADER=$("$BIN/dfs-admin" --cluster "$T59_ALL" lease status 2>/dev/null | python3 -c "
+import json,sys
+for l in sys.stdin:
+    x=json.loads(l)
+    if x['node'].startswith('$T59_LEADER_PREFIX'): print(x['addr'])" || true)
+[ -z "$T59_LEADER" ] && T59_LEADER=127.0.0.1:8900
+for spec in "metadata-db 127.0.0.1:8903 T59a" "healer-maps $T59_LEADER T59b" "cluster-membership 127.0.0.1:8902 T59c"; do
+    set -- $spec
+    T59_BEFORE=$(t59_lost)
+    T59_OUT=$("$BIN/dfs-admin" --cluster "$2" fault stall --target "$1" --millis 9000 2>&1 || true)
+    sleep 11
+    T59_LAPSES=$(( $(t59_lost) - T59_BEFORE ))
+    echo "  $3: stalled $1 on $2 for 9s -> $T59_LAPSES lease lapse(s) cluster-wide ($T59_OUT)"
+    [ "$T59_LAPSES" -eq 0 ] \
+        && check "$3 a 9s $1 stall costs no node its lease" PASS \
+        || check "$3 a 9s $1 stall cost $T59_LAPSES lease lapse(s): the lease path depends on it" FAIL
+    t59_wait5 || true
+done
+
+# T59d: freeze a whole process. It must lose its lease, and the majority must vote it out
+# only after its lease ended.
+T59_VICTIM=127.0.0.1:8904
+T59_VLOG="$LOG/server5.log"
+T59_VID=$("$BIN/dfs-admin" --cluster "$T59_VICTIM" lease status 2>/dev/null | python3 -c "import json,sys; print(json.loads(sys.stdin.readline())['node'])" || true)
+T59_PID=""
+for p in $(pgrep -x dfs-server || true); do
+    tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "node5/config.toml" && T59_PID=$p
+done
+T59_LOST_BEFORE=$(grep -c "LEASE own: lost" "$T59_VLOG" || true)
+T59_FREEZE_MS=$(date +%s%3N)
+if [ -n "$T59_PID" ]; then
+    kill -STOP "$T59_PID"; sleep 8; kill -CONT "$T59_PID"
+fi
+sleep 4
+# Filter by time, not by line count: the five logs are concatenated, not interleaved,
+# and earlier tests (T58) leave declarations about this same node.
+T59_EXPIRED=$(cat "$LOG"/server*.log | grep "LEASE takeover: node $T59_VID" \
+    | grep -oP 'at wall_ms \K[0-9]+' | awk -v t="$T59_FREEZE_MS" '$1 >= t' | sort -n | head -1 || true)
+T59_ENDED=$(grep "LEASE own: lost" "$T59_VLOG" | tail -n +$((T59_LOST_BEFORE + 1)) | head -1 | grep -oP 'wall_ms \K[0-9]+' || true)
+echo "  T59d: froze pid ${T59_PID:-?} for 8s: its lease ended at ${T59_ENDED:-?}, majority expiry at ${T59_EXPIRED:-?}"
+[ -n "$T59_ENDED" ] && [ -n "$T59_EXPIRED" ] && [ "$T59_EXPIRED" -gt "$T59_ENDED" ] \
+    && check "T59d frozen process: its lease ended $(( T59_EXPIRED - T59_ENDED ))ms before the majority voted it out" PASS \
+    || check "T59d frozen process: fencing order wrong or missing (ended=${T59_ENDED:-none}, expired=${T59_EXPIRED:-none})" FAIL
+t59_wait5 \
+    && check "T59d thawed node rejoins and holds a lease again" PASS \
+    || check "T59d thawed node did not rejoin within 20s" FAIL
+fi # should_run T59
+
+if should_run T60; then
+snapshot_log T60
+echo ""
+echo "=== T60: lease chaos: random partitions, black-holes, one-way cuts and freezes; zero overlaps (SLOT-OWNERSHIP-PLAN Phase 1) ==="
+T60_SECONDS="${DFS_T60_SECONDS:-120}"
+T60_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
+T60_ALL="$(IFS=,; echo "${T60_NODES[*]}")"
+t60_filter() {   # t60_filter <node> <drop-to-csv> [--black-hole]
+    [ -n "$2" ] && "$BIN/dfs-admin" --cluster "$1" fault set --drop-to "$2" $3 >/dev/null 2>&1 || true
+}
+t60_heal() { for n in "${T60_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done; }
+t60_pid() {   # t60_pid <node-index 1..5>
+    for p in $(pgrep -x dfs-server || true); do
+        tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "node$1/config.toml" && echo "$p"
+    done
+    true   # set -e: a non-matching last pid must not fail the caller's $(...)
+}
+T60_START_MS=$(date +%s%3N)
+T60_END=$(( $(date +%s) + T60_SECONDS ))
+T60_ROUNDS=0
+while [ "$(date +%s)" -lt "$T60_END" ]; do
+    T60_ROUNDS=$((T60_ROUNDS + 1))
+    victims=$(printf '%s\n' 0 1 2 3 4 | shuf -n $(( RANDOM % 2 + 1 )) | tr '\n' ' ')
+    inside=""; outside=""
+    for i in 0 1 2 3 4; do
+        if [[ " $victims " == *" $i "* ]]; then inside="${inside:+$inside,}${T60_NODES[$i]}"; else outside="${outside:+$outside,}${T60_NODES[$i]}"; fi
+    done
+    case $(( RANDOM % 4 )) in
+        0) mode=partition;  for i in 0 1 2 3 4; do
+               if [[ " $victims " == *" $i "* ]]; then t60_filter "${T60_NODES[$i]}" "$outside"; else t60_filter "${T60_NODES[$i]}" "$inside"; fi; done ;;
+        1) mode=blackhole;  for i in 0 1 2 3 4; do
+               if [[ " $victims " == *" $i "* ]]; then t60_filter "${T60_NODES[$i]}" "$outside" --black-hole; else t60_filter "${T60_NODES[$i]}" "$inside" --black-hole; fi; done ;;
+        2) mode=oneway;     for i in 0 1 2 3 4; do [[ " $victims " != *" $i "* ]] && t60_filter "${T60_NODES[$i]}" "$inside"; done ;;
+        3) mode=freeze;     for i in $victims; do p=$(t60_pid $((i + 1))); [ -n "$p" ] && kill -STOP "$p"; done ;;
+    esac
+    sleep $(( RANDOM % 6 + 2 ))
+    if [ "$mode" = freeze ]; then for i in $victims; do p=$(t60_pid $((i + 1))); [ -n "$p" ] && kill -CONT "$p"; done; fi
+    [ $(( RANDOM % 3 )) -ne 0 ] && t60_heal
+    sleep $(( RANDOM % 3 + 1 ))
+done
+t60_heal
+for i in 1 2 3 4 5; do p=$(t60_pid $i); [ -n "$p" ] && kill -CONT "$p" 2>/dev/null; done
+sleep 8
+
+T60_RESULT=$("$BIN/dfs-admin" --cluster "$T60_ALL" lease status 2>/dev/null | python3 -c "
+import json,sys,re,glob
+since=int('$T60_START_MS')
+addr_node={}
+for l in sys.stdin:
+    x=json.loads(l); addr_node[x['addr']]=x['node']
+ext={}   # node -> [(inc, until_ms, logged_ms)]
+decl=[]  # (target, inc, at_ms)
+import datetime
+for i in range(1,6):
+    node=addr_node.get('127.0.0.1:%d' % (8899+i))
+    for line in open('$LOG/server%d.log' % i, errors='replace'):
+        line=re.sub(r'\x1b\[[0-9;]*m','',line)
+        m=re.search(r'LEASE own: (?:acquired|renewed) \(incarnation (\d+).*until_wall_ms (\d+)\)', line)
+        if m and node:
+            ext.setdefault(node,[]).append((int(m.group(1)), int(m.group(2))))
+        m=re.search(r'LEASE takeover: node (\S+) incarnation (\d+) expired .* at wall_ms (\d+)', line)
+        if m:
+            decl.append((m.group(1), int(m.group(2)), int(m.group(3))))
+viol=[]
+checked=0
+for (t,inc,at) in decl:
+    if at < since: continue
+    checked+=1
+    for (i,u) in ext.get(t,[]):
+        if i <= inc and u > at:
+            viol.append('%s inc %d lease until %d > expired at %d (inc %d)' % (t[:8], i, u, at, inc))
+held=sum(len(v) for v in ext.values())
+print(len(viol), checked, held)
+for v in viol[:5]: print('   ', v)
+")
+T60_VIOL=$(echo "$T60_RESULT" | head -1 | awk '{print $1}')
+T60_CHECKED=$(echo "$T60_RESULT" | head -1 | awk '{print $2}')
+T60_EXT=$(echo "$T60_RESULT" | head -1 | awk '{print $3}')
+echo "  T60: ${T60_ROUNDS} chaos rounds over ${T60_SECONDS}s; ${T60_CHECKED:-0} majority expiries checked against ${T60_EXT:-0} logged lease extensions"
+echo "$T60_RESULT" | tail -n +2
+[ "${T60_VIOL:-1}" = 0 ] && [ "${T60_CHECKED:-0}" -gt 0 ] \
+    && check "T60 zero lease/expiry overlaps across ${T60_CHECKED} expiries" PASS \
+    || check "T60 ${T60_VIOL:-?} overlap(s) (or no expiries to check: ${T60_CHECKED:-0})" FAIL
+T60_HOLD=$("$BIN/dfs-admin" --cluster "$T60_ALL" lease status 2>/dev/null | python3 -c "import json,sys; print(sum(1 for l in sys.stdin if json.loads(l).get('holds_lease')))" || echo 0)
+[ "$T60_HOLD" = 5 ] \
+    && check "T60 cluster fully recovers: all 5 hold leases after the chaos" PASS \
+    || check "T60 only $T60_HOLD/5 hold leases 8s after the chaos ended" FAIL
+fi # should_run T60
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

@@ -135,6 +135,8 @@ pub struct Vote {
 /// before a granted vote is reported (see `LeaseStateFile`).
 #[derive(Debug)]
 pub struct VoterState {
+    /// This voter's own id: it never votes on itself (see `on_vote`).
+    me: NodeId,
     started_at: Instant,
     /// Last ack given to each node: when (receive time) and the highest incarnation seen.
     last_ack: HashMap<NodeId, (Instant, u64)>,
@@ -143,8 +145,8 @@ pub struct VoterState {
 }
 
 impl VoterState {
-    pub fn new(started_at: Instant, fences: HashMap<NodeId, u64>) -> Self {
-        Self { started_at, last_ack: HashMap::new(), fences }
+    pub fn new(me: NodeId, started_at: Instant, fences: HashMap<NodeId, u64>) -> Self {
+        Self { me, started_at, last_ack: HashMap::new(), fences }
     }
 
     pub fn on_renew(&mut self, node: NodeId, incarnation: u64, now: Instant) -> Ack {
@@ -181,7 +183,11 @@ impl VoterState {
     /// caller must persist `fences` before reporting it).
     pub fn on_vote(&mut self, target: NodeId, incarnation: u64, now: Instant, cfg: &LeaseConfig) -> Vote {
         let highest_seen = self.highest_seen(target);
-        let granted = highest_seen <= incarnation && self.could_vote(target, now, cfg);
+        // Never on itself. The target's lease majority always includes the target, so a
+        // self-vote could be the only overlap between that majority and the expiry majority,
+        // and the safety argument needs one other shared voter. (Local T60 chaos found 40
+        // overlaps when a node, never having acked itself, voted itself expired.)
+        let granted = target != self.me && highest_seen <= incarnation && self.could_vote(target, now, cfg);
         if granted {
             let f = self.fences.entry(target).or_insert(incarnation);
             *f = (*f).max(incarnation);
@@ -330,6 +336,14 @@ pub struct LeaseRuntime {
     acks_last_round: AtomicUsize,
     /// (node, incarnation) this node has already seen voted expired by a majority.
     declared: Mutex<HashMap<NodeId, u64>>,
+    /// Last peer list read from membership. Used when the membership lock is busy, so a
+    /// stall there can't stop renewals (local T59c: a 9 s hold cost that node its lease).
+    peers: Mutex<Vec<(NodeId, std::net::SocketAddr)>>,
+}
+
+fn lease_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DFS_LEASE_TRACE").is_ok_and(|v| v == "1"))
 }
 
 /// Wall-clock milliseconds for an `Instant`, for logs that tests compare across processes.
@@ -358,12 +372,13 @@ impl LeaseRuntime {
             state_file,
             membership_file,
             holder: Mutex::new(HolderState::new(durable.incarnation)),
-            voter: Mutex::new(VoterState::new(Instant::now(), durable.fences)),
+            voter: Mutex::new(VoterState::new(me, Instant::now(), durable.fences)),
             cluster_size: AtomicUsize::new(size),
             held_last_tick: AtomicBool::new(false),
             last_until_wall_ms: Mutex::new(None),
             acks_last_round: AtomicUsize::new(0),
             declared: Mutex::new(HashMap::new()),
+            peers: Mutex::new(Vec::new()),
         }
     }
 
@@ -387,9 +402,16 @@ impl LeaseRuntime {
     }
 
     /// Every other known member (their status doesn't matter: renewals to a dead node
-    /// just fail), and grow the persisted membership high-water mark if needed.
+    /// just fail), and grow the persisted membership high-water mark if needed. Reads
+    /// membership for at most 100 ms; if its lock is held, renews with the last list.
     async fn refresh_peers(&self) -> Vec<(NodeId, std::net::SocketAddr)> {
-        let nodes = self.cluster.get_all_nodes().await;
+        let nodes = match tokio::time::timeout(Duration::from_millis(100), self.cluster.get_all_nodes()).await {
+            Ok(nodes) => nodes,
+            Err(_) => {
+                debug!("LEASE: membership lock busy; renewing with the cached peer list");
+                return self.peers.lock().unwrap().clone();
+            }
+        };
         let known = nodes.len();
         if known > self.cluster_size.load(Ordering::Relaxed) {
             let file = MembershipFile { path: self.membership_file.path.clone() };
@@ -398,7 +420,9 @@ impl LeaseRuntime {
                 info!("LEASE: membership high-water now {} (majority {})", known, known / 2 + 1);
             }
         }
-        nodes.into_iter().filter(|n| n.id != self.me).map(|n| (n.id, n.addr)).collect()
+        let peers: Vec<_> = nodes.into_iter().filter(|n| n.id != self.me).map(|n| (n.id, n.addr)).collect();
+        *self.peers.lock().unwrap() = peers.clone();
+        peers
     }
 
     async fn persist(&self) -> bool {
@@ -474,6 +498,10 @@ impl LeaseRuntime {
         if has && !had {
             info!("LEASE own: acquired (incarnation {}, {} of {} acked, until_wall_ms {})",
                 inc, acks, self.cluster_size.load(Ordering::Relaxed), wall_ms(now + remaining));
+        } else if has && lease_trace() {
+            // Every extension (DFS_LEASE_TRACE=1 only: one line per node per second), so the
+            // chaos test can check that no lease outlives its expiry vote.
+            info!("LEASE own: renewed (incarnation {}, until_wall_ms {})", inc, wall_ms(now + remaining));
         } else if !has && had {
             // The exact end, so a test can check it precedes any expiry declaration.
             info!("LEASE own: lost ({} acks, need {}); it ended at wall_ms {}", acks, majority,
@@ -495,7 +523,10 @@ impl LeaseRuntime {
             if !mine.granted || !self.persist().await {
                 continue;
             }
-            let replies = self.ask_all(peers, Request::VoteLeaseExpired { target, incarnation: inc }).await;
+            // Never ask the target: its vote on itself would count toward a majority that
+            // can overlap its own lease majority only in itself (local T60 chaos, 40 overlaps).
+            let voters: Vec<_> = peers.iter().copied().filter(|(id, _)| *id != target).collect();
+            let replies = self.ask_all(&voters, Request::VoteLeaseExpired { target, incarnation: inc }).await;
             let mut votes = 1;
             let mut newer = None;
             for (_, r) in &replies {
@@ -597,7 +628,7 @@ mod tests {
             let mut rng = Rng(seed * 0x9E37_79B9_7F4A_7C15);
             let t0 = Instant::now();
             let mut holders: Vec<HolderState> = (0..5).map(|_| HolderState::new(0)).collect();
-            let mut voters: Vec<VoterState> = (0..5).map(|_| VoterState::new(t0, HashMap::new())).collect();
+            let mut voters: Vec<VoterState> = (0..5).map(|i| VoterState::new(n[i], t0, HashMap::new())).collect();
             // declared[target] = highest incarnation a majority voted expired.
             let mut declared: HashMap<usize, u64> = HashMap::new();
             // cut[a][b]: a can't reach b.
@@ -628,8 +659,10 @@ mod tests {
                     let inc = voters[a].highest_seen(n[t]);
                     let mut votes = 0;
                     let mut newer = false;
+                    // Ask everyone, the target included, as the runtime once did: the voter
+                    // state machine itself must refuse a self-vote.
                     for b in 0..5 {
-                        if b == t || (b != a && (cut[a][b] || cut[b][a])) { continue; }
+                        if b != a && (cut[a][b] || cut[b][a]) { continue; }
                         let v = voters[b].on_vote(n[t], inc, now + ms(rng.below(400)), &c);
                         if v.highest_seen > inc { newer = true; } else if v.granted { votes += 1; }
                     }
@@ -672,7 +705,7 @@ mod tests {
         let c = cfg();
         let n = ids(2);
         let t0 = Instant::now();
-        let mut v = VoterState::new(t0, HashMap::new());
+        let mut v = VoterState::new(n[1], t0, HashMap::new());
         let later = t0 + c.silence(); // past the post-start abstention
         assert!(v.on_renew(n[0], 1, later).acked);
         assert!(!v.on_vote(n[0], 1, later + c.silence() - ms(1), &c).granted, "too soon after the last ack");
@@ -699,7 +732,7 @@ mod tests {
         let restarted = Instant::now();
         let loaded = LeaseStateFile::new(dir.path()).load();
         assert_eq!(loaded.incarnation, 2);
-        let mut v = VoterState::new(restarted, loaded.fences);
+        let mut v = VoterState::new(ids(2)[1], restarted, loaded.fences);
         assert!(!v.on_vote(n[0], 4, restarted + c.silence() - ms(1), &c).granted, "abstains right after a restart");
         assert!(!v.on_renew(n[0], 4, restarted).acked, "fence survived the restart");
         assert!(v.on_renew(n[0], 5, restarted).acked);
@@ -745,12 +778,51 @@ mod tests {
         let rt = LeaseRuntime::new(n[0], cluster, Arc::new(NetworkClient::new()), dir.path());
         let c = rt.cfg;
         let t0 = Instant::now();
-        *rt.voter.lock().unwrap() = VoterState::new(t0, HashMap::new());
+        *rt.voter.lock().unwrap() = VoterState::new(n[0], t0, HashMap::new());
         rt.voter.lock().unwrap().on_renew(n[1], 0, t0);
         let later = t0 + c.silence() + ms(1);
         assert_eq!(rt.expiry_candidates(&[n[1], n[2]], later), vec![(n[1], 0)],
             "a peer acked at incarnation 0 then silent must be a candidate; one never heard from must not");
         assert!(rt.expiry_candidates(&[n[1]], t0 + ms(100)).is_empty(), "not while it's still renewing");
+    }
+
+    /// Local T60 chaos: a node asked to vote on itself had never acked itself, so it voted
+    /// itself expired, and that self-vote completed a majority overlapping its own lease
+    /// majority only in itself. 40 lease/expiry overlaps in one 120 s run.
+    #[tokio::test]
+    async fn a_node_never_votes_itself_expired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let n = ids(1);
+        let cluster = Arc::new(ClusterManager::new(n[0], "127.0.0.1:19354".parse().unwrap(), 10, 30));
+        let rt = LeaseRuntime::new(n[0], cluster, Arc::new(NetworkClient::new()), dir.path());
+        // Well past the post-start abstention, and never acked itself.
+        *rt.voter.lock().unwrap() = VoterState::new(n[0], Instant::now() - rt.cfg.silence() * 2, HashMap::new());
+        match rt.handle_vote(n[0], 0).await {
+            Response::LeaseExpiryVote { granted, .. } => assert!(!granted, "a node voted itself expired"),
+            other => panic!("unexpected {:?}", other),
+        }
+        assert!(rt.voter.lock().unwrap().fences.is_empty(), "and it must not have fenced itself");
+    }
+
+    /// Local T59c: a 9 s hold on the membership lock cost that node its lease, because the
+    /// lease loop waited on it every tick. With the lock held, the loop must fall back to
+    /// the peers it already knows, promptly.
+    #[tokio::test]
+    async fn membership_lock_stall_does_not_block_renewal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let n = ids(2);
+        let cluster = Arc::new(ClusterManager::new(n[0], "127.0.0.1:19352".parse().unwrap(), 10, 30));
+        cluster.add_node(dfs_common::NodeInfo::new(n[1], "127.0.0.1:19353".parse().unwrap(), None)).await.unwrap();
+        let rt = LeaseRuntime::new(n[0], cluster.clone(), Arc::new(NetworkClient::new()), dir.path());
+        assert_eq!(rt.refresh_peers().await.len(), 1, "precondition: primes the cache");
+
+        let holder = { let c = cluster.clone(); tokio::spawn(async move { c.hold_membership_lock_for(Duration::from_secs(5)).await }) };
+        tokio::time::sleep(ms(50)).await;
+        let started = Instant::now();
+        let peers = rt.refresh_peers().await;
+        assert!(started.elapsed() < ms(1000), "refresh_peers waited {:?} on a held membership lock", started.elapsed());
+        assert_eq!(peers.len(), 1, "falls back to the cached peer list");
+        holder.abort();
     }
 
     /// Takeover goes only past a member a majority has voted expired, never past one

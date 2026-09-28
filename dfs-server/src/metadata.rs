@@ -2588,6 +2588,14 @@ impl MetadataStore {
     /// Look up a patch_state row by its public token. `None` means `chunk_id` is
     /// not a currently-outstanding patch token at all — callers should treat it
     /// as ordinary, directly-readable chunk content.
+    /// Fault injection only (see `Request::InjectStall`): hold the database write lock,
+    /// so every metadata read and write on this node waits. Blocking; run it on a
+    /// blocking thread.
+    pub fn hold_db_lock_for(&self, d: std::time::Duration) {
+        let _guard = self.db.write();
+        std::thread::sleep(d);
+    }
+
     pub fn get_patch_state(&self, public_token: &ChunkId) -> Result<Option<PatchState>> {
         let key = format!("{}", public_token);
         let _db = self.db.read();

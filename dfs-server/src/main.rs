@@ -419,6 +419,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
 
     server.clone().start_conn_pressure_watchdog();
+    server.clone().start_slot_audit();
     let mut server_handle = tokio::spawn(async move {
         let (client_result, peer_result) = tokio::join!(net_server.start(), peer_net_server.start());
         if let Err(e) = client_result {

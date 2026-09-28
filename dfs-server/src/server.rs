@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use dfs_common::{
     ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
     FoldReleaseOutcome, Message, NodeId, ProposeFoldOutcome, Request, Response,
+    SlotAuditEntry, SlotAuditFinding, SlotAuditMismatch,
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -1110,7 +1111,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ConfirmChunksLive { .. }
         | Request::GetPendingPatchChunkIds { .. }
         | Request::GetOrphanAuthInfo
-        | Request::GetPatchState { .. } => PeerOther,
+        | Request::GetPatchState { .. }
+        | Request::AuditSlots { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -2325,6 +2327,62 @@ fn backfill_chunk_generations_from_chunk_seq_table(
         }
     }
     info!("backfill_chunk_generations_from_chunk_seq_table: seeded {} chunk_generations entries from CHUNK_SEQ_TABLE", seeded);
+}
+
+/// Which listed holder audits a slot: rendezvous hashing, i.e. the holder with the highest
+/// hash(file_id, chunk_idx, node). Every node computes the same answer whatever order its
+/// holder list is in (holder lists are merged from many sources and have no reliable
+/// order), and ownership spreads evenly across nodes. "Lowest NodeId wins" was also
+/// order-independent, but made one node, the lowest id and so also the leader, audit
+/// every slot it held.
+fn slot_audit_owner(file_id: FileId, chunk_idx: u64, holders: &[NodeId]) -> Option<NodeId> {
+    holders.iter().copied().max_by_key(|node| {
+        let mut h = blake3::Hasher::new();
+        h.update(file_id.0.as_bytes());
+        h.update(&chunk_idx.to_le_bytes());
+        h.update(node.as_bytes());
+        *h.finalize().as_bytes()
+    })
+}
+
+/// The slot audit's memory between passes (see Server::run_slot_audit_pass). Lives in
+/// the audit task, not on Server: nothing else reads it.
+#[derive(Default)]
+struct SlotAuditState {
+    slots: HashMap<(FileId, u64), SlotAuditSeen>,
+    generation: u64,
+    slots_audited: u64,
+    /// Confirmed (persisted across a confirm delay) findings only.
+    view_diverged: u64,
+    phantom_holder: u64,
+    /// Suspects that cleared on their confirmation check: propagation lag, not drift.
+    transient: u64,
+}
+
+/// Slot-audit pacing (see Server::start_slot_audit for the env vars).
+#[derive(Clone, Copy)]
+struct SlotAuditConfig {
+    /// A slot's id must be unchanged this long before it's audited.
+    quiet: std::time::Duration,
+    /// Settled slots are re-audited this often.
+    reaudit: std::time::Duration,
+    /// A first-time finding is re-checked after this long, and only reported if it's
+    /// still there. One observation can't tell lag from drift; two can.
+    confirm: std::time::Duration,
+    max_slots: usize,
+}
+
+struct SlotAuditSeen {
+    chunk_id: ChunkId,
+    /// When this id was first seen for the slot; audited once it's been quiet long enough.
+    since: std::time::Instant,
+    /// Last successful audit of this id. Re-audited after `reaudit`, since bytes can
+    /// vanish from under an unchanged view (a sweep bug, a bad disk).
+    audited_at: Option<std::time::Instant>,
+    /// Last pass that still found the slot; stale entries are dropped.
+    generation: u64,
+    /// Unconfirmed findings awaiting their re-check: when first seen, and by whom.
+    suspect: Option<(std::time::Instant, Vec<(NodeId, SlotAuditFinding)>)>,
 }
 
 /// Shared body of `Server::pull_chunk_from_peers` (see its doc comment) — a free
@@ -7537,6 +7595,7 @@ impl Server {
             Request::ReplicateChunkLocationsWithReceipts { locations } => {
                 self.handle_replicate_chunk_locations(locations, true).await
             }
+            Request::AuditSlots { entries } => self.handle_audit_slots(entries).await,
             Request::SetPeerFilter { filter } => match crate::network::set_peer_filter(filter) {
                 Ok(()) => Response::Ok { data: None },
                 Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::PermissionDenied },
@@ -10561,6 +10620,254 @@ impl Server {
     }
 
     /// Write data to the cluster with replication
+    /// Follow a patch token to its fold result, if it has one. Views that differ only
+    /// by "token vs. what it folded into" agree about the slot's content.
+    async fn slot_audit_resolve(&self, id: ChunkId) -> ChunkId {
+        match self.metadata.get_patch_state_async(id).await {
+            Ok(Some(PatchState::Folded(real))) => real,
+            _ => id,
+        }
+    }
+
+    /// Whether this node really holds the content `id` names, judged from the disk
+    /// itself (not the presence index, which has lied before: 2026-09-11) and never
+    /// from RAM. A pending patch counts only if both its base and delta files exist;
+    /// 2026-09-27's phantom was a node whose pending patch had no base on disk.
+    async fn slot_audit_has_bytes(&self, id: ChunkId) -> bool {
+        let paths = match self.metadata.get_patch_state_async(id).await {
+            Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. })) => vec![
+                self.storage.get_chunk_path(&base_chunk_id),
+                self.storage.get_chunk_path(&delta_chunk_id),
+            ],
+            Ok(Some(PatchState::Folded(real))) => vec![self.storage.get_chunk_path(&real)],
+            _ => vec![self.storage.get_chunk_path(&id)],
+        };
+        tokio::task::spawn_blocking(move || paths.iter().all(|p| p.exists())).await.unwrap_or(false)
+    }
+
+    /// This node's verdict on one slot the auditing owner described. None = agrees.
+    async fn slot_audit_check(&self, entry: SlotAuditEntry) -> Option<SlotAuditFinding> {
+        let mine = self.chunk_map.get(&entry.file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, entry.chunk_idx).map(|i| locs[i].chunk_id)
+        });
+        let Some(mine) = mine else {
+            return Some(SlotAuditFinding::ViewDiverged { holder_chunk_id: None });
+        };
+        let theirs = self.slot_audit_resolve(entry.chunk_id).await;
+        if mine != entry.chunk_id && self.slot_audit_resolve(mine).await != theirs {
+            return Some(SlotAuditFinding::ViewDiverged { holder_chunk_id: Some(mine) });
+        }
+        if !self.slot_audit_has_bytes(entry.chunk_id).await {
+            return Some(SlotAuditFinding::PhantomHolder);
+        }
+        None
+    }
+
+    async fn handle_audit_slots(&self, entries: Vec<SlotAuditEntry>) -> Response {
+        let mut mismatches = Vec::new();
+        for entry in entries {
+            if let Some(finding) = self.slot_audit_check(entry).await {
+                mismatches.push(SlotAuditMismatch { entry, finding });
+            }
+        }
+        Response::SlotAuditReport { mismatches }
+    }
+
+    /// One slot-audit pass (SLOT-OWNERSHIP-PLAN.md Phase 0). Observation only.
+    ///
+    /// Scans chunk_map rather than hooking write paths, so every way a slot can change
+    /// (patch, fold, RCL, metadata sync) is covered without touching any of them. A slot
+    /// is audited once its id has stayed the same for `quiet` (so in-flight writes aren't
+    /// reported as drift), and only by its owner (see slot_audit_owner), which stands in
+    /// for the primary of later phases. At most `max_slots` slots
+    /// go out per pass, so the first sweep after a restart is paced by result rather than
+    /// hitting every holder's disk at once (see feedback_20260913 widening-a-trigger).
+    async fn run_slot_audit_pass(
+        &self,
+        state: &mut SlotAuditState,
+        cfg: SlotAuditConfig,
+    ) {
+        let now = std::time::Instant::now();
+        let local = self.cluster.local_node_id();
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+
+        // (entry, other listed holders) for every owned slot that's due.
+        let mut due: Vec<(SlotAuditEntry, Vec<NodeId>)> = Vec::new();
+        for file in self.chunk_map.iter() {
+            let file_id = *file.key();
+            let (locs, _) = file.value();
+            for loc in locs.iter() {
+                let Some(off) = loc.file_offset else { continue };
+                if slot_audit_owner(file_id, off / (4 * 1024 * 1024), &loc.nodes) != Some(local) {
+                    continue;
+                }
+                let chunk_idx = off / (4 * 1024 * 1024);
+                let slot = state.slots.entry((file_id, chunk_idx)).or_insert(SlotAuditSeen {
+                    chunk_id: loc.chunk_id, since: now, audited_at: None, generation, suspect: None,
+                });
+                slot.generation = generation;
+                if slot.chunk_id != loc.chunk_id {
+                    *slot = SlotAuditSeen { chunk_id: loc.chunk_id, since: now, audited_at: None, generation, suspect: None };
+                    continue;
+                }
+                let recheck = if slot.suspect.is_some() { cfg.confirm } else { cfg.reaudit };
+                let settled = slot.audited_at.is_some_and(|t| now.duration_since(t) < recheck);
+                if settled || now.duration_since(slot.since) < cfg.quiet || due.len() >= cfg.max_slots {
+                    continue;
+                }
+                let others: Vec<NodeId> = loc.nodes.iter().copied().filter(|n| *n != local).collect();
+                due.push((SlotAuditEntry { file_id, chunk_idx, chunk_id: loc.chunk_id }, others));
+            }
+        }
+        state.slots.retain(|_, s| s.generation == generation);
+
+        // A deleted file's slots can linger in chunk_map after its patch state and bytes
+        // are gone. Auditing them reports "divergence" on data nobody can read anymore,
+        // which drowned the real findings on the first local run. Settle them without
+        // asking anyone; the re-audit revisits them if the file ever reappears.
+        let mut exists: HashMap<FileId, bool> = HashMap::new();
+        let mut live = Vec::with_capacity(due.len());
+        for (entry, others) in due {
+            let alive = match exists.get(&entry.file_id) {
+                Some(a) => *a,
+                None => {
+                    let a = self.metadata.file_exists_by_id_async(entry.file_id).await.unwrap_or(true);
+                    exists.insert(entry.file_id, a);
+                    a
+                }
+            };
+            if alive {
+                live.push((entry, others));
+            } else if let Some(slot) = state.slots.get_mut(&(entry.file_id, entry.chunk_idx)) {
+                slot.audited_at = Some(now);
+            }
+        }
+        let due = live;
+        if due.is_empty() {
+            return;
+        }
+
+        let addrs: HashMap<NodeId, (SocketAddr, bool)> = self.cluster.get_all_nodes().await
+            .into_iter()
+            .map(|n| (n.id, (n.addr, n.status == dfs_common::NodeStatus::Online)))
+            .collect();
+        let mut per_peer: HashMap<NodeId, Vec<SlotAuditEntry>> = HashMap::new();
+        let mut finished: Vec<(FileId, u64)> = Vec::new();
+        let mut findings: Vec<(NodeId, SlotAuditMismatch)> = Vec::new();
+        for (entry, others) in &due {
+            if let Some(finding) = self.slot_audit_check(*entry).await {
+                findings.push((local, SlotAuditMismatch { entry: *entry, finding }));
+            }
+            // An unreachable holder leaves the slot un-audited, to retry next pass.
+            if others.iter().all(|n| addrs.get(n).is_some_and(|(_, online)| *online)) {
+                finished.push((entry.file_id, entry.chunk_idx));
+                for n in others {
+                    per_peer.entry(*n).or_default().push(*entry);
+                }
+            }
+        }
+        let mut unanswered: std::collections::HashSet<(FileId, u64)> = std::collections::HashSet::new();
+        for (peer, entries) in per_peer {
+            let addr = addrs[&peer].0;
+            for batch in entries.chunks(512) {
+                let request = Message::Request(Request::AuditSlots { entries: batch.to_vec() });
+                match self.client.send_message_timeout(addr, request, std::time::Duration::from_secs(20)).await {
+                    Ok(env) => match env.message {
+                        Message::Response(Response::SlotAuditReport { mismatches }) => {
+                            findings.extend(mismatches.into_iter().map(|m| (peer, m)));
+                        }
+                        other => {
+                            warn!("SLOT AUDIT: unexpected reply from {} ({}): {:?}", peer, addr, other);
+                            unanswered.extend(batch.iter().map(|e| (e.file_id, e.chunk_idx)));
+                        }
+                    },
+                    Err(e) => {
+                        debug!("SLOT AUDIT: {} ({}) unreachable: {}", peer, addr, e);
+                        unanswered.extend(batch.iter().map(|e| (e.file_id, e.chunk_idx)));
+                    }
+                }
+            }
+        }
+        let mut by_slot: HashMap<(FileId, u64), Vec<(NodeId, SlotAuditMismatch)>> = HashMap::new();
+        for (holder, m) in findings {
+            by_slot.entry((m.entry.file_id, m.entry.chunk_idx)).or_default().push((holder, m));
+        }
+        let same = |a: &SlotAuditFinding, b: &SlotAuditFinding| std::mem::discriminant(a) == std::mem::discriminant(b);
+        let mut confirmed = 0usize;
+        for key in finished.into_iter().filter(|k| !unanswered.contains(k)) {
+            let Some(slot) = state.slots.get_mut(&key) else { continue };
+            slot.audited_at = Some(now);
+            let now_found = by_slot.remove(&key).unwrap_or_default();
+            let Some((first_seen, earlier)) = slot.suspect.take() else {
+                if !now_found.is_empty() {
+                    slot.suspect = Some((now, now_found.iter().map(|(h, m)| (*h, m.finding)).collect()));
+                }
+                continue;
+            };
+            let age = now.duration_since(first_seen);
+            for (holder, m) in &now_found {
+                if earlier.iter().any(|(h, f)| h == holder && same(f, &m.finding)) {
+                    let kind = match m.finding {
+                        SlotAuditFinding::ViewDiverged { .. } => { state.view_diverged += 1; "view_diverged" }
+                        SlotAuditFinding::PhantomHolder => { state.phantom_holder += 1; "phantom_holder" }
+                    };
+                    confirmed += 1;
+                    warn!("[DIVERGENCE] kind={} file={} chunk_idx={} owner={} owner_view={} holder={} persisted={:?} finding={:?}",
+                        kind, m.entry.file_id, m.entry.chunk_idx, local, m.entry.chunk_id, holder, age, m.finding);
+                }
+            }
+            for (holder, f) in &earlier {
+                if !now_found.iter().any(|(h, m)| h == holder && same(f, &m.finding)) {
+                    state.transient += 1;
+                    info!("[DIVERGENCE-TRANSIENT] file={} chunk_idx={} owner={} holder={} finding={:?} cleared within {:?}",
+                        key.0, key.1, local, holder, f, age);
+                }
+            }
+            // Findings that weren't in the earlier set start their own confirmation.
+            let fresh: Vec<(NodeId, SlotAuditFinding)> = now_found.iter()
+                .filter(|(h, m)| !earlier.iter().any(|(eh, f)| eh == h && same(f, &m.finding)))
+                .map(|(h, m)| (*h, m.finding))
+                .collect();
+            if !fresh.is_empty() {
+                slot.suspect = Some((now, fresh));
+            }
+        }
+
+        state.slots_audited += due.len() as u64;
+        let suspects = state.slots.values().filter(|s| s.suspect.is_some()).count();
+        info!("SLOT AUDIT pass: {} slots due, {} confirmed finding(s), {} suspect(s) awaiting re-check \
+               (since start: {} audited, {} view_diverged, {} phantom_holder, {} transient)",
+            due.len(), confirmed, suspects, state.slots_audited, state.view_diverged, state.phantom_holder, state.transient);
+    }
+
+    /// Start the background slot audit. DFS_SLOT_AUDIT_INTERVAL_SECS (default 60, 0 = off),
+    /// DFS_SLOT_AUDIT_QUIET_SECS (default 30), DFS_SLOT_AUDIT_REAUDIT_SECS (default 3600),
+    /// DFS_SLOT_AUDIT_CONFIRM_SECS (default 60), DFS_SLOT_AUDIT_MAX_PER_PASS (default 2000).
+    pub fn start_slot_audit(self: Arc<Self>) {
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let interval = env_u64("DFS_SLOT_AUDIT_INTERVAL_SECS", 60);
+        if interval == 0 {
+            info!("SLOT AUDIT disabled (DFS_SLOT_AUDIT_INTERVAL_SECS=0)");
+            return;
+        }
+        let secs = |k: &str, d: u64| std::time::Duration::from_secs(env_u64(k, d));
+        let cfg = SlotAuditConfig {
+            quiet: secs("DFS_SLOT_AUDIT_QUIET_SECS", 30),
+            reaudit: secs("DFS_SLOT_AUDIT_REAUDIT_SECS", 3600),
+            confirm: secs("DFS_SLOT_AUDIT_CONFIRM_SECS", 60),
+            max_slots: env_u64("DFS_SLOT_AUDIT_MAX_PER_PASS", 2000) as usize,
+        };
+        tokio::spawn(async move {
+            let mut state = SlotAuditState::default();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                self.run_slot_audit_pass(&mut state, cfg).await;
+            }
+        });
+    }
+
     pub async fn write_data(&self, data: &[u8], file_id: dfs_common::FileId) -> Result<Vec<(ChunkId, u64, Vec<dfs_common::NodeId>)>> {
         let total_start = std::time::Instant::now();
         info!("Writing {} bytes to cluster", data.len());
@@ -21071,6 +21378,123 @@ mod tests {
              its base's bytes — the slot is left naming a token no node holds (permanent EIO)");
         assert_eq!(h.storage.read_chunk(&base_chunk_id).unwrap(), base_content,
             "the base must now be on this node's disk, verified, so the fold's retry succeeds");
+    }
+
+    /// The audit owner must be the same on every node whatever order its holder list is
+    /// in (lists are merged from many sources), and ownership must spread evenly rather
+    /// than land on one node, the leader in particular, as "lowest id wins" did.
+    #[test]
+    fn slot_audit_owner_is_order_independent_and_balanced() {
+        let nodes: Vec<NodeId> = (0..5).map(|_| NodeId::new()).collect();
+        let file_id = FileId::new();
+        let mut owned = std::collections::HashMap::<NodeId, usize>::new();
+        for chunk_idx in 0..5000u64 {
+            let holders = [nodes[(chunk_idx % 5) as usize], nodes[((chunk_idx + 2) % 5) as usize]];
+            let reversed = [holders[1], holders[0]];
+            let o = slot_audit_owner(file_id, chunk_idx, &holders);
+            assert_eq!(o, slot_audit_owner(file_id, chunk_idx, &reversed), "order changed the owner");
+            *owned.entry(o.unwrap()).or_default() += 1;
+        }
+        for n in &nodes {
+            let share = *owned.get(n).unwrap_or(&0) as f64 / 5000.0;
+            assert!((0.15..=0.25).contains(&share), "node {} owns {:.1}% of slots, expected ~20%", n, share * 100.0);
+        }
+    }
+
+    /// SLOT-OWNERSHIP-PLAN.md Phase 0: the slot audit must find exactly the planted
+    /// faults and nothing else. Two real Servers over real networking. The audit owner
+    /// holds five slots of one file with the peer; each carries one condition: agreeing,
+    /// peer view diverged, peer phantom (listed, no bytes: the 2026-09-27 gluster1 shape),
+    /// owner phantom, and a divergence that heals before its confirmation (transient).
+    /// Confirmed slots must not be re-reported before the re-audit interval, and a slot
+    /// inside its quiet window must not be audited at all.
+    #[tokio::test]
+    async fn slot_audit_finds_planted_divergence_and_phantoms_only() {
+        use crate::network::NetworkServer;
+        use dfs_common::NodeInfo;
+
+        let peer_temp_storage = TempDir::new().unwrap();
+        let peer_temp_metadata = TempDir::new().unwrap();
+        let peer_temp_metadata_dir = TempDir::new().unwrap();
+        let peer_storage = Arc::new(ChunkStorage::new(peer_temp_storage.path().to_path_buf()).unwrap());
+        let peer_metadata = Arc::new(MetadataStore::new(peer_temp_metadata.path().to_path_buf()).unwrap());
+        let h = make_overlay_test_harness();
+        let owner = h.server.cluster.local_node_id();
+        let file_meta = dfs_common::FileMetadata::new("/slot-audit-test".to_string(), dfs_common::types::FileType::RegularFile);
+        let file_id = file_meta.id;
+        h.metadata.put_file(&file_meta).unwrap();
+        // Ownership is per slot (rendezvous hash), so pick a peer id that leaves the
+        // harness node owning all five slots under test.
+        let peer_node_id = (0..=255u8).map(|b| NodeId::from_bytes([b; 16]))
+            .find(|p| (0..5).all(|i| slot_audit_owner(file_id, i, &[owner, *p]) == Some(owner)))
+            .expect("some peer id leaves the harness owning all five slots");
+        let peer_addr: SocketAddr = "127.0.0.1:19342".parse().unwrap();
+        let peer_cluster = Arc::new(ClusterManager::new(peer_node_id, peer_addr, 10, 30));
+        let peer_server = Arc::new(Server::new(
+            peer_storage.clone(), peer_metadata.clone(), 4 * 1024 * 1024, peer_cluster.clone(), 3,
+            peer_temp_metadata_dir.path().to_path_buf(), peer_temp_metadata_dir.path().join("config.toml"), true,
+        ));
+        let mut peer_net_server = NetworkServer::new(crate::network::peer_port_addr(peer_addr), peer_server.clone(), 10);
+        tokio::spawn(async move { peer_net_server.start().await.ok(); });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        h.server.cluster().add_node(NodeInfo::new(peer_node_id, peer_addr, None)).await.unwrap();
+        const CS: u64 = 4 * 1024 * 1024;
+        let content = |i: u64| vec![i as u8 + 1; 4096];
+        let id_at = |i: u64, data: &[u8]| ChunkId::from_hash(dfs_common::compute_chunk_hash_at(data, i * CS, file_id));
+        let loc = |i: u64, id: ChunkId| ChunkLocation {
+            chunk_id: id, nodes: vec![owner, peer_node_id], size: 4096, checksum: id.hash,
+            file_offset: Some(i * CS), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        let ids: Vec<ChunkId> = (0..5).map(|i| id_at(i, &content(i))).collect();
+        let other = |i: u64| id_at(i, &[0xeeu8; 4096]);
+
+        // Owner's view: five slots, both nodes listed. Owner lacks slot 3's bytes.
+        for i in [0u64, 1, 2, 4] { h.storage.write_chunk(&ids[i as usize], &content(i)).unwrap(); }
+        h.server.chunk_map.insert(file_id, ((0..5).map(|i| loc(i, ids[i as usize])).collect(), 1));
+        // Peer's view: slots 1 and 4 name other chunks (4 will catch up: lag, not drift);
+        // peer lacks slot 2's bytes.
+        for i in [0u64, 1, 3, 4] { peer_storage.write_chunk(&ids[i as usize], &content(i)).unwrap(); }
+        for i in [1u64, 4] { peer_storage.write_chunk(&other(i), &[0xeeu8; 4096]).unwrap(); }
+        let peer_view = |slot4: ChunkId| (vec![loc(0, ids[0]), loc(1, other(1)), loc(2, ids[2]), loc(3, ids[3]), loc(4, slot4)], 1);
+        peer_server.chunk_map.insert(file_id, peer_view(other(4)));
+
+        let hour = std::time::Duration::from_secs(3600);
+        let zero = std::time::Duration::ZERO;
+        let cfg = |quiet, reaudit| SlotAuditConfig { quiet, reaudit, confirm: zero, max_slots: 100 };
+        let counts = |st: &SlotAuditState| (st.view_diverged, st.phantom_holder, st.transient);
+        let mut state = SlotAuditState::default();
+
+        h.server.run_slot_audit_pass(&mut state, cfg(hour, hour)).await;
+        assert_eq!(state.slots_audited, 0, "slots inside the quiet window must not be audited yet");
+
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, hour)).await;
+        assert_eq!(state.slots_audited, 5, "all five owned slots are due");
+        assert_eq!(counts(&state), (0, 0, 0), "a first sighting is only a suspect, never reported");
+
+        peer_server.chunk_map.insert(file_id, peer_view(ids[4])); // slot 4's peer catches up
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, hour)).await;
+        assert_eq!(counts(&state), (1, 2, 1),
+            "confirmed: slot 1 diverged, phantoms on peer slot 2 and owner slot 3; slot 4 cleared = transient");
+
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, hour)).await;
+        assert_eq!(counts(&state), (1, 2, 1), "a confirmed slot isn't re-reported before the re-audit interval");
+
+        // Bytes vanishing under an unchanged view (slot 0's peer copy) must still be
+        // caught by the re-audit, confirmed like any other finding.
+        std::fs::remove_file(peer_storage.get_chunk_path(&ids[0])).unwrap();
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, zero)).await;
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, zero)).await;
+        assert_eq!(counts(&state), (2, 5, 1),
+            "re-audit confirms slot 1 again, phantoms on slots 0 (newly vanished), 2 and 3");
+
+        // A deleted file's leftover chunk_map slots are not divergence: nobody can read them.
+        h.metadata.delete_file(&file_id).unwrap();
+        let before = counts(&state);
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, zero)).await;
+        h.server.run_slot_audit_pass(&mut state, cfg(zero, zero)).await;
+        assert_eq!(counts(&state), before,
+            "slots of a deleted file must not be reported");
     }
 
     /// 2026-08-09: fold_slot_now used to acquire chunk_patch_locks for a slot FIRST,

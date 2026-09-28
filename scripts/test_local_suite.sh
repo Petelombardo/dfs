@@ -33,6 +33,12 @@ export DFS_CHUNK_RING_CAPACITY=8
 export DFS_DELTA_RING_CAPACITY=8
 export DFS_MAX_CACHE_CHUNKS=8
 export DFS_WRITE_BUFFER_CAP_MB=32
+# Slot audit (SLOT-OWNERSHIP-PLAN Phase 0) runs fast here so T57 can observe it, and
+# so every other test doubles as a divergence measurement: grep "[DIVERGENCE]".
+export DFS_SLOT_AUDIT_INTERVAL_SECS=2
+export DFS_SLOT_AUDIT_QUIET_SECS=3
+export DFS_SLOT_AUDIT_REAUDIT_SECS=20
+export DFS_SLOT_AUDIT_CONFIRM_SECS=10
 
 # If test filter args given, only run those tests (e.g. T7 T23).
 RUN_TESTS="${*:-ALL}"
@@ -4806,6 +4812,65 @@ T56_LATE=$(( $(grep -c "first dropped send to" "$T56_LOG" 2>/dev/null || true) -
     && check "T56f peer links healed after clear (no injected failures in the next heartbeat)" PASS \
     || check "T56f $T56_LATE injected failures after clear -- filter not cleared" FAIL
 fi # should_run T56
+
+if should_run T57; then
+snapshot_log T57
+echo ""
+echo "=== T57: slot audit sees clean data as clean and catches a planted phantom holder (SLOT-OWNERSHIP-PLAN Phase 0) ==="
+t57_fid() {
+    grep -h "\[META SERVER\] put path=$1 id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+'
+}
+t57_div() { cat "$LOG"/server*.log 2>/dev/null | grep "\[DIVERGENCE\]" | grep -c "file=$1" || true; }
+
+# T57a: ordinary writes plus in-place patches, then quiet -- zero findings allowed.
+dd if=/dev/urandom of="$MOUNT/t57_clean.bin" bs=1M count=12 status=none
+for off in 5 6 9; do
+    dd if=/dev/urandom of="$MOUNT/t57_clean.bin" bs=4K count=1 seek=$((off * 256 + 3)) conv=notrunc status=none
+done
+dfs_sync
+T57A_FID=$(t57_fid /t57_clean.bin)
+T57A_PASSES_BEFORE=$(cat "$LOG"/server*.log | grep -c "SLOT AUDIT pass" || true)
+sleep 20   # quiet (3s) + first check + confirm delay (10s) + re-check, with 2s passes
+T57A_PASSES=$(( $(cat "$LOG"/server*.log | grep -c "SLOT AUDIT pass" || true) - T57A_PASSES_BEFORE ))
+T57A_DIV=$(t57_div "$T57A_FID")
+echo "  T57a: file_id=${T57A_FID:-<not found>} audit passes with work=$T57A_PASSES divergences=$T57A_DIV"
+[ -n "$T57A_FID" ] && [ "$T57A_PASSES" -gt 0 ] \
+    && check "T57a slot audit ran over fresh writes ($T57A_PASSES passes)" PASS \
+    || check "T57a slot audit never ran (fid=${T57A_FID:-none}, passes=$T57A_PASSES)" FAIL
+[ "$T57A_DIV" -eq 0 ] \
+    && check "T57a zero confirmed [DIVERGENCE] findings on clean, settled data" PASS \
+    || check "T57a $T57A_DIV confirmed [DIVERGENCE] findings on clean data -- false positives or real drift, see server logs" FAIL
+
+# T57b: delete one replica's bytes from disk under an unchanged view (the 2026-09-27
+# phantom shape). Healing is paused so the outcome can't depend on who wins a race.
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing disable >/dev/null 2>&1 || true
+dd if=/dev/urandom of="$MOUNT/t57_phantom.bin" bs=1M count=4 status=none
+dfs_sync
+T57B_FID=$(t57_fid /t57_phantom.bin)
+T57B_CHUNK=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t57_phantom.bin 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][0]['chunk_id'])" 2>/dev/null)
+T57B_VICTIM=$(find "$BASE"/node*/data -name "$T57B_CHUNK" 2>/dev/null | head -1)
+if [ -n "$T57B_VICTIM" ]; then
+    rm -f "$T57B_VICTIM"
+    echo "  T57b: removed $T57B_VICTIM"
+fi
+T57B_FOUND=0
+for _ in $(seq 1 90); do   # up to 45s: 20s re-audit + 10s confirm + passes
+    T57B_FOUND=$(cat "$LOG"/server*.log 2>/dev/null | grep "\[DIVERGENCE\] kind=phantom_holder" \
+        | grep "file=$T57B_FID" | grep -c "chunk_idx=0 " || true)
+    [ "$T57B_FOUND" -gt 0 ] && break
+    sleep 0.5
+done
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing enable >/dev/null 2>&1 || true
+[ -n "$T57B_VICTIM" ] && [ "$T57B_FOUND" -gt 0 ] \
+    && check "T57b planted phantom holder reported by the slot audit" PASS \
+    || check "T57b planted phantom not reported (victim=${T57B_VICTIM:-none}, fid=${T57B_FID:-none})" FAIL
+
+T57_ALL_DIV=$(cat "$LOG"/server*.log 2>/dev/null | grep -c "\[DIVERGENCE\]" || true)
+T57_ALL_TRANSIENT=$(cat "$LOG"/server*.log 2>/dev/null | grep -c "\[DIVERGENCE-TRANSIENT\]" || true)
+echo "  (informational) across this whole run: $T57_ALL_DIV confirmed [DIVERGENCE], $T57_ALL_TRANSIENT transient (cleared within the confirm delay)"
+rm -f "$MOUNT/t57_clean.bin" "$MOUNT/t57_phantom.bin"
+fi # should_run T57
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

@@ -58,6 +58,10 @@ pub struct ClusterManager {
     /// Listeners use this to trigger proactive sync without polling.
     pub node_recovered_notify: Arc<Notify>,
 
+    /// Heartbeat round trips per peer since the last `PEER RTT` log line
+    /// (SLOT-OWNERSHIP-PLAN.md Phase 0: the stall distribution Phase 1 sizes leases against).
+    peer_rtt: Arc<std::sync::Mutex<HashMap<SocketAddr, PeerRtt>>>,
+
     /// Timestamp of the most recent leader promotion on this node.
     /// Set by the server when it detects !was_leader && is_leader.
     /// Used by the healer to enforce a post-election grace period before
@@ -141,6 +145,7 @@ impl ClusterManager {
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compaction_intents: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            peer_rtt: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -851,6 +856,10 @@ impl ClusterManager {
         let mut probe_counter = 0u32;
 
         tokio::spawn(async move {
+            let rtt_window = std::time::Duration::from_secs(
+                std::env::var("DFS_PEER_RTT_LOG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
+            );
+            let mut rtt_window_start = std::time::Instant::now();
             loop {
                 heartbeat_interval.tick().await;
 
@@ -876,8 +885,30 @@ impl ClusterManager {
                 if let Err(e) = self.send_heartbeats(probe_failed).await {
                     warn!("Error sending heartbeats: {}", e);
                 }
+
+                if rtt_window_start.elapsed() >= rtt_window {
+                    rtt_window_start = std::time::Instant::now();
+                    self.log_peer_rtt(rtt_window);
+                }
             }
         });
+    }
+
+    /// One line per window: the worst heartbeat round trip to each peer, how many
+    /// completed, and how many failed. A heartbeat only exercises the network and
+    /// request dispatch, so this catches whole-process and runtime stalls, not a single
+    /// wedged subsystem; that is exactly what an isolated lease-renewal path would see.
+    fn log_peer_rtt(&self, window: std::time::Duration) {
+        let taken = std::mem::take(&mut *self.peer_rtt.lock().unwrap());
+        if taken.is_empty() {
+            return;
+        }
+        let mut peers: Vec<_> = taken.into_iter().collect();
+        peers.sort_by_key(|(addr, _)| *addr);
+        let summary: Vec<String> = peers.iter()
+            .map(|(addr, r)| format!("{} max={}ms n={} failed={}", addr, r.max_ms, r.ok, r.failed))
+            .collect();
+        info!("PEER RTT (last {}s): {}", window.as_secs(), summary.join("; "));
     }
 
     /// Send heartbeats to all nodes in the cluster.
@@ -953,12 +984,24 @@ impl ClusterManager {
             let target_addr = node_info.addr;
             let is_probe = node_info.status == NodeStatus::Failed;
             let client = self.client.clone();
+            let peer_rtt = self.peer_rtt.clone();
             tokio::spawn(async move {
+                let started = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
                     client.send_message(target_addr, heartbeat),
                 ).await;
                 let failed = matches!(result, Err(_) | Ok(Err(_)));
+                if !is_probe {
+                    let mut rtt = peer_rtt.lock().unwrap();
+                    let r = rtt.entry(target_addr).or_default();
+                    if failed {
+                        r.failed += 1;
+                    } else {
+                        r.ok += 1;
+                        r.max_ms = r.max_ms.max(started.elapsed().as_millis() as u64);
+                    }
+                }
                 if failed {
                     let reason = match &result {
                         Err(_) => "timeout".to_string(),
@@ -1411,4 +1454,12 @@ mod tests {
         let won = manager.propose_and_race_compaction_intent().await;
         assert!(!won, "a genuinely earlier, fresh competing intent must still win the race");
     }
+}
+
+/// Heartbeat round trips to one peer within the current `PEER RTT` window.
+#[derive(Default)]
+struct PeerRtt {
+    max_ms: u64,
+    ok: u64,
+    failed: u64,
 }

@@ -996,6 +996,15 @@ pub enum Request {
     SetPeerFilter {
         filter: PeerFilter,
     },
+
+    /// Slot audit (SLOT-OWNERSHIP-PLAN.md Phase 0): the auditing owner of these
+    /// slots (chosen by rendezvous hash among each slot's listed holders) asks a fellow holder
+    /// whether it agrees on each slot's current id and actually has its bytes. The
+    /// answer lists disagreements only. Observation only: nothing is repaired.
+    /// APPENDED at end to preserve wire compatibility.
+    AuditSlots {
+        entries: Vec<SlotAuditEntry>,
+    },
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1542,6 +1551,13 @@ pub enum Response {
     ChunkLocationReceipts {
         receipts: Vec<ChunkLocationReceipt>,
     },
+
+    /// Answer to `Request::AuditSlots`: only the entries this node disagrees with.
+    /// Only ever sent in response to that request. APPENDED at end to preserve wire
+    /// compatibility.
+    SlotAuditReport {
+        mismatches: Vec<SlotAuditMismatch>,
+    },
 }
 
 /// One entry in a Response::PendingHealingSample. See that response's doc
@@ -1770,4 +1786,30 @@ pub struct PeerFilter {
     /// except `SetPeerFilter`): clients can't reach it, peers still can.
     pub refuse_clients: bool,
     pub mode: PeerFilterMode,
+}
+
+/// One slot as its auditing owner sees it. See `Request::AuditSlots`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotAuditEntry {
+    pub file_id: FileId,
+    pub chunk_idx: u64,
+    /// The owner's current id for the slot (a real chunk id or a patch token).
+    pub chunk_id: ChunkId,
+}
+
+/// What a holder found wrong with one audited slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotAuditFinding {
+    /// This holder's view of the slot resolves to a different chunk than the owner's
+    /// (None: this holder has no entry for the slot at all).
+    ViewDiverged { holder_chunk_id: Option<ChunkId> },
+    /// Same view, but this node is listed as a holder and doesn't have the bytes on
+    /// disk: the real file, or for a pending patch its base and delta.
+    PhantomHolder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotAuditMismatch {
+    pub entry: SlotAuditEntry,
+    pub finding: SlotAuditFinding,
 }

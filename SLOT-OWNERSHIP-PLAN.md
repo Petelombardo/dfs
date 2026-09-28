@@ -35,11 +35,16 @@ everything else.
    of today's.
 3. **Clients never cause a promotion.** Only the leader decides a failover, based on its own
    reachability plus lease expiry. A client's view of the network is advisory.
-4. **An acknowledged write exists on every in-sync replica.** This single rule is what makes
+4. **The client writes exactly 2 replicas; replicas 3..n are backfilled.** With RF = n > 2,
+   every client write, full or patch, goes to exactly 2 nodes (primary + secondary). The
+   remaining n−2 copies are filled afterwards by the primary (Phase 4; the healer until then),
+   never by the client. RF = 1 writes 1, RF = 2 writes 2. Today's patch fan-out to every holder
+   violates this and is removed in Phase 3.
+5. **An acknowledged write exists on every in-sync replica.** This single rule is what makes
    any in-sync replica safe to promote.
-5. **Deterministic, testable failure handling.** Partitions are tested by injected message
+6. **Deterministic, testable failure handling.** Partitions are tested by injected message
    filters, not wall-clock races (see feedback_timing_based_concurrency_tests_unreliable).
-6. **Incremental.** Every phase is deployable on its own and earns its keep before the next.
+7. **Incremental.** Every phase is deployable on its own and earns its keep before the next.
 
 ## 3. Current state (verified 2026-09-28)
 
@@ -61,7 +66,8 @@ everything else.
   by a cheap heartbeat.
 - **Slot**: `(file_id, chunk_idx)`.
 - **ISR (in-sync replica list)**: per slot, the *ordered* list of nodes guaranteed to hold
-  every acknowledged write. Normally `[primary, secondary]`. Order matters.
+  every acknowledged write. Normally `[primary, secondary]`. Order matters, and it is a
+  **recorded** order, never a sorted one (see "ISR order" below).
 - **Primary of a slot**: the **first node in the slot's ISR that holds a valid node lease**.
   It is derived, not assigned per slot. Everyone computes the same answer from the same inputs.
 - **Secondary**: the other ISR member.
@@ -85,13 +91,32 @@ placement groups would force a data migration. Instead:
 
 Leader state is O(nodes + node pairs). Hot-path cost is zero leader RPCs.
 
+### ISR order: recorded, versioned, never derived from the holder list
+
+"First node in the ISR" only works if every node sees the same order. So:
+
+- The ISR is a **new stored field per slot**, separate from today's `ChunkLocation.nodes`.
+  That list is merged from many sources (union merges, per-node registrations, healer
+  additions) and has no reliable order, so two nodes can list the same holders differently.
+- **Not sorted by NodeId.** Sorting would make the lowest-id node primary for every slot it
+  holds (gluster1, which is also the leader), and the highest-id node never primary except
+  on failover, whatever was designated.
+- It starts as `[P, S]` in the order the client chose at creation. The client's placement
+  already spreads chunks evenly, so primaries spread the same way, and no node is
+  structurally excluded from being primary.
+- Only the primary changes it (replace a secondary, re-admit one, add a caught-up follower),
+  and every change bumps the slot epoch. Every slot-level message carries that epoch, so a
+  node acting on a stale order is rejected and refreshes instead of disagreeing.
+- Anything that needs a node choice *without* an ISR (the Phase 0 audit, before ISRs exist)
+  uses rendezvous hashing over the holder set: order-independent and balanced.
+
 ## 5. Topologies
 
 | Setup | Behavior |
 |---|---|
 | **RF = 1** (aggregation, no redundancy) | ISR = `[holder]`. Every holder is primary for its slots. The lease still fences a node that was declared dead from resurfacing and writing. Node down means its slots are unavailable (no copy exists). |
 | **RF = 2** | ISR = `[P, S]` as chosen by the client at creation. Writes are acked only when both have them. P fails → S promoted (after lease expiry). S fails → P recruits a replacement secondary. |
-| **RF ≥ 3** | The client still writes only P and S (quorum 2). P replicates asynchronously to followers. Only ISR members are promotable. A follower becomes secondary only after catch-up plus a leader-recorded ISR change. |
+| **RF ≥ 3** | Principle 4: the client writes only P and S (quorum 2), for full writes and patches alike. P replicates asynchronously to followers. Only ISR members are promotable. A follower becomes secondary only after catch-up plus a leader-recorded ISR change. |
 
 This matches the rule that the client writes 2 replicas. It also **narrows today's patch
 fan-out from all holders to P+S** (a behavior change, Phase 3).
@@ -196,7 +221,7 @@ Actors: **P** (primary), **S** (secondary), **L** (leader), **C** (client). "✗
 | 2 | P–S ✗; P–L ok; S–L ok | **No promotion.** P is leased and alive. P gets `Exclude{P,S}` recorded, recruits a replacement secondary, and catches it up. S is re-admitted after the link heals and it catches up. Promoting S here would create two primaries. |
 | 3 | P–S ✗; S–L ✗; P–L ok | S is isolated. Same as #2. |
 | 4 | P–L ✗; P–S ok; S–L ok | P can't renew. With relayed renewal (6.2 option), S forwards it and nothing changes. Without it, P self-fences at lease lapse, L waits `L+margin`, then S becomes primary (it is ISR, so it has every acked write). P rejoins as secondary after catch-up. |
-| 5 | **P reachable only by C** (P–S ✗, P–L ✗, C–P ok). This was your open case. | P's lease lapses and **P fences itself**: it refuses writes and reads with `NotPrimary`. It can't have acked anything since then, because acks need S (rule 4). L waits `L+margin` and promotes S. C's retries against P get `NotPrimary`, so C refreshes and moves to S. No split-brain: the old primary stops before the new one starts. |
+| 5 | **P reachable only by C** (P–S ✗, P–L ✗, C–P ok). This was your open case. | P's lease lapses and **P fences itself**: it refuses writes and reads with `NotPrimary`. It can't have acked anything since then, because acks need S (principle 5). L waits `L+margin` and promotes S. C's retries against P get `NotPrimary`, so C refreshes and moves to S. No split-brain: the old primary stops before the new one starts. |
 | 6 | S–P ✗; S–L ok; S–C ok (your promotion case) | Promote S **only if L also can't reach P and P's lease has expired.** If L can reach P, this is #2 and S is excluded instead. S's own view never triggers promotion. |
 | 7 | C–P ✗, everything else ok | Not a failover. C sends via S, which relays to P, or C retries. Clients never cause promotion (principle 3). |
 | 8 | L fails / L loses majority | Existing quorum gate: the old L stops being leader. The new leader bumps the term, learns the lease table from a majority, and **must not re-appoint any node until that node's last lease could have expired.** Primaries keep serving on their unexpired leases, so a leader change alone causes no write outage. |
@@ -211,23 +236,34 @@ Actors: **P** (primary), **S** (secondary), **L** (leader), **C** (client). "✗
 ## 8. Phases
 
 Each phase has a verification gate. New tests are written first and shown failing, as usual.
-Partition tests need a **fault-injection message filter** (test builds / local suite only):
-`SetPeerFilter { drop_to: [NodeId], drop_from: [NodeId] }`. This makes #2–#15 deterministic
-on the local 5-node cluster.
+Partition tests use the **fault-injection link filter** (built in Phase 0, local suite only):
+`SetPeerFilter { drop_to, refuse_clients, mode: Refuse | BlackHole }`, driven by
+`dfs-admin fault set|clear`. It is outbound-only per node: set both sides for a partition,
+one side for an asymmetric link. This makes #2–#15 deterministic on the local 5-node cluster.
 
 **Phase 0 — Observe only (no behavior change)**
-- **Slot audit.** For each slot, the *audit owner* is the lowest NodeId among the slot's
-  listed holders. It is deterministic and needs no coordination, so it stands in for the
-  future primary. It tracks slots that changed since their last audit. Once a slot has been
+- **Slot audit.** For each slot, the *audit owner* is chosen by rendezvous hash over the
+  slot's listed holders (the highest hash(slot, node) wins). It is deterministic,
+  order-independent, balanced across nodes, and needs no coordination, so it stands in for
+  the future primary. It tracks slots that changed since their last audit. Once a slot has been
   write-quiet for Q seconds, it sends each other listed holder one batched
   `AuditSlots { entries: [(file_id, chunk_idx, my_chunk_id)] }` per peer per period.
   The peer replies with mismatches only: a different current id, or bytes/patch state for the
   listed id absent (a **phantom holder**, the 2026-09-27 bug). Cost scales with changed slots,
-  not total slots.
-- Each mismatch is logged as `[DIVERGENCE]` at WARN with the slot and both views. Counters go
-  into node stats, and `dfs-admin` shows them.
-- **Fault-injection filter** in the network layer (`SetPeerFilter`, off unless explicitly set)
-  plus a local-suite helper to partition node pairs. Phases 1–3 need it for the failure matrix.
+  not total slots, and at most a fixed number of slots go out per pass.
+- **Confirmation:** a first sighting is only a suspect. It is re-checked after a confirm delay
+  and reported as `[DIVERGENCE]` (WARN, with how long it persisted) only if still there;
+  otherwise it's counted as `[DIVERGENCE-TRANSIENT]` with how long it took to clear. One
+  observation can't tell propagation lag from drift. The lag measurements feed the Phase 3
+  fan-out decision.
+- Settled slots are **re-audited** periodically (bytes can vanish under an unchanged view), and
+  slots of files deleted from the owner's file table are skipped.
+- Per-pass summary line `SLOT AUDIT pass: …` with running totals. (Findings live in the logs;
+  no dfs-admin display.)
+- **Fault-injection filter** in the network layer (`SetPeerFilter`, refused unless the server
+  runs with `DFS_FAULT_INJECTION=1`). Phases 1–3 need it for the failure matrix.
+- **Stall measurement:** each node logs, once a minute, the worst heartbeat round trip to each
+  peer. A week of this gives the partial-stall distribution that Phase 1 sizes `L` against.
 - (Shadow slot versions moved to Phase 3. A version counter no node is authoritative for
   can't be compared across replicas, so it would measure nothing.)
 - Gate: one week on staging. We get a measured divergence rate and a list of which paths
@@ -241,6 +277,24 @@ on the local 5-node cluster.
   and that no two nodes ever both believe they hold the lease for the same interval.
 - Gate: a chaos run on the local cluster (random filters, kill/restart) with zero overlapping
   leases. Staging soak with leases shadowed.
+- **Gate: leader-stall resilience.** Leases add a new failure mode. A leader that stalls
+  longer than `L` stops renewals, every primary fences itself, and writes stop cluster-wide.
+  Today a leader stall only hurts part of the system. So:
+  - The leader's renewal handling runs on its own task and connection, sharing no lock with
+    the metadata committer, the healer (`evict_pending`, discovery), compaction, or
+    chunk_map. This is the set that stalled gluster1 for 26 s on 2026-09-24.
+  - A test-only **stall injector** (next to the fault filter, same `DFS_FAULT_INJECTION`
+    opt-in) holds a named subsystem on one node for N seconds: metadata committer, healer
+    pending/stalled maps, compaction quiesce.
+  - Test A (partial stall): stall each of those subsystems on the leader for 3×`L`. Pass =
+    zero lease lapses and zero failovers anywhere, and client writes keep completing.
+  - Test B (whole leader gone): black-hole the leader completely for 3×`L`. Pass = writes
+    resume within a measured bound (leader failure detection + `L` + margin). That bound is
+    recorded, and it drives the choice of `L` and of the failure-detection timeout (today
+    `failure_timeout_secs` is 30 s in production and 120 s locally, which would make this
+    window far too long; Phase 1 has to bring leader-failure detection down to near `L`).
+  - `L` is chosen from Phase 0's measured stall distribution, comfortably above the worst
+    observed partial stall.
 
 **Phase 2 — Primary-owned folds**
 - §6.5. Only the derived primary folds. The others fold on `FoldAt` and verify hashes.
@@ -260,10 +314,24 @@ on the local 5-node cluster.
 - Gate: leader CPU and RPC rate measured before/after (expect a large drop). RF restore time
   after a node kill is no worse.
 
-**Phase 5 — Delete what's now dead**
+**Phase 5 — Delete what's now dead, and take per-write traffic off the leader**
 - Ghost-chunk guard, RevalidateChunkSlot, location_supersedes ranking, never-revert guard,
   RCL union-merge, abandon heuristics, content-id reference assumptions. Each removal gets
   its own commit, and TODO_DEAD_CODE.md is updated.
+- **Stop sending every write's chunk location to the leader.** Today each client write also
+  sends a location update (ReplicateChunkLocation*) that the leader arbitrates. That's the
+  traffic behind 573k declined updates in 25 minutes (2026-09-08) and the leader's
+  chunk_map lagging clients for days. Once primaries are the authority for their slots:
+  - The primary holds the slot's `(epoch, version, ISR)`. Clients learn locations from the
+    primary (or any ISR member), with the leader's map as a hint.
+  - The leader's chunk_map becomes a *cache*, refreshed in bulk from primaries' digests
+    (§6.7) rather than per write. Its job is placement policy and answering "who owns this
+    slot", not tracking every version.
+  - Location updates to the leader happen only on ISR changes (rare), not on writes.
+  - Gate: leader RPCs per client write, measured before and after on staging under
+    kdiskmark and VM-108 load. Target: near zero on the steady-state write path. Also,
+    client read latency after a cold cache is no worse (the lookup moves from leader to
+    primary).
 
 ## 8a. Test protocol (every phase, no exceptions)
 
@@ -297,6 +365,8 @@ until then.
 - Rollback: `enforce → shadow` is always safe because tokens keep working until Phase 5.
 
 ## 10. Risks
+- **Leader stall becomes a cluster-wide write stall** unless renewals are isolated. See the
+  Phase 1 leader-stall gate; this is the largest new risk leases introduce.
 - **Lease tuning vs stalls:** too short means spurious failovers during the known stalls;
   too long means slow failover. Mitigated by the dedicated renewal path, the measured stall
   distribution, and relayed renewal.

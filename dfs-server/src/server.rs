@@ -18731,7 +18731,13 @@ impl Server {
         let new_prefix = format!("{}/", new_dir.trim_end_matches('/'));
         let mut moved: Vec<FileMetadata> = Vec::with_capacity(descendants.len());
         let mut old_paths: Vec<String> = Vec::with_capacity(descendants.len());
-        for mut m in descendants {
+        for listed in descendants {
+            // Same read-modify-write hazard as the directory's own entry: a push for
+            // this descendant may be acked but still queued in sled_write_tx. Read
+            // before it lands and our write_seq ties it, and the queued write's old
+            // path wins when it commits. Wait it out, then work from the fresh record.
+            self.wait_for_pending_metadata_write(listed.id).await;
+            let Some(mut m) = self.metadata.get_file_async(listed.id).await? else { continue };
             let Some(rest) = m.path.strip_prefix(&old_prefix).map(str::to_string) else { continue };
             old_paths.push(m.path.clone());
             m.path = format!("{}{}", new_prefix, rest);

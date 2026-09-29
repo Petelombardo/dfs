@@ -1,5 +1,7 @@
 # Slot Ownership Plan — one owner per chunk slot
 
+> **Current status and the ordered to-do list live in [SLOT-OWNERSHIP-TODO.md](SLOT-OWNERSHIP-TODO.md).**
+
 Status: PROPOSED (2026-09-28). Owner: Pete. Supersedes nothing yet; phases below retire
 specific heuristics as they land.
 

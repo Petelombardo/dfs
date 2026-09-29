@@ -6303,12 +6303,6 @@ mod tests {
     /// path; a plain delete_file (admin purge) still lets the cluster push it back.
     #[test]
     fn put_after_delete_for_good_cannot_resurrect_the_file() {
-    /// A pre-rename push that arrives after the rename is stale (lower write_seq). The
-    /// record keeps the renamed path, and so must the path index: indexing the stale
-    /// write's own path re-created "/old -> file", and lookups of the renamed-away name
-    /// found the file again (suite T13b "src still exists after rename").
-    #[test]
-    fn stale_put_does_not_reindex_a_renamed_away_path() {
         use dfs_common::FileType;
         let temp_dir = TempDir::new().unwrap();
         let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
@@ -6336,6 +6330,18 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert_eq!(store.prune_file_tombstones(std::time::Duration::ZERO).unwrap(), 1);
         assert!(matches!(store.put_file(&late).unwrap(), PutFileResult::Stored));
+    }
+
+    /// A pre-rename push that arrives after the rename is stale (lower write_seq). The
+    /// record keeps the renamed path, and so must the path index: indexing the stale
+    /// write's own path re-created "/old -> file", and lookups of the renamed-away name
+    /// found the file again (suite T13b "src still exists after rename").
+    #[test]
+    fn stale_put_does_not_reindex_a_renamed_away_path() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
         let mut before = FileMetadata::new("/old.bin".to_string(), FileType::RegularFile);
         before.write_seq = 2;
         store.put_file(&before).unwrap();

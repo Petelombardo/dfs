@@ -4764,6 +4764,43 @@ echo "  T55: $T55_PUT_COUNT metadata PUTs over ${T55_ELAPSED}s wall time (bound:
 rm -f "$T55_FILE"
 fi # should_run T55
 
+# ── Test 71: a node restarted while its peers are down must not lead ─────────
+# Legata bug: is_leader()/has_quorum() sized the majority from the peers this
+# process has heard from so far, not from the cluster it belongs to — a node
+# that restarts alone sees {self}, computes quorum = 1 of 1, and runs leader-only
+# healing (including has_quorum-gated destructive cleanup) against a partition of
+# one. Runs LAST: it stops the whole cluster and restarts only node5 (alone,
+# any node is the min-id online node, so which one we pick doesn't matter).
+snapshot_log T71
+if should_run T71; then
+echo "=== T71: a node restarted alone (peers down) must not claim leadership ==="
+dfs_sync
+fusermount -u "$MOUNT" 2>/dev/null || true
+pkill -f "dfs-client mount $MOUNT" 2>/dev/null || true
+pkill -f "dfs-server start" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start" >/dev/null || break; sleep 0.1; done
+[ -s "$BASE/node5/peers.json" ] \
+    && check "T71a node5 persisted its peers before the restart" PASS \
+    || check "T71a node5 has no peers.json — cannot know its cluster size" FAIL
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+    > "$LOG/server5_t71.log" 2>&1 &
+T71_PID=$!
+# The healer's discovery loop re-evaluates leadership on a 60s tick; wait past
+# the first one so a lone node that believes it leads has had its chance to say so.
+sleep 70
+T71_LED=$(grep -c "now the cluster leader" "$LOG/server5_t71.log" || true)
+echo "  T71: lone node5 'now the cluster leader' lines: $T71_LED"
+[ "$T71_LED" -eq 0 ] \
+    && check "T71b lone restarted node does not take over healing coordination" PASS \
+    || check "T71b lone restarted node declared itself leader of a partition of one" FAIL
+T71_STATUS=$(timeout 5 "$BIN/dfs-admin" --cluster "127.0.0.1:8904" cluster status 2>/dev/null | grep -E "^(Total Nodes|Leader):" || true)
+echo "  T71: node5 status: $(echo $T71_STATUS)"
+echo "$T71_STATUS" | grep -q "^Leader:" \
+    && check "T71c lone node reports a leader it cannot have (no quorum)" FAIL \
+    || check "T71c lone node reports no leader while it lacks a majority" PASS
+kill "$T71_PID" 2>/dev/null || true
+fi # should_run T71
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

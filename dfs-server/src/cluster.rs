@@ -89,6 +89,18 @@ pub struct ClusterManager {
     /// to heartbeat while "offline". Same AtomicBool-checked-each-tick pattern as
     /// Server::compaction_quiescing.
     heartbeat_paused: Arc<std::sync::atomic::AtomicBool>,
+
+    /// The largest cluster this node knows it belongs to — the denominator of every
+    /// majority (is_leader, has_quorum). `nodes.len()` alone is NOT that: a node that
+    /// restarts while its peers are down has heard from nobody yet, so `nodes` is
+    /// {self} and "1 of 1" made it leader of a partition of one, running leader-only
+    /// healing and quorum-gated destructive cleanup (Legata bug; suite T71).
+    /// Seeded at startup from peers.json + seed nodes, raised whenever membership
+    /// grows, persisted to `cluster_size.json` in the config dir, and lowered only by
+    /// an explicit operator remove. A stale-high value makes a majority harder to
+    /// reach, never easier.
+    known_cluster_size: Arc<std::sync::atomic::AtomicUsize>,
+    known_cluster_size_file: Arc<std::sync::OnceLock<std::path::PathBuf>>,
 }
 
 /// Decide the epoch (unix secs) this leadership episode "started" at.
@@ -141,7 +153,70 @@ impl ClusterManager {
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compaction_intents: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            known_cluster_size: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            known_cluster_size_file: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Load the persisted cluster size from `config_dir` and raise it to at least
+    /// `members_hint` (self + the distinct peers/seeds this node was configured or has
+    /// persisted to join). Call once at startup, before anything asks is_leader().
+    pub async fn init_known_cluster_size(&self, config_dir: &Path, members_hint: usize) {
+        let file = config_dir.join("cluster_size.json");
+        let persisted = std::fs::read(&file).ok()
+            .and_then(|b| serde_json::from_slice::<usize>(&b).ok())
+            .unwrap_or(0);
+        let _ = self.known_cluster_size_file.set(file);
+        self.known_cluster_size.fetch_max(persisted, std::sync::atomic::Ordering::SeqCst);
+        let seen = self.nodes.read().await.len();
+        self.note_cluster_size(members_hint.max(seen)).await;
+        info!("Cluster size for majority decisions: {} (persisted {}, startup hint {})",
+            self.known_cluster_size(), persisted, members_hint);
+    }
+
+    /// The cluster size majorities are computed against.
+    pub fn known_cluster_size(&self) -> usize {
+        self.known_cluster_size.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Raise the known cluster size to `n` if larger, persisting the new value.
+    async fn note_cluster_size(&self, n: usize) {
+        let prev = self.known_cluster_size.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        if n > prev {
+            info!("Cluster size for majority decisions raised {} -> {}", prev, n);
+            self.persist_known_cluster_size().await;
+        }
+    }
+
+    /// An operator removed a member for good: lower the known size by one (never
+    /// below the members currently known) so the remaining nodes can still form a
+    /// majority. Only the node that received the remove lowers its own count.
+    pub async fn forget_cluster_member(&self) {
+        let seen = self.nodes.read().await.len();
+        let cur = self.known_cluster_size();
+        let next = cur.saturating_sub(1).max(seen).max(1);
+        self.known_cluster_size.store(next, std::sync::atomic::Ordering::SeqCst);
+        info!("Cluster size for majority decisions lowered {} -> {} (operator remove)", cur, next);
+        self.persist_known_cluster_size().await;
+    }
+
+    async fn persist_known_cluster_size(&self) {
+        let Some(file) = self.known_cluster_size_file.get().cloned() else { return };
+        let n = self.known_cluster_size();
+        let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let tmp = file.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec(&n).expect("usize serializes"))?;
+            std::fs::File::open(&tmp)?.sync_all()?;
+            std::fs::rename(&tmp, &file)
+        }).await;
+        if !matches!(res, Ok(Ok(()))) {
+            warn!("Failed to persist cluster size {}: {:?}", n, res);
+        }
+    }
+
+    /// Strict majority of the known cluster size, e.g. 3-of-5, 2-of-3.
+    fn quorum_of(&self, members_seen: usize) -> usize {
+        members_seen.max(self.known_cluster_size()) / 2 + 1
     }
 
     /// Record this node's just-computed heal bandwidth target (MB/s) so the next
@@ -187,8 +262,10 @@ impl ClusterManager {
         // nodes already present). This re-admits nodes removed by failure detection.
         ring.add_node(node_info.id);
         nodes.insert(node_info.id, node_info);
+        let members_seen = nodes.len();
         drop(nodes);
         drop(ring);
+        self.note_cluster_size(members_seen).await;
 
         if is_new || !was_in_ring {
             self.node_recovered_notify.notify_waiters();
@@ -303,18 +380,22 @@ impl ClusterManager {
     /// Leadership transfers automatically when the current leader goes offline
     /// and a majority of remaining nodes agree on the new minimum-ID leader.
     pub async fn is_leader(&self) -> bool {
+        self.leader_with_quorum().await == Some(self.local_node_id)
+    }
+
+    /// The min-id online node, but only if this node sees a strict majority of the
+    /// known cluster online — otherwise this node cannot know who leads, and says so.
+    pub async fn leader_with_quorum(&self) -> Option<NodeId> {
         let nodes = self.nodes.read().await;
-        let total = nodes.len();
         let online_ids: Vec<NodeId> = nodes
             .values()
             .filter(|n| n.status == NodeStatus::Online)
             .map(|n| n.id)
             .collect();
-        let quorum = total / 2 + 1;
-        if online_ids.len() < quorum {
-            return false;
+        if online_ids.len() < self.quorum_of(nodes.len()) {
+            return None;
         }
-        online_ids.iter().min() == Some(&self.local_node_id)
+        online_ids.into_iter().min()
     }
 
     /// Returns the SocketAddr of the current leader, if known.
@@ -341,7 +422,8 @@ impl ClusterManager {
 
     /// Returns true if a strict majority of known nodes are online.
     ///
-    /// Quorum = floor(total / 2) + 1, e.g. 3-of-5, 2-of-3.
+    /// Quorum = floor(total / 2) + 1, e.g. 3-of-5, 2-of-3, where total is the known
+    /// cluster size (see `known_cluster_size`), not just the members heard from.
     /// The leader must have quorum before taking any destructive / irreversible
     /// action (orphan purge, over-replication cleanup). This prevents a partitioned
     /// leader from deleting data that the majority partition still considers live.
@@ -349,13 +431,11 @@ impl ClusterManager {
     /// always safe to create more copies.
     pub async fn has_quorum(&self) -> bool {
         let nodes = self.nodes.read().await;
-        let total = nodes.len();
         let online = nodes
             .values()
             .filter(|n| n.status == NodeStatus::Online)
             .count();
-        let quorum = total / 2 + 1;
-        online >= quorum
+        online >= self.quorum_of(nodes.len())
     }
 
     /// Record the moment this node became leader. Call on every leader transition.
@@ -1260,6 +1340,43 @@ mod tests {
 
         // Should have 1 node (just local)
         assert_eq!(manager.get_all_nodes().await.len(), 1);
+    }
+
+    /// A node that restarts alone, knowing (from its persisted size) that it belongs
+    /// to a 5-node cluster, must not lead or claim quorum; the size survives a restart
+    /// and an operator remove lowers it. Suite T71 is the end-to-end version.
+    #[tokio::test]
+    async fn lone_restarted_node_sizes_majority_by_known_cluster() {
+        let dir = std::env::temp_dir().join(format!("dfs-cluster-size-{}", NodeId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+
+        let first = ClusterManager::new(NodeId::new(), local_addr, 10, 30);
+        first.init_known_cluster_size(&dir, 1).await;
+        for port in 8901..8905 {
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            first.add_node(NodeInfo::new(NodeId::new(), addr, None)).await.unwrap();
+        }
+        assert_eq!(first.known_cluster_size(), 5);
+
+        // Restart with only itself known and no peers/seeds hint.
+        let lone = ClusterManager::new(NodeId::new(), local_addr, 10, 30);
+        lone.init_known_cluster_size(&dir, 1).await;
+        assert_eq!(lone.known_cluster_size(), 5, "size must survive a restart");
+        assert!(!lone.is_leader().await, "1 of 5 online is not a majority");
+        assert!(!lone.has_quorum().await);
+        assert_eq!(lone.leader_with_quorum().await, None);
+
+        // Two peers come back: 3 of 5 is a majority again.
+        for port in 8901..8903 {
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            lone.add_node(NodeInfo::new(NodeId::new(), addr, None)).await.unwrap();
+        }
+        assert!(lone.has_quorum().await);
+
+        lone.forget_cluster_member().await;
+        assert_eq!(lone.known_cluster_size(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

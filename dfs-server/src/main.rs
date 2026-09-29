@@ -489,6 +489,15 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         Err(e) => debug!("Failed to load persisted peers: {}", e),
     }
 
+    // Size majorities against the cluster this node belongs to, not the peers it has
+    // heard from yet — see ClusterManager::known_cluster_size.
+    {
+        let distinct: std::collections::HashSet<_> = all_join_targets.iter()
+            .filter(|a| **a != local_addr)
+            .collect();
+        server.cluster().init_known_cluster_size(&config_dir, distinct.len() + 1).await;
+    }
+
     // Join cluster if we have any targets (seeds or peers)
     if !all_join_targets.is_empty() {
         info!("Attempting to join cluster via {} total nodes (seeds + peers)...", all_join_targets.len());

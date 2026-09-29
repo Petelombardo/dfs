@@ -397,8 +397,19 @@ a newer one, so versions go first. Next after 3a: catch-up for missed commits, t
   removes the 9c40-vs-8195 split outright).
 - The primary is the commit authority: it acks when S has the version. S behind: it NACKs with
   its version, and P pushes the missing deltas/base.
-- The client keeps parallel fan-out to P and S (no extra hop); primary relay is the fallback
-  if the numbers say so.
+- **Ordering (decided 2026-09-29): the primary orders, the data still fans out.** Parallel
+  fan-out alone (the client orders) lets two writers to one chunk land in different orders on P
+  and S at the same version: silent divergence. A naive store-and-forward relay orders correctly
+  but serializes P's and S's hash+write and sends every payload twice. So split data from
+  ordering: the client sends the bytes to P and S in parallel as today; P, under the slot lock,
+  assigns `version = n` to the write (microseconds, before any hashing or disk) and sends S a
+  small "version n = write X" message; each replica hashes and writes in parallel, S applying
+  strictly in version order (holding a payload whose version hasn't arrived yet). The client is
+  acked when both hold version n. Expected cost over today: one small-message hop (~0.2 ms).
+- Behind a flag (`DFS_ORDERED_WRITES`), measured before it becomes the default: fio 4k randwrite
+  QD1 and 32-way, plus a large sequential write, flag off vs on, same build (`scripts/bench_fio.sh`).
+  Keep it if the difference is within run-to-run noise; if 4k QD1 regresses beyond noise, add a
+  fast path for single-writer chunks (VM disks) rather than drop the ordering.
 - Test gate: the 2026-09-27 no-op-divergence repro (identical rewrite on a base one replica
   can't compose) must end with one version on both; lagging-secondary catch-up; T60-style chaos
   with writes running, no acked write lost (verified by reading back every acked range).

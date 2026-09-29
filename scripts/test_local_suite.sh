@@ -5354,6 +5354,78 @@ fi
 rm -f "$MOUNT$T63_FILE"
 fi # should_run T63
 
+# ── Test 64: two clients writing one chunk must not split its replicas ──────────
+# SLOT-OWNERSHIP-PLAN 3c. Each client sends a patch to both replicas in parallel; with
+# nobody ordering the two clients' patches, P can apply A-then-B while S applies B-then-A
+# and the replicas end on different content at the same point in the stream. The client
+# logs that as REPLICA DISAGREEMENT. With DFS_ORDERED_WRITES the primary orders every
+# write to the chunk and both replicas apply that order.
+if should_run T64; then
+snapshot_log T64
+echo ""
+echo "=== T64: two clients writing the same chunk leave its replicas identical (SLOT-OWNERSHIP-PLAN 3c) ==="
+T64_MOUNT2=/tmp/dfs-mount2
+T64_LOG2="$LOG/client_t64b.log"
+mkdir -p "$T64_MOUNT2"; : > "$T64_LOG2"
+RUST_LOG=info "$BIN/dfs-client" mount "$T64_MOUNT2" --cluster "$CLUSTER" \
+    --log-file "$T64_LOG2" --allow-other --log-level debug &
+T64_PID2=$!
+sleep 2
+mountpoint -q "$T64_MOUNT2" || check "T64 second client mounted" FAIL
+T64_FILE=t64_shared.bin
+dd if=/dev/urandom of="$MOUNT/$T64_FILE" bs=4M count=2 status=none
+dfs_sync
+sleep 1
+t64_writer() {  # mount tag: 150 fsync'd 4K writes of this client's own content to one block
+    python3 - "$1/$T64_FILE" "$2" <<'PY'
+import os, sys
+path, tag = sys.argv[1], sys.argv[2].encode()
+fd = os.open(path, os.O_RDWR)
+off = 4 * 1024 * 1024 + 8192          # the same 4K block of chunk 1 for both clients
+for i in range(150):
+    os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
+    os.fsync(fd)
+os.close(fd)
+PY
+}
+t64_writer "$MOUNT" A & T64_W1=$!
+t64_writer "$T64_MOUNT2" B & T64_W2=$!
+wait "$T64_W1" "$T64_W2" 2>/dev/null || true
+dfs_sync; sync "$T64_MOUNT2" 2>/dev/null || true
+sleep 3
+T64_DIS=$(( $(grep -ac "REPLICA DISAGREEMENT" "$CURRENT_CLIENT_LOG" 2>/dev/null || true) \
+          + $(grep -ac "REPLICA DISAGREEMENT" "$T64_LOG2" 2>/dev/null || true) ))
+t64_read() { python3 -c "f=open('$1/$T64_FILE','rb');f.seek(4*1024*1024+8192);print(f.read(10).decode(errors='replace'))" 2>/dev/null || true; }
+# A third client that never saw the file: what the servers actually hold. Each writer's writes
+# are sequential, so the final block must be one writer's LAST write.
+T64_MOUNT3=/tmp/dfs-mount3
+mkdir -p "$T64_MOUNT3"
+RUST_LOG=info "$BIN/dfs-client" mount "$T64_MOUNT3" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t64c.log" --allow-other &
+T64_PID3=$!
+sleep 2
+T64_FRESH=$(t64_read "$T64_MOUNT3")
+T64_R1=$(t64_read "$MOUNT"); T64_R2=$(t64_read "$T64_MOUNT2")
+echo "  T64: DFS_ORDERED_WRITES=${DFS_ORDERED_WRITES:-0}: $T64_DIS replica disagreement(s); final block: fresh client=$T64_FRESH writer1=$T64_R1 writer2=$T64_R2"
+if [ "$T64_DIS" != 0 ]; then
+    grep -ah "REPLICA DISAGREEMENT" "$CURRENT_CLIENT_LOG" "$T64_LOG2" | head -3 | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-240 | sed 's/^/    /'
+fi
+[ "$T64_DIS" = 0 ] \
+    && check "T64a concurrent writers to one chunk: replicas never disagreed" PASS \
+    || check "T64a concurrent writers to one chunk: $T64_DIS replica disagreement(s) -- replicas applied the writes in different orders" FAIL
+case "$T64_FRESH" in
+    A000149AAA|B000149BBB) check "T64b the servers hold one writer's last write ($T64_FRESH)" PASS ;;
+    *) check "T64b the servers hold $T64_FRESH, not either writer's last write (A000149/B000149) -- an acked write was lost" FAIL ;;
+esac
+# Informational: a writer's own later reads after the other client's writes (cache coherence).
+echo "  (informational) T64c: writers read back writer1=$T64_R1 writer2=$T64_R2 vs servers $T64_FRESH"
+fusermount -u "$T64_MOUNT3" 2>/dev/null || true
+kill_client_and_wait "$T64_PID3"
+rm -f "$MOUNT/$T64_FILE"
+fusermount -u "$T64_MOUNT2" 2>/dev/null || true
+kill_client_and_wait "$T64_PID2"
+fi # should_run T64
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

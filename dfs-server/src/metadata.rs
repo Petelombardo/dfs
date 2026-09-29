@@ -1474,7 +1474,6 @@ impl MetadataStore {
         metadata: &FileMetadata,
     ) -> Result<(PutFileResult, Option<String>, usize)> {
         let file_id_str = format!("{}", metadata.id);
-        let path_str = metadata.path.as_str();
         if tombstones.get(file_id_str.as_str())?.is_some() {
             return Ok((PutFileResult::Deleted, None, 0));
         }
@@ -1494,6 +1493,11 @@ impl MetadataStore {
         let incoming_chunk_count = metadata.chunk_locations.len();
 
         let (metadata_to_store, is_stale) = Self::merge_file_metadata(existing_opt.as_ref(), metadata);
+        // Index the path the record is actually stored under. For a stale write that is
+        // existing's path, not incoming's: indexing incoming's re-created a renamed-away
+        // path (a late pre-rename push re-pointed "/old" at the file, so lookups of the
+        // old name found it again — suite T13b).
+        let path_str = metadata_to_store.path.as_str();
 
         // Never persist the full chunk_locations array — CHUNK_TABLE (via put_chunk_location)
         // is the sole authoritative per-chunk store, updated O(1) per touch. Before this fix,
@@ -6299,6 +6303,12 @@ mod tests {
     /// path; a plain delete_file (admin purge) still lets the cluster push it back.
     #[test]
     fn put_after_delete_for_good_cannot_resurrect_the_file() {
+    /// A pre-rename push that arrives after the rename is stale (lower write_seq). The
+    /// record keeps the renamed path, and so must the path index: indexing the stale
+    /// write's own path re-created "/old -> file", and lookups of the renamed-away name
+    /// found the file again (suite T13b "src still exists after rename").
+    #[test]
+    fn stale_put_does_not_reindex_a_renamed_away_path() {
         use dfs_common::FileType;
         let temp_dir = TempDir::new().unwrap();
         let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
@@ -6326,6 +6336,21 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert_eq!(store.prune_file_tombstones(std::time::Duration::ZERO).unwrap(), 1);
         assert!(matches!(store.put_file(&late).unwrap(), PutFileResult::Stored));
+        let mut before = FileMetadata::new("/old.bin".to_string(), FileType::RegularFile);
+        before.write_seq = 2;
+        store.put_file(&before).unwrap();
+
+        let mut renamed = before.clone();
+        renamed.path = "/new.bin".to_string();
+        renamed.write_seq = 3;
+        store.put_file(&renamed).unwrap();
+        store.delete_path_index("/old.bin").unwrap();
+
+        let late = before.clone(); // write_seq 2 < 3: stale
+        assert!(matches!(store.put_file(&late).unwrap(), PutFileResult::Stale(_)));
+        assert!(store.get_file_by_path("/old.bin").unwrap().is_none(),
+            "a stale write must not bring back the renamed-away path");
+        assert_eq!(store.get_file_by_path("/new.bin").unwrap().map(|m| m.id), Some(before.id));
     }
 
     /// Regression test for a real deployment finding: a rejoining follower (gluster2)

@@ -3191,7 +3191,31 @@ else
     check "T42 leader hung under chunk-write flood ($T42_TIMEOUTS/$T42_CALLS cluster-status calls timed out, max ${T42_MAX_MS}ms)" FAIL
 fi
 
+# Prove the per-node probe below sees the files while they exist, so its "none"
+# after the delete means something.
+T42B_BEFORE=""
+for port in 8900 8901 8902 8903 8904; do
+    T42B_BEFORE="${T42B_BEFORE} $port:$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -c "t42_flood_" || true)"
+done
+echo "  T42b: flood files listed per node before delete:${T42B_BEFORE}"
+
 for i in $(seq 0 $((T42_NUM_PROCS-1))); do rm -f "$MOUNT/t42_flood_${i}.bin" 2>/dev/null || true; done
+
+# T42b (Legata bug): files deleted right after the flood lingered on some nodes'
+# FILE_TABLE for minutes. Wait past the 30s delete-tombstone TTL, so an update
+# that was still in flight at delete time has had its chance to re-create the
+# row, then every node must have forgotten every flood file.
+dfs_sync 2>/dev/null || true
+sleep 40
+T42B_LEFT=""
+for port in 8900 8901 8902 8903 8904; do
+    n=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -c "t42_flood_" || true)
+    [ "$n" -gt 0 ] && T42B_LEFT="${T42B_LEFT} $port:$n"
+done
+echo "  T42b: flood files still listed 40s after delete:${T42B_LEFT:- none}"
+[ -z "$T42B_LEFT" ] \
+    && check "T42b every node forgot the deleted flood files" PASS \
+    || check "T42b deleted flood files resurrected/lingered on:${T42B_LEFT}" FAIL
 fi # should_run T42
 
 if should_run T43; then

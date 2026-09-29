@@ -8868,6 +8868,37 @@ impl Filesystem for DfsFilesystem {
                     new_metadata.path = new_path.clone();
                     metadata_cache.insert(old_ino, new_metadata);
 
+                    // A directory's contents moved with it (the server rewrites every
+                    // descendant's path). Rewrite this client's cached paths for them too,
+                    // keeping their inode numbers: otherwise the next lookup under the new
+                    // name mints a fresh inode, and the kernel's dentries, open handles and
+                    // tools like find are left holding inodes whose paths no longer exist.
+                    if metadata.file_type == dfs_common::types::FileType::Directory {
+                        let old_prefix = format!("{}/", old_path.trim_end_matches('/'));
+                        let new_prefix = format!("{}/", new_path.trim_end_matches('/'));
+                        let moved: Vec<(String, u64)> = path_to_inode.read().unwrap().iter()
+                            .filter(|(p, _)| p.starts_with(&old_prefix))
+                            .map(|(p, i)| (p.clone(), *i))
+                            .collect();
+                        let mut p2i = path_to_inode.write().unwrap();
+                        let mut i2p = inode_to_path.write().unwrap();
+                        for (old_child, ino) in &moved {
+                            let new_child = format!("{}{}", new_prefix, &old_child[old_prefix.len()..]);
+                            p2i.remove(old_child);
+                            p2i.insert(new_child.clone(), *ino);
+                            i2p.insert(*ino, new_child.clone());
+                            if let Some(mut m) = metadata_cache.get_mut(ino) {
+                                m.path = new_child.clone();
+                            }
+                            DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, old_child);
+                            DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, &new_child);
+                        }
+                        drop((p2i, i2p));
+                        DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, &old_path);
+                        DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, &new_path);
+                        info!("Renamed directory {} -> {}: {} cached descendant(s) moved", old_path, new_path, moved.len());
+                    }
+
                     // Invalidate directory caches.
                     let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
                     let old_parent = if raw_old.is_empty() { "/" } else { raw_old };

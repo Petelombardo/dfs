@@ -18680,6 +18680,15 @@ impl Server {
                         }
 
                         info!("Renamed {} -> {} (file_id: {})", old_path, new_path, file_id);
+                        if metadata.file_type == dfs_common::types::FileType::Directory {
+                            if let Err(e) = self.rename_descendants(&old_path, &new_path).await {
+                                warn!("Rename {} -> {}: moving the directory's contents failed: {}", old_path, new_path, e);
+                                return Response::Error {
+                                    message: format!("Renamed directory but failed to move its contents: {}", e),
+                                    code: ErrorCode::InternalError,
+                                };
+                            }
+                        }
                         Response::Ok { data: None }
                     }
                     Err(e) => {
@@ -18703,6 +18712,68 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Move every entry below a renamed directory to the new prefix. Paths are stored in
+    /// full, so renaming only the directory's own entry left its contents on the old prefix,
+    /// listed under neither name (a user's `mv sobpoena subpoena` showed 0 files, and renaming
+    /// it back brought them all back). Each descendant is rewritten here with a bumped
+    /// write_seq (same stale-retry rule as the entry itself), replicated to every node in
+    /// batches, and its old path-index entry removed everywhere.
+    async fn rename_descendants(&self, old_dir: &str, new_dir: &str) -> anyhow::Result<()> {
+        let metadata = self.metadata.clone();
+        let old = old_dir.to_string();
+        let descendants = tokio::task::spawn_blocking(move || metadata.list_subtree(&old)).await??;
+        if descendants.is_empty() {
+            return Ok(());
+        }
+        let old_prefix = format!("{}/", old_dir.trim_end_matches('/'));
+        let new_prefix = format!("{}/", new_dir.trim_end_matches('/'));
+        let mut moved: Vec<FileMetadata> = Vec::with_capacity(descendants.len());
+        let mut old_paths: Vec<String> = Vec::with_capacity(descendants.len());
+        for mut m in descendants {
+            let Some(rest) = m.path.strip_prefix(&old_prefix).map(str::to_string) else { continue };
+            old_paths.push(m.path.clone());
+            m.path = format!("{}{}", new_prefix, rest);
+            m.write_seq = m.write_seq.saturating_add(1);
+            let mut stored = false;
+            for _ in 0..5 {
+                match self.metadata.put_file_async(m.clone()).await? {
+                    PutFileResult::Stored => { stored = true; break; }
+                    PutFileResult::Stale(existing) => m.write_seq = existing.write_seq.saturating_add(1),
+                }
+            }
+            if !stored {
+                anyhow::bail!("{} kept losing to concurrent writers", m.path);
+            }
+            moved.push(m);
+        }
+        for p in &old_paths {
+            self.metadata.delete_path_index_async(p.clone()).await?;
+        }
+
+        let local_id = self.cluster.local_node_id();
+        let peers: Vec<SocketAddr> = self.cluster.get_all_nodes().await.into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .map(|n| n.addr)
+            .collect();
+        for addr in peers {
+            for batch in moved.chunks(200) {
+                let req = Request::ReplicateMetadataBatch { items: batch.to_vec() };
+                if let Err(e) = self.client.send_message(addr, Message::Request(req)).await {
+                    warn!("rename_descendants: replicating to {} failed: {}", addr, e);
+                }
+            }
+            for p in &old_paths {
+                let req = Request::DeletePathIndex { path: p.clone() };
+                if let Err(e) = self.client.send_message(addr, Message::Request(req)).await {
+                    warn!("rename_descendants: removing old path {} on {} failed: {}", p, addr, e);
+                }
+            }
+        }
+        info!("Renamed directory contents {} -> {}: {} entr{} moved", old_dir, new_dir, moved.len(),
+            if moved.len() == 1 { "y" } else { "ies" });
+        Ok(())
     }
 
     async fn handle_remove_node(&self, node_id: NodeId) -> Response {

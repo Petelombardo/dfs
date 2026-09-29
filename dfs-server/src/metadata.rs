@@ -1999,6 +1999,32 @@ impl MetadataStore {
     }
 
     /// List direct children of `dir_path`.
+    /// Every entry strictly below `dir_path`, at any depth (list_directory returns only
+    /// direct children). A directory rename has to move all of them: paths are stored in
+    /// full, so a descendant left on the old prefix is invisible under the new name.
+    pub fn list_subtree(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
+        let dir_path = if dir_path.ends_with('/') { dir_path.to_string() } else { format!("{}/", dir_path) };
+        let end = prefix_next(&dir_path);
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let path_table = txn.open_table(PATH_TABLE)?;
+        let file_table = txn.open_table(FILE_TABLE)?;
+        let mut out = Vec::new();
+        for item in path_table.range(dir_path.as_str()..end.as_str())? {
+            let (k, v) = item?;
+            let Ok(file_id) = Self::resolve_path_entry_file_id(v.value()) else {
+                warn!("list_subtree: could not resolve path index entry for {}", k.value());
+                continue;
+            };
+            if let Some(fv) = file_table.get(format!("{}", file_id).as_str())? {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(fv.value()) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn list_directory(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
         let dir_path = if dir_path.ends_with('/') {
             dir_path.to_string()

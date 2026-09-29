@@ -4764,6 +4764,57 @@ echo "  T55: $T55_PUT_COUNT metadata PUTs over ${T55_ELAPSED}s wall time (bound:
 rm -f "$T55_FILE"
 fi # should_run T55
 
+if should_run T70; then
+snapshot_log T70
+echo ""
+echo "=== T70: renaming a directory keeps its contents (Legata bug: sobpoena -> subpoena showed 0 files) ==="
+rm -rf "$MOUNT/t70_sob" "$MOUNT/t70_sub" 2>/dev/null || true
+mkdir -p "$MOUNT/t70_sob/sub"
+dd if=/dev/urandom of="$MOUNT/t70_sob/a.bin" bs=1M count=1 status=none
+dd if=/dev/urandom of="$MOUNT/t70_sob/sub/b.bin" bs=1M count=1 status=none
+dfs_sync
+T70_A=$(md5sum < "$MOUNT/t70_sob/a.bin" | cut -c1-32)
+T70_B=$(md5sum < "$MOUNT/t70_sob/sub/b.bin" | cut -c1-32)
+# Hold a file open across the rename and write through it afterwards, as a VM with its
+# disk image in the directory would: its later writes must not resurrect the old path.
+T70_INO_BEFORE=$(ls -i "$MOUNT/t70_sob/sub/b.bin" | awk '{print $1}')
+exec 7>>"$MOUNT/t70_sob/sub/b.bin"
+mv "$MOUNT/t70_sob" "$MOUNT/t70_sub"
+head -c 65536 /dev/urandom >&7
+exec 7>&-
+dfs_sync
+T70_B=$(md5sum < "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null | cut -c1-32)
+T70_LS=$(ls "$MOUNT/t70_sub" 2>/dev/null | tr '\n' ' ')
+T70_LS_SUB=$(ls "$MOUNT/t70_sub/sub" 2>/dev/null | tr '\n' ' ')
+echo "  T70: ls t70_sub = [$T70_LS], ls t70_sub/sub = [$T70_LS_SUB]"
+[[ "$T70_LS" == *"a.bin"* && "$T70_LS" == *"sub"* && "$T70_LS_SUB" == *"b.bin"* ]] \
+    && check "T70a renamed directory lists its file and its subdirectory's file" PASS \
+    || check "T70a renamed directory lost its contents" FAIL
+[ "$(md5sum < "$MOUNT/t70_sub/a.bin" 2>/dev/null | cut -c1-32)" = "$T70_A" ] && \
+[ "$(md5sum < "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null | cut -c1-32)" = "$T70_B" ] \
+    && check "T70b file contents intact under the new name" PASS \
+    || check "T70b file contents unreadable or changed under the new name" FAIL
+[ ! -e "$MOUNT/t70_sob" ] \
+    && check "T70c old directory name is gone" PASS \
+    || check "T70c old directory name still exists" FAIL
+# The servers' own metadata, independent of any client cache.
+T70_SRV=$("$BIN/dfs-admin" --cluster "$CLUSTER" file list 2>/dev/null | grep -oE "/t70_(sob|sub)[^ ]*" | sort -u | tr '\n' ' ')
+echo "  T70: server paths: $T70_SRV"
+[[ "$T70_SRV" == *"/t70_sub/a.bin"* && "$T70_SRV" == *"/t70_sub/sub/b.bin"* && "$T70_SRV" != *"/t70_sob"* ]] \
+    && check "T70d server metadata moved every descendant to the new path" PASS \
+    || check "T70d server metadata still has old descendant paths or lacks new ones" FAIL
+T70_INO_AFTER=$(ls -i "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null | awk '{print $1}')
+echo "  T70: b.bin inode before rename $T70_INO_BEFORE, after $T70_INO_AFTER"
+[ -n "$T70_INO_BEFORE" ] && [ "$T70_INO_BEFORE" = "$T70_INO_AFTER" ] \
+    && check "T70f a child keeps its inode number across the directory rename" PASS \
+    || check "T70f a child's inode number changed across the directory rename" FAIL
+T70_BSIZE=$(stat -c %s "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null || echo 0)
+[ "$T70_BSIZE" = $((1048576 + 65536)) ] \
+    && check "T70e a file held open across the rename takes writes under its new name" PASS \
+    || check "T70e write through a handle held across the rename was lost (size $T70_BSIZE)" FAIL
+rm -rf "$MOUNT/t70_sub" "$MOUNT/t70_sob" 2>/dev/null || true
+fi # should_run T70
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

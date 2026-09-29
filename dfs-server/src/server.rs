@@ -3001,7 +3001,7 @@ impl OverlayForkCtx {
         // avoids drowning the real signal: a full-suite run logged 1179
         // "no longer exists" lines, which is what the first version of this
         // counted as urgent single-replica events.
-        let file_deleted = matches!(self.metadata.get_file(&file_id), Ok(None));
+        let file_deleted = matches!(self.metadata.get_file_async(file_id).await, Ok(None));
 
         if holders.len() < 2 && !file_deleted {
             // Push the bytes this fold just produced — already in memory, no
@@ -6533,7 +6533,7 @@ impl Server {
                 // accept leader data if it is strictly newer than our local copy.
                 // Applying stale leader metadata would regress our chunk_map from the
                 // current chunk_id (Y, just patched) back to the old one (X, pre-patch).
-                let local_seq = self.metadata.get_file(&file_id)
+                let local_seq = self.metadata.get_file_async(file_id).await
                     .ok().flatten()
                     .map(|m| m.write_seq)
                     .unwrap_or(0);
@@ -7640,7 +7640,7 @@ impl Server {
             Request::TriggerHealing => self.handle_trigger_healing().await,
             Request::TriggerPhantomReconciliation => self.handle_trigger_phantom_reconciliation().await,
             Request::DebugGetRawChunkLocation { chunk_id } => {
-                let location = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+                let location = self.metadata.get_chunk_location_async(chunk_id).await.ok().flatten();
                 Response::DebugRawChunkLocation { location }
             }
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
@@ -8633,7 +8633,7 @@ impl Server {
         // pushed replica's mtime ~1000x too far in the future (e.g. a chunk written
         // 2026-08-04 landed with an mtime of 2446-05-10) — confirmed live 2026-08-04
         // on staging chunks pushed via PushChunkTo during the VM-108 restore.
-        let loc = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+        let loc = self.metadata.get_chunk_location_async(chunk_id).await.ok().flatten();
         let written_at = loc.as_ref().and_then(|l| l.written_at).map(|ms| ms / 1000);
 
         // Pace this transfer against the configured heal bandwidth (DFS_HEAL_BANDWIDTH_MB)
@@ -13024,7 +13024,7 @@ impl Server {
             // Snap to the current canonical path so this push can't resurrect the
             // old path index entry or strand its fields (e.g. modified_at) under
             // a stale path key that get_file_by_path will never see again.
-            if let Ok(Some(existing)) = self.metadata.get_file(&m.id) {
+            if let Ok(Some(existing)) = self.metadata.get_file_async(m.id).await {
                 if existing.path != m.path {
                     m.path = existing.path;
                 }
@@ -13376,7 +13376,7 @@ impl Server {
         self.wait_if_compaction_quiescing().await;
 
         // --- Step 1: Fetch current metadata ---
-        let mut metadata = match self.metadata.get_file(&file_id) {
+        let mut metadata = match self.metadata.get_file_async(file_id).await {
             Ok(Some(m)) => m,
             Ok(None) => return Response::Error {
                 message: format!("File not found: {}", file_id),
@@ -15831,7 +15831,7 @@ impl Server {
     async fn handle_delete_file(&self, path: String) -> Response {
         debug!("Handling delete file: {}", path);
 
-        let metadata = match self.metadata.get_file_by_path(&path) {
+        let metadata = match self.metadata.get_file_by_path_async(path.clone()).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 return Response::Error {
@@ -16937,7 +16937,7 @@ impl Server {
         // Resolve file metadata — try UUID first, then path
         let file_meta = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
             let file_id = dfs_common::FileId::from_uuid(uuid);
-            match self.metadata.get_file(&file_id) {
+            match self.metadata.get_file_async(file_id).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -16949,7 +16949,7 @@ impl Server {
                 },
             }
         } else {
-            match self.metadata.get_file_by_path(&path) {
+            match self.metadata.get_file_by_path_async(path.clone()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -17006,7 +17006,7 @@ impl Server {
         // Resolve file metadata up front so we can report errors immediately.
         let file_meta = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
             let file_id = dfs_common::FileId::from_uuid(uuid);
-            match self.metadata.get_file(&file_id) {
+            match self.metadata.get_file_async(file_id).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -17018,7 +17018,7 @@ impl Server {
                 },
             }
         } else {
-            match self.metadata.get_file_by_path(&path) {
+            match self.metadata.get_file_by_path_async(path.clone()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -17098,7 +17098,7 @@ impl Server {
                 chunks_checked += 1;
 
                 // Refresh the live location from sled (may have more nodes than inline).
-                let live_loc = metadata.get_chunk_location(&chunk_id)
+                let live_loc = metadata.get_chunk_location_async(chunk_id).await
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| chunk_loc.clone());
@@ -17919,7 +17919,7 @@ impl Server {
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
-        match self.metadata.get_file_by_path(&path) {
+        match self.metadata.get_file_by_path_async(path.clone()).await {
             Ok(Some(metadata)) => {
                 let chunk_locations = match self.chunk_locations_for_info_async(metadata.id).await {
                     Ok(locs) => locs,
@@ -17955,7 +17955,7 @@ impl Server {
     async fn handle_get_file_info_by_id(&self, file_id: dfs_common::FileId) -> Response {
         debug!("Handling get file info by id: {}", file_id);
 
-        match self.metadata.get_file(&file_id) {
+        match self.metadata.get_file_async(file_id).await {
             Ok(Some(metadata)) => {
                 let chunk_locations = match self.chunk_locations_for_info_async(file_id).await {
                     Ok(locs) => locs,
@@ -18001,7 +18001,22 @@ impl Server {
         // is !Sync, so a closure holding &Cell isn't Send; AtomicBool is
         // both Send and Sync).
         let found_purged_chunk_id = std::sync::atomic::AtomicBool::new(false);
-        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, write_seq: u64| {
+        // CHUNK_TABLE records for the window, fetched by the caller off the tokio worker
+        // (one batched spawn_blocking read). slice_response used to call get_chunk_location
+        // per entry synchronously on the worker; under a metadata-db stall every such read
+        // parked a worker, and enough of them starved the runtime (suite T59e).
+        let window_ids = |locations: &Vec<dfs_common::ChunkLocation>| -> Vec<ChunkId> {
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            locations.iter()
+                .filter(|l| {
+                    let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
+                    idx >= from_chunk && idx < from_chunk.saturating_add(count)
+                })
+                .map(|l| l.chunk_id)
+                .collect()
+        };
+        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, write_seq: u64,
+                              sled: &anyhow::Result<std::collections::HashMap<ChunkId, dfs_common::ChunkLocation>>| {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             // total_chunks = max chunk index + 1 (not list length) so the client knows
             // the true density of the file and can size its engine map correctly.
@@ -18041,9 +18056,9 @@ impl Server {
                     let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
                     idx >= from_chunk && idx < from_chunk.saturating_add(count)
                 })
-                .map(|l| match self.metadata.get_chunk_location(&l.chunk_id) {
+                .map(|l| match sled.as_ref().map(|m| m.get(&l.chunk_id)) {
                     Ok(Some(sled_loc)) => {
-                        Self::resolve_chunk_nodes(l, sled_loc)
+                        Self::resolve_chunk_nodes(l, sled_loc.clone())
                     }
                     Ok(None) => {
                         // The chunk_id itself has no CHUNK_TABLE record at all — not
@@ -18106,7 +18121,8 @@ impl Server {
             // (this exact class of bug has taken a node down before in this codebase,
             // see the black-hole-node incident memory around lock-across-await).
             drop(entry);
-            let response = slice_response(&locations, write_seq);
+            let sled = self.metadata.get_chunk_locations_batch_async(window_ids(&locations)).await;
+            let response = slice_response(&locations, write_seq, &sled);
 
             // A dangling patch token is the OTHER way a slot's identity dies, and the
             // Ok(None) test above is blind to it: the token's CHUNK_TABLE row outlives
@@ -18264,7 +18280,8 @@ impl Server {
                     let repaired = changed_a_slot || !reclaimable.is_empty();
                     self.note_self_heal_outcome(file_id, repaired);
                     self.reclaim_unresolvable_token_rows(file_id, reclaimable).await;
-                    return slice_response(&merged, fresh_write_seq);
+                    let sled = self.metadata.get_chunk_locations_batch_async(window_ids(&merged)).await;
+                    return slice_response(&merged, fresh_write_seq, &sled);
                 }
                 self.note_self_heal_outcome(file_id, false);
                 warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
@@ -18336,7 +18353,8 @@ impl Server {
                 for loc in &locations {
                     self.chunk_to_file.insert(loc.chunk_id, file_id);
                 }
-                slice_response(&locations, write_seq)
+                let sled = self.metadata.get_chunk_locations_batch_async(window_ids(&locations)).await;
+                slice_response(&locations, write_seq, &sled)
             }
             // The file itself exists (get_file found it) but a full CHUNK_TABLE scan
             // filtered to this file_id genuinely found zero rows — e.g. freshly
@@ -18413,7 +18431,7 @@ impl Server {
         info!("Handling purge file metadata: {}", path);
 
         // Get metadata to find file ID
-        match self.metadata.get_file_by_path(&path) {
+        match self.metadata.get_file_by_path_async(path.clone()).await {
             Ok(Some(metadata)) => {
                 let file_id = metadata.id;
 

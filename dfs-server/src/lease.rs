@@ -562,6 +562,34 @@ impl LeaseRuntime {
             .collect()
     }
 
+    /// Whether this node holds its own lease right now.
+    pub fn holds_own_lease(&self) -> bool {
+        self.holder.lock().unwrap().holds_lease(Instant::now())
+    }
+
+    /// Whether `node` is known here to have been voted expired by a majority at its
+    /// latest known incarnation: this node coordinated that vote, or voted in it (a
+    /// voter fences what it votes). Anything less means `node` may still act as primary.
+    pub fn is_expired(&self, node: NodeId) -> bool {
+        let v = self.voter.lock().unwrap();
+        let highest = v.highest_seen(node);
+        v.state_of(node, Instant::now(), &self.cfg) == LeaseState::Expired
+            || self.declared.lock().unwrap().get(&node).is_some_and(|i| *i >= highest)
+    }
+
+    /// Test-only: hold a lease as if a majority had just acked a renewal.
+    #[cfg(test)]
+    pub fn grant_own_lease_for_test(&self) {
+        self.holder.lock().unwrap().on_round(Instant::now(), 1, 1, &self.cfg);
+    }
+
+    /// Test-only: behave as if a majority voted `node` expired at its latest incarnation.
+    #[cfg(test)]
+    pub fn declare_expired_for_test(&self, node: NodeId) {
+        let highest = self.voter.lock().unwrap().highest_seen(node);
+        self.declared.lock().unwrap().insert(node, highest);
+    }
+
     pub fn handle_renew(&self, node: NodeId, incarnation: u64) -> Response {
         let ack = self.voter.lock().unwrap().on_renew(node, incarnation, Instant::now());
         Response::LeaseAck { acked: ack.acked, fenced: ack.fenced }

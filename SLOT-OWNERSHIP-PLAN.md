@@ -307,10 +307,28 @@ one side for an asymmetric link. This makes #2–#15 deterministic on the local 
 - `L` stays at the local default (3 s, margin 500 ms). It is confirmed against real
   `PEER RTT` numbers at the branch's final staging validation (see "Staging policy" below).
 
-**Phase 2 — Primary-owned folds**
-- §6.5. Only the derived primary folds. The others fold on `FoldAt` and verify hashes.
-- Retire fold_lock_grants / outbound_fold_claims / uncoordinated fallback.
-- Gate: T53-style storm with zero REPLICA DISAGREEMENT and zero divergence alarms. VM-108 soak.
+**Phase 2 — One fold owner per chunk** (built; local gate below)
+- A chunk's **fold owner** is the first of its holders, in rendezvous order, that isn't known
+  to be majority-expired; this node counts only while it holds its own lease. Every node
+  computes it locally; there is no negotiation.
+- Background folds (debounce, backstop sweep, post-restart resume) start only on the owner, as
+  a wave (fold, then push the bytes to peers; >= 2 matching copies). A non-owner waits; if the
+  owner's result has already arrived it adopts it; after `FOLD_OWNER_PATIENCE` (60 s dirty,
+  3x the debounce) it takes over, logged `[FOLD-OWNER]` and counted.
+- Retired from use: the `ProposeFold`/`ReleaseFoldLock` negotiation, fold-lock grants, and its
+  "no peer" / "hard failure" solo-fold fallbacks (listed in TODO_DEAD_CODE.md, deleted in Phase 5).
+- **Deliberately unchanged: client ForceFold.** The client already folds on every replica it
+  wrote and cross-checks the results. Forwarding it to the owner would leave non-owners without
+  the folded bytes until healing (the phantom-holder shape), and pushing them from the owner
+  would put a 4 MB transfer in the client's flush path. It moves to Phase 3, with the write path.
+- Known limit until Phase 3's stored ISR: the owner is computed from each node's holder list, so
+  nodes whose lists differ can each see themselves as owner. Safe (the wave's >= 2 rule), and no
+  worse than the negotiation it replaces.
+- Tests: `fold_role` unit test; non-owner defers / owner folds without negotiating / takeover
+  after patience, each shown failing against the old negotiation body; adopt-instead-of-takeover
+  guard. Suite T61: a 16-chunk patch storm, then quiet; every chunk's background folds start on
+  one node, no takeovers, no replica disagreement. A planted "every holder owns" fault fails
+  T61 on all 16 chunks.
 
 **Phase 3 — Versioned writes, ISR, catch-up** (includes the flap guard, #13)
 - §6.3 + §6.4: the client narrows patch fan-out to P+S with `(epoch, base_version)`, and

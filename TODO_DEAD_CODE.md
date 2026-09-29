@@ -140,3 +140,19 @@ of losing track of them. Add an entry whenever you find one; remove the entry wh
   not less. Superseded by that mechanism; candidate for deletion, but its misleading doc
   comment is the more urgent problem if it's kept around — at minimum mark it
   `#[allow(dead_code)]` with a pointer to the real mechanism, or just delete it.
+
+## Found 2026-09-28 (SLOT-OWNERSHIP-PLAN Phase 2: fold owner replaces ProposeFold)
+
+Nothing sends these any more: a slot's fold owner (rendezvous order + majority leases) folds
+without negotiating. The receive side is kept only so a peer on an older build doesn't get an
+unknown-request error mid-rollout. Delete in Phase 5, once no node can send them.
+
+- **`Request::ProposeFold` / `Request::ReleaseFoldLock`**, their `Response` variants,
+  `handle_propose_fold`, `handle_release_fold_lock`, `ProposeFoldOutcome`, `FoldReleaseOutcome`.
+  (Variants stay in the enums forever: bincode is positional.)
+- **`Server::fold_lock_grants` / `FoldLockGrant`**, **`outbound_fold_claims` / `OutboundFoldClaim`**,
+  `FOLD_COORD_STEP_TIMEOUT`, `FOLD_LOCK_GRANT_TTL`, and the grant checks in
+  `coordinate_and_fold_slot` / `handle_force_fold` (never set now).
+- **Counters `fold_coord_fallback_no_peer`, `fold_coord_fallback_hard_failure`**: their branches
+  are gone (no negotiation, so neither "no peer to propose to" nor "proposal failed" exists).
+- **`FoldCoordination::Async`**: defined, never used (reads compose base+delta without folding).

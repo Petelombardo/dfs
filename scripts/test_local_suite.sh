@@ -5128,6 +5128,59 @@ T60_HOLD=$("$BIN/dfs-admin" --cluster "$T60_ALL" lease status 2>/dev/null | pyth
     || check "T60 only $T60_HOLD/5 hold leases 8s after the chaos ended" FAIL
 fi # should_run T60
 
+if should_run T61; then
+snapshot_log T61
+echo ""
+echo "=== T61: one fold owner per chunk: background folds start on a single node, no takeovers (SLOT-OWNERSHIP-PLAN Phase 2) ==="
+T61_IMG="$MOUNT/t61_owner.img"
+T61_CHUNKS=16
+dd if=/dev/urandom of="$T/t61_base.bin" bs=4M count=$T61_CHUNKS 2>/dev/null
+cp "$T/t61_base.bin" "$T61_IMG"
+dfs_sync
+T61_FID=$(grep -h "\[META SERVER\] put path=/t61_owner.img id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+echo "  T61: file_id=${T61_FID:-<not found>}; patch storm across $T61_CHUNKS chunks for 20s, then 45s quiet"
+python3 "$REPO/scripts/t53_patch_writer.py" "$T61_IMG" "$T61_CHUNKS" 45 20
+T61_RESULT=$(python3 - "$T61_FID" <<'PY'
+import re, sys, glob
+fid = sys.argv[1]
+owners = {}   # chunk -> set of server logs that folded it as owner
+takeovers = 0
+for path in sorted(glob.glob("/tmp/dfs-test-logs/server*.log")):
+    for line in open(path, errors="replace"):
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        m = re.search(r"FOLD OWNER: file (\S+) chunk (\d+) folding as its owner", line)
+        if m and m.group(1) == fid:
+            owners.setdefault(int(m.group(2)), set()).add(path)
+        if "[FOLD-OWNER]" in line and fid in line:
+            takeovers += 1
+multi = {c: sorted(p.rsplit('/',1)[1] for p in s) for c, s in owners.items() if len(s) > 1}
+print(len(owners), len(multi), takeovers)
+for c, s in sorted(multi.items())[:5]:
+    print("    chunk %d folded as owner by %s" % (c, ", ".join(s)))
+PY
+)
+T61_FOLDED=$(echo "$T61_RESULT" | head -1 | awk '{print $1}')
+T61_MULTI=$(echo "$T61_RESULT" | head -1 | awk '{print $2}')
+T61_TAKE=$(echo "$T61_RESULT" | head -1 | awk '{print $3}')
+# Logged by the client (without a file id); snapshot_log started this test's client log empty.
+T61_DISAGREE=$(grep -ac "REPLICA DISAGREEMENT" "$CURRENT_CLIENT_LOG" 2>/dev/null || true)
+echo "  T61: $T61_FOLDED chunk(s) folded in the background; $T61_MULTI with more than one owner; $T61_TAKE takeover(s); $T61_DISAGREE replica disagreement(s)"
+echo "$T61_RESULT" | tail -n +2
+[ -n "$T61_FID" ] && [ "${T61_FOLDED:-0}" -gt 0 ] \
+    && check "T61a background folds ran as owner folds ($T61_FOLDED chunks)" PASS \
+    || check "T61a no owner folds observed for the storm file (fid=${T61_FID:-none})" FAIL
+[ "${T61_MULTI:-1}" = 0 ] \
+    && check "T61b every chunk's background folds started on exactly one node" PASS \
+    || check "T61b $T61_MULTI chunk(s) had background folds started by more than one node" FAIL
+[ "${T61_TAKE:-1}" = 0 ] \
+    && check "T61c no owner takeovers with every node healthy" PASS \
+    || check "T61c $T61_TAKE owner takeover(s) with every node healthy -- an owner failed to fold" FAIL
+[ "${T61_DISAGREE:-1}" = 0 ] \
+    && check "T61d zero REPLICA DISAGREEMENT for the storm file" PASS \
+    || check "T61d $T61_DISAGREE REPLICA DISAGREEMENT line(s) for the storm file" FAIL
+rm -f "$T61_IMG" "$T/t61_base.bin"
+fi # should_run T61
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

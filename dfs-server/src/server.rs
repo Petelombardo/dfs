@@ -16222,11 +16222,9 @@ impl Server {
             .count();
         let total_nodes = nodes.len();
         let chunk_size_mb = self.chunker.chunk_size() / (1024 * 1024);
-        let leader_node_id = nodes
-            .iter()
-            .filter(|n| n.status == dfs_common::NodeStatus::Online)
-            .map(|n| n.id)
-            .min();
+        // None while this node can't see a majority of the known cluster — the same
+        // answer is_leader() gives, rather than naming itself leader of a partition.
+        let leader_node_id = self.cluster.leader_with_quorum().await;
 
         Response::ClusterStatus {
             nodes,
@@ -18790,6 +18788,7 @@ impl Server {
         // Remove from cluster
         match self.cluster.remove_node(&node_id).await {
             Ok(_) => {
+                self.cluster.forget_cluster_member().await;
                 info!("Successfully removed node {} from cluster", node_id);
                 Response::Ok { data: None }
             }

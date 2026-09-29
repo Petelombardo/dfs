@@ -384,6 +384,7 @@ async fn handle_cluster_command(
                     total_nodes,
                     healthy_nodes,
                     local_node_id,
+                    leader_node_id,
                     ..
                 } => {
                     // Service age (process uptime, not host uptime) isn't carried by
@@ -420,11 +421,8 @@ async fn handle_cluster_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
-                        // Leader = online node with minimum NodeId (same logic as server)
-                        let leader_id = nodes.iter()
-                            .filter(|n| n.status == dfs_common::NodeStatus::Online)
-                            .map(|n| n.id)
-                            .min();
+                        // The server's own answer: None while it can't see a majority.
+                        let leader_id = leader_node_id;
 
                         println!("DFS Cluster Status");
                         println!("==================");

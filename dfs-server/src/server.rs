@@ -1786,6 +1786,9 @@ pub(crate) enum SlotMergeOutcome {
     },
     /// Offset-less and unplaceable — see the legacy tail of the merge fn.
     Unplaceable,
+    /// The file was just deleted here; a location still in flight for it must not
+    /// re-create its chunk_map entry (see Server::file_recently_deleted).
+    FileDeleted,
 }
 
 impl SlotMergeOutcome {
@@ -1798,7 +1801,7 @@ impl SlotMergeOutcome {
         match self {
             SlotMergeOutcome::Applied { current } => Some(*current),
             SlotMergeOutcome::Rejected { current, .. } => Some(*current),
-            SlotMergeOutcome::Unplaceable => None,
+            SlotMergeOutcome::Unplaceable | SlotMergeOutcome::FileDeleted => None,
         }
     }
 }
@@ -6251,6 +6254,10 @@ impl Server {
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) -> SlotMergeOutcome {
+        if self.file_recently_deleted(file_id) {
+            debug!("[CHUNK_MAP] file={} deleted — dropping in-flight location {}", file_id, location.chunk_id);
+            return SlotMergeOutcome::FileDeleted;
+        }
         // Backfill the slot's CURRENT occupant's generation before arbitrating, if this
         // node never directly recorded it. chunk_generations is in-memory, per-chunk_id,
         // and only ever populated by whichever node computed a patch/fold's merge
@@ -14033,6 +14040,10 @@ impl Server {
         // replica from silently building on stale-but-physically-present bytes.
         trust_local_base: bool,
     ) -> Result<(ChunkId, usize, Option<u64>, Option<Arc<Vec<u8>>>, Option<ChunkLocation>), (String, ErrorCode)> {
+        if self.file_recently_deleted(file_id) {
+            drop(patch_guard);
+            return Err((format!("File {} was deleted", file_id), ErrorCode::NotFound));
+        }
         let Some(cidx) = chunk_idx else {
             // No stable per-slot key to track a pending patch against — see
             // handle_multi_patch's original "No chunk_idx" comment for when this
@@ -16019,6 +16030,17 @@ impl Server {
     /// every_dirty_slot_of_the_file). Keyed by file, not by the chunk list: a slot can
     /// be dirty without appearing in the file's chunk locations, and the follower's
     /// DeleteChunksBatch doesn't carry chunk indexes at all.
+    /// True while this node's delete tombstone for the file is fresh. A patch or
+    /// location sent before the delete can land just after it (a writer's last
+    /// MultiPatch, its RCL broadcast); accepting one re-creates the slot's dirty record
+    /// or chunk_map entry, and a later fold then resurrects the file (suite T72b, one
+    /// fold 73s after a delete that landed 170ms behind a patch). In-flight means
+    /// milliseconds to seconds, well inside the tombstone's 30s.
+    fn file_recently_deleted(&self, file_id: FileId) -> bool {
+        self.delete_tombstones.get(&file_id)
+            .is_some_and(|t| t.value().elapsed() < std::time::Duration::from_secs(30))
+    }
+
     fn forget_file_slots(&self, file_id: FileId) {
         self.dirty_patch_slots.retain(|(f, _), _| *f != file_id);
         self.chunk_patch_locks.retain(|(f, _), _| *f != file_id);
@@ -20813,6 +20835,39 @@ mod tests {
             "a deleted file must leave no dirty slot behind for the fold sweep to fold");
         assert!(!h.server.chunk_patch_locks.iter().any(|e| e.key().0 == dead));
         assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
+    }
+
+    /// A patch or location sent before a delete can land just after it. Accepting it
+    /// re-created the deleted file's chunk_map entry / dirty slot, and a fold 73s later
+    /// resurrected the file (suite T72b on the slot-ownership merge, 2026-09-29).
+    #[tokio::test]
+    async fn late_patch_or_location_after_delete_is_dropped() {
+        let h = make_overlay_test_harness();
+        let dead = FileId::new();
+        let data = vec![0u8; 4096];
+        let base = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&data, 0, dead));
+        h.storage.write_chunk(&base, &data).unwrap();
+        let loc = ChunkLocation {
+            chunk_id: base, nodes: vec![h.server.cluster.local_node_id()], size: 4096,
+            checksum: base.hash, file_offset: Some(0), written_at: Some(1000),
+            client_write_seq: Some(1), file_id: Some(dead),
+        };
+        h.server.chunk_map.insert(dead, (vec![loc.clone()], 1));
+        h.server.metadata.put_chunk_location(&loc).unwrap();
+
+        h.server.handle_delete_chunks_batch(dead, "/dead.bin".to_string(), vec![]).await;
+        assert!(h.server.chunk_map.get(&dead).is_none());
+
+        let late_loc = ChunkLocation { client_write_seq: Some(2), ..loc.clone() };
+        assert!(matches!(h.server.chunk_map_update_location_for_file(dead, &late_loc).await,
+            SlotMergeOutcome::FileDeleted));
+        assert!(h.server.chunk_map.get(&dead).is_none(), "a late location must not re-create the entry");
+
+        let resp = h.server.handle_multi_patch(
+            base, dead, Some(0), 0, vec![(0, vec![7u8; 16])], None, None, None, Some(2),
+        ).await;
+        assert!(!matches!(resp, Response::MultiPatchResult { .. }), "a late patch must be refused, got {:?}", resp);
+        assert!(!h.server.dirty_patch_slots.iter().any(|e| e.key().0 == dead), "and must leave no dirty slot");
     }
 
     #[tokio::test]

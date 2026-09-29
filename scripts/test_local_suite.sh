@@ -5051,6 +5051,32 @@ for spec in "metadata-db 127.0.0.1:8903 T59a" "healer-maps $T59_LEADER T59b" "cl
     t59_wait5 || true
 done
 
+# T59e: the same metadata-db stall on the node clients talk to (the leader), with
+# client metadata traffic running through it. Handlers that read redb synchronously
+# on a tokio worker (not via spawn_blocking) each park a worker for the whole stall;
+# enough of them starve the runtime, lease loop included. The full-suite run that
+# failed T59a (2026-09-29) had the stalled node near-silent for 5.5s under load.
+T59E_BEFORE=$(t59_lost)
+T59E_STOP=$(( $(date +%s) + 10 ))
+( i=0; while [ "$(date +%s)" -lt "$T59E_STOP" ]; do
+    for j in 1 2 3 4 5 6 7 8; do
+        ( echo "t59e $i $j" > "$MOUNT/t59e_$j.txt"; stat "$MOUNT/t59e_$j.txt" >/dev/null ) 2>/dev/null &
+    done
+    wait; i=$((i+1))
+  done ) &
+T59E_LOAD=$!
+sleep 1
+T59E_OUT=$("$BIN/dfs-admin" --cluster "$T59_LEADER" fault stall --target metadata-db --millis 9000 2>&1 || true)
+sleep 11
+kill "$T59E_LOAD" 2>/dev/null || true; wait "$T59E_LOAD" 2>/dev/null || true
+T59E_LAPSES=$(( $(t59_lost) - T59E_BEFORE ))
+echo "  T59e: stalled metadata-db on leader $T59_LEADER for 9s under client traffic -> $T59E_LAPSES lease lapse(s) ($T59E_OUT)"
+[ "$T59E_LAPSES" -eq 0 ] \
+    && check "T59e a 9s metadata-db stall on the leader under client traffic costs no node its lease" PASS \
+    || check "T59e a 9s metadata-db stall under client traffic cost $T59E_LAPSES lease lapse(s): blocking redb reads starve the runtime" FAIL
+rm -f "$MOUNT"/t59e_*.txt 2>/dev/null || true
+t59_wait5 || true
+
 # T59d: freeze a whole process. It must lose its lease, and the majority must vote it out
 # only after its lease ended.
 T59_VICTIM=127.0.0.1:8904

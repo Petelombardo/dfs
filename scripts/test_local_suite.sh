@@ -45,6 +45,7 @@ export DFS_LEASE_MARGIN_MS=500
 export DFS_LEASE_CLUSTER_SIZE=5   # fresh cluster: no membership history yet
 export DFS_LEASE_TRACE=1   # log every lease extension: T60 checks none outlives its expiry vote
 export DFS_SLOT_ISR_SEED_SECS=3   # seed per-chunk ISRs quickly so T62 can observe them
+export DFS_SLOT_ISR_CATCHUP_SECS=3   # and catch up missed commits quickly (T63)
 
 # If test filter args given, only run those tests (e.g. T7 T23).
 RUN_TESTS="${*:-ALL}"
@@ -5297,6 +5298,61 @@ check "T62d racing with two stalled acceptors: never two different values commit
 check "T62d every node ends on the same ISR for every chunk ($T62D_AGREE)" "${T62D_AGREE%% *}"
 rm -f "$MOUNT$T62_FILE" "$T/t62_info.json"
 fi # should_run T62
+
+if should_run T63; then
+snapshot_log T63
+echo ""
+echo "=== T63: a node that missed ISR commits while partitioned catches up on its own (SLOT-OWNERSHIP-PLAN Phase 3a) ==="
+T63_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
+T63_ALL="$(IFS=,; echo "${T63_NODES[*]}")"
+T63_FILE=/t63_isr.bin
+dd if=/dev/urandom of="$MOUNT$T63_FILE" bs=4M count=4 status=none
+dfs_sync
+T63_IDS=$("$BIN/dfs-admin" --cluster "$T63_ALL" lease status 2>/dev/null | python3 -c "import json,sys; print(' '.join(json.loads(l)['node'] for l in sys.stdin))" || true)
+read -r -a T63_ID <<< "$T63_IDS"
+t63_views() {   # prints one line per node: addr and its per-chunk epochs
+    "$BIN/dfs-admin" --cluster "$T63_ALL" isr get --file "$T63_FILE" --chunks 4 2>/dev/null | python3 -c "
+import json,sys
+for l in sys.stdin:
+    r=json.loads(l)
+    print(r['addr'], json.dumps(r.get('isr')))" || true
+}
+t63_node5_matches() {
+    t63_views | python3 -c "
+import sys
+rows=dict(l.split(' ',1) for l in sys.stdin.read().splitlines() if ' ' in l)
+others={v for a,v in rows.items() if a!='127.0.0.1:8904'}
+print('YES' if len(others)==1 and rows.get('127.0.0.1:8904') in others and 'null' not in next(iter(others)) else 'NO')" || echo NO
+}
+for _ in $(seq 1 30); do [ "$(t63_node5_matches)" = YES ] && break; sleep 1; done   # seeded everywhere
+# Cut node 5 off, move every chunk's ISR on the majority side, heal.
+for n in 127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903; do "$BIN/dfs-admin" --cluster "$n" fault set --drop-to 127.0.0.1:8904 >/dev/null 2>&1 || true; done
+"$BIN/dfs-admin" --cluster 127.0.0.1:8904 fault set --drop-to 127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903 >/dev/null 2>&1 || true
+for c in 0 1 2 3; do
+    "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr propose --file "$T63_FILE" --chunk "$c" --members "${T63_ID[1]},${T63_ID[2]}" >/dev/null 2>&1 || true
+done
+for n in "${T63_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
+T63_BEHIND=$(t63_node5_matches)
+T63_CAUGHT=NO
+for _ in $(seq 1 15); do T63_CAUGHT=$(t63_node5_matches); [ "$T63_CAUGHT" = YES ] && break; sleep 1; done
+echo "  T63: right after healing node 5 matches the others: $T63_BEHIND; within 15s: $T63_CAUGHT"
+[ "$T63_BEHIND" = NO ] \
+    && check "T63 precondition: the partitioned node really missed the new epochs" PASS \
+    || check "T63 precondition: node 5 already matched right after healing (test is vacuous)" FAIL
+if [ "$T63_CAUGHT" != YES ]; then
+    echo "  T63 diagnostics: each node's epochs per chunk"
+    t63_views | python3 -c "
+import json,sys
+for l in sys.stdin:
+    a,v=l.split(' ',1); v=json.loads(v)
+    print('    %s %s' % (a, [(r or {}).get('epoch') for r in (v or [])]))"
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG/server5.log" | grep "SLOT ISR catch-up" | tail -3 | sed 's/^/    server5: /'
+fi
+[ "$T63_CAUGHT" = YES ] \
+    && check "T63 node 5 caught up on every missed ISR commit on its own" PASS \
+    || check "T63 node 5 still behind 15s after healing" FAIL
+rm -f "$MOUNT$T63_FILE"
+fi # should_run T63
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

@@ -424,6 +424,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_slot_audit();
     server.start_leases();
     server.clone().start_slot_isr_seeder();
+    server.clone().start_slot_isr_catchup();
     let mut server_handle = tokio::spawn(async move {
         let (client_result, peer_result) = tokio::join!(net_server.start(), peer_net_server.start());
         if let Err(e) = client_result {

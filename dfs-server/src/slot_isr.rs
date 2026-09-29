@@ -222,6 +222,8 @@ pub struct SlotIsrService {
     committed: DashMap<Slot, SlotIsr>,
     /// Highest ballot round seen per slot, so a retry always outbids.
     max_round: DashMap<Slot, u64>,
+    /// Advances every catch-up pass so each pass asks different peers.
+    catch_up_turn: std::sync::atomic::AtomicUsize,
 }
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -238,7 +240,7 @@ impl SlotIsrService {
             }
             Err(e) => warn!("SLOT ISR: could not load committed records: {}", e),
         }
-        Self { me, client, metadata, lease, committed, max_round: DashMap::new() }
+        Self { me, client, metadata, lease, committed, max_round: DashMap::new(), catch_up_turn: Default::default() }
     }
 
     /// The committed ISR this node knows for a slot (possibly behind; every later use
@@ -306,6 +308,48 @@ impl SlotIsrService {
 
     pub fn handle_get(&self, slots: Vec<(FileId, u64)>) -> Response {
         Response::SlotIsrRecords { records: slots.into_iter().map(|(f, i)| self.get(f, i)).collect() }
+    }
+
+    /// Ask two peers (rotating) for their committed records on `slots` and learn any epoch
+    /// newer than this node's. Returns how many records were learned.
+    pub async fn catch_up(&self, slots: Vec<Slot>) -> usize {
+        if slots.is_empty() {
+            return 0;
+        }
+        let mut peers = self.lease.peers();
+        if peers.is_empty() {
+            return 0;
+        }
+        // Different peers every pass: asking the same two forever would never learn a commit
+        // both of them happen to have missed.
+        let offset = self.catch_up_turn.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % peers.len();
+        peers.rotate_left(offset);
+        peers.truncate(2);
+        let mut newer: std::collections::HashMap<Slot, SlotIsr> = std::collections::HashMap::new();
+        for (_, addr) in peers {
+            let req = Message::Request(Request::GetSlotIsr { slots: slots.clone() });
+            let Ok(env) = self.client.send_message_timeout(addr, req, RPC_TIMEOUT).await else { continue };
+            let Message::Response(Response::SlotIsrRecords { records }) = env.message else { continue };
+            if records.len() != slots.len() {
+                continue;
+            }
+            for (slot, rec) in slots.iter().zip(records) {
+                let Some(rec) = rec else { continue };
+                let mine = self.get(slot.0, slot.1).map_or(0, |c| c.epoch);
+                if rec.epoch > mine && newer.get(slot).is_none_or(|n| rec.epoch > n.epoch) {
+                    newer.insert(*slot, rec);
+                }
+            }
+        }
+        if newer.is_empty() {
+            return 0;
+        }
+        let items: Vec<(FileId, u64, SlotIsr)> = newer.into_iter().map(|((f, i), v)| (f, i, v)).collect();
+        let n = items.len();
+        match self.handle_commit(items).await {
+            Response::Ok { .. } => n,
+            _ => 0,
+        }
     }
 
     /// Send `req` to every peer; collect (peer, response) for those that answered.

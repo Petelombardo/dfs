@@ -10971,6 +10971,54 @@ impl Server {
         });
     }
 
+    /// Catch up on ISR commits this node missed (SLOT-OWNERSHIP-PLAN.md Phase 3a): each pass
+    /// takes the next page of chunks this node knows of, asks two peers for their committed
+    /// records in one batched request each, and learns any newer epoch through the normal
+    /// commit path (so it's durable). Round-robin over passes, so every chunk is revisited.
+    /// DFS_SLOT_ISR_CATCHUP_SECS (default 60, 0 = off), DFS_SLOT_ISR_CATCHUP_PAGE (default 500).
+    pub fn start_slot_isr_catchup(self: Arc<Self>) {
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let every = env_u64("DFS_SLOT_ISR_CATCHUP_SECS", 60);
+        if every == 0 {
+            return;
+        }
+        let page = env_u64("DFS_SLOT_ISR_CATCHUP_PAGE", 500) as usize;
+        tokio::spawn(async move {
+            let mut cursor = 0usize;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+                cursor = self.catch_up_slot_isrs(cursor, page).await;
+            }
+        });
+    }
+
+    async fn catch_up_slot_isrs(&self, cursor: usize, page: usize) -> usize {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        // Every chunk this node knows of, held or not: it's an acceptor (and a source of
+        // answers) for all of them, so it must not sit on stale records for any.
+        let mut all: Vec<(FileId, u64)> = Vec::new();
+        for file in self.chunk_map.iter() {
+            let (locs, _) = file.value();
+            for loc in locs.iter() {
+                if let Some(off) = loc.file_offset {
+                    all.push((*file.key(), off / CHUNK_SIZE));
+                }
+            }
+        }
+        if all.is_empty() {
+            return 0;
+        }
+        all.sort_by_key(|(f, i)| (f.0, *i));
+        let start = if cursor >= all.len() { 0 } else { cursor };
+        let slots: Vec<(FileId, u64)> = all.iter().skip(start).take(page).copied().collect();
+        let next = start + slots.len();
+        let learned = self.slot_isr.catch_up(slots).await;
+        if learned > 0 {
+            info!("SLOT ISR catch-up: learned {} newer record(s) from peers", learned);
+        }
+        next
+    }
+
     async fn seed_slot_isrs(&self, max: usize) {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let me = self.cluster.local_node_id();

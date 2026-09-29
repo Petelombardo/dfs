@@ -8902,7 +8902,7 @@ impl Server {
         // to followers 100ms later, resurrecting the file there.
         self.pending_broadcasts.remove(&file_id);
 
-        if let Err(e) = self.metadata.delete_file_async(file_id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_async(file_id).await {
             warn!("Failed to delete file record {} on peer: {}", file_id, e);
         }
         if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
@@ -12076,6 +12076,22 @@ impl Server {
         });
     }
 
+    /// Age out FILE_TOMBSTONE_TABLE markers (see MetadataStore::prune_file_tombstones).
+    /// A day is far longer than any write stays queued or in flight here.
+    pub fn start_file_tombstone_prune_loop(self: Arc<Self>) {
+        const RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                match self.metadata.prune_file_tombstones_async(RETENTION).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("Pruned {} deleted-file markers older than {:?}", n, RETENTION),
+                    Err(e) => warn!("Pruning deleted-file markers failed: {}", e),
+                }
+            }
+        });
+    }
+
     pub fn start_metadata_healer_loop(self: Arc<Self>) {
         let server = self;
         tokio::spawn(async move {
@@ -13235,6 +13251,8 @@ impl Server {
                         );
                         corrections.push(newer);
                     }
+                    // Deleted here; the sender's copy is the stale one.
+                    crate::metadata::PutFileResult::Deleted => {}
                 }
             }
             Ok::<_, anyhow::Error>((stored, corrections))
@@ -15913,7 +15931,7 @@ impl Server {
         }
 
         // Step 3: remove metadata now that the chunk list is safely queued.
-        if let Err(e) = self.metadata.delete_file_async(metadata.id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_async(metadata.id).await {
             warn!("Failed to delete file metadata for {}: {}", path, e);
             // Queue entry is already written — drain worker will retry.
             // Still return error so client knows metadata removal may have failed.
@@ -15941,18 +15959,12 @@ impl Server {
         // slot (which never comes, since the file is gone). Confirmed root cause of the
         // gluster3 RSS growth during repeated create/delete/recreate benchmark runs
         // (2026-07-13).
-        const CHUNK_SIZE_DELETE: u64 = 4 * 1024 * 1024;
         for loc in file_chunk_locs.iter() {
-            // Computed from file_offset, not vector position: chunk_locations_for_info
-            // doesn't dedupe un-swept patch-rotation duplicates at the same offset, so
-            // enumerate() position would drift from the true chunk_idx once any exist.
-            let chunk_idx = loc.file_offset.unwrap_or(0) / CHUNK_SIZE_DELETE;
-            self.chunk_patch_locks.remove(&(metadata.id, chunk_idx));
-            self.dirty_patch_slots.remove(&(metadata.id, chunk_idx));
             self.pending_patch_ids.remove(&loc.chunk_id);
             self.pending_patch_fold_broadcasts.remove(&loc.chunk_id);
             self.chunk_io_locks.remove(&loc.chunk_id);
         }
+        self.forget_file_slots(metadata.id);
 
         // Notify the drain worker that there's a new entry (leader only acts on it,
         // but the notify is harmless on followers).
@@ -15977,7 +15989,7 @@ impl Server {
         self.pending_broadcasts.remove(&file_id);
 
         // Wipe metadata (idempotent — already gone on quorum nodes).
-        let _ = self.metadata.delete_file_async(file_id).await;
+        let _ = self.metadata.delete_file_for_good_async(file_id).await;
         let _ = self.metadata.delete_path_index_async(path).await;
         self.chunk_map_remove(&file_id).await;
 
@@ -15988,17 +16000,28 @@ impl Server {
                 // Not present locally — fine, log at debug.
                 debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
             }
-            // Partial cleanup of the same in-memory fold/patch bookkeeping purged in
-            // handle_delete_file — this RPC only carries chunk_id, not chunk_idx, so
-            // the (file_id, chunk_idx)-keyed chunk_patch_locks/dirty_patch_slots can't
-            // be targeted here without a protocol change. Those still leak on the
-            // follower-side drain path; tracked as a known follow-up.
+            // The chunk_id-keyed half of the fold/patch bookkeeping purged in
+            // handle_delete_file; the (file_id, chunk_idx)-keyed half is dropped for
+            // every slot of the file by forget_file_slots below.
             self.pending_patch_ids.remove(chunk_id);
             self.pending_patch_fold_broadcasts.remove(chunk_id);
             self.chunk_io_locks.remove(chunk_id);
         }
+        self.forget_file_slots(file_id);
 
         Response::Ok { data: None }
+    }
+
+    /// Drop every (file_id, chunk_idx)-keyed patch record of a deleted file. A dirty
+    /// slot left behind is folded by the patch-fold sweep once it looks abandoned, and
+    /// that fold re-installs the deleted file's chunk_map, from where its metadata
+    /// spread back to peers (Legata "deleted files persist"; follower_delete_forgets_
+    /// every_dirty_slot_of_the_file). Keyed by file, not by the chunk list: a slot can
+    /// be dirty without appearing in the file's chunk locations, and the follower's
+    /// DeleteChunksBatch doesn't carry chunk indexes at all.
+    fn forget_file_slots(&self, file_id: FileId) {
+        self.dirty_patch_slots.retain(|(f, _), _| *f != file_id);
+        self.chunk_patch_locks.retain(|(f, _), _| *f != file_id);
     }
 
     /// Handle ClearDeleteQueueEntry — leader broadcasts this after all nodes ack.
@@ -16124,7 +16147,7 @@ impl Server {
         // full-disk leader silently fails its own delete but still broadcasts
         // DeleteChunksBatch, causing followers to permanently lose the file while the
         // leader retains it.  The drain will retry on the next 30-second cycle.
-        if let Err(e) = self.metadata.delete_file_async(entry.file_id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_async(entry.file_id).await {
             warn!("drain_one_delete: local metadata delete failed for {} — will retry: {}", entry.path, e);
             return;
         }
@@ -18603,6 +18626,10 @@ impl Server {
                             put_result = Some(Ok(()));
                             break;
                         }
+                        Ok(PutFileResult::Deleted) => {
+                            put_result = Some(Err(anyhow::anyhow!("{} was deleted during the rename", old_path)));
+                            break;
+                        }
                         Ok(PutFileResult::Stale(existing)) => {
                             warn!("Rename {} -> {}: put_file_async dropped write_seq={} as stale against existing write_seq={} (attempt {}/{}) — retrying with a higher write_seq",
                                 old_path, new_path, metadata.write_seq, existing.write_seq, attempt + 1, MAX_RENAME_STALE_RETRIES);
@@ -20825,6 +20852,39 @@ mod tests {
     /// output), base X does not exist anywhere. Expected/fixed behavior: after
     /// abandoning, the slot must resolve back to `winner`, not stay parked on
     /// B's phantom token.
+    #[tokio::test]
+    async fn follower_delete_forgets_every_dirty_slot_of_the_file() {
+        // Legata "deleted files persist": DeleteChunksBatch only carries chunk ids, so it
+        // left the file's (file_id, chunk_idx)-keyed dirty_patch_slots behind. 60s later
+        // the fold sweep saw a slot "still dirty", folded it, and re-installed the deleted
+        // file's chunk_map (and from there its metadata spread back to peers).
+        let h = make_overlay_test_harness();
+        let dead = FileId::new();
+        let other = FileId::new();
+        let slot = |token: &[u8]| DirtyPatchSlot {
+            token: ChunkId::from_hash(compute_chunk_hash(token)),
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+            prior_chunk_id: None,
+        };
+        h.server.dirty_patch_slots.insert((dead, 0), slot(b"dead-0"));
+        h.server.dirty_patch_slots.insert((dead, 3), slot(b"dead-3"));
+        h.server.dirty_patch_slots.insert((other, 0), slot(b"other-0"));
+        h.server.chunk_patch_locks.insert((dead, 3), Default::default());
+
+        h.server.handle_delete_chunks_batch(dead, "/dead.bin".to_string(), vec![]).await;
+
+        assert!(!h.server.dirty_patch_slots.iter().any(|e| e.key().0 == dead),
+            "a deleted file must leave no dirty slot behind for the fold sweep to fold");
+        assert!(!h.server.chunk_patch_locks.iter().any(|e| e.key().0 == dead));
+        assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
+    }
+
     #[tokio::test]
     async fn test_run_single_fold_abandon_base_gone_restores_slot_to_prior_chunk() {
         let h = make_overlay_test_harness();

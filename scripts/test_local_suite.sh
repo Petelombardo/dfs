@@ -397,7 +397,7 @@ while [ "$T14A_ELAPSED" -le "$T14A_MAX_WAIT" ]; do
     OK=PASS
     FAILURES=""
     for port in 8900 8901 8902 8903 8904; do
-        LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null)
+        LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null)
         echo "$LIST" | grep -q "t12_after.txt" || { OK=FAIL; FAILURES="${FAILURES}  Node $port missing t12_after.txt\n"; }
         echo "$LIST" | grep -q "t12_before.txt" && { OK=FAIL; FAILURES="${FAILURES}  Node $port still has t12_before.txt\n"; }
         echo "$LIST" | grep -q "t13_dst.bin"   || { OK=FAIL; FAILURES="${FAILURES}  Node $port missing t13_dst.bin\n"; }

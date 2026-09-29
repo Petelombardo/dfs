@@ -18805,7 +18805,12 @@ impl Server {
                 match self.metadata.put_file_async(m.clone()).await? {
                     PutFileResult::Stored => { stored = true; break; }
                     PutFileResult::Stale(existing) => m.write_seq = existing.write_seq.saturating_add(1),
+                    // Deleted while we were renaming: nothing left to move.
+                    PutFileResult::Deleted => break,
                 }
+            }
+            if !stored && self.metadata.get_file_async(m.id).await?.is_none() {
+                continue;
             }
             if !stored {
                 anyhow::bail!("{} kept losing to concurrent writers", m.path);

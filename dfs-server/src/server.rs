@@ -250,7 +250,7 @@ pub struct Server {
     /// second: merge_file_metadata's is_stale check is strict `>`, so a tie lets
     /// the later commit's scalar fields (including path) win outright. See
     /// wait_for_pending_metadata_write.
-    pending_metadata_writes: Arc<dashmap::DashSet<FileId>>,
+    pending_metadata_writes: Arc<PendingWrites>,
 
     /// Fired by the sled-write worker after every batch commits (regardless of
     /// which files were in it). Paired with pending_metadata_writes to let
@@ -5131,6 +5131,35 @@ impl Drop for FoldHealingCancelGuard {
     }
 }
 
+/// How many metadata writes per file are queued in sled_write_tx and not yet committed
+/// (see Server::pending_metadata_writes). A count, not a set: two writes queued back to
+/// back for one file can land in different worker batches, and a set cleared by the
+/// first batch reported "nothing pending" while the second was still queued. A rename
+/// then read the stale record, tied the queued write's write_seq, and lost to it when it
+/// committed — the rename silently reverted to the old path (suite T12-T14 flake;
+/// pending_writes_count_every_queued_write).
+#[derive(Default)]
+pub(crate) struct PendingWrites(DashMap<FileId, usize>);
+
+impl PendingWrites {
+    pub(crate) fn queued(&self, id: FileId) {
+        *self.0.entry(id).or_insert(0) += 1;
+    }
+    /// One queued write for `id` is resolved (committed or dropped).
+    pub(crate) fn resolved(&self, id: FileId) {
+        self.0.remove_if_mut(&id, |_, n| { *n = n.saturating_sub(1); *n == 0 });
+    }
+    pub(crate) fn contains(&self, id: &FileId) -> bool {
+        self.0.contains_key(id)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl Server {
     /// True if this slot has crossed MAX_FOLD_FAILURES_BEFORE_ESCALATION and is
     /// still within its escalated backoff window (FOLD_ESCALATED_RETRY_INTERVAL
@@ -5201,7 +5230,7 @@ impl Server {
         tombstones_for_worker: Arc<DashMap<FileId, std::time::Instant>>,
         done_notify: Arc<tokio::sync::Notify>,
         backlog_for_worker: Arc<std::sync::atomic::AtomicUsize>,
-        pending_for_worker: Arc<dashmap::DashSet<FileId>>,
+        pending_for_worker: Arc<PendingWrites>,
         progress_for_worker: Arc<tokio::sync::Notify>,
         metadata_batch_drain_enabled: bool,
     ) -> tokio::sync::mpsc::UnboundedSender<FileMetadata> {
@@ -5301,7 +5330,7 @@ impl Server {
                     // committed above, or dropped as tombstoned. A read-modify-write op
                     // (rename) waiting on any of these can now safely re-read.
                     for id in ids_in_batch {
-                        pending_for_worker.remove(&id);
+                        pending_for_worker.resolved(id);
                     }
                     progress_for_worker.notify_waiters();
 
@@ -5337,7 +5366,7 @@ impl Server {
         // each other within a single literal).
         let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pending_metadata_writes: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
+        let pending_metadata_writes: Arc<PendingWrites> = Arc::new(PendingWrites::default());
         let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let pending_renames: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
         let rename_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
@@ -13068,8 +13097,12 @@ impl Server {
                 // Must be set before send(): once the worker picks this item up it
                 // clears the id at the end of its batch cycle, so setting it after
                 // send() could race a very fast worker and leak "pending" forever.
-                self.pending_metadata_writes.insert(metadata.id);
-                let _ = tx.send(metadata);
+                self.pending_metadata_writes.queued(metadata.id);
+                let id = metadata.id;
+                if tx.send(metadata).is_err() {
+                    // Worker gone: nothing will ever resolve this entry.
+                    self.pending_metadata_writes.resolved(id);
+                }
             }
         }
         match resync_requested_for {
@@ -18738,6 +18771,27 @@ mod tests {
     use super::*;
     use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
+
+    /// Two writes queued for one file, committed in separate worker batches: after the
+    /// first batch the file must still read as pending, or a rename proceeds on a stale
+    /// read and the second write's old path overwrites it (suite T12-T14 flake).
+    #[test]
+    fn pending_writes_count_every_queued_write() {
+        let p = PendingWrites::default();
+        let (f, g) = (FileId::new(), FileId::new());
+        p.queued(f);
+        p.queued(f);
+        p.queued(g);
+        p.resolved(f); // first batch committed
+        assert!(p.contains(&f), "the second queued write is still outstanding");
+        p.resolved(f);
+        assert!(!p.contains(&f));
+        assert!(p.contains(&g));
+        p.resolved(g);
+        assert!(p.is_empty());
+        p.resolved(g); // a stray resolve never underflows or re-adds
+        assert!(p.is_empty());
+    }
 
     /// classify_request (added 2026-08-06 for RpcClassCounts) — spot-checks
     /// representative variants from each bucket, plus the two fields-carry-

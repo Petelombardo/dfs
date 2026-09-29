@@ -20018,7 +20018,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+        // RF=1: a lone node can never reach RF=3's write quorum of 2.
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 1, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         // Write data
         let data = b"Hello, distributed filesystem!";
@@ -23292,8 +23293,10 @@ mod tests {
         let response = server.handle_read_chunk(chunk_id, None, None).await;
 
         match response {
-            Response::ChunkData { data: read_data, .. } => {
-                assert_eq!(data.as_slice(), read_data.as_slice());
+            // Zero-copy reply: the bytes ride in arc_data and `data` is left empty.
+            Response::ChunkData { data: read_data, arc_data, .. } => {
+                let read = arc_data.map(|a| a.to_vec()).unwrap_or(read_data);
+                assert_eq!(data.as_slice(), read.as_slice());
             }
             _ => panic!("Expected ChunkData response"),
         }
@@ -25172,11 +25175,17 @@ mod tests {
     mod overlay_stacking {
         use super::*;
 
-        /// Poll patch_state for `public_token` until it flips to Folded (or panic
-        /// after `timeout_ms`) — since every patch now folds immediately in the
-        /// background, tests that need to observe post-fold state can't control fold
-        /// timing directly the way the old below-the-depth-cap design allowed.
+        /// Fold `public_token`'s slot and wait for patch_state to flip to Folded (or
+        /// panic after `timeout_ms`). Folds are debounced (PATCH_DEBOUNCE_IDLE, 20s
+        /// after the slot's last patch), not immediate as when these tests were
+        /// written, so run now the fold that timer would eventually run.
         async fn wait_for_folded(h: &OverlayTestHarness, public_token: ChunkId, timeout_ms: u64) -> ChunkId {
+            let slot = h.server.dirty_patch_slots.iter()
+                .find(|e| e.value().token == public_token)
+                .map(|e| *e.key());
+            if let Some((file_id, chunk_idx)) = slot {
+                h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await;
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {
                 if let Ok(Some(PatchState::Folded(real))) = h.metadata.get_patch_state(&public_token) {
@@ -25305,10 +25314,15 @@ mod tests {
             let resp = h.server.handle_multi_patch(
                 ghost_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, None, None, None,
             ).await;
+            // Rejected either way: apply_patch refuses the ghost base with NotFound, and
+            // handle_multi_patch turns a slot-keyed NotFound into a retriable ChunkStale
+            // (2026-07-19, see its comment and chunk_seq_gap_onto_ghost_base_is_retriable_
+            // not_hard_eio) so a transient ghost backs off instead of EIO-ing the guest.
             match resp {
                 Response::Error { code, .. } => assert_eq!(code, dfs_common::ErrorCode::NotFound,
-                    "a ghost base (claimed by metadata, absent on disk) must be rejected as NotFound, not silently built on top of"),
-                other => panic!("expected Response::Error{{NotFound}}, got {:?}", other),
+                    "a ghost base (claimed by metadata, absent on disk) must be rejected, not silently built on top of"),
+                Response::ChunkStale { .. } => {}
+                other => panic!("a ghost base must be rejected (NotFound or ChunkStale), got {:?}", other),
             }
 
             // No patch_state should have been created for a base we never actually had.
@@ -25375,7 +25389,7 @@ mod tests {
             let file_id = dfs_common::FileId::new();
             let chunk_file_offset = 0u64;
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             let patch: (usize, Vec<u8>) = (0, vec![3u8; 64]);
 
@@ -25920,7 +25934,7 @@ mod tests {
             let chunk_file_offset = 0u64;
 
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
             let original_loc = ChunkLocation {
@@ -26011,7 +26025,7 @@ mod tests {
             let chunk_file_offset = 0u64;
 
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
             let original_loc = ChunkLocation {
@@ -26164,7 +26178,7 @@ mod tests {
             h.metadata.put_file(&file_meta).unwrap();
 
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_idx * 4 * 1024 * 1024, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
 
@@ -26634,8 +26648,10 @@ mod tests {
         // Simulate the state right after an in-place patch: chunk_map (the fresh
         // source) knows this chunk is file_id's current content at offset 0, but
         // FILE_TABLE was never rewritten to say so — no FileMetadata exists for
-        // file_id at all here, the extreme case of that staleness gap.
-        server.chunk_map.insert(file_id, (vec![ChunkLocation {
+        // file_id at all here, the extreme case of that staleness gap. Installed via
+        // commit_chunk_map, as production does, so chunk_to_file (the index
+        // handle_confirm_chunks_live consults) moves in lockstep with chunk_map.
+        server.commit_chunk_map(file_id, vec![ChunkLocation {
             chunk_id,
             nodes: vec![node_id],
             size: 33,
@@ -26644,7 +26660,7 @@ mod tests {
             written_at: Some(dfs_common::types::current_timestamp() * 1000),
             client_write_seq: Some(1),
             file_id: Some(file_id),
-        }], 1));
+        }], 1);
 
         let response = server.handle_confirm_chunks_live(vec![chunk_id]).await;
         let live = match response {
@@ -26988,6 +27004,15 @@ mod tests {
                 spawn_coordinating_peer(&h, peer_addr, file_id, chunk_idx, base_chunk_id).await;
 
             setup_coordinated_patch(&h, file_id, chunk_idx, "coord-case");
+            // A real patch leaves the slot's chunk_map entry on its public token
+            // (update_chunk_map_after_patch). Left on the base, run_single_fold's
+            // superseded-slot guard reads the patch as overtaken and abandons it.
+            let token = h.server.dirty_patch_slots.get(&(file_id, chunk_idx)).unwrap().token;
+            if let Some(mut e) = h.server.chunk_map.get_mut(&file_id) {
+                for loc in e.value_mut().0.iter_mut() {
+                    if loc.chunk_id == base_chunk_id { loc.chunk_id = token; }
+                }
+            }
 
             let outcome = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
             assert_eq!(outcome, CoordinatedFoldOutcome::Done,

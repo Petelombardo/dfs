@@ -1068,6 +1068,40 @@ pub enum Request {
         chunk_idx: u64,
         members: Vec<NodeId>,
     },
+
+    /// A slot write the chunk's primary puts in order (SLOT-OWNERSHIP-PLAN 3c,
+    /// DFS_ORDERED_WRITES). The client sends the same wrapped request to both ISR members in
+    /// parallel; the primary assigns it the slot's next version and tells the secondary with
+    /// `WriteOrder`, and the secondary applies it only in that order. Only `MultiPatch` is
+    /// wrapped today. APPENDED at end to preserve wire compatibility.
+    Ordered {
+        tag: WriteOrderTag,
+        request: Box<Request>,
+    },
+
+    /// Primary -> secondary: write `write_id` is version `version` of the slot at `isr_epoch`.
+    /// A few dozen bytes; the payload itself came from the client. APPENDED at end to
+    /// preserve wire compatibility.
+    WriteOrder {
+        file_id: FileId,
+        chunk_idx: u64,
+        isr_epoch: u64,
+        write_id: u128,
+        version: u64,
+    },
+}
+
+/// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member
+/// at `isr_epoch`, as the client looked it up). `write_id` names this one write in the
+/// primary's `WriteOrder` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteOrderTag {
+    pub file_id: FileId,
+    pub chunk_idx: u64,
+    pub isr_epoch: u64,
+    pub primary: NodeId,
+    pub secondary: NodeId,
+    pub write_id: u128,
 }
 
 /// See Request::ProposeFold's doc comment.

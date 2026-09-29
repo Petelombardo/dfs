@@ -5375,7 +5375,7 @@ mountpoint -q "$T64_MOUNT2" || check "T64 second client mounted" FAIL
 T64_FILE=t64_shared.bin
 dd if=/dev/urandom of="$MOUNT/$T64_FILE" bs=4M count=2 status=none
 dfs_sync
-sleep 1
+sleep 5   # let the ISR seeder (3s in this suite) commit the chunks' ISRs, which ordering needs
 t64_writer() {  # mount tag: 150 fsync'd 4K writes of this client's own content to one block
     python3 - "$1/$T64_FILE" "$2" <<'PY'
 import os, sys

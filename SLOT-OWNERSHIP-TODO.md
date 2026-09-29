@@ -4,7 +4,12 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-09-29_
+_Last updated: 2026-09-29, paused by Pete before the staging deploy_
+
+**Resume here:** `scripts/bench_staging.sh deploy 0` → `run off1` → `run off2` → `restart 1` →
+`run on1` → `run on2` → `teardown`. Both binaries are already built: the aarch64 server from
+this branch in `target/release`, and the x86 client in `dist/bench-x86_64/`. Rebuild both if the
+branch changes.
 
 ## Where things stand
 
@@ -39,14 +44,25 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
 - [x] Network: the split-frame decoder sees through `Ordered`
 - [x] Client: flag, ISR lookup and cache (`GetSlotIsr`), wrap the request for the ISR pair,
       drop the cached ISR on "not the primary"
-- [ ] Unit tests (`write_order`) + full unit set vs baseline
-- [ ] T64 locally with the flag on. Expect fewer disagreements, not zero: folds aren't ordered
-      yet (step 2)
-- [ ] Full suite, flag off (must not regress) and flag on
-- [ ] Commit
-- [ ] Staging bench cluster (user-approved): gluster1–5 port 8950, `/mnt/gluster/dfs-bench/…`,
-      plain processes, capped caches, client nanopir3 at `/mnt/dfs-bench`. Check free disk per
-      node first. Production untouched
+- [x] Unit tests (`write_order`, 3 tests) + full unit set = baseline (9 on this branch)
+- [x] T64 locally with the flag on: **0 replica disagreements** (flag off: 3–47 per run). This took
+      one more fix: an ordered write applies onto the replica's own current state for the slot,
+      not the client's possibly stale chunk id. Otherwise one replica rejected a write as stale
+      while the other rebased it, and the pair split with the order intact.
+- [ ] T64b (lost acked write) still fails with the flag on: the servers end on e.g. B000002 after
+      both writers were acked through write 149. The ordering is fine; the loss is in
+      location/metadata arbitration by per-client `client_write_seq` → step 2
+- [x] Full suite, flag on: **145/1** (only T64b, the step 2 gate; 0 replica disagreements).
+      Flag off: 143/3 (known failures only)
+- [x] Committed on slot-ownership (not pushed)
+- [x] Full suite, flag off: 143/3. All three failures are known (T38b flake; T59a, which the
+      async-reads branch fixes; T64b, the step 2 gate). No regression from the prototype.
+- [x] `scripts/bench_staging.sh` (check/deploy/restart/run/teardown). Placement agreed with Pete:
+      **gluster2–5 only** (gluster1 is the production leader with 470 MB free; a capped bench
+      server uses 170–280 MB), port 8950, `/mnt/gluster/dfs-bench/…`, plain processes. **Client
+      server4** (x86_64: binary from `dist/bench-x86_64/`, production `dist/x86_64/` untouched).
+      fio installed on server4 with Pete's OK. Disk: 31–71 GB free per node.
+- [ ] Deploy the bench cluster; production untouched
 - [ ] fio flag off vs on, two runs each: 4k randwrite QD1, 4k randwrite 16 writers, 1M sequential
 - [ ] Tear the bench cluster down; write up the numbers; **decide with Pete**
 

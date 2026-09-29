@@ -581,7 +581,8 @@ where
 
                 // Split-frame MultiPatch: all patch Vec<u8> are empty as a signal.
                 // Raw payload: [4B len0][data0][4B len1][data1]... for each patch.
-                if let dfs_common::Message::Request(dfs_common::Request::MultiPatch { chunk_id, ref mut patches, .. }) = envelope.message {
+                // Also when wrapped in Request::Ordered (DFS_ORDERED_WRITES).
+                if let Some((chunk_id, patches)) = split_frame_multi_patch(&mut envelope.message) {
                     if !patches.is_empty() && patches.iter().all(|(_, d)| d.is_empty()) {
                         // We have chunk_id before the patch bytes arrive — kick off the
                         // disk read immediately so it overlaps with the remaining network
@@ -1264,4 +1265,18 @@ mod tests {
         assert_eq!(client_sem.available_permits(), 4, "client pool must be unaffected by peer pool exhaustion");
     }
 
+}
+
+/// The chunk id and patch list of a MultiPatch request, looking inside `Request::Ordered`,
+/// so the split-frame decoder fills in the payload whichever form the client sent.
+fn split_frame_multi_patch(msg: &mut dfs_common::Message) -> Option<(dfs_common::ChunkId, &mut Vec<(usize, Vec<u8>)>)> {
+    let dfs_common::Message::Request(req) = msg else { return None };
+    let req = match req {
+        dfs_common::Request::Ordered { request, .. } => request.as_mut(),
+        other => other,
+    };
+    match req {
+        dfs_common::Request::MultiPatch { chunk_id, patches, .. } => Some((*chunk_id, patches)),
+        _ => None,
+    }
 }

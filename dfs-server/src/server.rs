@@ -55,6 +55,9 @@ pub struct Server {
     /// Per-chunk ISR records agreed by a majority (SLOT-OWNERSHIP-PLAN.md Phase 3a).
     slot_isr: Arc<crate::slot_isr::SlotIsrService>,
 
+    /// Per-slot write versions for `Request::Ordered` (SLOT-OWNERSHIP-PLAN 3c).
+    write_ordering: Arc<crate::write_order::WriteOrdering>,
+
     /// Replication factor. `Arc<AtomicUsize>` — the same instance is handed to
     /// `HealingManager` at construction (see `replication_factor_handle()`), so a live
     /// `dfs-admin cluster set --replication-factor` change or rejoin reconciliation is
@@ -1128,11 +1131,12 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::SlotIsrPrepare { .. }
         | Request::SlotIsrAccept { .. }
         | Request::SlotIsrCommit { .. }
-        | Request::GetSlotIsr { .. } => PeerOther,
+        | Request::GetSlotIsr { .. }
+        | Request::WriteOrder { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
-        Request::MultiPatch { .. } => ClientMultiPatch,
+        Request::MultiPatch { .. } | Request::Ordered { .. } => ClientMultiPatch,
         Request::ForceFold { .. } => ClientFold,
 
         // Client: everything else (HealChunkToNode is healing-flavored by name
@@ -5474,6 +5478,7 @@ impl Server {
             client: Arc::new(NetworkClient::new_for_peers()),
             lease,
             slot_isr,
+            write_ordering: Arc::new(crate::write_order::WriteOrdering::default()),
             replication_factor,
             metadata_dir,
             config_path,
@@ -7749,6 +7754,14 @@ impl Server {
             }
             Request::ForceFold { file_id, chunk_idx } => {
                 self.handle_force_fold(file_id, chunk_idx).await
+            }
+            Request::Ordered { tag, request } => {
+                self.ops_tracker.inc_write();
+                self.handle_ordered(tag, *request).await
+            }
+            Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version } => {
+                self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version);
+                Response::Ok { data: None }
             }
             Request::ProposeFold { file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint } => {
                 self.handle_propose_fold(file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint).await
@@ -15660,6 +15673,91 @@ impl Server {
                 };
                 stale.unwrap_or(Response::Error { message: msg, code })
             }
+        }
+    }
+
+    /// A write the slot's primary orders (see crate::write_order). The primary checks it
+    /// still is the primary the client looked up, gives the write the slot's next version,
+    /// tells the secondary, and applies it holding the slot's order lock; the secondary
+    /// applies it only in that order. Either way the patch itself goes through
+    /// handle_multi_patch unchanged.
+    async fn handle_ordered(&self, tag: dfs_common::WriteOrderTag, request: Request) -> Response {
+        let Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq } = request else {
+            return Response::Error { message: "Ordered: only MultiPatch can be ordered".into(), code: ErrorCode::InvalidRequest };
+        };
+        if file_id != tag.file_id || chunk_idx != Some(tag.chunk_idx) {
+            return Response::Error { message: "Ordered: tag does not match the write".into(), code: ErrorCode::InvalidRequest };
+        }
+        let me = self.cluster.local_node_id();
+        let slot = self.write_ordering.slot(tag.file_id, tag.chunk_idx, tag.isr_epoch);
+        // The version stream is the base: apply onto this replica's current state for the slot,
+        // not onto the chunk id the client last saw. Two writers' clients are routinely a step
+        // behind each other; judged against the client's id, one replica rejected a write as
+        // stale while the other rebased and applied it, and the pair split with the order intact.
+        let current_id = |srv: &Self| srv.chunk_map.get(&file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, tag.chunk_idx).map(|i| locs[i].chunk_id)
+        });
+        if me == tag.primary {
+            let current = self.slot_isr.get(tag.file_id, tag.chunk_idx);
+            let still_primary = current.as_ref().is_some_and(|isr| {
+                isr.epoch == tag.isr_epoch && isr.members.first() == Some(&me) && isr.members.get(1) == Some(&tag.secondary)
+            }) && self.lease.holds_own_lease();
+            if !still_primary {
+                return Response::Error {
+                    message: format!("Ordered: not the primary of file {} chunk {} at epoch {} (this node has {:?})",
+                        tag.file_id, tag.chunk_idx, tag.isr_epoch, current.map(|i| (i.epoch, i.members))),
+                    code: ErrorCode::InvalidRequest,
+                };
+            }
+            let _order = slot.order_lock.lock().await;
+            let version = slot.assign();
+            if version == 1 {
+                info!("[ORDER] primary: ordering file {} chunk {} epoch {} (secondary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.secondary);
+            }
+            if let Some(addr) = self.cluster.get_node(&tag.secondary).await.map(|n| n.addr) {
+                let client = self.client.clone();
+                let msg = Request::WriteOrder {
+                    file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
+                    write_id: tag.write_id, version,
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = client.send_message(addr, Message::Request(msg)).await {
+                        warn!("[ORDER] WriteOrder v{} to {} failed: {}", version, addr, e);
+                    }
+                });
+            }
+            let base = current_id(self).unwrap_or(chunk_id);
+            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await;
+            slot.applied(tag.write_id, version);
+            resp
+        } else if me == tag.secondary {
+            const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+            let version = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
+                Ok(v) => v,
+                Err(crate::write_order::TurnError::Gap { version, applied }) => {
+                    warn!("[ORDER] file {} chunk {} epoch {}: versions {}..{} never arrived; applying v{} past the gap",
+                        tag.file_id, tag.chunk_idx, tag.isr_epoch, applied + 1, version - 1, version);
+                    slot.skip_to(version);
+                    version
+                }
+                Err(crate::write_order::TurnError::NoOrder) => {
+                    return Response::Error {
+                        message: format!("Ordered: primary never ordered write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx),
+                        code: ErrorCode::InvalidRequest,
+                    };
+                }
+            };
+            if version == 1 {
+                info!("[ORDER] secondary: following file {} chunk {} epoch {} (primary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.primary);
+            }
+            let _order = slot.order_lock.lock().await;
+            let base = current_id(self).unwrap_or(chunk_id);
+            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await;
+            slot.applied(tag.write_id, version);
+            resp
+        } else {
+            Response::Error { message: "Ordered: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
         }
     }
 

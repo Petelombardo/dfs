@@ -16,6 +16,7 @@ mod slot_isr;
 mod stats;
 mod storage;
 mod watchdog;
+mod write_order;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

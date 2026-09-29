@@ -1015,6 +1015,10 @@ pub struct DfsClient {
     /// Maps SocketAddr -> NodeId to use real node IDs instead of synthetic ones
     addr_to_node_id: Arc<RwLock<HashMap<SocketAddr, dfs_common::NodeId>>>,
 
+    /// Committed per-chunk ISRs this client has looked up, for `DFS_ORDERED_WRITES`
+    /// (SLOT-OWNERSHIP-PLAN 3c). Dropped when a primary answers that it no longer is one.
+    slot_isr_cache: Arc<DashMap<(dfs_common::FileId, u64), dfs_common::SlotIsr>>,
+
     /// Tracks which chunks have been prefetch-hinted to which server nodes
     /// When reading chunks, prefer these nodes to hit warm server caches
     /// Maps ChunkId -> (SocketAddr, timestamp) where timestamp is when hint was sent
@@ -1457,6 +1461,7 @@ impl DfsClient {
             replica_cache: Arc::new(Mutex::new(replica_cache)),
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
+            slot_isr_cache: Arc::new(DashMap::new()),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
             node_capacities: Arc::new(DashMap::new()),
@@ -7552,6 +7557,55 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok((new_loc, fresh_meta))
     }
 
+    /// DFS_ORDERED_WRITES=1: send patches as `Request::Ordered` to the chunk's ISR pair, so
+    /// its primary orders concurrent writers (SLOT-OWNERSHIP-PLAN 3c). Read once.
+    fn ordered_writes_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("DFS_ORDERED_WRITES").map(|v| v == "1").unwrap_or(false))
+    }
+
+    /// The order tag for each of the chunk's two ISR members among `patch_addrs`, or an empty
+    /// map when the chunk has no committed ISR (yet) or its members aren't both targets of
+    /// this write — the write then goes out unordered, as without the flag.
+    async fn ordered_write_tags(
+        &self,
+        file_id: dfs_common::FileId,
+        chunk_idx: u64,
+        patch_addrs: &[SocketAddr],
+        addr_to_node_id: &HashMap<SocketAddr, dfs_common::NodeId>,
+    ) -> HashMap<SocketAddr, dfs_common::WriteOrderTag> {
+        let mut tags = HashMap::new();
+        let isr = match self.slot_isr_cache.get(&(file_id, chunk_idx)).map(|e| e.value().clone()) {
+            Some(isr) => isr,
+            None => {
+                let Some(&ask) = patch_addrs.first() else { return tags };
+                match self.send_request(ask, Request::GetSlotIsr { slots: vec![(file_id, chunk_idx)] }).await {
+                    Ok(Response::SlotIsrRecords { records }) => match records.into_iter().next().flatten() {
+                        Some(isr) => {
+                            self.slot_isr_cache.insert((file_id, chunk_idx), isr.clone());
+                            isr
+                        }
+                        None => return tags,
+                    },
+                    _ => return tags,
+                }
+            }
+        };
+        let (Some(&primary), Some(&secondary)) = (isr.members.first(), isr.members.get(1)) else { return tags };
+        let addr_of = |n: dfs_common::NodeId| addr_to_node_id.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
+        let (Some(p), Some(s)) = (addr_of(primary), addr_of(secondary)) else { return tags };
+        if !patch_addrs.contains(&p) || !patch_addrs.contains(&s) {
+            return tags;
+        }
+        let tag = dfs_common::WriteOrderTag {
+            file_id, chunk_idx, isr_epoch: isr.epoch, primary, secondary,
+            write_id: uuid::Uuid::new_v4().as_u128(),
+        };
+        tags.insert(p, tag);
+        tags.insert(s, tag);
+        tags
+    }
+
     /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
     /// Equivalent to patch_chunk_on_replicas but sends all dirty ranges in one request,
     /// so the server applies them atomically without serial round-trips or gap zero-fills.
@@ -7741,6 +7795,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
+        let order_tags = match chunk_idx {
+            Some(cidx) if Self::ordered_writes_enabled() =>
+                self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await,
+            _ => HashMap::new(),
+        };
 
         // Consume a fresh write_seq for this patch so the leader can use it to order
         // concurrent RCL notifications from the same file without relying on wall clocks.
@@ -7794,6 +7853,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                     prefetch_hints: hints,
                     new_chunk_seq,
                 };
+                let patch_req_split = match order_tags.get(&addr) {
+                    Some(tag) => Request::Ordered { tag: *tag, request: Box::new(patch_req_split) },
+                    None => patch_req_split,
+                };
                 async move {
                     let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
                     let envelope = MessageEnvelope::new(request_id, Message::Request(patch_req_split));
@@ -7820,11 +7883,24 @@ leader_addr: Arc::new(RwLock::new(None)),
                     prefetch_hints: hints,
                     new_chunk_seq,
                 };
+                let req = match order_tags.get(&addr) {
+                    Some(tag) => Request::Ordered { tag: *tag, request: Box::new(req) },
+                    None => req,
+                };
                 async move { (addr, client.send_request(addr, req).await) }
             }).collect();
             futures::future::join_all(futures).await
         };
         timing_rpc += rpc_start.elapsed();
+        if let Some(cidx) = chunk_idx {
+            // A primary that no longer is one: forget the cached ISR so the next attempt
+            // looks it up again.
+            let stale_isr = results.iter().any(|(_, r)| matches!(r,
+                Ok(Response::Error { message, .. }) if message.starts_with("Ordered: not the primary")));
+            if stale_isr {
+                self.slot_isr_cache.remove(&(file_id, cidx));
+            }
+        }
 
         // Collect per-replica results before any disagreement logic.
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.

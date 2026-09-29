@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId};
+use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId, SlotIsr as SlotIsrRecord};
 use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 // On Linux, Durability::Eventual calls fdatasync (same as Immediate). Only the macOS
 // backend (F_BARRIERFSYNC) distinguishes them. Durability::None writes to the OS page
@@ -23,6 +23,10 @@ use tracing::{debug, info, warn};
 
 /// file_id (hyphenated UUID string) → bincode(FileMetadata)
 const FILE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("file");
+// Per-slot Paxos acceptor state for the slot's ISR (SLOT-OWNERSHIP-PLAN.md Phase 3a):
+// key "file_id:chunk_idx", value bincode(slot_isr::AcceptorState). Written only with
+// Durability::Immediate: an acceptor must not answer before its promise is on disk.
+const SLOT_ISR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("slot_isr");
 
 /// full path string → bincode(FileMetadata)  (path index, same data as file table)
 const PATH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("path");
@@ -2588,6 +2592,62 @@ impl MetadataStore {
     /// Look up a patch_state row by its public token. `None` means `chunk_id` is
     /// not a currently-outstanding patch token at all — callers should treat it
     /// as ordinary, directly-readable chunk content.
+    fn slot_isr_key(file_id: FileId, chunk_idx: u64) -> String {
+        format!("{}:{}", file_id, chunk_idx)
+    }
+
+    /// Run `f` on each slot's acceptor state in one transaction and persist the results
+    /// with Durability::Immediate before returning. Everything a Paxos acceptor does goes
+    /// through here, so no answer can leave this node ahead of its state.
+    pub fn slot_isr_apply<R>(
+        &self,
+        slots: &[(FileId, u64)],
+        mut f: impl FnMut(usize, &mut crate::slot_isr::AcceptorState) -> R,
+    ) -> Result<Vec<R>> {
+        let _db = self.db.read();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(Durability::Immediate);
+        let mut out = Vec::with_capacity(slots.len());
+        {
+            let mut table = txn.open_table(SLOT_ISR_TABLE)?;
+            for (i, (file_id, chunk_idx)) in slots.iter().enumerate() {
+                let key = Self::slot_isr_key(*file_id, *chunk_idx);
+                let mut state: crate::slot_isr::AcceptorState = match table.get(key.as_str())? {
+                    Some(v) => bincode::deserialize(v.value()).context("corrupt slot_isr row")?,
+                    None => Default::default(),
+                };
+                let before = state.clone();
+                out.push(f(i, &mut state));
+                if state != before {
+                    table.insert(key.as_str(), bincode::serialize(&state)?.as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(out)
+    }
+
+    /// Every committed ISR this node knows, to warm the in-memory cache at startup.
+    pub fn slot_isr_all_committed(&self) -> Result<Vec<((FileId, u64), SlotIsrRecord)>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(SLOT_ISR_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (k, v) = row?;
+            let state: crate::slot_isr::AcceptorState = bincode::deserialize(v.value()).context("corrupt slot_isr row")?;
+            let Some(committed) = state.committed else { continue };
+            let Some((fid, idx)) = k.value().split_once(':') else { continue };
+            let (Ok(fid), Ok(idx)) = (fid.parse::<uuid::Uuid>(), idx.parse::<u64>()) else { continue };
+            out.push(((FileId::from_uuid(fid), idx), committed));
+        }
+        Ok(out)
+    }
+
     /// Fault injection only (see `Request::InjectStall`): hold the database write lock,
     /// so every metadata read and write on this node waits. Blocking; run it on a
     /// blocking thread.

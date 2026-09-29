@@ -330,13 +330,91 @@ one side for an asymmetric link. This makes #2–#15 deterministic on the local 
   one node, no takeovers, no replica disagreement. A planted "every holder owns" fault fails
   T61 on all 16 chunks.
 
-**Phase 3 — Versioned writes, ISR, catch-up** (includes the flap guard, #13)
-- §6.3 + §6.4: the client narrows patch fan-out to P+S with `(epoch, base_version)`, and
-  primary-driven catch-up. This is the parallel fan-out vs primary relay decision, made with
-  latency numbers (kdiskmark RND4K Q1T1/Q32T1 before and after).
-- The failure matrix #2–#7, #10 enforced and tested.
-- Gate: full suite, all failure-matrix tests, a kdiskmark regression within noise, and a
-  multi-day VM-108 soak with zero divergence alarms.
+**Phase 3 — Stored ISR, 2-replica writes, versions, catch-up** (DESIGN, awaiting approval)
+
+Where the write path stands today (read 2026-09-29):
+- Full writes already go to an ordered pair (`write_data_dual_replica`, `select_write_pair`).
+- Patches go to **every** holder, except the fsync/release path (`use_dual_rf: true`,
+  fuse_impl.rs ~3977), which picks two with the **leader first**, then by address.
+- Each replica mints its own token; ordering is the per-file `client_write_seq`.
+- The client already cross-checks ForceFold results across replicas.
+
+Four sub-phases, each gated on its own (§8a):
+
+**3a — The ISR as a majority-agreed record per chunk (server-only).** (built)
+- `SlotIsr { epoch, members }` per `(file_id, chunk_idx)`. Each epoch's value is chosen by
+  **single-decree Paxos** among all nodes (dfs-server/src/slot_isr.rs). The first design
+  said "compare-and-set on a majority"; that is unsafe when two nodes propose at once (each
+  can win a different minority), so it's Paxos: prepare/promise, then accept, and a proposer
+  adopts the highest-ballot value already accepted.
+- Acceptor state lives in a `slot_isr` table written with Durability::Immediate (an acceptor
+  must not answer ahead of its disk); prepare/accept/commit/get are batched RPCs, so one pass
+  costs one fsync per node, not one per chunk. A committed-record cache serves hot paths.
+- **Seeding:** every 30 s (`DFS_SLOT_ISR_SEED_SECS`), at most 500 chunks per pass, each
+  seeded by its first rendezvous holder: epoch 1 = the first 2 holders in rendezvous order.
+  Deleted files are skipped.
+- **Fold owner** now follows the stored ISR when a chunk has one (Phase 2's known limit is gone
+  for seeded chunks), falling back to rendezvous over holders otherwise.
+- **How it's tested, stated plainly:**
+  - Safety (never two values chosen for one epoch) is proven by a seeded randomized
+    simulation (5 acceptors, 3 competing proposers, loss/duplication/reordering, restarts),
+    which fails within one seed when a proposer ignores accepted values or an acceptor accepts
+    below its promise. Its first run caught a real bug: counting a duplicated reply twice
+    faked a majority; replies are now counted per acceptor.
+  - Suite T62 proves the wiring on the real cluster: seeding converges on all 5 nodes; 5 nodes
+    racing different values (5 rounds, during a 2|3 partition, and with two acceptors stalled)
+    always end on one value per epoch, checked from every node's commit log. T62 alone would
+    NOT catch a broken proposer: a planted "skip phase 1" fault passed it, because the conflict
+    window is ~1 ms on a local cluster. The simulation is the safety proof.
+- Still to do before 3b relies on it: **catch-up** for a node that missed a commit broadcast
+  (today it's stale until the chunk's next epoch; safe for folds, not for clients).
+- Gate 2026-09-29: suite 142/1 at 13m15s. The one failure, T61d (replica disagreement during a
+  patch storm), was shown to be **pre-existing**, not caused by 3a: T60-then-T61 reproduces it on
+  the committed Phase 2 build (1 run in 4, 10 disagreements) and on 3a (1 in 2). The cause is the
+  client ForceFold folding both replicas at once mid-storm. T61d is informational until 3c, which
+  removes the race, and becomes required again there.
+
+**Order change (2026-09-29, from the repo's history): 3c before 3b.** Narrowing writes to 2
+replicas before chunks have versions reopens the hazard from commit ef0afac (2026-05-15): the
+third replica keeps a stale copy and the healer can copy it back over the fresh two (tombstones
+were added to contain that). With versions, a stale copy is visibly older and is never copied over
+a newer one, so versions go first. Next after 3a: catch-up for missed commits, then 3c, then 3b.
+
+**3b — Client writes to exactly the ISR pair (client + server).** Principle 4.
+- Server answers a new `GetSlotIsr` (batched); the client caches ISRs by epoch.
+- Patches and full writes go to the ISR's first two members only; replicas 3..n are left to the
+  primary (healer until Phase 4). The all-holder fan-out and the leader-first ordering go away.
+- Any request carrying a stale epoch gets `NotPrimary`/`StaleIsr { epoch, isr }`; the client
+  refreshes and retries. An old client keeps working (servers still accept the old requests).
+- **ForceFold goes to the primary**, which folds as a wave and pushes the bytes to S, so S is
+  never left without them (the reason it stayed unchanged in Phase 2).
+- Test gate: kdiskmark RND4K Q1T1/Q32T1 locally before and after, within noise (fewer targets
+  should help); a patch storm shows 2 targets per write; T53/T61 unchanged.
+
+**3c — Slot versions (server + client).**
+- Each write carries `(epoch, base_version)`; a replica applies it only at `base_version`, giving
+  `version = base_version + 1` everywhere, whatever each node's no-op detection decides (this
+  removes the 9c40-vs-8195 split outright).
+- The primary is the commit authority: it acks when S has the version. S behind: it NACKs with
+  its version, and P pushes the missing deltas/base.
+- The client keeps parallel fan-out to P and S (no extra hop); primary relay is the fallback
+  if the numbers say so.
+- Test gate: the 2026-09-27 no-op-divergence repro (identical rewrite on a base one replica
+  can't compose) must end with one version on both; lagging-secondary catch-up; T60-style chaos
+  with writes running, no acked write lost (verified by reading back every acked range).
+
+**3d — Exclusions and replacement (server).**
+- S unreachable: P gets `Exclude{P,S}` onto a majority before acking without S, recruits a
+  replacement secondary, catches it up, then writes resume with 2 copies (the durability floor
+  is never lowered).
+- A takeover (majority expired P) makes S primary: ISR epoch+1 via the same compare-and-set.
+- **Flap guard** (from Phase 1): a rejoined node is re-admitted only after a dwell time.
+- Test gate: failure matrix rows #2, #3, #5, #6, #10, #11, #13 on the local cluster, each asserting
+  no acked write is lost and no two primaries accept writes at the same epoch.
+
+Order and risk: 3a is server-only and invisible to clients (low risk). 3b changes what the client
+sends. 3c changes what a write means. 3d is where failure handling becomes real. Each stays on
+this branch and off staging until the whole branch is proven.
 
 **Phase 4 — Primary-driven replication and healing**
 - §6.6. The leader healer becomes placement policy plus auditor.

@@ -52,6 +52,9 @@ pub struct Server {
     /// client and locks so nothing else on this node can stall a renewal.
     lease: Arc<crate::lease::LeaseRuntime>,
 
+    /// Per-chunk ISR records agreed by a majority (SLOT-OWNERSHIP-PLAN.md Phase 3a).
+    slot_isr: Arc<crate::slot_isr::SlotIsrService>,
+
     /// Replication factor. `Arc<AtomicUsize>` — the same instance is handed to
     /// `HealingManager` at construction (see `replication_factor_handle()`), so a live
     /// `dfs-admin cluster set --replication-factor` change or rejoin reconciliation is
@@ -1121,7 +1124,11 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetPatchState { .. }
         | Request::AuditSlots { .. }
         | Request::RenewNodeLease { .. }
-        | Request::VoteLeaseExpired { .. } => PeerOther,
+        | Request::VoteLeaseExpired { .. }
+        | Request::SlotIsrPrepare { .. }
+        | Request::SlotIsrAccept { .. }
+        | Request::SlotIsrCommit { .. }
+        | Request::GetSlotIsr { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -1174,7 +1181,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetPendingHealingSample { .. }
         | Request::SetPeerFilter { .. }
         | Request::GetLeaseStatus
-        | Request::InjectStall { .. } => Admin,
+        | Request::InjectStall { .. }
+        | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
 
@@ -1575,6 +1583,8 @@ struct OverlayForkCtx {
     fold_announce_inflight: Arc<FoldAnnounceInflight>,
     /// Majority leases: decide which holder of a slot owns its folds (see fold_role).
     lease: Arc<crate::lease::LeaseRuntime>,
+    /// Stored per-chunk ISRs: when a chunk has one, its order decides the fold owner.
+    slot_isr: Arc<crate::slot_isr::SlotIsrService>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -4585,7 +4595,12 @@ impl OverlayForkCtx {
             })
             .unwrap_or_default();
         holders.push(me); // a node with a dirty slot holds it, listed or not
-        let order = fold_owner_order(file_id, chunk_idx, &holders);
+        // The stored ISR (Phase 3a) is the same on every node that knows it, whatever each
+        // one's holder list says; without one, fall back to rendezvous over the holders.
+        let order = match self.slot_isr.get(file_id, chunk_idx) {
+            Some(isr) => isr.members,
+            None => fold_owner_order(file_id, chunk_idx, &holders),
+        };
         let owner = crate::lease::primary_of(&order, me, self.lease.holds_own_lease(), |n| self.lease.is_expired(n));
         match owner {
             Some(o) if o == me => FoldRole::Owner,
@@ -5447,6 +5462,9 @@ impl Server {
         let lease = Arc::new(crate::lease::LeaseRuntime::new(
             cluster.local_node_id(), cluster.clone(), Arc::new(NetworkClient::new_for_peers()), &metadata_dir,
         ));
+        let slot_isr = Arc::new(crate::slot_isr::SlotIsrService::new(
+            cluster.local_node_id(), Arc::new(NetworkClient::new_for_peers()), metadata.clone(), lease.clone(),
+        ));
         let server = Self {
             storage,
             metadata: metadata.clone(),
@@ -5455,6 +5473,7 @@ impl Server {
             cluster,
             client: Arc::new(NetworkClient::new_for_peers()),
             lease,
+            slot_isr,
             replication_factor,
             metadata_dir,
             config_path,
@@ -7638,6 +7657,22 @@ impl Server {
             Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
             Request::GetLeaseStatus => Response::LeaseStatus { report: self.lease.status() },
             Request::InjectStall { target, millis } => self.handle_inject_stall(target, millis).await,
+            Request::SlotIsrPrepare { items } => self.slot_isr.handle_prepare(items).await,
+            Request::SlotIsrAccept { items } => self.slot_isr.handle_accept(items).await,
+            Request::SlotIsrCommit { items } => self.slot_isr.handle_commit(items).await,
+            Request::GetSlotIsr { slots } => self.slot_isr.handle_get(slots),
+            Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
+                if !crate::network::fault_injection_allowed() {
+                    Response::Error {
+                        message: "ProposeSlotIsr is test-only (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    }
+                } else {
+                    let epoch = self.slot_isr.get(file_id, chunk_idx).map_or(0, |c| c.epoch) + 1;
+                    let wanted = vec![((file_id, chunk_idx), crate::slot_isr::SlotIsr { epoch, members })];
+                    Response::SlotIsrRecords { records: self.slot_isr.propose(wanted).await }
+                }
+            }
             Request::SetPeerFilter { filter } => match crate::network::set_peer_filter(filter) {
                 Ok(()) => Response::Ok { data: None },
                 Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::PermissionDenied },
@@ -10913,6 +10948,81 @@ impl Server {
             }
         }
         Response::Ok { data: None }
+    }
+
+    /// Seed ISR records for chunks that don't have one yet (SLOT-OWNERSHIP-PLAN.md Phase 3a).
+    /// Each chunk is seeded by one node, its first holder in rendezvous order, so seeders
+    /// rarely race (Paxos keeps it safe when they do). At most DFS_SLOT_ISR_SEED_MAX chunks
+    /// per pass (default 500) every DFS_SLOT_ISR_SEED_SECS (default 30, 0 = off), batched
+    /// into one Paxos round per pass: paced by results, not a flood (feedback_20260913).
+    pub fn start_slot_isr_seeder(self: Arc<Self>) {
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let every = env_u64("DFS_SLOT_ISR_SEED_SECS", 30);
+        if every == 0 {
+            info!("SLOT ISR seeder disabled (DFS_SLOT_ISR_SEED_SECS=0)");
+            return;
+        }
+        let max = env_u64("DFS_SLOT_ISR_SEED_MAX", 500) as usize;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+                self.seed_slot_isrs(max).await;
+            }
+        });
+    }
+
+    async fn seed_slot_isrs(&self, max: usize) {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let me = self.cluster.local_node_id();
+        let isr_size = self.replication_factor.load(Ordering::Relaxed).clamp(1, 2);
+        let mut wanted: Vec<((FileId, u64), crate::slot_isr::SlotIsr)> = Vec::new();
+        for file in self.chunk_map.iter() {
+            if wanted.len() >= max {
+                break;
+            }
+            let file_id = *file.key();
+            let (locs, _) = file.value();
+            for loc in locs.iter() {
+                let Some(off) = loc.file_offset else { continue };
+                let chunk_idx = off / CHUNK_SIZE;
+                if !loc.nodes.contains(&me) || self.slot_isr.get(file_id, chunk_idx).is_some() {
+                    continue;
+                }
+                let members = crate::slot_isr::initial_members(file_id, chunk_idx, &loc.nodes, isr_size);
+                if members.first() != Some(&me) {
+                    continue; // another holder seeds this chunk
+                }
+                wanted.push(((file_id, chunk_idx), crate::slot_isr::SlotIsr { epoch: 1, members }));
+                if wanted.len() >= max {
+                    break;
+                }
+            }
+        }
+        // Deleted files linger in chunk_map (see the Legata bug); don't seed their chunks.
+        let mut live = Vec::with_capacity(wanted.len());
+        let mut exists: HashMap<FileId, bool> = HashMap::new();
+        for w in wanted {
+            let fid = w.0 .0;
+            let alive = match exists.get(&fid) {
+                Some(a) => *a,
+                None => {
+                    let a = self.metadata.file_exists_by_id_async(fid).await.unwrap_or(false);
+                    exists.insert(fid, a);
+                    a
+                }
+            };
+            if alive {
+                live.push(w);
+            }
+        }
+        if live.is_empty() {
+            return;
+        }
+        let asked = live.len();
+        let results = self.slot_isr.propose(live).await;
+        let decided = results.iter().filter(|r| r.is_some()).count();
+        info!("SLOT ISR seed pass: {} chunk(s) proposed, {} decided, {} known here in total",
+            asked, decided, self.slot_isr.committed_count());
     }
 
     pub fn start_leases(&self) {
@@ -14197,6 +14307,7 @@ impl Server {
             fold_owner_takeovers: self.fold_owner_takeovers.clone(),
             fold_announce_inflight: self.fold_announce_inflight.clone(),
             lease: self.lease.clone(),
+            slot_isr: self.slot_isr.clone(),
             fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -27363,6 +27474,24 @@ mod tests {
                 "past the patience window a non-owner takes over");
             h.server.lease.declare_expired_for_test(peer2);
             assert_eq!(ctx.fold_role(file2, 0, quiet), FoldRole::Owner, "an expired owner is skipped");
+        }
+
+        /// Phase 3a: once a chunk has a stored ISR, its order decides the fold owner, not
+        /// the rendezvous order of whatever holder list this node happens to have.
+        #[tokio::test]
+        async fn stored_isr_order_overrides_the_holder_list() {
+            let h = make_overlay_test_harness();
+            h.server.lease.grant_own_lease_for_test();
+            let ctx = h.server.overlay_ctx();
+            let me = h.server.cluster().local_node_id();
+            let file_id = FileId::new();
+            let peer = phase2_peer(file_id, 0, me, false); // rendezvous puts this node first
+            phase2_holders(&h, file_id, peer, 19367, ChunkId::from_hash(compute_chunk_hash(b"phase3a"))).await;
+            let quiet = std::time::Duration::from_secs(1);
+            assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Owner, "precondition: no ISR yet, rendezvous picks this node");
+
+            h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 1, members: vec![peer, me] });
+            assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Wait(Some(peer)), "the stored ISR names the peer primary");
         }
 
         /// Before Phase 2, a non-owner proposed, found the peer unreachable, and folded

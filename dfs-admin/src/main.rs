@@ -86,6 +86,34 @@ enum Commands {
         #[command(subcommand)]
         cmd: LeaseCommands,
     },
+
+    /// Per-chunk in-sync replica lists (SLOT-OWNERSHIP-PLAN Phase 3a).
+    Isr {
+        #[command(subcommand)]
+        cmd: IsrCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum IsrCommands {
+    /// Each given node's committed ISR for every chunk of a file (one JSON line per node).
+    Get {
+        #[arg(long)]
+        file: String,
+        /// Number of chunks to ask about (default: from the file size).
+        #[arg(long)]
+        chunks: Option<u64>,
+    },
+    /// Test-only: have each given node propose `members` as a chunk's next ISR, concurrently.
+    Propose {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        chunk: u64,
+        /// Comma-separated node ids, primary first.
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -314,6 +342,7 @@ async fn main() -> Result<()> {
         Commands::Stats { watch } => handle_stats_command(&cluster_addrs, watch).await?,
         Commands::RpcStats { watch } => handle_rpc_stats_command(&cluster_addrs, watch).await?,
         Commands::Fault { cmd } => handle_fault_command(cmd, &cluster_addrs).await?,
+        Commands::Isr { cmd } => handle_isr_command(cmd, &cluster_addrs).await?,
         Commands::Lease { cmd: LeaseCommands::Status } => {
             for &addr in &cluster_addrs {
                 match send_request(addr, Request::GetLeaseStatus).await {
@@ -1654,6 +1683,55 @@ fn parse_file_id(s: &str) -> Result<FileId> {
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+async fn isr_file(addr: SocketAddr, path: &str) -> Result<(FileId, u64)> {
+    match send_request(addr, Request::GetFileInfo { path: path.to_string() }).await? {
+        Response::FileInfo { metadata, .. } => Ok((metadata.id, metadata.size.div_ceil(4 * 1024 * 1024).max(1))),
+        other => anyhow::bail!("file info for {}: {:?}", path, other),
+    }
+}
+
+async fn handle_isr_command(cmd: IsrCommands, cluster_addrs: &[SocketAddr]) -> Result<()> {
+    let first = *cluster_addrs.first().ok_or_else(|| anyhow::anyhow!("no cluster address"))?;
+    match cmd {
+        IsrCommands::Get { file, chunks } => {
+            let (file_id, n) = isr_file(first, &file).await?;
+            let slots: Vec<(FileId, u64)> = (0..chunks.unwrap_or(n)).map(|i| (file_id, i)).collect();
+            for &addr in cluster_addrs {
+                let records = match send_request(addr, Request::GetSlotIsr { slots: slots.clone() }).await {
+                    Ok(Response::SlotIsrRecords { records }) => records,
+                    other => { println!("{}", serde_json::json!({"addr": addr.to_string(), "error": format!("{:?}", other)})); continue; }
+                };
+                let recs: Vec<_> = records.iter().map(|r| r.as_ref().map(|r| serde_json::json!({
+                    "epoch": r.epoch, "members": r.members.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                }))).collect();
+                println!("{}", serde_json::json!({"addr": addr.to_string(), "file_id": file_id.to_string(), "isr": recs}));
+            }
+        }
+        IsrCommands::Propose { file, chunk, members } => {
+            let (file_id, _) = isr_file(first, &file).await?;
+            let members: Vec<NodeId> = members.iter()
+                .map(|m| m.parse::<uuid::Uuid>().map(NodeId).map_err(|e| anyhow::anyhow!("bad node id {}: {}", m, e)))
+                .collect::<Result<_>>()?;
+            // All at once, so the nodes genuinely race for the same epoch.
+            let handles: Vec<_> = cluster_addrs.iter().map(|&addr| {
+                let members = members.clone();
+                tokio::spawn(async move {
+                    (addr, send_request(addr, Request::ProposeSlotIsr { file_id, chunk_idx: chunk, members }).await)
+                })
+            }).collect();
+            for h in handles {
+                let (addr, r) = h.await?;
+                let out: String = match r {
+                    Ok(Response::SlotIsrRecords { records }) => format!("{:?}", records.first().cloned().flatten()),
+                    other => format!("{:?}", other),
+                };
+                println!("{}", serde_json::json!({"addr": addr.to_string(), "committed": out}));
+            }
+        }
+    }
+    Ok(())
+}
 
 async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) -> Result<()> {
     if let FaultCommands::Stall { target, millis } = &cmd {

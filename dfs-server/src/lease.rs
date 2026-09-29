@@ -397,8 +397,15 @@ impl LeaseRuntime {
         });
     }
 
-    fn majority(&self) -> usize {
+    /// Majority of the persisted membership high-water mark (see MembershipFile). Other
+    /// majority protocols (slot ISRs) use this same size, so "a majority" means one thing.
+    pub fn majority(&self) -> usize {
         self.cluster_size.load(Ordering::Relaxed) / 2 + 1
+    }
+
+    /// The peers this node last read from membership (never blocks on the membership lock).
+    pub fn peers(&self) -> Vec<(NodeId, std::net::SocketAddr)> {
+        self.peers.lock().unwrap().clone()
     }
 
     /// Every other known member (their status doesn't matter: renewals to a dead node

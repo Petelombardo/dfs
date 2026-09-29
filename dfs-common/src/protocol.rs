@@ -1035,6 +1035,39 @@ pub enum Request {
         target: StallTarget,
         millis: u64,
     },
+
+    /// Paxos phase 1 for slot ISRs (SLOT-OWNERSHIP-PLAN.md Phase 3a), batched: each item is
+    /// (file_id, chunk_idx, epoch, ballot). Replies come back in the same order, and each
+    /// is on disk before the batch is answered. APPENDED at end to preserve wire compatibility.
+    SlotIsrPrepare {
+        items: Vec<(FileId, u64, u64, Ballot)>,
+    },
+
+    /// Paxos phase 2 for slot ISRs, batched: (file_id, chunk_idx, ballot, value).
+    /// APPENDED at end to preserve wire compatibility.
+    SlotIsrAccept {
+        items: Vec<(FileId, u64, Ballot, SlotIsr)>,
+    },
+
+    /// A chosen slot ISR, for every node to learn. APPENDED at end to preserve wire compatibility.
+    SlotIsrCommit {
+        items: Vec<(FileId, u64, SlotIsr)>,
+    },
+
+    /// The committed ISR this node knows for each slot (None if it knows none).
+    /// APPENDED at end to preserve wire compatibility.
+    GetSlotIsr {
+        slots: Vec<(FileId, u64)>,
+    },
+
+    /// Test-only (DFS_FAULT_INJECTION opt-in): run a Paxos round on this node proposing
+    /// `members` as the slot's next ISR, and answer with what was committed. Lets a test make
+    /// several nodes propose different values at once. APPENDED at end to preserve wire compatibility.
+    ProposeSlotIsr {
+        file_id: FileId,
+        chunk_idx: u64,
+        members: Vec<NodeId>,
+    },
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1609,6 +1642,24 @@ pub enum Response {
     LeaseStatus {
         report: LeaseStatusReport,
     },
+
+    /// Answer to `Request::SlotIsrPrepare`, one reply per item, same order.
+    /// APPENDED at end to preserve wire compatibility.
+    SlotIsrPrepareReplies {
+        replies: Vec<PrepareReply>,
+    },
+
+    /// Answer to `Request::SlotIsrAccept`, one reply per item, same order.
+    /// APPENDED at end to preserve wire compatibility.
+    SlotIsrAcceptReplies {
+        replies: Vec<AcceptReply>,
+    },
+
+    /// Answer to `Request::GetSlotIsr`, one record per slot, same order.
+    /// APPENDED at end to preserve wire compatibility.
+    SlotIsrRecords {
+        records: Vec<Option<SlotIsr>>,
+    },
 }
 
 /// One entry in a Response::PendingHealingSample. See that response's doc
@@ -1900,4 +1951,38 @@ pub enum StallTarget {
     HealerMaps,
     /// The cluster membership lock (heartbeats, gossip, leader checks wait).
     ClusterMembership,
+}
+
+/// A chunk slot's in-sync replica list at one epoch (SLOT-OWNERSHIP-PLAN.md Phase 3a):
+/// members in order, primary first. Each epoch's value is chosen by a majority (Paxos);
+/// see dfs-server's slot_isr module.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SlotIsr {
+    pub epoch: u64,
+    pub members: Vec<NodeId>,
+}
+
+/// A Paxos ballot for a slot's ISR: higher round wins, ties broken by proposer id, so two
+/// proposers never share a ballot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+pub struct Ballot {
+    pub round: u64,
+    pub proposer: NodeId,
+}
+
+/// An acceptor's answer to a prepare (phase 1) for one slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrepareReply {
+    Promise { accepted: Option<(Ballot, SlotIsr)> },
+    Reject { promised: Option<Ballot> },
+    /// This epoch is already decided here: learn it.
+    Committed(SlotIsr),
+}
+
+/// An acceptor's answer to an accept (phase 2) for one slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcceptReply {
+    Accepted,
+    Reject { promised: Option<Ballot> },
+    Committed(SlotIsr),
 }

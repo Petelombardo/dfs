@@ -12,6 +12,7 @@ mod metadata;
 mod metadata_sql;
 mod network;
 mod server;
+mod slot_isr;
 mod stats;
 mod storage;
 mod watchdog;
@@ -422,6 +423,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_conn_pressure_watchdog();
     server.clone().start_slot_audit();
     server.start_leases();
+    server.clone().start_slot_isr_seeder();
     let mut server_handle = tokio::spawn(async move {
         let (client_result, peer_result) = tokio::join!(net_server.start(), peer_net_server.start());
         if let Err(e) = client_result {

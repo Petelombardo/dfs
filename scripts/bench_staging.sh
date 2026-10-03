@@ -36,16 +36,18 @@ stop_bench_servers() {
 stop_bench_client() {
     ssh root@"$CLIENT" "fusermount -u $MNT 2>/dev/null || umount -l $MNT 2>/dev/null; for p in \$(pgrep -x dfs-client); do [ \"\$(readlink /proc/\$p/exe)\" = $CDIR/dfs-client ] && kill \$p; done; true"
 }
+# Each remote start must background ONE simple command: `x && y &` backgrounds a subshell that
+# keeps ssh's stdout open, so ssh never returns.
 start_servers() {  # $1 = DFS_ORDERED_WRITES
     for n in $NODES; do
-        ssh root@"$n" "cd $DIR && $SERVER_ENV DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
+        ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
     done
     sleep 8
 }
 start_client() {  # $1 = DFS_ORDERED_WRITES
     local cluster
     cluster=$(for n in $NODES; do printf '%s:%s,' "$(ip_of "$n")" "$PORT"; done); cluster=${cluster%,}
-    ssh root@"$CLIENT" "mkdir -p $MNT && DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $CDIR/dfs-client mount $MNT --cluster $cluster --log-file $CDIR/client.log --allow-other > $CDIR/client.out 2>&1 < /dev/null & sleep 3; mountpoint -q $MNT && echo mounted || echo MOUNT-FAILED"
+    ssh root@"$CLIENT" "mkdir -p $MNT || exit 1; DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $CDIR/dfs-client mount $MNT --cluster $cluster --log-file $CDIR/client.log --allow-other > $CDIR/client.out 2>&1 < /dev/null & sleep 3; mountpoint -q $MNT && echo mounted || echo MOUNT-FAILED"
     sleep 10   # leases, ISR seeding (default 30s cadence: the first writes may go unordered)
 }
 
@@ -83,12 +85,15 @@ restart)
     ;;
 run)
     LABEL=${2:?label}; OUT=/root/dfs-staging-bench-$LABEL.txt
+    # Every job fsyncs each write: through FUSE, O_DIRECT alone lands in the client's
+    # write buffer, so unsynced numbers measure buffering and swing ~15x run to run
+    # (2026-10-03: 770 vs 18000 4k IOPS, same build and flag). Only acked writes count.
     ssh root@"$CLIENT" "cd $MNT && rm -f bench.bin && \
         fio --name=layout --filename=bench.bin --size=64m --bs=1m --rw=write --ioengine=psync --output=/dev/null && \
         sleep 10 && \
-        for job in 'rand4k_qd1 --rw=randwrite --bs=4k --numjobs=1' 'rand4k_16w --rw=randwrite --bs=4k --numjobs=16' 'seq1m --rw=write --bs=1m --numjobs=1'; do
+        for job in 'rand4k_fsync --rw=randwrite --bs=4k --numjobs=1' 'rand4k_16w_fsync --rw=randwrite --bs=4k --numjobs=16' 'seq1m_fsync --rw=write --bs=1m --numjobs=1'; do
             set -- \$job; name=\$1; shift
-            fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --direct=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null 2>&1 \
+            fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --direct=1 --fsync=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null 2>&1 \
               || fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --fsync=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null
             cat $CDIR/\$name.json
             echo '@@END@@'
@@ -103,7 +108,10 @@ for part in raw:
     j = json.loads(part[part.index("{"):]); job = j["jobs"][0]; w = job["write"]
     c = w["clat_ns"]; p = c.get("percentile", {})
     print(f"{job['jobname']:<12} iops={w['iops']:9.1f}  lat_us mean={c['mean']/1000:8.1f} "
-          f"p50={p.get('50.000000',0)/1000:8.1f} p99={p.get('99.000000',0)/1000:9.1f}  MBps={w['bw']/1024:7.1f}")
+          f"p50={p.get('50.000000',0)/1000:8.1f} p99={p.get('99.000000',0)/1000:9.1f}  MBps={w['bw']/1024:7.1f}"
+          + (f"  fsync_us mean={sy['lat_ns']['mean']/1000:.0f} p50={sy['lat_ns'].get('percentile',{}).get('50.000000',0)/1000:.0f} "
+             f"p99={sy['lat_ns'].get('percentile',{}).get('99.000000',0)/1000:.0f}"
+             if (sy := job.get("sync", {})) and sy.get("total_ios") else ""))
 EOF
     ;;
 teardown)

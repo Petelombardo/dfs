@@ -4,12 +4,10 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-09-29, paused by Pete before the staging deploy_
+_Last updated: 2026-10-03, staging fio bench done and torn down_
 
-**Resume here:** `scripts/bench_staging.sh deploy 0` → `run off1` → `run off2` → `restart 1` →
-`run on1` → `run on2` → `teardown`. Both binaries are already built: the aarch64 server from
-this branch in `target/release`, and the x86 client in `dist/bench-x86_64/`. Rebuild both if the
-branch changes.
+**Resume here:** Pete decides keep/drop from the 2026-10-03 numbers below (recommendation: keep,
+since it costs nothing measurable). If kept: 3c step 2, starting with version as identity (T64b).
 
 ## Where things stand
 
@@ -62,9 +60,23 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       server uses 170–280 MB), port 8950, `/mnt/gluster/dfs-bench/…`, plain processes. **Client
       server4** (x86_64: binary from `dist/bench-x86_64/`, production `dist/x86_64/` untouched).
       fio installed on server4 with Pete's OK. Disk: 31–71 GB free per node.
-- [ ] Deploy the bench cluster; production untouched
-- [ ] fio flag off vs on, two runs each: 4k randwrite QD1, 4k randwrite 16 writers, 1M sequential
-- [ ] Tear the bench cluster down; write up the numbers; **decide with Pete**
+- [x] Deploy the bench cluster; production untouched (2026-10-03, gluster2-5 :8950, client server4)
+- [x] fio flag off vs on, two clean runs each (restart before every run), every write fsynced:
+
+      | run  | 4k QD1 IOPS (fsync p50) | 4k 16 writers IOPS | 1M seq MB/s |
+      |------|-------------------------|--------------------|-------------|
+      | off4 | 34.0 (19.3 ms)          | 43.5               | 12.5        |
+      | off5 | 45.6 (16.6 ms)          | 49.7               | 15.2        |
+      | on2  | 45.1 (16.2 ms)          | 43.6               | 13.8        |
+      | on3  | 42.3 (16.1 ms)          | 50.9               | 15.6        |
+
+      **Ordering costs nothing measurable**: on is within the off-off spread on all three jobs.
+      `[ORDER]` primary/secondary lines on all four nodes, 0 gaps, 0 WriteOrder failures.
+      Unsynced jobs were dropped: through FUSE, O_DIRECT lands in the client write buffer, and
+      the same build and flag measured 770 and 18000 4k IOPS on different restarts (off1 vs off3).
+      Raw output: `/root/dfs-staging-bench-*.{raw,txt}` on the dev box.
+- [x] Tear the bench cluster down (verified: no bench dirs or processes, production active)
+- [ ] **Decide with Pete** (keep / drop)
 
 ### Step 2 — full 3c, if the numbers say keep it (L)
 - [ ] Folds go through the primary's order (ForceFold and the background wave), so both
@@ -87,6 +99,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   Combined on main they pass 122/0 (`scratch-integrate-main`); merging them into this branch
   comes after that.
 - **Open bugs:**
+  - Fsync doesn't scale with writers: 16 fsyncing writers get ~45 IOPS total, the same as one
+    (fsync p50 ~16 ms alone, ~165 ms with 16). Something on the fsync path serializes across
+    files or writers. Same with the flag on or off, so it's not 3c. Worth its own investigation.
   - Under full-suite load a metadata-db stall still sometimes costs a lease (T59a/T59e). The
     blocking path hasn't been found; gdb's pause seems to hide it. `eu-stack` (elfutils) would
     help — install is Pete's call.

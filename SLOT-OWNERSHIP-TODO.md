@@ -121,7 +121,18 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       the ISR (fsync commits locations + metadata to the leader synchronously) → Phase 5's
       measurable target. The feared stalled-secondary skip-the-gap reorder hasn't shown in any
       run yet; durable versions + catch-up below remove the gap-skip regardless.
-- [ ] Durable versions per slot; a lagging secondary NACKs and the primary sends what it missed
+- **Finding (2026-10-03, T66 with byte-level replica compare): token ids are replica-local.**
+      Two replicas applying the same write to the same bytes can mint different patch-token ids
+      (the id hashes the replica's own accumulator: what it folded, merged, or got backfilled).
+      So neither "secondary follows its own head" (diverges silently when it fell behind: after
+      a stall the client writes around it) nor "secondary applies only onto the primary's base
+      id" (tried; "behind" on nearly every write once ids drift, backfill churn, still diverged)
+      is sound. Needed: continuity BY VERSION (secondary applied v-1 → apply v onto own head;
+      never skip a gap) and catch-up BY THE PRIMARY when it can't continue (gap, or the primary
+      wrote unordered around it) — the next item. Until then T66[secondary]b can fail (~1 in 2
+      sequences); tooling to see it: `ReadSlotLocal` / `dfs-admin isr read` (each replica's own
+      bytes for a slot, blake3).
+- [ ] **NEXT — Durable versions per slot; a lagging secondary NACKs and the primary sends what it missed
       (replaces the prototype's "skip the gap")
 - [ ] Gates: T64 passes; the 2026-09-27 no-op-divergence repro ends with one version on both;
       lagging-secondary catch-up test; T60-style chaos with writes running and no acked write

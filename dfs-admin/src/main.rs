@@ -114,6 +114,14 @@ enum IsrCommands {
         #[arg(long, value_delimiter = ',')]
         members: Vec<String>,
     },
+    /// Each given node's OWN bytes for one chunk (its ordered head, else its local chunk_map
+    /// entry; no substitution): one JSON line per node with the blake3 of the bytes.
+    Read {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        chunk: u64,
+    },
     /// Test-only: ForceFold one chunk on exactly the given node(s) (--cluster), e.g. only one
     /// of its ISR members, to fold the replicas at different points of the write stream.
     Fold {
@@ -1737,6 +1745,19 @@ async fn handle_isr_command(cmd: IsrCommands, cluster_addrs: &[SocketAddr]) -> R
                 println!("{}", serde_json::json!({"addr": addr.to_string(), "committed": out}));
             }
         }
+        IsrCommands::Read { file, chunk } => {
+            let (file_id, _) = isr_file(first, &file).await?;
+            for &addr in cluster_addrs {
+                let out = match send_request(addr, Request::ReadSlotLocal { file_id, chunk_idx: chunk }).await {
+                    Ok(Response::ChunkData { chunk_id, data, .. }) => serde_json::json!({
+                        "addr": addr.to_string(), "chunk_id": chunk_id.to_string(),
+                        "len": data.len(), "blake3": blake3::hash(&data).to_hex().to_string(),
+                    }),
+                    other => serde_json::json!({"addr": addr.to_string(), "error": format!("{:?}", other)}),
+                };
+                println!("{}", out);
+            }
+        }
         IsrCommands::Fold { file, chunk } => {
             let (file_id, _) = isr_file(first, &file).await?;
             for &addr in cluster_addrs {
@@ -1844,6 +1865,15 @@ async fn send_request_inner(addr: SocketAddr, request: Request) -> Result<Respon
         .context("Failed to deserialize response")?;
 
     match response_envelope.message {
+        // Servers send ChunkData split-frame: the envelope carries empty data and the bytes
+        // follow as [4B len][raw]. Without reading that frame every chunk read came back empty.
+        Message::Response(Response::ChunkData { chunk_id, cache_stats, .. }) => {
+            let mut raw_len = [0u8; 4];
+            stream.read_exact(&mut raw_len).await.context("Failed to read chunk data length")?;
+            let mut data = vec![0u8; u32::from_be_bytes(raw_len) as usize];
+            stream.read_exact(&mut data).await.context("Failed to read chunk data")?;
+            Ok(Response::ChunkData { chunk_id, data, cache_stats, arc_data: None, arc_range: None })
+        }
         Message::Response(response) => Ok(response),
         _ => anyhow::bail!("Expected Response message"),
     }

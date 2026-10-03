@@ -1092,6 +1092,15 @@ pub enum Request {
         version: u64,
         base: ChunkId,
     },
+
+    /// Diagnostic: THIS node's own bytes for a slot (its ordered head, else its local chunk_map
+    /// entry), with no slot backstop or leader lookup substituting anything. The two ISR replicas
+    /// answering the same bytes is what "the pair is identical" means (suite T66). Answered
+    /// with `ChunkData`. APPENDED at end to preserve wire compatibility.
+    ReadSlotLocal {
+        file_id: FileId,
+        chunk_idx: u64,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

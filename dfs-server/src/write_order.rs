@@ -14,6 +14,8 @@
 //! on it, a secondary rejected ordered writes as stale and two concurrent writers drew EIO
 //! (suite T64d). The primary sends the base it applied each version onto with `WriteOrder`;
 //! a replica with no head yet (first ordered write, or an unordered patch cleared it) uses that.
+//! Patch-token ids are local to each replica's accumulator, so the secondary follows its own
+//! head rather than comparing ids with the primary's base.
 //!
 //! Still prototype limits: state is in memory only; a secondary that never received a version
 //! (primary crashed mid-send, or restarted) skips over it after `wait_turn`'s timeout and logs
@@ -66,6 +68,12 @@ impl WriteOrdering {
         let Some(epoch) = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e) else { return false };
         self.slots.get(&(file_id, chunk_idx, epoch))
             .is_some_and(|slot| slot.inner.lock().unwrap().head == Some(id))
+    }
+
+    /// This replica's head for the slot's newest ordered stream, if it has one.
+    pub fn latest_head(&self, file_id: FileId, chunk_idx: u64) -> Option<ChunkId> {
+        let epoch = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e)?;
+        self.slots.get(&(file_id, chunk_idx, epoch)).and_then(|slot| slot.inner.lock().unwrap().head)
     }
 
     /// An unordered write changed this slot here: the ordered stream's head no longer

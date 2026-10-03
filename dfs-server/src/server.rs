@@ -1160,7 +1160,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::SlotIsrAccept { .. }
         | Request::SlotIsrCommit { .. }
         | Request::GetSlotIsr { .. }
-        | Request::WriteOrder { .. } => PeerOther,
+        | Request::WriteOrder { .. }
+        | Request::ReadSlotLocal { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -7796,6 +7797,18 @@ impl Server {
             Request::Ordered { tag, request } => {
                 self.ops_tracker.inc_write();
                 self.handle_ordered(tag, *request).await
+            }
+            Request::ReadSlotLocal { file_id, chunk_idx } => {
+                let id = self.write_ordering.latest_head(file_id, chunk_idx).or_else(|| {
+                    self.chunk_map.get(&file_id).and_then(|e| {
+                        let (locs, _) = e.value();
+                        Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+                    })
+                });
+                match id {
+                    Some(id) => self.handle_read_chunk(id, None, None).await,
+                    None => Response::Error { message: format!("ReadSlotLocal: no entry here for file {} chunk {}", file_id, chunk_idx), code: ErrorCode::NotFound },
+                }
             }
             Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version, base } => {
                 self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version, base);
@@ -15829,17 +15842,13 @@ impl Server {
             }
             let _order = slot.order_lock.lock().await;
             // Our own head keeps the content right even where the ids differ: a replica-local
-            // fold between versions gives the same bytes a new id (folds aren't ordered yet).
-            let base = match slot.head() {
-                Some(head) => {
-                    if head != primary_base {
-                        debug!("[ORDER] secondary: file {} chunk {} v{}: own head {} differs from the primary's base {} (a local fold?)",
-                            file_id, tag.chunk_idx, version, head, primary_base);
-                    }
-                    head
-                }
-                None => primary_base,
-            };
+            // fold between versions gives the same bytes a new id. Patch-token ids are local to
+            // each replica's accumulator, so comparing ids can't tell "behind" from "same bytes,
+            // different id" (tried 2026-10-03: refusing on an id mismatch fired on nearly every
+            // write once ids drifted). A secondary that fell behind (a stall; the client wrote
+            // around it) still diverges here -- suite T66[secondary] -- which needs version-based
+            // continuity and catch-up from the primary (SLOT-OWNERSHIP-TODO, durable versions).
+            let base = slot.head().unwrap_or(primary_base);
             let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             slot.finish(tag.write_id, version, &resp);
@@ -15872,6 +15881,13 @@ impl Server {
         }
     }
 
+    /// Whether this node can serve `id` as a patch base: its bytes on disk, or a patch_state
+    /// row (a pending accumulator or a folded token).
+    async fn chunk_resolvable_locally(&self, id: ChunkId) -> bool {
+        self.storage.get_chunk_path(&id).exists()
+            || matches!(self.metadata.get_patch_state_async(id).await, Ok(Some(_)))
+    }
+
     /// Where a slot's ordered stream starts on the primary (no head yet: the first ordered
     /// write at this epoch, or an unordered write since). This node's view of the slot when it
     /// can resolve it locally, as the unordered staleness check would rebase onto, else the
@@ -15882,9 +15898,7 @@ impl Server {
             Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
         });
         match local {
-            Some(id) if id != client_base
-                && (self.storage.get_chunk_path(&id).exists()
-                    || matches!(self.metadata.get_patch_state_async(id).await, Ok(Some(_)))) => id,
+            Some(id) if id != client_base && self.chunk_resolvable_locally(id).await => id,
             _ => client_base,
         }
     }

@@ -114,6 +114,14 @@ enum IsrCommands {
         #[arg(long, value_delimiter = ',')]
         members: Vec<String>,
     },
+    /// Test-only: ForceFold one chunk on exactly the given node(s) (--cluster), e.g. only one
+    /// of its ISR members, to fold the replicas at different points of the write stream.
+    Fold {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        chunk: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1727,6 +1735,17 @@ async fn handle_isr_command(cmd: IsrCommands, cluster_addrs: &[SocketAddr]) -> R
                     other => format!("{:?}", other),
                 };
                 println!("{}", serde_json::json!({"addr": addr.to_string(), "committed": out}));
+            }
+        }
+        IsrCommands::Fold { file, chunk } => {
+            let (file_id, _) = isr_file(first, &file).await?;
+            for &addr in cluster_addrs {
+                let out = match send_request(addr, Request::ForceFold { file_id, chunk_idx: chunk }).await {
+                    Ok(Response::ForceFoldResult { real_chunk_id, size }) =>
+                        serde_json::json!({"addr": addr.to_string(), "real_chunk_id": real_chunk_id.to_string(), "size": size}),
+                    other => serde_json::json!({"addr": addr.to_string(), "error": format!("{:?}", other)}),
+                };
+                println!("{}", out);
             }
         }
     }

@@ -81,8 +81,12 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
 - [x] **Decided 2026-10-03: KEEP** (Pete)
 
 ### Step 2 — full 3c, if the numbers say keep it (L)
-- [ ] Folds go through the primary's order (ForceFold and the background wave), so both
-      replicas' chunk identities match, not just their bytes
+- [x] ~~Folds go through the primary's order~~ — **not needed: no failing case** (2026-10-03).
+      Background folds already run as one coordinated fold per chunk (T61: ~74 folds/run, 0
+      pulls), the client's ForceFold folds both replicas, and a fold on one replica alone is
+      adopted by the other (T65, new: deterministic one-sided fold via `dfs-admin isr fold`, 0
+      disagreements). T61d's old race after T60 chaos: flag off 1 run in 3, **flag on 0 in 6**
+      → T61d is now required with the flag on. Revisit only if a test shows ids diverging.
 - [x] **Replica side of version-as-identity** (2026-10-03): each replica applies version n onto its
       own result for n-1 (`SlotOrder::head`); the primary sends its base with `WriteOrder`. Ordered
       writes skip every check that substitutes the leader's/local chunk_map view (chunk_seq gap
@@ -103,7 +107,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       (replaces the prototype's "skip the gap")
 - [ ] Gates: T64 passes; the 2026-09-27 no-op-divergence repro ends with one version on both;
       lagging-secondary catch-up test; T60-style chaos with writes running and no acked write
-      lost; T61d becomes required
+      lost; T61d becomes required; **primary killed mid-storm**: no acked write lost, and say
+      what the client does until 3d promotes the secondary (fails/retries, or falls back to
+      unordered?) — Pete's 2026-10-03 question on the dual-stream durability guarantee
 - [ ] Make the flag the default (or drop it)
 
 ## Outside the phases — waiting on Pete

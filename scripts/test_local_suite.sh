@@ -5187,12 +5187,17 @@ if [ "${T61_DISAGREE:-0}" != 0 ]; then
             | head -8 | cut -c1-230 | sed "s/^/    server$i: /"
     done
 fi
-# T61d is informational until SLOT-OWNERSHIP-PLAN Phase 3c. The disagreements it catches are a
-# PRE-EXISTING race (measured 2026-09-29 with T60 then T61: Phase 2 build 1 run in 4, Phase 3a
-# build 1 in 2): the client's ForceFold folds both replicas at once while patches still arrive,
-# and they end on different tokens (the healer corrects it). Phase 3c's slot versions and
-# ForceFold-to-primary remove it; T61d becomes a required check again there.
-echo "  (informational until Phase 3c) T61d: ${T61_DISAGREE:-?} REPLICA DISAGREEMENT line(s) for the storm file"
+# T61d: the disagreements it catches are a PRE-EXISTING race of unordered writes (the client's
+# ForceFold folds both replicas while patches still arrive, and they end on different tokens;
+# the healer corrects it). Measured 2026-10-03 with T60 then T61: flag off 1 run in 3, flag on
+# 0 in 6. Required with DFS_ORDERED_WRITES=1; informational without it, where the race remains.
+if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+    [ "${T61_DISAGREE:-1}" = 0 ] \
+        && check "T61d ordered writes: no replica disagreements during the storm" PASS \
+        || check "T61d ordered writes: ${T61_DISAGREE:-?} replica disagreement(s) during the storm" FAIL
+else
+    echo "  (informational without DFS_ORDERED_WRITES) T61d: ${T61_DISAGREE:-?} REPLICA DISAGREEMENT line(s) for the storm file"
+fi
 rm -f "$T61_IMG" "$T/t61_base.bin"
 fi # should_run T61
 
@@ -5448,6 +5453,85 @@ rm -f "$MOUNT/$T64_FILE"
 fusermount -u "$T64_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T64_PID2"
 fi # should_run T64
+
+# ── Test 65: a fold on one ISR member between ordered writes must not split the pair ────
+# SLOT-OWNERSHIP-PLAN 3c step 2 ("folds go through the primary's order"). A fold gives a slot a
+# new identity without changing its bytes. If only one replica folds between two ordered writes,
+# the next write lands on different bases: the folded replica starts a fresh accumulator on the
+# fold result while the other merges into its pending one, and the two return different chunk
+# ids for the same version. The client then calls it a REPLICA DISAGREEMENT, excludes one
+# replica and backfills it. Deterministic: fold the primary alone, then write again.
+if should_run T65; then
+snapshot_log T65
+echo ""
+echo "=== T65: folding one ISR member between ordered writes keeps the pair identical (SLOT-OWNERSHIP-PLAN 3c) ==="
+T65_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T65_FILE=t65_fold.bin
+dd if=/dev/urandom of="$MOUNT/$T65_FILE" bs=4M count=2 status=none
+dfs_sync
+# Ordering needs chunk 1's committed ISR; the seeder (3s in this suite) can take a few rounds.
+for _ in $(seq 1 30); do
+    "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T65_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; sys.exit(0 if json.loads(sys.stdin.readline())['isr'][1] else 1)" 2>/dev/null && break
+    sleep 1
+done
+t65_writes() {  # first last: fsync'd 4K writes of "W<n>" to distinct blocks of chunk 1
+    python3 - "$MOUNT/$T65_FILE" "$1" "$2" <<'PY'
+import os, sys
+path, a, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+for i in range(a, b + 1):
+    os.pwrite(fd, (b"W%06d" % i).ljust(4096, b"w"), 4 * 1024 * 1024 + i * 8192)
+    os.fsync(fd)
+os.close(fd)
+PY
+}
+t65_writes 0 4
+T65_PRIMARY=$(python3 - "$("$BIN/dfs-admin" --cluster "$T65_ALL" lease status 2>/dev/null)" \
+    "$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T65_FILE" --chunks 2 2>/dev/null)" <<'PY'
+import json, sys
+addr = {}
+for l in sys.argv[1].splitlines():
+    r = json.loads(l)
+    if "node" in r: addr[r["node"]] = r["addr"]
+isr = json.loads(sys.argv[2].splitlines()[0])["isr"][1]
+print(addr.get(isr["members"][0], "") if isr else "")
+PY
+)
+T65_MARK=$(wc -l < "$CURRENT_CLIENT_LOG")
+if [ -n "$T65_PRIMARY" ]; then
+    echo "  T65: chunk 1's primary is $T65_PRIMARY; folding it alone, then 5 more writes"
+    "$BIN/dfs-admin" --cluster "$T65_PRIMARY" isr fold --file "/$T65_FILE" --chunk 1 | sed 's/^/    /'
+else
+    check "T65 chunk 1 has a committed ISR" FAIL
+    "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T65_FILE" --chunks 2 2>&1 | head -3 | cut -c1-300 | sed 's/^/    isr get: /'
+    "$BIN/dfs-admin" --cluster "$T65_ALL" lease status 2>&1 | head -2 | cut -c1-200 | sed 's/^/    lease: /'
+fi
+t65_writes 5 9
+dfs_sync
+T65_SINCE=$(tail -n +"$((T65_MARK + 1))" "$CURRENT_CLIENT_LOG" | sed 's/\x1b\[[0-9;]*m//g')
+T65_DIS=$(echo "$T65_SINCE" | grep -ac "REPLICA DISAGREEMENT" || true)
+T65_BACKFILL=$(echo "$T65_SINCE" | grep -ac "landed on only" || true)
+echo "  T65: DFS_ORDERED_WRITES=${DFS_ORDERED_WRITES:-0}: after the one-sided fold: $T65_DIS replica disagreement(s), $T65_BACKFILL backfill(s)"
+echo "$T65_SINCE" | grep -a "REPLICA DISAGREEMENT\|landed on only" | head -2 | cut -c1-240 | sed 's/^/    /'
+[ "$T65_DIS" = 0 ] && [ "$T65_BACKFILL" = 0 ] \
+    && check "T65a writes after a one-sided fold land identically on both ISR members" PASS \
+    || check "T65a a one-sided fold split the pair: $T65_DIS disagreement(s), $T65_BACKFILL backfill(s)" FAIL
+T65_BAD=$(python3 - "$MOUNT/$T65_FILE" <<'PY'
+import sys
+f = open(sys.argv[1], "rb")
+bad = []
+for i in range(10):
+    f.seek(4 * 1024 * 1024 + i * 8192)
+    if f.read(4096) != (b"W%06d" % i).ljust(4096, b"w"): bad.append(i)
+print(" ".join(map(str, bad)))
+PY
+)
+[ -z "$T65_BAD" ] \
+    && check "T65b all 10 writes read back" PASS \
+    || check "T65b writes $T65_BAD read back wrong" FAIL
+rm -f "$MOUNT/$T65_FILE"
+fi # should_run T65
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

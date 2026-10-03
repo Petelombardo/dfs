@@ -1079,15 +1079,18 @@ pub enum Request {
         request: Box<Request>,
     },
 
-    /// Primary -> secondary: write `write_id` is version `version` of the slot at `isr_epoch`.
-    /// A few dozen bytes; the payload itself came from the client. APPENDED at end to
-    /// preserve wire compatibility.
+    /// Primary -> secondary: write `write_id` is version `version` of the slot at `isr_epoch`,
+    /// and the primary applied it onto `base` (its own result for the previous version). A
+    /// secondary with no head of its own for the slot applies onto `base` too. Under a hundred
+    /// bytes; the payload itself came from the client. APPENDED at end to preserve wire
+    /// compatibility (`base` was added before this variant was ever deployed).
     WriteOrder {
         file_id: FileId,
         chunk_idx: u64,
         isr_epoch: u64,
         write_id: u128,
         version: u64,
+        base: ChunkId,
     },
 }
 

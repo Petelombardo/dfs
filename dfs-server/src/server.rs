@@ -891,6 +891,34 @@ fn update_chunk_map_after_patch(
     rejected
 }
 
+/// An ordered write's result is its replicas' state for the slot (write_order.rs), so their
+/// chunk_map entry follows it even where `update_chunk_map_after_patch`'s client_write_seq
+/// guard declined: that guard compares per-client counters, which mean nothing across two
+/// writers' clients. The stored seq becomes the max of both, so a seq-ordered update can't
+/// later pull the slot back below the ordered head (the `fold_successor_write_seq` rule: a
+/// max over seqs clients really produced, never an invented one).
+fn advance_chunk_map_for_ordered_write(
+    chunk_map: &Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
+    file_id: FileId,
+    chunk_idx: u64,
+    new_chunk_id: ChunkId,
+    size: usize,
+    client_write_seq: Option<u64>,
+) {
+    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    if let Some(mut entry) = chunk_map.get_mut(&file_id) {
+        let (locations, _) = entry.value_mut();
+        if let Some(loc) = locations.iter_mut().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx)) {
+            loc.client_write_seq = fold_successor_write_seq(loc.client_write_seq, client_write_seq);
+            loc.chunk_id = new_chunk_id;
+            loc.checksum = new_chunk_id.hash;
+            loc.size = size;
+            loc.written_at = Some(now_ms);
+        }
+    }
+}
+
 /// On-disk format for an overlay patch delta: a plain concatenation of records,
 /// each `[seq: u64 LE][offset: u64 LE][len: u32 LE][data: len bytes]`, with no
 /// overall count or length prefix — parsed by reading records until EOF.
@@ -1589,6 +1617,8 @@ struct OverlayForkCtx {
     lease: Arc<crate::lease::LeaseRuntime>,
     /// Stored per-chunk ISRs: when a chunk has one, its order decides the fold owner.
     slot_isr: Arc<crate::slot_isr::SlotIsrService>,
+    /// Same Arc as Server::write_ordering: a slot's ordered head is never abandoned.
+    write_ordering: Arc<crate::write_order::WriteOrdering>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -2763,6 +2793,14 @@ impl OverlayForkCtx {
         public_token: ChunkId,
         patch_client_write_seq: Option<u64>,
     ) -> bool {
+        // The slot's ordered head (DFS_ORDERED_WRITES) is the result of the latest version this
+        // replica applied: acked data, whatever chunk_map says. chunk_map can name an older
+        // occupant because it still arbitrates by per-client client_write_seq, which two
+        // writers' clients don't share: abandoning here deleted the head's patch state and
+        // every later write and read of the slot failed (suite T64d).
+        if self.write_ordering.is_head(file_id, chunk_idx, public_token) {
+            return false;
+        }
         let current = self.chunk_map.get(&file_id).and_then(|entry| {
             let (locs, _) = entry.value();
             Server::chunk_map_find_by_idx(locs, chunk_idx)
@@ -7750,7 +7788,7 @@ impl Server {
             }
             Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq } => {
                 self.ops_tracker.inc_write();
-                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await
+                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, false).await
             }
             Request::ForceFold { file_id, chunk_idx } => {
                 self.handle_force_fold(file_id, chunk_idx).await
@@ -7759,8 +7797,8 @@ impl Server {
                 self.ops_tracker.inc_write();
                 self.handle_ordered(tag, *request).await
             }
-            Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version } => {
-                self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version);
+            Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version, base } => {
+                self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version, base);
                 Response::Ok { data: None }
             }
             Request::ProposeFold { file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint } => {
@@ -14369,6 +14407,7 @@ impl Server {
             fold_announce_inflight: self.fold_announce_inflight.clone(),
             lease: self.lease.clone(),
             slot_isr: self.slot_isr.clone(),
+            write_ordering: self.write_ordering.clone(),
             fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -15690,14 +15729,10 @@ impl Server {
         }
         let me = self.cluster.local_node_id();
         let slot = self.write_ordering.slot(tag.file_id, tag.chunk_idx, tag.isr_epoch);
-        // The version stream is the base: apply onto this replica's current state for the slot,
-        // not onto the chunk id the client last saw. Two writers' clients are routinely a step
-        // behind each other; judged against the client's id, one replica rejected a write as
-        // stale while the other rebased and applied it, and the pair split with the order intact.
-        let current_id = |srv: &Self| srv.chunk_map.get(&file_id).and_then(|e| {
-            let (locs, _) = e.value();
-            Self::chunk_map_find_by_idx(locs, tag.chunk_idx).map(|i| locs[i].chunk_id)
-        });
+        // The version stream is the base: each replica applies version n onto its own result
+        // for n-1 (see write_order.rs). Neither the client's chunk id (two writers' clients are
+        // routinely a step behind each other) nor the leader's chunk_map (which can name a token
+        // only the other replica holds) is this replica's state.
         if me == tag.primary {
             let current = self.slot_isr.get(tag.file_id, tag.chunk_idx);
             let still_primary = current.as_ref().is_some_and(|isr| {
@@ -15715,11 +15750,15 @@ impl Server {
             if version == 1 {
                 info!("[ORDER] primary: ordering file {} chunk {} epoch {} (secondary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.secondary);
             }
+            let base = match slot.head() {
+                Some(head) => head,
+                None => self.ordered_stream_start(file_id, tag.chunk_idx, chunk_id).await,
+            };
             if let Some(addr) = self.cluster.get_node(&tag.secondary).await.map(|n| n.addr) {
                 let client = self.client.clone();
                 let msg = Request::WriteOrder {
                     file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
-                    write_id: tag.write_id, version,
+                    write_id: tag.write_id, version, base,
                 };
                 tokio::spawn(async move {
                     if let Err(e) = client.send_message(addr, Message::Request(msg)).await {
@@ -15727,19 +15766,24 @@ impl Server {
                     }
                 });
             }
-            let base = current_id(self).unwrap_or(chunk_id);
-            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await;
-            slot.applied(tag.write_id, version);
+            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
+            slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             resp
         } else if me == tag.secondary {
             const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-            let version = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
+            let (version, primary_base) = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
                 Ok(v) => v,
                 Err(crate::write_order::TurnError::Gap { version, applied }) => {
                     warn!("[ORDER] file {} chunk {} epoch {}: versions {}..{} never arrived; applying v{} past the gap",
                         tag.file_id, tag.chunk_idx, tag.isr_epoch, applied + 1, version - 1, version);
                     slot.skip_to(version);
-                    version
+                    match slot.wait_turn(tag.write_id, std::time::Duration::ZERO).await {
+                        Ok(v) => v,
+                        Err(_) => return Response::Error {
+                            message: format!("Ordered: lost write {:x}'s order after skipping a gap", tag.write_id),
+                            code: ErrorCode::InternalError,
+                        },
+                    }
                 }
                 Err(crate::write_order::TurnError::NoOrder) => {
                     return Response::Error {
@@ -15752,12 +15796,48 @@ impl Server {
                 info!("[ORDER] secondary: following file {} chunk {} epoch {} (primary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.primary);
             }
             let _order = slot.order_lock.lock().await;
-            let base = current_id(self).unwrap_or(chunk_id);
-            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await;
-            slot.applied(tag.write_id, version);
+            // Our own head keeps the content right even where the ids differ: a replica-local
+            // fold between versions gives the same bytes a new id (folds aren't ordered yet).
+            let base = match slot.head() {
+                Some(head) => {
+                    if head != primary_base {
+                        debug!("[ORDER] secondary: file {} chunk {} v{}: own head {} differs from the primary's base {} (a local fold?)",
+                            file_id, tag.chunk_idx, version, head, primary_base);
+                    }
+                    head
+                }
+                None => primary_base,
+            };
+            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
+            slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             resp
         } else {
             Response::Error { message: "Ordered: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
+        }
+    }
+
+    /// The chunk id a successful MultiPatch produced, for the ordered stream's head.
+    fn multi_patch_result_id(resp: &Response) -> Option<ChunkId> {
+        match resp {
+            Response::MultiPatchResult { new_chunk_id, .. } => Some(*new_chunk_id),
+            _ => None,
+        }
+    }
+
+    /// Where a slot's ordered stream starts on the primary (no head yet: the first ordered
+    /// write at this epoch, or an unordered write since). This node's view of the slot when it
+    /// can resolve it locally, as the unordered staleness check would rebase onto, else the
+    /// client's id. Either way the secondary is told this exact base with `WriteOrder`.
+    async fn ordered_stream_start(&self, file_id: FileId, chunk_idx: u64, client_base: ChunkId) -> ChunkId {
+        let local = self.chunk_map.get(&file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+        });
+        match local {
+            Some(id) if id != client_base
+                && (self.storage.get_chunk_path(&id).exists()
+                    || matches!(self.metadata.get_patch_state_async(id).await, Ok(Some(_)))) => id,
+            _ => client_base,
         }
     }
 
@@ -15772,8 +15852,17 @@ impl Server {
         client_write_seq: Option<u64>,
         prefetch_hints: Option<Vec<ChunkId>>,
         new_chunk_seq: Option<u64>,
+        // From handle_ordered: `chunk_id` is this replica's own base for the write's version
+        // (write_order.rs), so none of the checks below that substitute the leader's or the
+        // local chunk_map's view of the slot apply: they would undo the ordering.
+        ordered: bool,
     ) -> Response {
         self.wait_if_compaction_quiescing().await;
+        if !ordered {
+            if let Some(cidx) = chunk_idx {
+                self.write_ordering.clear_head(file_id, cidx);
+            }
+        }
         // Mutable so the staleness check below can rebase onto the current value
         // in place instead of bouncing ChunkStale back to the client for an external
         // round trip — see that check's doc comment for why the round trip itself
@@ -15835,7 +15924,7 @@ impl Server {
         // anywhere. Detecting genuine duplicates safely needs more than a plain
         // integer compare (e.g. content-based dedup, or the client guaranteeing
         // strict per-slot in-flight ordering) — not implemented here.
-        if let (Some(cidx), Some(new_seq)) = (chunk_idx, new_chunk_seq) {
+        if let (Some(cidx), Some(new_seq), false) = (chunk_idx, new_chunk_seq, ordered) {
             if let Ok(Some(current_seq)) = self.metadata.get_chunk_seq_async(file_id, cidx).await {
                 if new_seq > current_seq + 1 {
                     info!("MultiPatch: chunk_seq gap ({} vs expected {}) for file {} chunk {} — refreshing from leader before applying",
@@ -15849,7 +15938,7 @@ impl Server {
         let chunk_seq_elapsed = cp.elapsed();
         cp = std::time::Instant::now();
 
-        if let Some(cidx) = chunk_idx {
+        if let Some(cidx) = chunk_idx.filter(|_| !ordered) {
             // See the matching comment in handle_patch_chunk: clone the candidate
             // location out and drop the DashMap guard *before* the .await below —
             // holding a Ref across an await point on dashmap's synchronous,
@@ -15956,9 +16045,11 @@ impl Server {
         let prefetch_wait_elapsed = cp.elapsed();
 
         let apply_patch_start = std::time::Instant::now();
+        // An ordered write's base is this replica's own result for the previous version:
+        // the leader-confirmation (trust_local_base=false) would substitute the leader's view.
         let mut result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
-            patches.clone(), client_write_seq, prefetched.clone(), false,
+            patches.clone(), client_write_seq, prefetched.clone(), ordered,
         ).await;
         let apply_patch_elapsed = apply_patch_start.elapsed();
 
@@ -15978,7 +16069,7 @@ impl Server {
         // client's deterministic sort always puts it first), so it processes every
         // patch to a slot first-hand and never depends on this same broadcast path.
         let ghost_retry_start = std::time::Instant::now();
-        if let (Err((_, ErrorCode::NotFound)), Some(cidx)) = (&result, chunk_idx) {
+        if let (Err((_, ErrorCode::NotFound)), Some(cidx), false) = (&result, chunk_idx, ordered) {
             if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, chunk_id).await {
                 info!("MultiPatch: ghost-chunk guard tripped for file {} chunk {} (tried {}) — leader reports {} is current, retrying",
                     file_id, cidx, chunk_id, fresh_loc.chunk_id);
@@ -16164,7 +16255,13 @@ impl Server {
                 // handle_patch_chunk's matching Ok arm, and
                 // update_chunk_map_after_patch's doc comment for the full incident
                 // this closes.
-                if let Some(current) = chunk_map_rejected {
+                // An ordered write: its order is the primary's, and the guard that rejected
+                // the update compared two clients' unrelated client_write_seqs. The ordered
+                // result is this replica's state for the slot, so advance chunk_map to it.
+                if let (true, Some(cidx), Some(_)) = (ordered, chunk_idx, &chunk_map_rejected) {
+                    advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, cidx, new_chunk_id, final_size, client_write_seq);
+                }
+                if let Some(current) = chunk_map_rejected.filter(|_| !ordered) {
                     info!("MultiPatch: {} -> {} chunk_map update rejected as stale (current is {}) — \
                            returning ChunkStale instead of false success",
                         chunk_id, new_chunk_id, current.chunk_id);
@@ -22977,7 +23074,7 @@ mod tests {
         let stale_client_claim = ChunkId::from_hash(compute_chunk_hash(b"stale-claim-nobody-has"));
         let resp = follower_h.server.handle_multi_patch(
             stale_client_claim, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(5usize, vec![0x22u8; 4])], None, Some(1), None, Some(1),
+            vec![(5usize, vec![0x22u8; 4])], None, Some(1), None, Some(1), false,
         ).await;
 
         let new_chunk_id = match resp {
@@ -23082,7 +23179,7 @@ mod tests {
         let stale_client_claim = ChunkId::from_hash(compute_chunk_hash(b"stale-claim-follower-never-heard-of"));
         let resp = follower_h.server.handle_multi_patch(
             stale_client_claim, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(0usize, vec![0x22u8; 4])], None, Some(1), None, Some(1),
+            vec![(0usize, vec![0x22u8; 4])], None, Some(1), None, Some(1), false,
         ).await;
 
         match resp {
@@ -23197,7 +23294,7 @@ mod tests {
         // as current — i.e. it is doing exactly the right thing.
         let resp = follower_h.server.handle_multi_patch(
             real_base_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(64usize, vec![0x22u8; 4])], None, Some(4), None, Some(4),
+            vec![(64usize, vec![0x22u8; 4])], None, Some(4), None, Some(4), false,
         ).await;
 
         // Invariant, independent of the recovery below: a ChunkStale naming the
@@ -23277,7 +23374,7 @@ mod tests {
         // on the sequence comparison, exactly like the real incident.
         let resp = h.server.handle_multi_patch(
             base_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0x22u8; 4])], None, Some(1), None, Some(1),
+            vec![(10usize, vec![0x22u8; 4])], None, Some(1), None, Some(1), false,
         ).await;
 
         match resp {
@@ -25903,7 +26000,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&ghost_loc).unwrap();
 
             let resp = h.server.handle_multi_patch(
-                ghost_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, None, None, None,
+                ghost_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, None, None, None, false,
             ).await;
             match resp {
                 Response::Error { code, .. } => assert_eq!(code, dfs_common::ErrorCode::NotFound,
@@ -25942,7 +26039,7 @@ mod tests {
 
             let resp1 = h.server.handle_multi_patch(
                 original_chunk_id, file_id, Some(0), chunk_file_offset,
-                vec![(0, vec![1u8; 100])], None, None, None, Some(1),
+                vec![(0, vec![1u8; 100])], None, None, None, Some(1), false,
             ).await;
             let first_new_id = match resp1 {
                 Response::MultiPatchResult { new_chunk_id, chunk_seq, .. } => { assert_eq!(chunk_seq, Some(1)); new_chunk_id }
@@ -25956,7 +26053,7 @@ mod tests {
             // applied patch 1), so it falls through and applies normally.
             let resp2 = h.server.handle_multi_patch(
                 first_new_id, file_id, Some(0), chunk_file_offset,
-                vec![(200, vec![2u8; 50])], None, None, None, Some(50),
+                vec![(200, vec![2u8; 50])], None, None, None, Some(50), false,
             ).await;
             match resp2 {
                 Response::MultiPatchResult { chunk_seq, .. } => assert_eq!(chunk_seq, Some(50)),
@@ -26009,7 +26106,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&original_loc).unwrap();
 
             let resp = h.server.handle_multi_patch(
-                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![patch], None, Some(2), None, None,
+                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![patch], None, Some(2), None, None, false,
             ).await;
             let public_token = match resp {
                 Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -26335,7 +26432,7 @@ mod tests {
             let resp = h.server.handle_multi_patch(
                 client_stale_id, file_id, Some(cidx), 0,
                 vec![(0usize, vec![0xABu8; 8])],
-                None, Some(151), None, Some(151),
+                None, Some(151), None, Some(151), false,
             ).await;
 
             // GRACEFUL contract: a gap the node can't close itself must be retriable,
@@ -26390,7 +26487,7 @@ mod tests {
                 expected.extend_from_slice(&data);
 
                 let resp = h.server.handle_multi_patch(
-                    head, file_id, Some(0), chunk_file_offset, vec![(append_offset, data)], None, Some(seq), None, None,
+                    head, file_id, Some(0), chunk_file_offset, vec![(append_offset, data)], None, Some(seq), None, None, false,
                 ).await;
                 head = match resp {
                     Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -26531,7 +26628,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&original_loc).unwrap();
 
             let resp = h.server.handle_multi_patch(
-                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![2u8; 100])], None, Some(2), None, None,
+                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![2u8; 100])], None, Some(2), None, None, false,
             ).await;
             let public_token = match resp { Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id, o => panic!("{:?}", o) };
             let folded_chunk_id = wait_for_folded(&h, public_token, 2000).await;
@@ -26622,7 +26719,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&original_loc).unwrap();
 
             let resp1 = h.server.handle_multi_patch(
-                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, Some(2), None, None,
+                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, Some(2), None, None, false,
             ).await;
             let public_token_1 = match resp1 { Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id, o => panic!("{:?}", o) };
             wait_for_folded(&h, public_token_1, 2000).await;
@@ -26631,7 +26728,7 @@ mod tests {
             // bookkeeping would use, unaware the fold already moved chunk_map on to
             // the real folded identity. Must succeed directly, not ChunkStale.
             let resp2 = h.server.handle_multi_patch(
-                public_token_1, file_id, Some(0), chunk_file_offset, vec![(100, vec![2u8; 100])], None, Some(3), None, None,
+                public_token_1, file_id, Some(0), chunk_file_offset, vec![(100, vec![2u8; 100])], None, Some(3), None, None, false,
             ).await;
             let public_token_2 = match resp2 {
                 Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -26703,7 +26800,7 @@ mod tests {
                         let patch = vec![(200 + i, vec![(i % 256) as u8; 16])];
                         let resp = server.handle_multi_patch(
                             claimed, file_id, Some(chunk_idx), chunk_file_offset,
-                            patch, None, Some(1000 + i as u64), None, None,
+                            patch, None, Some(1000 + i as u64), None, None, false,
                         ).await;
                         match resp {
                             Response::MultiPatchResult { .. } => return Ok(attempt),

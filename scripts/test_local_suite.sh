@@ -5377,20 +5377,32 @@ dd if=/dev/urandom of="$MOUNT/$T64_FILE" bs=4M count=2 status=none
 dfs_sync
 sleep 5   # let the ISR seeder (3s in this suite) commit the chunks' ISRs, which ordering needs
 t64_writer() {  # mount tag: 150 fsync'd 4K writes of this client's own content to one block
+    # Prints the last write whose fsync succeeded (its ack), or NONE, then FAILED:<error> if a
+    # write or fsync failed. A failed fsync means that write was never acked, so T64b judges
+    # the servers against each writer's last ACKED write, not against write 149.
     python3 - "$1/$T64_FILE" "$2" <<'PY'
 import os, sys
 path, tag = sys.argv[1], sys.argv[2].encode()
 fd = os.open(path, os.O_RDWR)
 off = 4 * 1024 * 1024 + 8192          # the same 4K block of chunk 1 for both clients
+acked, err = None, None
 for i in range(150):
-    os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
-    os.fsync(fd)
+    try:
+        os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
+        os.fsync(fd)
+    except OSError as e:
+        err = "write %d: %s" % (i, e); break
+    acked = (tag + b"%06d" % i).decode() + tag.decode() * 3
+print(acked or "NONE")
+if err: print("FAILED:" + err)
 os.close(fd)
 PY
 }
-t64_writer "$MOUNT" A & T64_W1=$!
-t64_writer "$T64_MOUNT2" B & T64_W2=$!
+t64_writer "$MOUNT" A > "$LOG/t64_w1.out" 2>&1 & T64_W1=$!
+t64_writer "$T64_MOUNT2" B > "$LOG/t64_w2.out" 2>&1 & T64_W2=$!
 wait "$T64_W1" "$T64_W2" 2>/dev/null || true
+T64_ACK1=$(head -1 "$LOG/t64_w1.out"); T64_ACK2=$(head -1 "$LOG/t64_w2.out")
+T64_ERR=$(grep -h "FAILED:\|Traceback\|Error" "$LOG/t64_w1.out" "$LOG/t64_w2.out" | head -2 | tr '\n' ' ')
 dfs_sync; sync "$T64_MOUNT2" 2>/dev/null || true
 sleep 3
 T64_DIS=$(( $(grep -ac "REPLICA DISAGREEMENT" "$CURRENT_CLIENT_LOG" 2>/dev/null || true) \
@@ -5413,10 +5425,21 @@ fi
 [ "$T64_DIS" = 0 ] \
     && check "T64a concurrent writers to one chunk: replicas never disagreed" PASS \
     || check "T64a concurrent writers to one chunk: $T64_DIS replica disagreement(s) -- replicas applied the writes in different orders" FAIL
+# Each writer's writes are sequential and every ack is an fsync, so the block must end on one
+# writer's last ACKED write (a write whose fsync failed may or may not have landed: both count).
+echo "  T64: last acked: writer1=$T64_ACK1 writer2=$T64_ACK2${T64_ERR:+; errors: $T64_ERR}"
+t64_next() { python3 -c "import sys;t=sys.argv[1];print(t[0]+'%06d'%(int(t[1:7])+1)+t[0]*3 if t!='NONE' else '')" "$1"; }
 case "$T64_FRESH" in
-    A000149AAA|B000149BBB) check "T64b the servers hold one writer's last write ($T64_FRESH)" PASS ;;
-    *) check "T64b the servers hold $T64_FRESH, not either writer's last write (A000149/B000149) -- an acked write was lost" FAIL ;;
+    "$T64_ACK1"|"$T64_ACK2"|"") [ -n "$T64_FRESH" ] \
+        && check "T64b the servers hold one writer's last acked write ($T64_FRESH)" PASS \
+        || check "T64b the fresh client read nothing back" FAIL ;;
+    "$(t64_next "$T64_ACK1")"|"$(t64_next "$T64_ACK2")")
+        check "T64b the servers hold a writer's un-acked final write ($T64_FRESH, its fsync failed)" PASS ;;
+    *) check "T64b the servers hold $T64_FRESH, not either writer's last acked write ($T64_ACK1/$T64_ACK2) -- an acked write was lost" FAIL ;;
 esac
+[ -z "$T64_ERR" ] \
+    && check "T64d both writers' 150 fsync'd writes succeeded (no EIO)" PASS \
+    || check "T64d a writer failed: $T64_ERR" FAIL
 # Informational: a writer's own later reads after the other client's writes (cache coherence).
 echo "  (informational) T64c: writers read back writer1=$T64_R1 writer2=$T64_R2 vs servers $T64_FRESH"
 fusermount -u "$T64_MOUNT3" 2>/dev/null || true

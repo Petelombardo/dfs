@@ -6,8 +6,8 @@ with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure
 
 _Last updated: 2026-10-03, staging fio bench done and torn down_
 
-**Resume here:** Pete decides keep/drop from the 2026-10-03 numbers below (recommendation: keep,
-since it costs nothing measurable). If kept: 3c step 2, starting with version as identity (T64b).
+**Resume here:** 3c step 2 — next: order folds through the primary, then arbitration by version
+at the leader. Ordering kept (2026-10-03). Replica-side version identity done (T64 5/5).
 
 ## Where things stand
 
@@ -47,9 +47,11 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       one more fix: an ordered write applies onto the replica's own current state for the slot,
       not the client's possibly stale chunk id. Otherwise one replica rejected a write as stale
       while the other rebased it, and the pair split with the order intact.
-- [ ] T64b (lost acked write) still fails with the flag on: the servers end on e.g. B000002 after
-      both writers were acked through write 149. The ordering is fine; the loss is in
-      location/metadata arbitration by per-client `client_write_seq` → step 2
+- [x] ~~T64b lost acked write~~ — **misdiagnosed** (corrected 2026-10-03): in every failing run a
+      writer's fsync had returned **EIO** and the writer died there, so the "lost" writes were
+      never acked. T64 hid writer errors. It now records each writer's last acked write, judges
+      T64b against that, and T64d fails on any EIO. Real bug: two writers on one chunk get EIO,
+      flag on AND off (2/3 runs each) — see step 2's replica-side item.
 - [x] Full suite, flag on: **145/1** (only T64b, the step 2 gate; 0 replica disagreements).
       Flag off: 143/3 (known failures only)
 - [x] Committed on slot-ownership (not pushed)
@@ -76,14 +78,27 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       the same build and flag measured 770 and 18000 4k IOPS on different restarts (off1 vs off3).
       Raw output: `/root/dfs-staging-bench-*.{raw,txt}` on the dev box.
 - [x] Tear the bench cluster down (verified: no bench dirs or processes, production active)
-- [ ] **Decide with Pete** (keep / drop)
+- [x] **Decided 2026-10-03: KEEP** (Pete)
 
 ### Step 2 — full 3c, if the numbers say keep it (L)
 - [ ] Folds go through the primary's order (ForceFold and the background wave), so both
       replicas' chunk identities match, not just their bytes
-- [ ] Version as identity: responses carry the version; the client compares versions, not chunk
-      ids; location/metadata arbitration uses the version instead of per-client
-      `client_write_seq` (the likely cause of T64's lost acked write)
+- [x] **Replica side of version-as-identity** (2026-10-03): each replica applies version n onto its
+      own result for n-1 (`SlotOrder::head`); the primary sends its base with `WriteOrder`. Ordered
+      writes skip every check that substitutes the leader's/local chunk_map view (chunk_seq gap
+      refresh, staleness rebase, leader-confirmation, ghost retry, chunk_map-reject ChunkStale);
+      an ordered result always advances the replica's chunk_map (seq = max); the fold-abandon
+      check never discards the slot's ordered head; an unordered patch clears the head.
+      Root cause it fixes (T64d EIO): `update_chunk_map_after_patch` rejected the ordered result
+      by comparing two clients' unrelated `client_write_seq`s (25 vs 27), the fold then saw the
+      token as superseded and abandoned it, and every later write/read of the slot failed.
+      T64 flag on: 3/5 fail → **5/5 pass** (0 disagreements, 0 EIO, last acked write held).
+- Gate 2026-10-03: unit set = baseline; suite flag ON **147/0** (14m03s), flag OFF **146/1** (13m60s: T53c
+      once under load — passes 3/3 alone, path unchanged with the flag off; watch it).
+- [ ] Leader side: responses carry the version; the client compares versions, not chunk ids;
+      the leader's location arbitration uses the version instead of per-client
+      `client_write_seq` (not needed for T64 now; needed so a leader-side seq compare can't
+      prefer an older occupant)
 - [ ] Durable versions per slot; a lagging secondary NACKs and the primary sends what it missed
       (replaces the prototype's "skip the gap")
 - [ ] Gates: T64 passes; the 2026-09-27 no-op-divergence repro ends with one version on both;
@@ -105,6 +120,8 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   - Under full-suite load a metadata-db stall still sometimes costs a lease (T59a/T59e). The
     blocking path hasn't been found; gdb's pause seems to hide it. `eu-stack` (elfutils) would
     help — install is Pete's call.
-  - T64's lost acked write with two writers exists on main today; 3c step 2 fixes it.
+  - Two writers on one chunk get EIO on main today (flag off: T64d fails 2/3, plus 4-109
+    replica disagreements). Fixed with the flag on; the flag-off path is the reason to make
+    ordering the default.
 - **Deploy note for the delete fix:** clusters upgraded after files were already deleted fold
   those leftover patch rows once.

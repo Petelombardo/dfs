@@ -15734,11 +15734,29 @@ impl Server {
         // routinely a step behind each other) nor the leader's chunk_map (which can name a token
         // only the other replica holds) is this replica's state.
         if me == tag.primary {
+            if let Some(prev) = slot.decided(tag.write_id) {
+                return Self::ordered_resend_response(tag.write_id, prev);
+            }
             let current = self.slot_isr.get(tag.file_id, tag.chunk_idx);
             let still_primary = current.as_ref().is_some_and(|isr| {
                 isr.epoch == tag.isr_epoch && isr.members.first() == Some(&me) && isr.members.get(1) == Some(&tag.secondary)
             }) && self.lease.holds_own_lease();
             if !still_primary {
+                if let Some(prev) = slot.refuse_once(tag.write_id) {
+                    return Self::ordered_resend_response(tag.write_id, prev);
+                }
+                // Tell the secondary now, so it fails this write at once instead of holding the
+                // client for its whole turn timeout. A primary that just resumed from a stall
+                // refuses until it re-acquires its lease (~1s); without this every write in
+                // that window cost the client a full RPC timeout (suite T66[primary]).
+                if let Some(addr) = self.cluster.get_node(&tag.secondary).await.map(|n| n.addr) {
+                    let client = self.client.clone();
+                    let msg = Request::WriteOrder {
+                        file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
+                        write_id: tag.write_id, version: crate::write_order::REFUSED, base: chunk_id,
+                    };
+                    tokio::spawn(async move { let _ = client.send_message(addr, Message::Request(msg)).await; });
+                }
                 return Response::Error {
                     message: format!("Ordered: not the primary of file {} chunk {} at epoch {} (this node has {:?})",
                         tag.file_id, tag.chunk_idx, tag.isr_epoch, current.map(|i| (i.epoch, i.members))),
@@ -15746,7 +15764,10 @@ impl Server {
                 };
             }
             let _order = slot.order_lock.lock().await;
-            let version = slot.assign();
+            let version = match slot.assign_once(tag.write_id) {
+                Ok(v) => v,
+                Err(prev) => return Self::ordered_resend_response(tag.write_id, prev),
+            };
             if version == 1 {
                 info!("[ORDER] primary: ordering file {} chunk {} epoch {} (secondary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.secondary);
             }
@@ -15768,8 +15789,13 @@ impl Server {
             }
             let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
+            slot.finish(tag.write_id, version, &resp);
             resp
         } else if me == tag.secondary {
+            // A resent copy of a write this replica already applied gets the same answer.
+            if let Some(prev @ crate::write_order::Decision::Ordered { response: Some(_), .. }) = slot.decided(tag.write_id) {
+                return Self::ordered_resend_response(tag.write_id, prev);
+            }
             const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
             let (version, primary_base) = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
                 Ok(v) => v,
@@ -15784,6 +15810,12 @@ impl Server {
                             code: ErrorCode::InternalError,
                         },
                     }
+                }
+                Err(crate::write_order::TurnError::Refused) => {
+                    return Response::Error {
+                        message: format!("Ordered: the primary refused write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx),
+                        code: ErrorCode::InvalidRequest,
+                    };
                 }
                 Err(crate::write_order::TurnError::NoOrder) => {
                     return Response::Error {
@@ -15810,9 +15842,25 @@ impl Server {
             };
             let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
+            slot.finish(tag.write_id, version, &resp);
             resp
         } else {
             Response::Error { message: "Ordered: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
+        }
+    }
+
+    /// The answer to a resent copy of an ordered write: whatever this replica already decided.
+    fn ordered_resend_response(write_id: u128, prev: crate::write_order::Decision) -> Response {
+        match prev {
+            crate::write_order::Decision::Ordered { response: Some(r), .. } => r,
+            crate::write_order::Decision::Ordered { version, response: None } => Response::Error {
+                message: format!("Ordered: write {:x} (v{}) is still being applied", write_id, version),
+                code: ErrorCode::InternalError,
+            },
+            crate::write_order::Decision::Refused => Response::Error {
+                message: format!("Ordered: the primary refused write {:x}", write_id),
+                code: ErrorCode::InvalidRequest,
+            },
         }
     }
 

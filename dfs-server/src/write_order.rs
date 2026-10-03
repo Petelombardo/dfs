@@ -21,11 +21,28 @@
 //! so a replica-local fold can give the same content a different id on the two replicas.
 
 use dashmap::DashMap;
-use dfs_common::{ChunkId, FileId};
-use std::collections::HashMap;
+use dfs_common::{ChunkId, FileId, Response};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 type SlotKey = (FileId, u64, u64); // file, chunk_idx, isr_epoch
+
+/// The version a primary announces for a write it refused to order. Real versions start at 1.
+pub const REFUSED: u64 = 0;
+
+/// How many decided writes each slot remembers, so a resent copy of a write gets the same answer.
+const DECIDED_CAP: usize = 1024;
+
+/// What a replica decided for one write. Each write is decided exactly once: the client's
+/// transport resends a request whose reply timed out (a stalled node), and a primary that
+/// refused the stale copy (lease lapsed during the stall) and then ordered the resent one left
+/// its secondary failing a write the primary applied, and the pair diverged (suite T66[primary]).
+#[derive(Clone, Debug)]
+pub enum Decision {
+    Refused,
+    /// `response` is None while the write is still being applied.
+    Ordered { version: u64, response: Option<Response> },
+}
 
 #[derive(Default)]
 pub struct WriteOrdering {
@@ -81,12 +98,30 @@ struct Inner {
     orders: HashMap<u128, (u64, ChunkId)>,
     /// This replica's chunk id for the slot after the last version it applied.
     head: Option<ChunkId>,
+    decided: HashMap<u128, Decision>,
+    decided_order: VecDeque<u128>,
+}
+
+impl Inner {
+    fn decide(&mut self, write_id: u128, d: Decision) {
+        if self.decided.insert(write_id, d).is_none() {
+            self.decided_order.push_back(write_id);
+            while self.decided_order.len() > DECIDED_CAP {
+                if let Some(old) = self.decided_order.pop_front() {
+                    self.decided.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TurnError {
     /// The primary never announced a version for this write.
     NoOrder,
+    /// The primary refused to order this write (not the primary, no lease, stale ISR):
+    /// it announced version `REFUSED`, so the secondary fails it at once.
+    Refused,
     /// This write is version `version`, but versions after `applied` and before it never
     /// arrived.
     Gap { version: u64, applied: u64 },
@@ -94,15 +129,57 @@ pub enum TurnError {
 
 impl SlotOrder {
     /// Primary: the next version for this slot.
+    #[cfg(test)]
     pub fn assign(&self) -> u64 {
         let mut g = self.inner.lock().unwrap();
         g.next += 1;
         g.next
     }
 
-    /// Secondary: the primary says `write_id` is `version`, applied onto `base`.
+    /// What this replica already decided for `write_id`, if anything.
+    pub fn decided(&self, write_id: u128) -> Option<Decision> {
+        self.inner.lock().unwrap().decided.get(&write_id).cloned()
+    }
+
+    /// Primary: the next version for `write_id`, or what was already decided for it.
+    pub fn assign_once(&self, write_id: u128) -> Result<u64, Decision> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(d) = g.decided.get(&write_id) {
+            return Err(d.clone());
+        }
+        g.next += 1;
+        let version = g.next;
+        g.decide(write_id, Decision::Ordered { version, response: None });
+        Ok(version)
+    }
+
+    /// Primary: refuse `write_id`. Returns what was already decided instead, if it was.
+    pub fn refuse_once(&self, write_id: u128) -> Option<Decision> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(d) = g.decided.get(&write_id) {
+            return Some(d.clone());
+        }
+        g.decide(write_id, Decision::Refused);
+        None
+    }
+
+    /// Either side: `write_id` (version `version`) is applied here and answered `response`.
+    pub fn finish(&self, write_id: u128, version: u64, response: &Response) {
+        let mut g = self.inner.lock().unwrap();
+        g.decided.remove(&write_id);
+        g.decide(write_id, Decision::Ordered { version, response: Some(response.clone()) });
+    }
+
+    /// Secondary: the primary says `write_id` is `version`, applied onto `base`. The first
+    /// word on a write stands: the primary decides each write once, so a second message can
+    /// only be a resend.
     pub fn record_order(&self, write_id: u128, version: u64, base: ChunkId) {
-        self.inner.lock().unwrap().orders.insert(write_id, (version, base));
+        let mut g = self.inner.lock().unwrap();
+        if g.decided.contains_key(&write_id) {
+            return;
+        }
+        g.orders.entry(write_id).or_insert((version, base));
+        drop(g);
         self.changed.notify_waiters();
     }
 
@@ -122,6 +199,11 @@ impl SlotOrder {
             {
                 let g = self.inner.lock().unwrap();
                 if let Some(&(v, base)) = g.orders.get(&write_id) {
+                    if v == REFUSED {
+                        drop(g);
+                        self.inner.lock().unwrap().orders.remove(&write_id);
+                        return Err(TurnError::Refused);
+                    }
                     if g.applied + 1 >= v {
                         return Ok((v, base));
                     }
@@ -217,6 +299,37 @@ mod tests {
         assert!(o.is_head(f, 4, cid(7)) && !o.is_head(f, 4, cid(3)) && !o.is_head(f, 5, cid(7)));
         o.clear_head(f, 4);
         assert_eq!(o.slot(f, 4, 3).head(), None, "clear_head reaches the newest epoch's stream");
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_fails_at_once_instead_of_waiting_out_the_timeout() {
+        let o = WriteOrdering::default();
+        let s = o.slot(FileId::new(), 1, 1);
+        let s2 = s.clone();
+        let waiting = tokio::spawn(async move { s2.wait_turn(5, Duration::from_secs(30)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        s.record_order(5, REFUSED, cid(0));
+        let r = tokio::time::timeout(Duration::from_secs(1), waiting).await
+            .expect("the refusal must end the wait, not the 30s timeout").unwrap();
+        assert_eq!(r, Err(TurnError::Refused));
+    }
+
+    #[test]
+    fn each_write_is_decided_once_whatever_copy_arrives_later() {
+        let o = WriteOrdering::default();
+        let s = o.slot(FileId::new(), 1, 1);
+        // Refused first (lease lapsed), then the resent copy arrives with the lease back.
+        assert!(s.refuse_once(7).is_none());
+        assert!(matches!(s.assign_once(7), Err(Decision::Refused)));
+        // Ordered first: a later refusal attempt gets the order back, and so does a resend.
+        let v = s.assign_once(8).unwrap();
+        assert!(matches!(s.refuse_once(8), Some(Decision::Ordered { version, response: None }) if version == v));
+        s.finish(8, v, &Response::Ok { data: None });
+        assert!(matches!(s.decided(8), Some(Decision::Ordered { response: Some(Response::Ok { .. }), .. })));
+        // The secondary keeps the first word on a write.
+        s.record_order(9, 3, cid(3));
+        s.record_order(9, REFUSED, cid(0));
+        assert_eq!(s.inner.lock().unwrap().orders.get(&9).map(|o| o.0), Some(3));
     }
 
     #[test]

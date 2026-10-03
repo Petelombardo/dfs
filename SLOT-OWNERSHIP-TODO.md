@@ -103,6 +103,24 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       the leader's location arbitration uses the version instead of per-client
       `client_write_seq` (not needed for T64 now; needed so a leader-side seq compare can't
       prefer an older occupant)
+- [x] **Stall matrix T66** (2026-10-03, Pete: "a locked node during a dual-replica write" is where
+      most past problems came from). Two writers on one block; one node SIGSTOPped 8s: chunk's
+      ISR primary, secondary, or the leader when outside the ISR. Checks: no acked write lost,
+      ISR replicas byte-identical (fold ids are content hashes), writes resume after SIGCONT.
+      Flag off is far worse (12-54 writes in 16s vs ~300; a replica failed to fold after a
+      primary freeze). Two ordered-path bugs found and fixed:
+      - A resumed primary refuses until its lease is back (~0.9s) but left the secondary
+        waiting out its turn timeout: every write in that window cost a 6s RPC timeout.
+        Now the primary sends `WriteOrder { version: REFUSED }` and the secondary fails at once.
+      - The client's transport resends a request whose reply timed out. The primary refused the
+        stale copy (lease lapsed) and ORDERED the resend; the secondary had failed the write,
+        got a raw backfill outside the stream, and the pair diverged (byte-different replicas).
+        Now each replica decides each write once (`Decision`, bounded per slot): a resend gets
+        the original answer. Frozen-primary case: 4/4 pass after the fix.
+      Still open from T66: a frozen leader blocks writes for the whole freeze even when outside
+      the ISR (fsync commits locations + metadata to the leader synchronously) → Phase 5's
+      measurable target. The feared stalled-secondary skip-the-gap reorder hasn't shown in any
+      run yet; durable versions + catch-up below remove the gap-skip regardless.
 - [ ] Durable versions per slot; a lagging secondary NACKs and the primary sends what it missed
       (replaces the prototype's "skip the gap")
 - [ ] Gates: T64 passes; the 2026-09-27 no-op-divergence repro ends with one version on both;

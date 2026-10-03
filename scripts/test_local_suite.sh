@@ -5533,6 +5533,139 @@ PY
 rm -f "$MOUNT/$T65_FILE"
 fi # should_run T65
 
+# ── Test 66: a frozen node during two-writer ordered writes (stall matrix) ──────────────
+# A locked node is worse than a dead one: it comes back and acts on what it knew before. Two
+# writers hammer one block of chunk 1 while one node is frozen (SIGSTOP 8s, then SIGCONT): the
+# chunk's ISR primary, its secondary, or the leader when it is in neither. T66_TARGETS picks the
+# cases (default: all three). Checks per case: (a) no acked write lost; (b) the two ISR replicas
+# end byte-identical (each folds; fold ids are content hashes); (c) both writers make progress
+# again after the node resumes. Errors and worst latency are reported, not judged.
+if should_run T66; then
+snapshot_log T66
+echo ""
+echo "=== T66: two writers on one chunk while a node is frozen (stall matrix, SLOT-OWNERSHIP 3c) ==="
+T66_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T66_MOUNT2=/tmp/dfs-mount2
+mkdir -p "$T66_MOUNT2"
+RUST_LOG=info "$BIN/dfs-client" mount "$T66_MOUNT2" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t66b.log" --allow-other --log-level debug &
+T66_PID2=$!
+sleep 2
+mountpoint -q "$T66_MOUNT2" || check "T66 second client mounted" FAIL
+t66_pid_of() {   # addr -> dfs-server pid
+    local n=$(( ${1##*:} - 8900 + 1 ))
+    for p in $(pgrep -x dfs-server || true); do
+        tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "node$n/config.toml" && echo "$p"
+    done
+    true
+}
+t66_writer() {  # mount file tag seconds out: fsync'd 4K writes to one block until the deadline
+    python3 - "$1/$2" "$3" "$4" > "$5" 2>&1 <<'PY'
+import os, sys, time, json
+path, tag, secs = sys.argv[1], sys.argv[2].encode(), float(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+off = 4 * 1024 * 1024 + 8192
+start = time.time(); i = 0
+acked = []; failed = []; worst = 0.0
+while time.time() - start < secs:
+    t0 = time.time()
+    try:
+        os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
+        os.fsync(fd)
+        acked.append((i, time.time() - start))
+    except OSError as e:
+        failed.append(i)
+        time.sleep(0.2)
+    worst = max(worst, time.time() - t0)
+    i += 1
+os.close(fd)
+print(json.dumps({"acked": [a for a, _ in acked], "late": sum(1 for _, t in acked if t > secs - 4),
+                  "failed": failed, "worst_s": round(worst, 2)}))
+PY
+}
+T66_CASES=${T66_TARGETS:-primary secondary leader}
+for T66_CASE in $T66_CASES; do
+    T66_FILE=t66_$T66_CASE.bin
+    dd if=/dev/urandom of="$MOUNT/$T66_FILE" bs=4M count=2 status=none
+    dfs_sync
+    T66_ISR=""
+    for _ in $(seq 1 30); do
+        T66_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T66_FILE" --chunks 2 2>/dev/null \
+            | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+        [ -n "$T66_ISR" ] && break
+        sleep 1
+    done
+    T66_MAP=$("$BIN/dfs-admin" --cluster "$T66_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    read -r T66_PID_NODE T66_SID_NODE <<< "$T66_ISR"
+    T66_P=$(echo "$T66_MAP" | awk -v n="$T66_PID_NODE" '$1==n{print $2}')
+    T66_S=$(echo "$T66_MAP" | awk -v n="$T66_SID_NODE" '$1==n{print $2}')
+    T66_LEADER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[0]['address'] if online else '')" 2>/dev/null || true)
+    case "$T66_CASE" in
+        primary) T66_TARGET=$T66_P ;;
+        secondary) T66_TARGET=$T66_S ;;
+        leader) if [ "$T66_LEADER" = "$T66_P" ] || [ "$T66_LEADER" = "$T66_S" ]; then
+                    echo "  T66[leader]: the leader $T66_LEADER is in chunk 1's ISR -- case covered by primary/secondary, skipped"
+                    rm -f "$MOUNT/$T66_FILE"; continue
+                fi
+                T66_TARGET=$T66_LEADER ;;
+    esac
+    if [ -z "$T66_P" ] || [ -z "$T66_S" ] || [ -z "$T66_TARGET" ]; then
+        check "T66[$T66_CASE] setup: ISR ($T66_P,$T66_S) and target ($T66_TARGET) found" FAIL
+        rm -f "$MOUNT/$T66_FILE"; continue
+    fi
+    T66_TPID=$(t66_pid_of "$T66_TARGET")
+    echo "  T66[$T66_CASE]: ISR primary=$T66_P secondary=$T66_S leader=$T66_LEADER; freezing $T66_TARGET (pid $T66_TPID) 8s"
+    t66_writer "$MOUNT" "$T66_FILE" A 16 "$LOG/t66_w1.out" & T66_W1=$!
+    t66_writer "$T66_MOUNT2" "$T66_FILE" B 16 "$LOG/t66_w2.out" & T66_W2=$!
+    sleep 3
+    kill -STOP "$T66_TPID"; sleep 8; kill -CONT "$T66_TPID"
+    wait "$T66_W1" "$T66_W2" 2>/dev/null || true
+    dfs_sync; sync "$T66_MOUNT2" 2>/dev/null || true
+    sleep 3
+    T66_FRESH=$(python3 -c "f=open('$MOUNT/$T66_FILE','rb');f.seek(4*1024*1024+8192);print(f.read(10).decode(errors='replace'))" 2>/dev/null || true)
+    T66_VERDICT=$(python3 - "$LOG/t66_w1.out" "$LOG/t66_w2.out" "$T66_FRESH" <<'PY'
+import json, sys
+fresh = sys.argv[3]
+ok, summary = False, []
+for path, tag in ((sys.argv[1], "A"), (sys.argv[2], "B")):
+    try: r = json.loads(open(path).read().strip().splitlines()[-1])
+    except Exception as e: print("BAD", "writer %s output unreadable: %s" % (tag, e)); sys.exit()
+    last = max(r["acked"]) if r["acked"] else -1
+    allowed = {last} | {f for f in r["failed"] if f > last}
+    if fresh[:1] == tag and fresh[1:7].isdigit() and int(fresh[1:7]) in allowed: ok = True
+    summary.append("%s: %d acked (last %d, %d in the last 4s), %d failed, worst %.1fs"
+                   % (tag, len(r["acked"]), last, r["late"], len(r["failed"]), r["worst_s"]))
+    if r["late"] == 0: summary.append("NOPROGRESS-" + tag)
+print("OK" if ok else "LOST", "; ".join(summary))
+PY
+)
+    echo "  T66[$T66_CASE]: servers hold $T66_FRESH; ${T66_VERDICT#* }"
+    case "$T66_VERDICT" in
+        OK*) check "T66[$T66_CASE]a no acked write lost (servers hold $T66_FRESH)" PASS ;;
+        *)   check "T66[$T66_CASE]a servers hold $T66_FRESH, not a writer's last acked write -- acked write lost" FAIL ;;
+    esac
+    T66_FOLDS=$("$BIN/dfs-admin" --cluster "$T66_P,$T66_S" isr fold --file "/$T66_FILE" --chunk 1 2>/dev/null \
+        | python3 -c "import json,sys; print(' '.join(json.loads(l).get('real_chunk_id','ERR')[:16] for l in sys.stdin))" || true)
+    read -r T66_F1 T66_F2 <<< "$T66_FOLDS"
+    [ -n "$T66_F1" ] && [ "$T66_F1" = "$T66_F2" ] && [ "$T66_F1" != ERR ] \
+        && check "T66[$T66_CASE]b both ISR replicas hold identical bytes ($T66_F1)" PASS \
+        || check "T66[$T66_CASE]b ISR replicas differ or failed to fold: $T66_FOLDS" FAIL
+    case "$T66_VERDICT" in
+        *NOPROGRESS*) check "T66[$T66_CASE]c a writer made no progress in the last 4s after the node resumed" FAIL ;;
+        *)            check "T66[$T66_CASE]c both writers made progress after the node resumed" PASS ;;
+    esac
+    rm -f "$MOUNT/$T66_FILE"
+    sleep 3
+done
+fusermount -u "$T66_MOUNT2" 2>/dev/null || true
+kill_client_and_wait "$T66_PID2"
+fi # should_run T66
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

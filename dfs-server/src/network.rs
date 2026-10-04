@@ -695,7 +695,7 @@ async fn process_message<H: MessageHandler>(
 ) -> MessageEnvelope {
     let response = match envelope.message {
         Message::Request(req) => {
-            debug!("Processing request: {:?}", req);
+            debug!("Processing request: {}", dfs_common::debug_truncated(&req, 600));
             let response = handler.handle_request(req).await;
             Message::Response(response)
         }

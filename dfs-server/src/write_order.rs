@@ -38,6 +38,17 @@ type SlotKey = (FileId, u64, u64); // file, chunk_idx, isr_epoch
 /// The version a primary announces for a write it refused to order. Real versions start at 1.
 pub const REFUSED: u64 = 0;
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectOrderedApplyFailures`): the primary
+/// fails its own apply of this many upcoming ordered writes, after announcing them.
+pub static INJECTED_APPLY_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Consume one injected apply failure, if any are armed.
+pub fn take_injected_apply_failure() -> bool {
+    INJECTED_APPLY_FAILURES
+        .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
 /// How many decided writes each slot remembers, so a resent copy of a write gets the same answer.
 const DECIDED_CAP: usize = 1024;
 

@@ -1115,6 +1115,13 @@ pub enum Request {
         chunk_idx: u64,
         isr_epoch: u64,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): this node, as an ordered-write primary, fails its own
+    /// apply of the next `count` ordered writes AFTER announcing their versions, so the
+    /// secondary applies them (suite T68). APPENDED at end to preserve wire compatibility.
+    InjectOrderedApplyFailures {
+        count: u32,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

@@ -107,6 +107,21 @@ kill_client_and_wait() {
     kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
 }
 
+# fresh_read <file in the mount> <offset> <len>: read through a NEW client mount, so no writer's
+# own cache can serve its writes whatever the servers hold (that hid a real lost acked write in
+# T68, 2026-10-04). Prints the bytes decoded leniently.
+fresh_read() {
+    local m=/tmp/dfs-mount-fresh
+    mkdir -p "$m"
+    RUST_LOG=info "$BIN/dfs-client" mount "$m" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_fresh.log" --allow-other --log-level debug &
+    local pid=$!
+    sleep 2
+    python3 -c "f=open('$m/$1','rb');f.seek($2);print(f.read($3).decode(errors='replace'))" 2>/dev/null || true
+    fusermount -u "$m" 2>/dev/null || true
+    kill_client_and_wait "$pid"
+}
+
 # ── cleanup ──────────────────────────────────────────────────────────────────
 pkill -f "dfs-server" 2>/dev/null || true
 pkill -f "dfs-client" 2>/dev/null || true
@@ -5643,7 +5658,7 @@ print(online[0]['address'] if online else '')" 2>/dev/null || true)
     wait "$T66_W1" "$T66_W2" 2>/dev/null || true
     dfs_sync; sync "$T66_MOUNT2" 2>/dev/null || true
     sleep 3
-    T66_FRESH=$(python3 -c "f=open('$MOUNT/$T66_FILE','rb');f.seek(4*1024*1024+8192);print(f.read(10).decode(errors='replace'))" 2>/dev/null || true)
+    T66_FRESH=$(fresh_read "$T66_FILE" $((4*1024*1024+8192)) 10)
     T66_VERDICT=$(python3 - "$LOG/t66_w1.out" "$LOG/t66_w2.out" "$T66_FRESH" <<'PY'
 import json, sys
 fresh = sys.argv[3]
@@ -5774,7 +5789,7 @@ else
     wait "$T67_W1" "$T67_W2" 2>/dev/null || true
     dfs_sync; sync "$T67_MOUNT2" 2>/dev/null || true
     sleep 5
-    T67_FRESH=$(python3 -c "f=open('$MOUNT/$T67_FILE','rb');f.seek(4*1024*1024+8192);print(f.read(10).decode(errors='replace'))" 2>/dev/null || true)
+    T67_FRESH=$(fresh_read "$T67_FILE" $((4*1024*1024+8192)) 10)
     T67_VERDICT=$(python3 - "$LOG/t67_w1.out" "$LOG/t67_w2.out" "$T67_FRESH" <<'PY'
 import json, sys
 fresh = sys.argv[3]
@@ -5834,6 +5849,117 @@ rm -f "$MOUNT/$T67_FILE"
 fusermount -u "$T67_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T67_PID2"
 fi # should_run T67
+
+# ── Test 68: the primary's apply of an ordered write fails while the secondary's succeeds ──
+# The primary announces version v, then fails its own apply; the secondary applies v. The client
+# sees one replica succeed, backfills it and acks. The primary's stream then re-anchors from its
+# own head, which lacks v. If the secondary adopts that anchor, v is gone from both ordered
+# replicas although it was acked. One writer writes 30 distinct blocks of chunk 1 (fsync each);
+# chunk 1's primary is armed to fail one ordered apply after block 9. Checks: (a) every acked
+# block reads back; (b) both ISR replicas end byte-identical; (c) the injected failure fired.
+if should_run T68; then
+snapshot_log T68
+echo ""
+echo "=== T68: the primary fails an ordered apply the secondary made; no acked write may be lost (SLOT-OWNERSHIP 3c) ==="
+T68_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T68_FILE=t68_primary_fail.bin
+t68_check() {
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+dd if=/dev/urandom of="$MOUNT/$T68_FILE" bs=4M count=2 status=none
+dfs_sync
+T68_ISR=""
+for _ in $(seq 1 30); do
+    T68_ISR=$("$BIN/dfs-admin" --cluster "$T68_ALL" isr get --file "/$T68_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "
+import json,sys
+rs=[json.loads(l) for l in sys.stdin]
+ok=len(rs)==5 and all(r.get('isr') and r['isr'][1] for r in rs)
+print(' '.join(rs[0]['isr'][1]['members']) if ok else '')" 2>/dev/null || true)
+    [ -n "$T68_ISR" ] && break
+    sleep 1
+done
+T68_MAP=$("$BIN/dfs-admin" --cluster "$T68_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+read -r T68_PN T68_SN <<< "$T68_ISR"
+T68_P=$(echo "$T68_MAP" | awk -v n="$T68_PN" '$1==n{print $2}')
+T68_S=$(echo "$T68_MAP" | awk -v n="$T68_SN" '$1==n{print $2}')
+t68_writes() {  # first last: fsync'd 4K writes of "W<n>" to distinct blocks of chunk 1
+    python3 - "$MOUNT/$T68_FILE" "$1" "$2" <<'PY'
+import os, sys
+path, a, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+for i in range(a, b + 1):
+    try:
+        os.pwrite(fd, (b"W%06d" % i).ljust(4096, b"w"), 4 * 1024 * 1024 + i * 8192)
+        os.fsync(fd)
+        print("ACK", i)
+    except OSError as e:
+        print("FAIL", i, e)
+os.close(fd)
+PY
+}
+if [ -z "$T68_P" ] || [ -z "$T68_S" ]; then
+    check "T68 setup: chunk 1's ISR found ($T68_P,$T68_S)" FAIL
+else
+    T68_FIRED0=$(cat "$LOG"/server*.log | grep -ac "FAULT INJECTION: primary failing" || true)
+    echo "  T68: ISR primary=$T68_P secondary=$T68_S; failing one ordered apply on the primary after block 9"
+    T68_OUT=$(t68_writes 0 9)
+    "$BIN/dfs-admin" --cluster "$T68_P" fault fail-ordered --count 1 >/dev/null 2>&1 || true
+    T68_OUT="$T68_OUT
+$(t68_writes 10 29)"
+    dfs_sync
+    sleep 3
+    T68_ACKED=$(echo "$T68_OUT" | awk '$1=="ACK"{print $2}' | tr '\n' ' ')
+    # Read back through a FRESH client: the writing client's own cache would serve its writes
+    # whatever the servers hold (that hid a real loss on the first runs, 2026-10-04).
+    T68_MOUNT2=/tmp/dfs-mount2
+    mkdir -p "$T68_MOUNT2"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T68_MOUNT2" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t68b.log" --allow-other --log-level debug &
+    T68_PID2=$!
+    sleep 2
+    T68_BAD=$(python3 - "$T68_MOUNT2/$T68_FILE" "$T68_ACKED" <<'PY'
+import sys
+f = open(sys.argv[1], "rb")
+bad = []
+for i in map(int, sys.argv[2].split()):
+    f.seek(4 * 1024 * 1024 + i * 8192)
+    if f.read(4096) != (b"W%06d" % i).ljust(4096, b"w"): bad.append(i)
+print(" ".join(map(str, bad)))
+PY
+)
+    T68_NACK=$(echo "$T68_ACKED" | wc -w)
+    echo "  T68: $T68_NACK of 30 writes acked; $(echo "$T68_OUT" | grep -c '^FAIL') failed"
+    [ -z "$T68_BAD" ] \
+        && t68_check "T68a every acked write reads back ($T68_NACK acked)" PASS \
+        || t68_check "T68a acked write(s) $T68_BAD read back wrong -- lost" FAIL
+    T68_READ_RAW=$("$BIN/dfs-admin" --cluster "$T68_P,$T68_S" isr read --file "/$T68_FILE" --chunk 1 2>&1 || true)
+    T68_HASHES=$(echo "$T68_READ_RAW" | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T68_H1 T68_H2 <<< "$T68_HASHES"
+    if [ -n "$T68_H1" ] && [ "$T68_H1" = "$T68_H2" ] && [ "$T68_H1" != ERR ]; then
+        t68_check "T68b both ISR replicas hold identical bytes ($T68_H1)" PASS
+    else
+        t68_check "T68b ISR replicas differ or unreadable: $T68_HASHES" FAIL
+        echo "$T68_READ_RAW" | cut -c1-260 | sed 's/^/    read: /'
+    fi
+    fusermount -u "$T68_MOUNT2" 2>/dev/null || true
+    kill_client_and_wait "$T68_PID2"
+    T68_FIRED=$(( $(cat "$LOG"/server*.log | grep -ac "FAULT INJECTION: primary failing" || true) - ${T68_FIRED0:-0} ))
+    [ "${T68_FIRED:-0}" -ge 1 ] \
+        && t68_check "T68c the injected primary apply failure fired ($T68_FIRED)" PASS \
+        || t68_check "T68c the injected failure never fired: the writes after block 9 weren't ordered" FAIL
+fi
+rm -f "$MOUNT/$T68_FILE"
+fi # should_run T68
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

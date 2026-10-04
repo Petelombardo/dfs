@@ -8151,6 +8151,23 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
+        // An ordered write is in the slot's version stream only if its PRIMARY applied it: the
+        // primary is the authority the stream re-anchors from. If the primary failed while the
+        // secondary applied it, a raw backfill puts the bytes beside the stream, the primary's
+        // next write re-anchors from its own head (which lacks this write), the secondary adopts
+        // that anchor, and the acked write is gone from both (suite T68). So don't backfill-and-
+        // ack: fail this attempt, and the caller's retry sends the bytes again as a new version
+        // that both replicas apply. (A failed SECONDARY is fine: it resyncs from the primary,
+        // which has the write.)
+        if let Some(tag) = order_tags.values().next() {
+            if !patched_node_ids.contains(&tag.primary) {
+                warn!("MultiPatch: ordered write to file {} chunk {} wasn't applied by its primary {} — retrying it, not backfilling",
+                    tag.file_id, tag.chunk_idx, tag.primary);
+                return Err(anyhow::anyhow!(
+                    "MultiPatch: the primary didn't apply ordered write to file {} chunk {}; retry", tag.file_id, tag.chunk_idx));
+            }
+        }
+
         // Require at least 2 replicas whenever configured replication_factor >= 2 — a
         // chunk that lands on exactly 1 node is a single point of failure: if that one
         // node dies before the healer catches up, the chunk is unrecoverably lost.

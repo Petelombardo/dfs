@@ -1216,6 +1216,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::SetPeerFilter { .. }
         | Request::GetLeaseStatus
         | Request::InjectStall { .. }
+        | Request::InjectOrderedApplyFailures { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -7704,6 +7705,17 @@ impl Server {
             Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
             Request::GetLeaseStatus => Response::LeaseStatus { report: self.lease.status() },
             Request::InjectStall { target, millis } => self.handle_inject_stall(target, millis).await,
+            Request::InjectOrderedApplyFailures { count } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: failing this primary's apply of the next {} ordered write(s)", count);
+                crate::write_order::INJECTED_APPLY_FAILURES.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
             Request::SlotIsrPrepare { items } => self.slot_isr.handle_prepare(items).await,
             Request::SlotIsrAccept { items } => self.slot_isr.handle_accept(items).await,
             Request::SlotIsrCommit { items } => self.slot_isr.handle_commit(items).await,
@@ -15813,6 +15825,8 @@ impl Server {
                     };
                     match self.materialize_anchor(file_id, tag.chunk_idx, start).await {
                         Some(anchor) => {
+                            info!("[ORDER] primary: file {} chunk {} v{}: anchoring the stream on {} (from {}, head {:?})",
+                                file_id, tag.chunk_idx, version, anchor, start, head);
                             slot.set_anchor(anchor, version - 1);
                             anchor
                         }
@@ -15836,7 +15850,12 @@ impl Server {
                     }
                 });
             }
-            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
+            let resp = if crate::write_order::take_injected_apply_failure() {
+                warn!("FAULT INJECTION: primary failing its apply of v{} for file {} chunk {}", version, file_id, tag.chunk_idx);
+                Response::Error { message: "FAULT INJECTION: ordered apply failed on the primary".into(), code: ErrorCode::InternalError }
+            } else {
+                self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await
+            };
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             slot.finish(tag.write_id, version, &resp);
             resp

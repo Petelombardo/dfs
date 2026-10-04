@@ -154,6 +154,12 @@ enum FaultCommands {
     },
     /// Heal every injected link failure on the node.
     Clear,
+    /// Test-only: as an ordered-write primary, fail this node's own apply of the next
+    /// `count` ordered writes after announcing them (the secondary still applies them).
+    FailOrdered {
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
     /// Hold one subsystem's lock for a while: metadata-db, healer-maps or cluster-membership.
     Stall {
         #[arg(long)]
@@ -1774,6 +1780,16 @@ async fn handle_isr_command(cmd: IsrCommands, cluster_addrs: &[SocketAddr]) -> R
 }
 
 async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) -> Result<()> {
+    if let FaultCommands::FailOrdered { count } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectOrderedApplyFailures { count: *count }).await? {
+                Response::Ok { .. } => println!("{}: failing the next {} ordered apply(s) as primary", addr, count),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::Stall { target, millis } = &cmd {
         let target = match target.as_str() {
             "metadata-db" => dfs_common::StallTarget::MetadataDb,
@@ -1797,7 +1813,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
             mode: if black_hole { dfs_common::PeerFilterMode::BlackHole } else { dfs_common::PeerFilterMode::Refuse },
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
-        FaultCommands::Stall { .. } => unreachable!("handled above"),
+        FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } => unreachable!("handled above"),
     };
     for &addr in cluster_addrs {
         match send_request(addr, Request::SetPeerFilter { filter: filter.clone() }).await? {

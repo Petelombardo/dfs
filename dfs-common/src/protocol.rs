@@ -1147,6 +1147,17 @@ pub enum Request {
         isr_epoch: u64,
         failed: NodeId,
     },
+
+    /// Primary -> its secondary at `isr_epoch`: resync the slot from me now (pull my head as a
+    /// real anchor at my current version). Sent when a client reports the secondary failed a
+    /// write but it is still reachable: versions it missed (their WriteOrders dropped) would
+    /// otherwise leave it stale inside the ISR until some later write happened to reach it
+    /// (suite T69 row #3). APPENDED at end to preserve wire compatibility.
+    ResyncFromPrimary {
+        file_id: FileId,
+        chunk_idx: u64,
+        isr_epoch: u64,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

@@ -5983,6 +5983,196 @@ fi
 rm -f "$MOUNT/$T68_FILE"
 fi # should_run T68
 
+# ── Test 69: the failure matrix under ordered writes (SLOT-OWNERSHIP-PLAN §7, Phase 3d) ──────
+# Rows #2/#6 (P–S link cut, both reach the majority), #3 (S isolated from everyone), #5+#11 (P cut
+# off from the majority but reachable by clients; then healed), #10 (P and S both frozen). Each
+# case: fresh file, two writers on one block of chunk 1 for 18s, the fault 4s in for 7s. Checked
+# for every case:
+#   I1 no acked write lost (read through a fresh client)
+#   I2 never two primaries at one ISR epoch (from the servers' "[ORDER] primary: ordering" lines)
+#   I3 no unclean promotion: each new epoch's primary was a member of the previous epoch
+#   I4 the CURRENT ISR pair ends byte-identical
+# plus the row's own decision: #2/#3 keep the primary (no promotion); #5 moves it (takeover).
+# T69_CASES picks cases (default: all). Requires DFS_ORDERED_WRITES=1 (informational without).
+if should_run T69; then
+snapshot_log T69
+echo ""
+echo "=== T69: failure matrix rows #2/#6, #3, #5+#11, #10 under ordered writes (SLOT-OWNERSHIP 3d) ==="
+T69_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
+T69_ALL="$(IFS=,; echo "${T69_NODES[*]}")"
+T69_MOUNT2=/tmp/dfs-mount2
+mkdir -p "$T69_MOUNT2"
+RUST_LOG=info "$BIN/dfs-client" mount "$T69_MOUNT2" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t69b.log" --allow-other --log-level debug &
+T69_PID2=$!
+sleep 2
+mountpoint -q "$T69_MOUNT2" || check "T69 second client mounted" FAIL
+t69_check() {
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t69_pid_of() {   # addr -> dfs-server pid
+    local n=$(( ${1##*:} - 8900 + 1 ))
+    for p in $(pgrep -x dfs-server || true); do
+        tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "node$n/config.toml" && echo "$p"
+    done
+    true
+}
+t69_others() {   # addr -> every other node, comma-separated
+    local out=""
+    for n in "${T69_NODES[@]}"; do [ "$n" != "$1" ] && out="$out${out:+,}$n"; done
+    echo "$out"
+}
+t69_isr() {   # file -> "epoch primary-addr secondary-addr" (highest epoch any node reports)
+    local raw map
+    raw=$("$BIN/dfs-admin" --cluster "$T69_ALL" isr get --file "/$1" --chunks 2 2>/dev/null || true)
+    map=$("$BIN/dfs-admin" --cluster "$T69_ALL" lease status 2>/dev/null || true)
+    python3 - "$raw" "$map" <<'PY'
+import json, sys
+best = None
+for l in sys.argv[1].splitlines():
+    try: r = json.loads(l)["isr"][1]
+    except Exception: continue
+    if r and (best is None or r["epoch"] > best["epoch"]): best = r
+addr = {}
+for l in sys.argv[2].splitlines():
+    try: r = json.loads(l)
+    except Exception: continue
+    if "node" in r: addr[r["node"]] = r["addr"]
+if best:
+    print(best["epoch"], addr.get(best["members"][0], "?"), addr.get(best["members"][1], "?"))
+PY
+}
+t69_writer() {  # mount file tag seconds out
+    python3 - "$1/$2" "$3" "$4" > "$5" 2>&1 <<'PY'
+import os, sys, time, json
+path, tag, secs = sys.argv[1], sys.argv[2].encode(), float(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+off = 4 * 1024 * 1024 + 8192
+start = time.time(); i = 0
+acked = []; failed = []
+while time.time() - start < secs:
+    try:
+        os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
+        os.fsync(fd)
+        acked.append(i)
+    except OSError:
+        failed.append(i)
+        time.sleep(0.2)
+    i += 1
+os.close(fd)
+print(json.dumps({"acked": acked, "failed": failed}))
+PY
+}
+t69_heal() {
+    for n in "${T69_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
+}
+T69_CASES=${T69_CASES:-row2 row3 row5 row10}
+for T69_CASE in $T69_CASES; do
+    T69_FILE=t69_$T69_CASE.bin
+    dd if=/dev/urandom of="$MOUNT/$T69_FILE" bs=4M count=2 status=none
+    dfs_sync
+    T69_START=""
+    for _ in $(seq 1 30); do
+        T69_START=$(t69_isr "$T69_FILE")
+        [ -n "$T69_START" ] && break
+        sleep 1
+    done
+    read -r T69_E0 T69_P T69_S <<< "$T69_START"
+    if [ -z "$T69_P" ] || [ "$T69_P" = "?" ] || [ -z "$T69_S" ] || [ "$T69_S" = "?" ]; then
+        check "T69[$T69_CASE] setup: chunk 1's ISR found ($T69_START)" FAIL
+        rm -f "${MOUNT:?}/${T69_FILE:?}"; continue
+    fi
+    T69_FID=$(grep -h "\[META SERVER\] put path=/$T69_FILE id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+    echo "  T69[$T69_CASE]: ISR epoch $T69_E0 primary=$T69_P secondary=$T69_S"
+    t69_writer "$MOUNT" "$T69_FILE" A 18 "$LOG/t69_w1.out" & T69_W1=$!
+    t69_writer "$T69_MOUNT2" "$T69_FILE" B 18 "$LOG/t69_w2.out" & T69_W2=$!
+    sleep 4
+    case "$T69_CASE" in
+        row2)   # P–S link cut both ways; both still reach everyone else and the clients
+            "$BIN/dfs-admin" --cluster "$T69_P" fault set --drop-to "$T69_S" >/dev/null 2>&1 || true
+            "$BIN/dfs-admin" --cluster "$T69_S" fault set --drop-to "$T69_P" >/dev/null 2>&1 || true
+            sleep 7; t69_heal ;;
+        row3)   # S isolated from every peer and from clients
+            "$BIN/dfs-admin" --cluster "$T69_S" fault set --drop-to "$(t69_others "$T69_S")" --refuse-clients >/dev/null 2>&1 || true
+            for n in "${T69_NODES[@]}"; do [ "$n" != "$T69_S" ] && "$BIN/dfs-admin" --cluster "$n" fault set --drop-to "$T69_S" >/dev/null 2>&1; done
+            sleep 7; t69_heal ;;
+        row5)   # P cut off from every peer; clients still reach it. Then healed (#11).
+            "$BIN/dfs-admin" --cluster "$T69_P" fault set --drop-to "$(t69_others "$T69_P")" >/dev/null 2>&1 || true
+            for n in "${T69_NODES[@]}"; do [ "$n" != "$T69_P" ] && "$BIN/dfs-admin" --cluster "$n" fault set --drop-to "$T69_P" >/dev/null 2>&1; done
+            sleep 10; t69_heal ;;   # lease 3s + margin, then a majority vote: takeover takes ~5s
+        row10)  # P and S both frozen
+            T69_PP=$(t69_pid_of "$T69_P"); T69_SP=$(t69_pid_of "$T69_S")
+            kill -STOP $T69_PP $T69_SP; sleep 7; kill -CONT $T69_PP $T69_SP ;;
+    esac
+    wait "$T69_W1" "$T69_W2" 2>/dev/null || true
+    dfs_sync; sync "$T69_MOUNT2" 2>/dev/null || true
+    sleep 3
+    T69_FRESH=$(fresh_read "$T69_FILE" $((4*1024*1024+8192)) 10)
+    T69_END=$(t69_isr "$T69_FILE")
+    read -r T69_E1 T69_CP T69_CS <<< "$T69_END"
+    T69_V=$(python3 - "$LOG/t69_w1.out" "$LOG/t69_w2.out" "$T69_FRESH" "$T69_FID" <<'PY'
+import json, sys, re, glob
+fresh, fid = sys.argv[3], sys.argv[4]
+ok, acks = False, []
+for path, tag in ((sys.argv[1], "A"), (sys.argv[2], "B")):
+    try: r = json.loads(open(path).read().strip().splitlines()[-1])
+    except Exception: r = {"acked": [], "failed": []}
+    last = max(r["acked"]) if r["acked"] else -1
+    allowed = {last} | {f for f in r["failed"] if f > last}
+    if fresh[:1] == tag and fresh[1:7].isdigit() and int(fresh[1:7]) in allowed: ok = True
+    acks.append("%s:%d acked/%d failed" % (tag, len(r["acked"]), len(r["failed"])))
+# I2/I3 from the servers' logs for this file's chunk 1
+primaries, commits = {}, {}
+for path in glob.glob("/tmp/dfs-test-logs/server*.log"):
+    node = path.rsplit("/", 1)[1]
+    for line in open(path, errors="replace"):
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        if not fid or fid not in line: continue
+        m = re.search(r"\[ORDER\] primary: ordering file \S+ chunk 1 epoch (\d+)", line)
+        if m: primaries.setdefault(int(m.group(1)), set()).add(node)
+        m = re.search(r"SLOT ISR: file \S+ chunk 1 epoch (\d+) = \[(.*)\]", line)
+        if m: commits[int(m.group(1))] = re.findall(r"NodeId\(([0-9a-f-]+)\)", m.group(2))
+two = {e: sorted(n) for e, n in primaries.items() if len(n) > 1}
+unclean = [e for e in sorted(commits) if e - 1 in commits and commits[e] and commits[e][0] not in commits[e - 1]]
+print("OK" if ok else "LOST", "TWO=%s" % (two or "none"), "UNCLEAN=%s" % (unclean or "none"), " ".join(acks))
+PY
+)
+    echo "  T69[$T69_CASE]: servers hold $T69_FRESH; ISR now epoch ${T69_E1:-?} primary=${T69_CP:-?} secondary=${T69_CS:-?}; $T69_V"
+    case "$T69_V" in OK*) t69_check "T69[$T69_CASE] I1 no acked write lost" PASS ;;
+                     *)   t69_check "T69[$T69_CASE] I1 servers hold $T69_FRESH, not a writer's last acked write" FAIL ;; esac
+    case "$T69_V" in *TWO=none*) t69_check "T69[$T69_CASE] I2 one primary per ISR epoch" PASS ;;
+                     *)          t69_check "T69[$T69_CASE] I2 two primaries ordered writes at one epoch: $T69_V" FAIL ;; esac
+    case "$T69_V" in *UNCLEAN=none*) t69_check "T69[$T69_CASE] I3 no unclean promotion" PASS ;;
+                     *)              t69_check "T69[$T69_CASE] I3 an epoch's primary wasn't in the previous epoch: $T69_V" FAIL ;; esac
+    T69_HASHES=$("$BIN/dfs-admin" --cluster "${T69_CP},${T69_CS}" isr read --file "/$T69_FILE" --chunk 1 2>/dev/null | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T69_H1 T69_H2 <<< "$T69_HASHES"
+    [ -n "$T69_H1" ] && [ "$T69_H1" = "$T69_H2" ] && [ "$T69_H1" != ERR ] \
+        && t69_check "T69[$T69_CASE] I4 current ISR replicas identical ($T69_H1)" PASS \
+        || t69_check "T69[$T69_CASE] I4 current ISR replicas differ or unreadable: $T69_HASHES" FAIL
+    case "$T69_CASE" in
+        row2|row3) [ "$T69_CP" = "$T69_P" ] \
+            && t69_check "T69[$T69_CASE] no promotion: the primary stayed ($T69_P)" PASS \
+            || t69_check "T69[$T69_CASE] the primary moved $T69_P -> $T69_CP without being voted out" FAIL ;;
+        row5) [ "$T69_CP" != "$T69_P" ] && [ "${T69_E1:-0}" -gt "$T69_E0" ] \
+            && t69_check "T69[row5] takeover: primary $T69_P -> $T69_CP at epoch $T69_E1" PASS \
+            || t69_check "T69[row5] no takeover after the primary was cut off (epoch ${T69_E1:-?}, primary ${T69_CP:-?})" FAIL ;;
+    esac
+    t69_heal
+    rm -f "${MOUNT:?}/${T69_FILE:?}"
+    sleep 3
+done
+fusermount -u "$T69_MOUNT2" 2>/dev/null || true
+kill_client_and_wait "$T69_PID2"
+fi # should_run T69
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

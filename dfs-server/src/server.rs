@@ -1165,6 +1165,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ResyncSlot { .. } => PeerOther,
         Request::GetOrSeedSlotIsr { .. }
         | Request::ReplaceIsrMember { .. } => ClientOther,
+        Request::ResyncFromPrimary { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -7746,6 +7747,8 @@ impl Server {
             Request::GetOrSeedSlotIsr { file_id, chunk_idx } => self.handle_get_or_seed_slot_isr(file_id, chunk_idx).await,
             Request::ReplaceIsrMember { file_id, chunk_idx, isr_epoch, failed } =>
                 self.handle_replace_isr_member(file_id, chunk_idx, isr_epoch, failed).await,
+            Request::ResyncFromPrimary { file_id, chunk_idx, isr_epoch } =>
+                self.handle_resync_from_primary(file_id, chunk_idx, isr_epoch).await,
             Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
                 if !crate::network::fault_injection_allowed() {
                     Response::Error {
@@ -11190,7 +11193,15 @@ impl Server {
                 None => false,
             };
             if reachable {
-                return refuse(format!("secondary {} answers here; not excluding it", failed));
+                // Reachable but it failed a write: it may have missed versions (their
+                // WriteOrders dropped). Have it resync from us now rather than stay stale
+                // inside the ISR until some later write reaches it.
+                if let Some(addr) = addr {
+                    let req = Request::ResyncFromPrimary { file_id, chunk_idx, isr_epoch: cur.epoch };
+                    let client = self.client.clone();
+                    tokio::spawn(async move { let _ = client.send_message(addr, Message::Request(req)).await; });
+                }
+                return refuse(format!("secondary {} answers here; not excluding it (asked it to resync)", failed));
             }
         } else if !self.lease.is_expired(failed) {
             // Secondary taking over: only from a primary a majority voted expired, or two
@@ -15985,6 +15996,17 @@ impl Server {
             if let Some(prev @ crate::write_order::Decision::Ordered { response: Some(_), .. }) = slot.decided(tag.write_id) {
                 return Self::ordered_resend_response(tag.write_id, prev);
             }
+            // A primary a majority voted expired will never send this write's order: fail now so
+            // the client can ask us to take over, instead of every attempt hanging on our turn
+            // timeout (and the client's RPC timeout) for as long as the primary is cut off
+            // (suite T69 row #5: one 6s round per attempt; the cut outlasted the takeover).
+            if self.lease.is_expired(tag.primary) {
+                return Response::Error {
+                    message: format!("Ordered: primary {} of file {} chunk {} is expired by a majority; ask the secondary to take over",
+                        tag.primary, tag.file_id, tag.chunk_idx),
+                    code: ErrorCode::InvalidRequest,
+                };
+            }
             const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
             let (version, primary_base) = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
                 Ok(v) => v,
@@ -16299,6 +16321,27 @@ impl Server {
             }
         };
         self.ensure_anchor_local(tag.file_id, tag.chunk_idx, anchor, tag.primary).await.then_some((anchor, at))
+    }
+
+    /// Secondary side of `Request::ResyncFromPrimary`.
+    async fn handle_resync_from_primary(&self, file_id: FileId, chunk_idx: u64, isr_epoch: u64) -> Response {
+        let me = self.cluster.local_node_id();
+        let Some(cur) = self.slot_isr.get(file_id, chunk_idx).filter(|c| c.epoch == isr_epoch && c.members.get(1) == Some(&me)) else {
+            return Response::Error { message: "ResyncFromPrimary: not this slot's secondary at that epoch".into(), code: ErrorCode::InvalidRequest };
+        };
+        let tag = dfs_common::WriteOrderTag {
+            file_id, chunk_idx, isr_epoch, primary: cur.members[0], secondary: me, write_id: 0,
+        };
+        let slot = self.write_ordering.slot(file_id, chunk_idx, isr_epoch);
+        let _order = slot.order_lock.lock().await;
+        match self.resync_from_primary(&tag).await {
+            Some((anchor, at)) => {
+                info!("[ORDER] secondary: file {} chunk {}: resynced from the primary at v{} on its request ({})", file_id, chunk_idx, at, anchor);
+                slot.set_anchor(anchor, at);
+                Response::Ok { data: None }
+            }
+            None => Response::Error { message: "ResyncFromPrimary: resync failed".into(), code: ErrorCode::InternalError },
+        }
     }
 
     /// Primary side of `Request::ResyncSlot`.

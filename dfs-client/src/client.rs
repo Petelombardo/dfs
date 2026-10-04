@@ -7969,6 +7969,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
         // (addr, Ok((chunk_id, size, patch_ts_from_server)))
         let mut replica_results: Vec<(SocketAddr, Result<(ChunkId, usize, Option<u64>)>)> = Vec::new();
+        // Replicas that failed at the transport level (no reply at all), as opposed to a reply
+        // that is an error. Tracked structurally: matching error text missed "read len" from a
+        // node that drops client connections (suite T69 row #3).
+        let mut transport_failed_addrs: Vec<SocketAddr> = Vec::new();
         // If any replica reports a stale base, record its corrected location for a
         // potential full retry. We do NOT continue 'retry immediately upon the first
         // stale response — doing so discards all successful results from other replicas
@@ -8045,10 +8049,68 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
                 Err(e) => {
                     warn!("MultiPatch replica {} failed: {}", addr, e);
+                    transport_failed_addrs.push(addr);
                     replica_results.push((addr, Err(e)));
                 }
                 _ => {
                     replica_results.push((addr, Err(anyhow::anyhow!("unexpected response"))));
+                }
+            }
+        }
+
+        // Phase 3d: an ISR member that failed at the TRANSPORT level (timeout, refused, reset)
+        // is replaced now, by the other member, which verifies the failure itself. Decided as
+        // soon as the per-replica results are in, before any "no replica succeeded" bail-out:
+        // with the primary refusing (lease lapsed) and the secondary waiting for orders that
+        // never come, both fail and the takeover request was never sent (suite T69 row #5). Waiting
+        // for a penalty flag missed it: a dead node "recovers" after every single failure, and
+        // the client drifted to an unordered pair with a non-ISR node instead (suite T67).
+        if let Some(tag) = order_tags.values().next() {
+            let transport_failed = |node: dfs_common::NodeId| transport_failed_addrs.iter()
+                .any(|a| addr_to_node_id_snap.get(a) == Some(&node));
+            // A secondary that REPLIED with an error while the primary applied the write (e.g.
+            // its turn timed out because the order never arrived) has missed a version too:
+            // the primary checks it and, if reachable, has it resync.
+            let secondary_errored = replica_results.iter().any(|(a, r)| addr_to_node_id_snap.get(a) == Some(&tag.secondary) && r.is_err());
+            let addr_of = |n: dfs_common::NodeId| addr_to_node_id_snap.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
+            // A primary cut off from the majority still answers clients but refuses: its lease
+            // lapsed (it fenced itself). That's a reply, not a transport failure, and without
+            // this nobody asked S to take over: writes stalled until the link healed (suite
+            // T69 row #5). S still takes over only from a primary a majority voted expired.
+            let refused_as_primary = replica_results.iter().any(|(a, r)| {
+                addr_to_node_id_snap.get(a) == Some(&tag.primary)
+                    && matches!(r, Err(e) if e.to_string().starts_with("Ordered: not the primary"))
+            }) || replica_results.iter().any(|(a, r)| {
+                // The secondary says a majority already voted the primary expired.
+                addr_to_node_id_snap.get(a) == Some(&tag.secondary)
+                    && matches!(r, Err(e) if e.to_string().contains("is expired by a majority; ask the secondary to take over"))
+            });
+            let primary_ok = replica_results.iter().any(|(a, r)| addr_to_node_id_snap.get(a) == Some(&tag.primary) && r.is_ok());
+            let ask = if (transport_failed(tag.secondary) || secondary_errored) && primary_ok {
+                addr_of(tag.primary).map(|a| (a, tag.secondary))
+            } else if (transport_failed(tag.primary) || refused_as_primary) && !primary_ok {
+                addr_of(tag.secondary).map(|a| (a, tag.primary))
+            } else {
+                None
+            };
+            if let Some((healthy, failed)) = ask {
+                let req = Request::ReplaceIsrMember { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch, failed };
+                match self.send_request(healthy, req).await {
+                    Ok(Response::SlotIsrRecords { records }) => {
+                        if let Some(next) = records.into_iter().next().flatten().filter(|n| n.epoch > tag.isr_epoch) {
+                            info!("ISR for file {} chunk {}: epoch {} -> {} after member {} failed (members {:?}) -- retrying on the new pair",
+                                tag.file_id, tag.chunk_idx, tag.isr_epoch, next.epoch, failed, next.members);
+                            self.slot_isr_cache.insert((tag.file_id, tag.chunk_idx), next);
+                            // Never ack below two copies: rather than a raw backfill (which can
+                            // fail to read the token back and settle for ONE replica), resend
+                            // the write to the new pair, where the replacement catches up from
+                            // the primary first. The primary re-applies identical bytes.
+                            return Err(anyhow::anyhow!(
+                                "MultiPatch: ISR member replaced for file {} chunk {}; retry on the new pair", tag.file_id, tag.chunk_idx));
+                        }
+                    }
+                    other => info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",
+                        tag.file_id, tag.chunk_idx, failed, other.map(|r| dfs_common::debug_truncated(&r, 200)).unwrap_or_else(|e| e.to_string())),
                 }
             }
         }
@@ -8222,49 +8284,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         // ack: fail this attempt, and the caller's retry sends the bytes again as a new version
         // that both replicas apply. (A failed SECONDARY is fine: it resyncs from the primary,
         // which has the write.)
-        // Phase 3d: an ISR member that failed at the TRANSPORT level (timeout, refused, reset)
-        // is replaced now, by the other member, which verifies the failure itself. Waiting
-        // for a penalty flag missed it: a dead node "recovers" after every single failure, and
-        // the client drifted to an unordered pair with a non-ISR node instead (suite T67).
-        if let Some(tag) = order_tags.values().next() {
-            let transport_failed = |node: dfs_common::NodeId| replica_results.iter().any(|(a, r)| {
-                addr_to_node_id_snap.get(a) == Some(&node)
-                    && matches!(r, Err(e) if {
-                        let m = e.to_string();
-                        m.contains("Timeout") || m.contains("timed out") || m.contains("connect")
-                            || m.contains("Connection") || m.contains("reset")
-                    })
-            });
-            let addr_of = |n: dfs_common::NodeId| addr_to_node_id_snap.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
-            let ask = if transport_failed(tag.secondary) && patched_node_ids.contains(&tag.primary) {
-                addr_of(tag.primary).map(|a| (a, tag.secondary))
-            } else if transport_failed(tag.primary) && !patched_node_ids.contains(&tag.primary) {
-                addr_of(tag.secondary).map(|a| (a, tag.primary))
-            } else {
-                None
-            };
-            if let Some((healthy, failed)) = ask {
-                let req = Request::ReplaceIsrMember { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch, failed };
-                match self.send_request(healthy, req).await {
-                    Ok(Response::SlotIsrRecords { records }) => {
-                        if let Some(next) = records.into_iter().next().flatten().filter(|n| n.epoch > tag.isr_epoch) {
-                            info!("ISR for file {} chunk {}: epoch {} -> {} after member {} failed (members {:?}) -- retrying on the new pair",
-                                tag.file_id, tag.chunk_idx, tag.isr_epoch, next.epoch, failed, next.members);
-                            self.slot_isr_cache.insert((tag.file_id, tag.chunk_idx), next);
-                            // Never ack below two copies: rather than a raw backfill (which can
-                            // fail to read the token back and settle for ONE replica), resend
-                            // the write to the new pair, where the replacement catches up from
-                            // the primary first. The primary re-applies identical bytes.
-                            return Err(anyhow::anyhow!(
-                                "MultiPatch: ISR member replaced for file {} chunk {}; retry on the new pair", tag.file_id, tag.chunk_idx));
-                        }
-                    }
-                    other => info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",
-                        tag.file_id, tag.chunk_idx, failed, other.map(|r| dfs_common::debug_truncated(&r, 200)).unwrap_or_else(|e| e.to_string())),
-                }
-            }
-        }
-
         if let Some(tag) = order_tags.values().next() {
             if !patched_node_ids.contains(&tag.primary) {
                 warn!("MultiPatch: ordered write to file {} chunk {} wasn't applied by its primary {} — retrying it, not backfilling",

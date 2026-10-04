@@ -180,6 +180,17 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       T57a (the delete-resurrection divergence; fix on unmerged fix/delete-resurrection).
       Not yet: the flap guard (a replaced node is simply not re-added, so flapping costs nothing
       today); the plan's failure-matrix rows as their own tests.
+- [~] **Phase 3d failure-matrix test T69 (2026-10-04, committed locally, NOT pushed):** rows #2/#6,
+      #3, #5+#11, #10 with invariants I1 no acked write lost, I2 one primary per epoch, I3 no
+      unclean promotion, I4 current ISR identical. 19/19 together; row #5 takeover 4/4. Fixes it
+      drove: replace/takeover decided before the "no replica succeeded" bail-out; transport
+      failures tracked structurally ("read len" was missed); a primary that finds a reported-failed
+      secondary REACHABLE makes it resync (ResyncFromPrimary, appended) instead of leaving it stale
+      in the ISR; a secondary fails fast once the primary is voted expired (each attempt cost a 6s
+      timeout). T66-T68 15/15. PENDING: full suites (disk filled to 100% in the flag-off run;
+      flag-on run hit the T13b rename flake → T14 aborts the suite). RESUME: add disk space, rerun
+      both full suites (`{ time DFS_ORDERED_WRITES=1 ./scripts/test_local_suite.sh; } > ...`,
+      then =0, `rm -rf /tmp/dfs-test` between), push if clean, update Legata (3d task).
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

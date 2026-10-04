@@ -7593,10 +7593,37 @@ leader_addr: Arc::new(RwLock::new(None)),
         addr_to_node_id: &HashMap<SocketAddr, dfs_common::NodeId>,
     ) -> Option<[SocketAddr; 2]> {
         let ask = *replica_addrs.first()?;
-        let isr = self.slot_isr_for(file_id, chunk_idx, ask).await?;
+        let mut isr = self.slot_isr_for(file_id, chunk_idx, ask).await?;
         let addr_of = |n: dfs_common::NodeId| addr_to_node_id.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
-        let (p, s) = (addr_of(*isr.members.first()?)?, addr_of(*isr.members.get(1)?)?);
-        if !replica_addrs.contains(&p) || !replica_addrs.contains(&s) {
+        let (mut p, mut s) = (addr_of(*isr.members.first()?)?, addr_of(*isr.members.get(1)?)?);
+        let (p_bad, s_bad) = (self.node_health.is_penalized(p).await, self.node_health.is_penalized(s).await);
+        if p_bad != s_bad {
+            // One member is down: ask the other to replace it (Phase 3d) rather than falling
+            // back to an unordered pair with a non-ISR node, where two writers can diverge
+            // (suite T67). The healthy member verifies the failure itself before committing.
+            let (healthy, failed) = if p_bad { (s, isr.members[0]) } else { (p, isr.members[1]) };
+            let req = Request::ReplaceIsrMember { file_id, chunk_idx, isr_epoch: isr.epoch, failed };
+            match self.send_request(healthy, req).await {
+                Ok(Response::SlotIsrRecords { records }) => {
+                    let next = records.into_iter().next().flatten()?;
+                    if next.epoch <= isr.epoch {
+                        return None;
+                    }
+                    info!("ISR for file {} chunk {}: epoch {} -> {} (replaced a down member)", file_id, chunk_idx, isr.epoch, next.epoch);
+                    self.slot_isr_cache.insert((file_id, chunk_idx), next.clone());
+                    isr = next;
+                    p = addr_of(*isr.members.first()?)?;
+                    s = addr_of(*isr.members.get(1)?)?;
+                }
+                other => {
+                    info!("ReplaceIsrMember for file {} chunk {} declined: {:?}", file_id, chunk_idx, other.map(|r| dfs_common::debug_truncated(&r, 200)));
+                    return None;
+                }
+            }
+        }
+        // The primary must hold the chunk; a fresh secondary (a replacement) catches up from
+        // the primary through the ordered stream's anchor before any write is acked.
+        if !replica_addrs.contains(&p) {
             return None;
         }
         if self.node_health.is_penalized(p).await || self.node_health.is_penalized(s).await {
@@ -7931,7 +7958,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             // A primary that no longer is one: forget the cached ISR so the next attempt
             // looks it up again.
             let stale_isr = results.iter().any(|(_, r)| matches!(r,
-                Ok(Response::Error { message, .. }) if message.starts_with("Ordered: not the primary")));
+                Ok(Response::Error { message, .. }) if message.starts_with("Ordered: not the primary")
+                    || message.starts_with("Ordered: stale ISR epoch")));
             if stale_isr {
                 self.slot_isr_cache.remove(&(file_id, cidx));
             }
@@ -8194,6 +8222,49 @@ leader_addr: Arc::new(RwLock::new(None)),
         // ack: fail this attempt, and the caller's retry sends the bytes again as a new version
         // that both replicas apply. (A failed SECONDARY is fine: it resyncs from the primary,
         // which has the write.)
+        // Phase 3d: an ISR member that failed at the TRANSPORT level (timeout, refused, reset)
+        // is replaced now, by the other member, which verifies the failure itself. Waiting
+        // for a penalty flag missed it: a dead node "recovers" after every single failure, and
+        // the client drifted to an unordered pair with a non-ISR node instead (suite T67).
+        if let Some(tag) = order_tags.values().next() {
+            let transport_failed = |node: dfs_common::NodeId| replica_results.iter().any(|(a, r)| {
+                addr_to_node_id_snap.get(a) == Some(&node)
+                    && matches!(r, Err(e) if {
+                        let m = e.to_string();
+                        m.contains("Timeout") || m.contains("timed out") || m.contains("connect")
+                            || m.contains("Connection") || m.contains("reset")
+                    })
+            });
+            let addr_of = |n: dfs_common::NodeId| addr_to_node_id_snap.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
+            let ask = if transport_failed(tag.secondary) && patched_node_ids.contains(&tag.primary) {
+                addr_of(tag.primary).map(|a| (a, tag.secondary))
+            } else if transport_failed(tag.primary) && !patched_node_ids.contains(&tag.primary) {
+                addr_of(tag.secondary).map(|a| (a, tag.primary))
+            } else {
+                None
+            };
+            if let Some((healthy, failed)) = ask {
+                let req = Request::ReplaceIsrMember { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch, failed };
+                match self.send_request(healthy, req).await {
+                    Ok(Response::SlotIsrRecords { records }) => {
+                        if let Some(next) = records.into_iter().next().flatten().filter(|n| n.epoch > tag.isr_epoch) {
+                            info!("ISR for file {} chunk {}: epoch {} -> {} after member {} failed (members {:?}) -- retrying on the new pair",
+                                tag.file_id, tag.chunk_idx, tag.isr_epoch, next.epoch, failed, next.members);
+                            self.slot_isr_cache.insert((tag.file_id, tag.chunk_idx), next);
+                            // Never ack below two copies: rather than a raw backfill (which can
+                            // fail to read the token back and settle for ONE replica), resend
+                            // the write to the new pair, where the replacement catches up from
+                            // the primary first. The primary re-applies identical bytes.
+                            return Err(anyhow::anyhow!(
+                                "MultiPatch: ISR member replaced for file {} chunk {}; retry on the new pair", tag.file_id, tag.chunk_idx));
+                        }
+                    }
+                    other => info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",
+                        tag.file_id, tag.chunk_idx, failed, other.map(|r| dfs_common::debug_truncated(&r, 200)).unwrap_or_else(|e| e.to_string())),
+                }
+            }
+        }
+
         if let Some(tag) = order_tags.values().next() {
             if !patched_node_ids.contains(&tag.primary) {
                 warn!("MultiPatch: ordered write to file {} chunk {} wasn't applied by its primary {} — retrying it, not backfilling",
@@ -8363,6 +8434,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Still accept the write (refusing would strand the client with no way
                 // to persist durable data during a real outage) but make this loud and
                 // immediately actionable rather than silently routine.
+                // Ordered writes never ack below two copies (SLOT-OWNERSHIP 3d: "the durability
+                // floor is never lowered"). Retrying either reaches the ISR pair again (a member
+                // that came back resyncs from the primary) or gets the down member replaced; a
+                // raw single copy beside the stream is neither (suite T67: 1-3 per run before).
+                if let Some(tag) = order_tags.values().next() {
+                    warn!("MultiPatch: ordered write to file {} chunk {} reached only {}/{} copies -- retrying, not acking one",
+                        tag.file_id, tag.chunk_idx, patched_node_ids.len(), required_replicas);
+                    return Err(anyhow::anyhow!(
+                        "MultiPatch: ordered write reached only {}/{} copies; retry", patched_node_ids.len(), required_replicas));
+                }
                 self.single_replica_emergency_count.fetch_add(1, Ordering::Relaxed);
                 error!("URGENT_SINGLE_REPLICA: chunk {} landed on only {}/{} replica(s) after \
                         exhausting all reachable candidates — cluster degraded, queuing urgent heal",

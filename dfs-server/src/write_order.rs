@@ -116,6 +116,18 @@ impl WriteOrdering {
         }
     }
 
+    /// Whether the slot's ordered stream applied a version here within `window`. A background
+    /// (unordered) fold must wait while it is: folding one replica mid-stream resets its
+    /// accumulator, so later writes mint different ids on the two replicas (suite T67 after a
+    /// replacement: a no-op retry folded anchor+delta -> anchor on the secondary only). While
+    /// the stream is active the client's ordered ForceFold folds; once it is quiet, both
+    /// replicas fold the same content into the same content-addressed id.
+    pub fn stream_active(&self, file_id: FileId, chunk_idx: u64, window: std::time::Duration) -> bool {
+        self.latest_slot(file_id, chunk_idx).is_some_and(|slot| {
+            slot.inner.lock().unwrap().last_active.is_some_and(|t| t.elapsed() < window)
+        })
+    }
+
     /// The slot's newest ordered stream, if it has one (never creates one).
     pub fn latest_slot(&self, file_id: FileId, chunk_idx: u64) -> Option<Arc<SlotOrder>> {
         let epoch = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e)?;
@@ -161,6 +173,8 @@ struct Inner {
     stream: Option<u64>,
     decided: HashMap<u128, Decision>,
     decided_order: VecDeque<u128>,
+    /// When this replica last applied (or anchored) a version of the stream.
+    last_active: Option<std::time::Instant>,
 }
 
 impl Inner {
@@ -269,6 +283,7 @@ impl SlotOrder {
     /// (stream start, a real base from the primary, or a resync). Orders up to it are moot.
     pub fn set_anchor(&self, id: ChunkId, version: u64) {
         let mut g = self.inner.lock().unwrap();
+        g.last_active = Some(std::time::Instant::now());
         g.head = Some(id);
         g.head_version = Some(version);
         g.applied = g.applied.max(version);
@@ -316,6 +331,7 @@ impl SlotOrder {
     /// stream (on the primary the next write re-anchors; a secondary resyncs).
     pub fn applied(&self, write_id: u128, version: u64, new_head: Option<ChunkId>) {
         let mut g = self.inner.lock().unwrap();
+        g.last_active = Some(std::time::Instant::now());
         g.applied = g.applied.max(version);
         g.orders.remove(&write_id);
         match new_head {

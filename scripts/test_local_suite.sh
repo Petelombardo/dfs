@@ -5683,7 +5683,24 @@ PY
     # Each ISR member's own bytes for the slot (ReadSlotLocal: its ordered head, else its local
     # chunk_map entry; nothing substituted). Folding and comparing fold ids proved unreliable:
     # ForceFold answers with the local chunk_map entry, which can be a token it didn't fold.
-    T66_READ_RAW=$("$BIN/dfs-admin" --cluster "$T66_P,$T66_S" isr read --file "/$T66_FILE" --chunk 1 2>&1 || true)
+    # Compare the ISR as it is NOW: a frozen member that stops answering the primary is
+    # replaced (Phase 3d), so the pair recorded before the freeze can be stale.
+    T66_NOW=$("$BIN/dfs-admin" --cluster "$T66_ALL" isr get --file "/$T66_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "
+import json,sys
+best=None
+for l in sys.stdin:
+    try: r=json.loads(l)['isr'][1]
+    except Exception: continue
+    if r and (best is None or r['epoch']>best['epoch']): best=r
+print(best['epoch'], ' '.join(best['members']) if best else '')" 2>/dev/null || true)
+    read -r T66_EPOCH T66_NPN T66_NSN <<< "$T66_NOW"
+    T66_MAPNOW=$("$BIN/dfs-admin" --cluster "$T66_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    T66_CP=$(echo "$T66_MAPNOW" | awk -v n="$T66_NPN" '$1==n{print $2}')
+    T66_CS=$(echo "$T66_MAPNOW" | awk -v n="$T66_NSN" '$1==n{print $2}')
+    [ "${T66_EPOCH:-1}" != 1 ] && echo "  T66[$T66_CASE]: ISR now epoch $T66_EPOCH: primary=$T66_CP secondary=$T66_CS"
+    T66_READ_RAW=$("$BIN/dfs-admin" --cluster "${T66_CP:-$T66_P},${T66_CS:-$T66_S}" isr read --file "/$T66_FILE" --chunk 1 2>&1 || true)
     T66_HASHES=$(echo "$T66_READ_RAW" | python3 -c "
 import json,sys
 hs=[]
@@ -5811,7 +5828,17 @@ PY
         OK*) t67_check "T67a no acked write lost across the secondary's restart (servers hold $T67_FRESH)" PASS ;;
         *)   t67_check "T67a servers hold $T67_FRESH, not a writer's last acked write -- acked write lost" FAIL ;;
     esac
-    T67_READ_RAW=$("$BIN/dfs-admin" --cluster "$T67_P,$T67_S" isr read --file "/$T67_FILE" --chunk 1 2>&1 || true)
+    # Compare the ISR as it is NOW: a down secondary is replaced (Phase 3d), and the restarted
+    # node is no longer a member.
+    T67_NOW=$("$BIN/dfs-admin" --cluster "$T67_P" isr get --file "/$T67_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(r['epoch'], ' '.join(r['members']))" 2>/dev/null || true)
+    read -r T67_EPOCH T67_NP T67_NS <<< "$T67_NOW"
+    T67_MAP2=$("$BIN/dfs-admin" --cluster "$T67_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    T67_CP=$(echo "$T67_MAP2" | awk -v n="$T67_NP" '$1==n{print $2}')
+    T67_CS=$(echo "$T67_MAP2" | awk -v n="$T67_NS" '$1==n{print $2}')
+    echo "  T67: ISR now epoch ${T67_EPOCH:-?}: primary=${T67_CP:-?} secondary=${T67_CS:-?}"
+    T67_READ_RAW=$("$BIN/dfs-admin" --cluster "${T67_CP:-$T67_P},${T67_CS:-$T67_S}" isr read --file "/$T67_FILE" --chunk 1 2>&1 || true)
     T67_HASHES=$(echo "$T67_READ_RAW" | python3 -c "
 import json,sys
 hs=[]
@@ -5821,23 +5848,18 @@ for l in sys.stdin:
     hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
 print(' '.join(hs))" || true)
     read -r T67_H1 T67_H2 <<< "$T67_HASHES"
-    # Informational until SLOT-OWNERSHIP Phase 3d. Phase 3b (the client patches exactly the ISR
-    # pair when both members are healthy) took this from failing most runs to 4 of 5 (2026-10-04).
-    # The rest: while the secondary is down the ISR pair isn't usable, the client falls back to
-    # an unordered pair with a non-ISR node, two unordered writers diverge there, and the slot
-    # can be left broken. A down member being excluded and replaced under ordering is 3d.
+    # Required with ordering since Phase 3d (2026-10-04): a down member is replaced under
+    # ordering (ReplaceIsrMember), so the CURRENT ISR pair must end byte-identical.
     if [ -n "$T67_H1" ] && [ "$T67_H1" = "$T67_H2" ] && [ "$T67_H1" != ERR ]; then
-        echo "  (informational until Phase 3d) T67b both ISR replicas hold identical bytes after the restart ($T67_H1)"
+        t67_check "T67b both ISR replicas hold identical bytes after the restart ($T67_H1)" PASS
     else
-        echo "  (informational until Phase 3d) T67b ISR replicas differ or unreadable after the restart: $T67_HASHES"
+        t67_check "T67b ISR replicas differ or unreadable after the restart: $T67_HASHES" FAIL
         echo "$T67_READ_RAW" | cut -c1-260 | sed 's/^/    read: /'
     fi
-    # Informational until Phase 3d too: during the outage the client writes unordered to a pair
-    # with a non-ISR node, and two unordered writers on one chunk can stall (the pre-3c two-writer
-    # bug; seen 2 runs in 5 on 2026-10-04 even with 3b's ISR-pair targeting).
+    # Required with ordering since Phase 3d: the writers stay on an ordered ISR pair throughout.
     case "$T67_VERDICT" in
-        *NOPROGRESS*) echo "  (informational until Phase 3d) T67c a writer made no progress in the last 4s after the restart" ;;
-        *)            echo "  (informational until Phase 3d) T67c both writers made progress after the restart" ;;
+        *NOPROGRESS*) t67_check "T67c a writer made no progress in the last 4s after the restart" FAIL ;;
+        *)            t67_check "T67c both writers made progress after the restart" PASS ;;
     esac
     T67_SINCE=$(cat "$LOG"/server*.log | tail -n +"$((T67_MARK + 1))" | sed 's/\x1b\[[0-9;]*m//g')
     T67_RESYNCS=$(echo "$T67_SINCE" | grep -ac "resync anchor" || true)

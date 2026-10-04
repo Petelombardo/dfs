@@ -1133,6 +1133,20 @@ pub enum Request {
         file_id: FileId,
         chunk_idx: u64,
     },
+
+    /// Client -> the healthy member of a chunk's ISR at `isr_epoch` (SLOT-OWNERSHIP Phase 3d):
+    /// `failed` (the other member) isn't usable. The receiver verifies that itself and, if it
+    /// holds, commits epoch+1 = [receiver, replacement] by the same Paxos compare-and-set. A
+    /// primary excludes a secondary it can't reach (matrix row 2); a secondary takes over only
+    /// from a primary a majority voted expired. The replacement catches up through the ordered
+    /// stream's anchor/resync before any write is acked. Answered with SlotIsrRecords (the
+    /// committed record, or the current one if the epoch already moved). APPENDED at end.
+    ReplaceIsrMember {
+        file_id: FileId,
+        chunk_idx: u64,
+        isr_epoch: u64,
+        failed: NodeId,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

@@ -165,6 +165,21 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       hold the chunk and aren't penalized. T67b went from failing most runs to 4/5; the remaining
       failures are the outage-time unordered fallback → Phase 3d. Known flakes in full suites:
       T38b, T45i (RF 3→4 replica count; ~1 in 13 runs across builds, also in earlier sessions).
+- [x] **Phase 3d step 1 (2026-10-04): replace a down ISR member; takeover.** New ReplaceIsrMember
+      (appended). The client asks the healthy member when an ordered write's member fails at the
+      TRANSPORT level (a penalty flag never fired: a dead node "recovers" after each failure). A
+      primary excludes a secondary it can't ping (1s); a secondary takes over only from a primary
+      a majority voted expired. Replacement = a holder first, epoch+1 via Paxos; it catches up by
+      the 3c anchor/resync. Durability floor: after a replacement the client RETRIES on the new
+      pair, and an ordered write never acks one copy (URGENT_SINGLE_REPLICA was 1-7/run). Unordered
+      folds (background owner, RF-restore push, unordered ForceFold) wait while the slot's ordered
+      stream is active (10s): a one-sided mid-stream fold parted the accumulators. A member refuses
+      an ordered write/fold tagged with an older epoch than it knows (stale primary after a
+      takeover can never get two copies). T67b/T67c REQUIRED: 5/5 each, 0 unordered, 0 single.
+      T66 frozen primary → real takeovers (epoch 2, new primary). Known suite flakes: T38b, T45i,
+      T57a (the delete-resurrection divergence; fix on unmerged fix/delete-resurrection).
+      Not yet: the flap guard (a replaced node is simply not re-added, so flapping costs nothing
+      today); the plan's failure-matrix rows as their own tests.
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

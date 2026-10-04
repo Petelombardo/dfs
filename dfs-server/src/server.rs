@@ -1163,7 +1163,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::WriteOrder { .. }
         | Request::ReadSlotLocal { .. }
         | Request::ResyncSlot { .. } => PeerOther,
-        Request::GetOrSeedSlotIsr { .. } => ClientOther,
+        Request::GetOrSeedSlotIsr { .. }
+        | Request::ReplaceIsrMember { .. } => ClientOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -1977,6 +1978,10 @@ enum FoldSlotOutcome {
     /// The fold attempt itself failed.
     Failed,
 }
+
+/// How long after a slot's last ordered version its unordered folds (background, RF-restore
+/// push, unordered ForceFold) stay off: see WriteOrdering::stream_active.
+const ORDERED_STREAM_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How hard a locally-initiated fold waits for its output's second replica.
 /// See OverlayForkCtx::fold_slot_coordinated for why this lives in the fold
@@ -3019,6 +3024,13 @@ impl OverlayForkCtx {
         chunk_idx: u64,
         mode: FoldCoordination,
     ) -> bool {
+        // Not mid-stream: an unordered fold of one replica while the slot's ordered stream is
+        // active parts the replicas' accumulators (suite T67: RF-restore pushing the head token
+        // forced this fold on the new secondary alone). The ordered ForceFold folds while it is.
+        if self.write_ordering.stream_active(file_id, chunk_idx, ORDERED_STREAM_QUIET) {
+            debug!("fold_slot_coordinated: file {} chunk {} has an active ordered stream; not folding now", file_id, chunk_idx);
+            return false;
+        }
         if matches!(mode, FoldCoordination::Local) {
             // Local never reaches replicate_fold_result/announce_fold_result
             // below — this is its only peer-directed broadcast, must stay on.
@@ -4660,6 +4672,9 @@ impl OverlayForkCtx {
     /// Fold as a wave if this node owns the slot's folds (or the owner's patience has run
     /// out); otherwise leave it to the owner. For paths that have no fingerprint to verify.
     async fn fold_if_owner(&self, file_id: FileId, chunk_idx: u64) -> CoordinatedFoldOutcome {
+        if self.write_ordering.stream_active(file_id, chunk_idx, ORDERED_STREAM_QUIET) {
+            return CoordinatedFoldOutcome::Deferred;
+        }
         let idle = self.dirty_patch_slots.get(&(file_id, chunk_idx))
             .map(|e| e.value().last_patch_at.elapsed()).unwrap_or_default();
         match self.fold_role(file_id, chunk_idx, idle) {
@@ -4835,6 +4850,13 @@ impl OverlayForkCtx {
         // ProposeFold/ReleaseFoldLock round whose declines and failures fell back to solo
         // folds, the uncoordinated path it existed to prevent.
         let idle = self.dirty_patch_slots.get(&key).map(|e| e.value().last_patch_at.elapsed()).unwrap_or_default();
+        // An active ordered stream folds through the client's ordered ForceFold; an unordered
+        // background fold now would fold this replica alone mid-stream (see stream_active).
+        if self.write_ordering.stream_active(file_id, chunk_idx, ORDERED_STREAM_QUIET) {
+            debug!("coordinate_and_fold_slot: file {} chunk {} has an active ordered stream; background fold deferred",
+                file_id, chunk_idx);
+            return CoordinatedFoldOutcome::Deferred;
+        }
         match self.fold_role(file_id, chunk_idx, idle) {
             FoldRole::Wait(owner) => {
                 // The owner's fold may already be here (its announcement flipped this
@@ -7722,6 +7744,8 @@ impl Server {
             Request::SlotIsrCommit { items } => self.slot_isr.handle_commit(items).await,
             Request::GetSlotIsr { slots } => self.slot_isr.handle_get(slots),
             Request::GetOrSeedSlotIsr { file_id, chunk_idx } => self.handle_get_or_seed_slot_isr(file_id, chunk_idx).await,
+            Request::ReplaceIsrMember { file_id, chunk_idx, isr_epoch, failed } =>
+                self.handle_replace_isr_member(file_id, chunk_idx, isr_epoch, failed).await,
             Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
                 if !crate::network::fault_injection_allowed() {
                     Response::Error {
@@ -11137,6 +11161,67 @@ impl Server {
             }
             Err(_) => Response::SlotIsrRecords { records: vec![self.slot_isr.get(file_id, chunk_idx)] },
         }
+    }
+
+    /// See `Request::ReplaceIsrMember`.
+    async fn handle_replace_isr_member(&self, file_id: FileId, chunk_idx: u64, isr_epoch: u64, failed: NodeId) -> Response {
+        let refuse = |why: String| Response::Error { message: format!("ReplaceIsrMember: {}", why), code: ErrorCode::InvalidRequest };
+        let me = self.cluster.local_node_id();
+        let Some(cur) = self.slot_isr.get(file_id, chunk_idx) else {
+            return refuse(format!("no ISR here for file {} chunk {}", file_id, chunk_idx));
+        };
+        if cur.epoch != isr_epoch {
+            return Response::SlotIsrRecords { records: vec![Some(cur)] }; // already moved on
+        }
+        if failed == me || !cur.members.contains(&me) || !cur.members.contains(&failed) {
+            return refuse(format!("{} and {} aren't both members of epoch {} {:?}", me, failed, cur.epoch, cur.members));
+        }
+        if !self.lease.holds_own_lease() {
+            return refuse("this node doesn't hold its own lease".into());
+        }
+        if cur.members.first() == Some(&me) {
+            // Primary excluding its secondary: only one it can't reach itself.
+            let addr = self.cluster.get_node(&failed).await.map(|n| n.addr);
+            let reachable = match addr {
+                Some(addr) => matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1),
+                        self.client.send_message(addr, Message::Request(Request::Ping))).await,
+                    Ok(Ok(env)) if matches!(env.message, Message::Response(Response::Pong))),
+                None => false,
+            };
+            if reachable {
+                return refuse(format!("secondary {} answers here; not excluding it", failed));
+            }
+        } else if !self.lease.is_expired(failed) {
+            // Secondary taking over: only from a primary a majority voted expired, or two
+            // primaries could accept writes at once.
+            return refuse(format!("primary {} isn't expired by a majority; not taking over", failed));
+        }
+        // Replacement: prefer a node already holding the chunk, then any other online node.
+        let holders: Vec<NodeId> = self.chunk_map.get(&file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].nodes.clone())
+        }).unwrap_or_default();
+        let online: Vec<NodeId> = self.cluster.get_all_nodes().await.into_iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online).map(|n| n.id).collect();
+        let pick = |pool: Vec<NodeId>| {
+            let pool: Vec<NodeId> = pool.into_iter().filter(|n| !cur.members.contains(n) && online.contains(n)).collect();
+            crate::slot_isr::initial_members(file_id, chunk_idx, &pool, 1).first().copied()
+        };
+        let Some(replacement) = pick(holders).or_else(|| pick(online.clone())) else {
+            return refuse("no online node to replace it with".into());
+        };
+        let next = crate::slot_isr::SlotIsr { epoch: cur.epoch + 1, members: vec![me, replacement] };
+        let records = match tokio::time::timeout(std::time::Duration::from_secs(3),
+            self.slot_isr.propose(vec![((file_id, chunk_idx), next.clone())])).await {
+            Ok(r) => r,
+            Err(_) => return refuse("the epoch change didn't commit in time".into()),
+        };
+        if records.first().cloned().flatten().as_ref() == Some(&next) {
+            info!("[ISR] file {} chunk {}: {} replaced {} -- epoch {} -> {}, members {:?}",
+                file_id, chunk_idx, me, failed, cur.epoch, next.epoch, next.members);
+        }
+        Response::SlotIsrRecords { records }
     }
 
     async fn seed_slot_isrs(&self, max: usize) {
@@ -15803,6 +15888,9 @@ impl Server {
             return Response::Error { message: "Ordered: tag does not match the write".into(), code: ErrorCode::InvalidRequest };
         }
         let me = self.cluster.local_node_id();
+        if let Some(resp) = self.stale_epoch_refusal(&tag) {
+            return resp;
+        }
         let slot = self.write_ordering.slot(tag.file_id, tag.chunk_idx, tag.isr_epoch);
         // The version stream is the base: each replica applies version n onto its own result
         // for n-1 (see write_order.rs). Neither the client's chunk id (two writers' clients are
@@ -15967,6 +16055,20 @@ impl Server {
         }
     }
 
+    /// Refuse an ordered write or fold tagged with an ISR epoch older than this node's current
+    /// one. After a takeover (Phase 3d) the old primary can resume still believing it is primary
+    /// at the old epoch; its old secondary, now the new epoch's primary, must not apply that
+    /// stream beside the live one, or a stale-epoch write could be acked by two nodes. With this
+    /// the stale primary can never reach two copies (ordered writes never ack one).
+    fn stale_epoch_refusal(&self, tag: &dfs_common::WriteOrderTag) -> Option<Response> {
+        let cur = self.slot_isr.get(tag.file_id, tag.chunk_idx)?;
+        (cur.epoch > tag.isr_epoch).then(|| Response::Error {
+            message: format!("Ordered: stale ISR epoch {} for file {} chunk {} (current {} {:?})",
+                tag.isr_epoch, tag.file_id, tag.chunk_idx, cur.epoch, cur.members),
+            code: ErrorCode::InvalidRequest,
+        })
+    }
+
     /// An ordered ForceFold: a version of the slot's stream like any write, so both replicas fold
     /// at exactly the same point. Unordered, the client's ForceFold reached the two replicas at
     /// different points of the stream; they folded different bytes, their accumulators parted,
@@ -15978,6 +16080,9 @@ impl Server {
     async fn handle_ordered_fold(&self, tag: dfs_common::WriteOrderTag) -> Response {
         let (file_id, chunk_idx) = (tag.file_id, tag.chunk_idx);
         let me = self.cluster.local_node_id();
+        if let Some(resp) = self.stale_epoch_refusal(&tag) {
+            return resp;
+        }
         let slot = self.write_ordering.slot(file_id, chunk_idx, tag.isr_epoch);
         let fold_result = |c: ChunkId, size: Option<u64>| match size {
             Some(size) => Response::ForceFoldResult { real_chunk_id: c, size: size as usize },
@@ -16857,6 +16962,14 @@ impl Server {
         // typically a synchronous client path (e.g. fsync) that shouldn't be
         // blocked anywhere near that long.
         let key = (file_id, chunk_idx);
+        // An unordered ForceFold on a slot with an active ordered stream would fold this replica
+        // alone mid-stream; while the stream is active the client folds it ordered.
+        if self.write_ordering.stream_active(file_id, chunk_idx, ORDERED_STREAM_QUIET) {
+            return Response::Error {
+                message: format!("ForceFold: file {} chunk {} has an active ordered stream; fold it ordered", file_id, chunk_idx),
+                code: ErrorCode::InvalidRequest,
+            };
+        }
         if let Some(grant) = self.fold_lock_grants.get(&key) {
             if grant.value().expires_at > std::time::Instant::now() {
                 return Response::Error {

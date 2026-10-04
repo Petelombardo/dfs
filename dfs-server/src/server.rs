@@ -1163,6 +1163,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::WriteOrder { .. }
         | Request::ReadSlotLocal { .. }
         | Request::ResyncSlot { .. } => PeerOther,
+        Request::GetOrSeedSlotIsr { .. } => ClientOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -7720,6 +7721,7 @@ impl Server {
             Request::SlotIsrAccept { items } => self.slot_isr.handle_accept(items).await,
             Request::SlotIsrCommit { items } => self.slot_isr.handle_commit(items).await,
             Request::GetSlotIsr { slots } => self.slot_isr.handle_get(slots),
+            Request::GetOrSeedSlotIsr { file_id, chunk_idx } => self.handle_get_or_seed_slot_isr(file_id, chunk_idx).await,
             Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
                 if !crate::network::fault_injection_allowed() {
                     Response::Error {
@@ -11104,6 +11106,37 @@ impl Server {
             info!("SLOT ISR catch-up: learned {} newer record(s) from peers", learned);
         }
         next
+    }
+
+    /// See `Request::GetOrSeedSlotIsr`. Seeds only a chunk this node holds, with the seeder's
+    /// members (rendezvous over the holders); concurrent seeders are safe (Paxos).
+    async fn handle_get_or_seed_slot_isr(&self, file_id: FileId, chunk_idx: u64) -> Response {
+        if let Some(isr) = self.slot_isr.get(file_id, chunk_idx) {
+            return Response::SlotIsrRecords { records: vec![Some(isr)] };
+        }
+        let me = self.cluster.local_node_id();
+        let holders = self.chunk_map.get(&file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].nodes.clone())
+        });
+        let isr_size = self.replication_factor.load(Ordering::Relaxed).clamp(1, 2);
+        let Some(holders) = holders.filter(|h| h.contains(&me) && h.len() >= isr_size) else {
+            return Response::SlotIsrRecords { records: vec![None] };
+        };
+        if !self.metadata.file_exists_by_id_async(file_id).await.unwrap_or(false) {
+            return Response::SlotIsrRecords { records: vec![None] };
+        }
+        let members = crate::slot_isr::initial_members(file_id, chunk_idx, &holders, isr_size);
+        let wanted = vec![((file_id, chunk_idx), crate::slot_isr::SlotIsr { epoch: 1, members })];
+        match tokio::time::timeout(std::time::Duration::from_secs(2), self.slot_isr.propose(wanted)).await {
+            Ok(records) => {
+                if records.first().is_some_and(|r| r.is_some()) {
+                    info!("SLOT ISR seeded on demand: file {} chunk {}", file_id, chunk_idx);
+                }
+                Response::SlotIsrRecords { records }
+            }
+            Err(_) => Response::SlotIsrRecords { records: vec![self.slot_isr.get(file_id, chunk_idx)] },
+        }
     }
 
     async fn seed_slot_isrs(&self, max: usize) {

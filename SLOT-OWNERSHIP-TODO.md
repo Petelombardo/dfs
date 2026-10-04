@@ -159,6 +159,12 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       one 3s turn timeout, then resyncs); ~~the primary-apply-fails-but-secondary-succeeds case~~
       — FIXED dca079f (T68: the client retries an ordered write its primary didn't apply,
       instead of backfill-and-ack; before, 3/3 runs lost an acked write).
+- [x] **Phase 3b part 1 (2026-10-04):** (a) on-demand ISR seeding (`GetOrSeedSlotIsr`, client-only;
+      verify with `DFS_SLOT_ISR_SEED_SECS=0 DFS_ORDERED_WRITES=1 ./scripts/test_local_suite.sh T64`:
+      604 ordered / 0 unordered, 3/3); (b) the client patches exactly the ISR pair when both members
+      hold the chunk and aren't penalized. T67b went from failing most runs to 4/5; the remaining
+      failures are the outage-time unordered fallback → Phase 3d. Known flakes in full suites:
+      T38b, T45i (RF 3→4 replica count; ~1 in 13 runs across builds, also in earlier sessions).
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

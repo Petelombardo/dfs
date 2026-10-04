@@ -44,7 +44,7 @@ export DFS_LEASE_MS=3000
 export DFS_LEASE_MARGIN_MS=500
 export DFS_LEASE_CLUSTER_SIZE=5   # fresh cluster: no membership history yet
 export DFS_LEASE_TRACE=1   # log every lease extension: T60 checks none outlives its expiry vote
-export DFS_SLOT_ISR_SEED_SECS=3   # seed per-chunk ISRs quickly so T62 can observe them
+export DFS_SLOT_ISR_SEED_SECS=${DFS_SLOT_ISR_SEED_SECS:-3}   # seed per-chunk ISRs quickly so T62 can observe them (0 = off: only on-demand seeding)
 export DFS_SLOT_ISR_CATCHUP_SECS=3   # and catch up missed commits quickly (T63)
 
 # If test filter args given, only run those tests (e.g. T7 T23).
@@ -5821,23 +5821,23 @@ for l in sys.stdin:
     hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
 print(' '.join(hs))" || true)
     read -r T67_H1 T67_H2 <<< "$T67_HASHES"
-    # Informational until SLOT-OWNERSHIP Phase 3b: after the restart the client picks its write
-    # pair from the leader's locations, not the ISR, and can move to a pair without the ISR
-    # primary (seen 2026-10-03: [secondary, other node]); those writes go out unordered and the
-    # ISR primary is left stale. Making the client write exactly the ISR pair is 3b's job; then
-    # this becomes required.
+    # Informational until SLOT-OWNERSHIP Phase 3d. Phase 3b (the client patches exactly the ISR
+    # pair when both members are healthy) took this from failing most runs to 4 of 5 (2026-10-04).
+    # The rest: while the secondary is down the ISR pair isn't usable, the client falls back to
+    # an unordered pair with a non-ISR node, two unordered writers diverge there, and the slot
+    # can be left broken. A down member being excluded and replaced under ordering is 3d.
     if [ -n "$T67_H1" ] && [ "$T67_H1" = "$T67_H2" ] && [ "$T67_H1" != ERR ]; then
-        echo "  (informational until Phase 3b) T67b both ISR replicas hold identical bytes after the restart ($T67_H1)"
+        echo "  (informational until Phase 3d) T67b both ISR replicas hold identical bytes after the restart ($T67_H1)"
     else
-        echo "  (informational until Phase 3b) T67b ISR replicas differ or unreadable after the restart: $T67_HASHES"
+        echo "  (informational until Phase 3d) T67b ISR replicas differ or unreadable after the restart: $T67_HASHES"
         echo "$T67_READ_RAW" | cut -c1-260 | sed 's/^/    read: /'
     fi
-    # Informational until Phase 3b too: off the ISR pair the client writes unordered, and two
-    # unordered writers on one chunk can stall (the pre-3c two-writer bug; seen 1 run in 2 on
-    # 2026-10-03, ~720 unordered writes vs ~43 ordered after the kill).
+    # Informational until Phase 3d too: during the outage the client writes unordered to a pair
+    # with a non-ISR node, and two unordered writers on one chunk can stall (the pre-3c two-writer
+    # bug; seen 2 runs in 5 on 2026-10-04 even with 3b's ISR-pair targeting).
     case "$T67_VERDICT" in
-        *NOPROGRESS*) echo "  (informational until Phase 3b) T67c a writer made no progress in the last 4s after the restart" ;;
-        *)            echo "  (informational until Phase 3b) T67c both writers made progress after the restart" ;;
+        *NOPROGRESS*) echo "  (informational until Phase 3d) T67c a writer made no progress in the last 4s after the restart" ;;
+        *)            echo "  (informational until Phase 3d) T67c both writers made progress after the restart" ;;
     esac
     T67_SINCE=$(cat "$LOG"/server*.log | tail -n +"$((T67_MARK + 1))" | sed 's/\x1b\[[0-9;]*m//g')
     T67_RESYNCS=$(echo "$T67_SINCE" | grep -ac "resync anchor" || true)

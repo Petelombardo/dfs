@@ -1122,6 +1122,17 @@ pub enum Request {
     InjectOrderedApplyFailures {
         count: u32,
     },
+
+    /// Client -> a holder of the chunk (ordered writes): the chunk's committed ISR, or if it
+    /// has none yet and this node holds the chunk, propose epoch 1 now (the periodic seeder's
+    /// member choice and Paxos commit) and answer with the outcome. A new chunk was otherwise
+    /// written unordered until the next seeder pass (suite T64). Kept apart from GetSlotIsr,
+    /// which peers' catch-up uses, so catch-up never seeds. Answered with SlotIsrRecords (one
+    /// record). APPENDED at end to preserve wire compatibility.
+    GetOrSeedSlotIsr {
+        file_id: FileId,
+        chunk_idx: u64,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

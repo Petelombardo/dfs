@@ -7564,6 +7564,47 @@ leader_addr: Arc::new(RwLock::new(None)),
         *ON.get_or_init(|| std::env::var("DFS_ORDERED_WRITES").map(|v| v == "1").unwrap_or(false))
     }
 
+    /// The chunk's committed ISR: cached, else asked of `ask` (a holder), which seeds one on
+    /// the spot if the chunk has none yet (GetOrSeedSlotIsr). Misses aren't cached: the next
+    /// write asks again.
+    async fn slot_isr_for(&self, file_id: dfs_common::FileId, chunk_idx: u64, ask: SocketAddr) -> Option<dfs_common::SlotIsr> {
+        if let Some(isr) = self.slot_isr_cache.get(&(file_id, chunk_idx)).map(|e| e.value().clone()) {
+            return Some(isr);
+        }
+        match self.send_request(ask, Request::GetOrSeedSlotIsr { file_id, chunk_idx }).await {
+            Ok(Response::SlotIsrRecords { records }) => {
+                let isr = records.into_iter().next().flatten()?;
+                self.slot_isr_cache.insert((file_id, chunk_idx), isr.clone());
+                Some(isr)
+            }
+            _ => None,
+        }
+    }
+
+    /// With ordered writes, the chunk's ISR pair as patch targets (primary first), when both
+    /// members are among the chunk's known holders and neither is penalized. Without this the
+    /// client patched whatever pair its location view gave and wrote unordered whenever that
+    /// wasn't the ISR (after a restart it drifted to a pair without the primary: suite T67).
+    async fn isr_patch_pair(
+        &self,
+        file_id: dfs_common::FileId,
+        chunk_idx: u64,
+        replica_addrs: &[SocketAddr],
+        addr_to_node_id: &HashMap<SocketAddr, dfs_common::NodeId>,
+    ) -> Option<[SocketAddr; 2]> {
+        let ask = *replica_addrs.first()?;
+        let isr = self.slot_isr_for(file_id, chunk_idx, ask).await?;
+        let addr_of = |n: dfs_common::NodeId| addr_to_node_id.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
+        let (p, s) = (addr_of(*isr.members.first()?)?, addr_of(*isr.members.get(1)?)?);
+        if !replica_addrs.contains(&p) || !replica_addrs.contains(&s) {
+            return None;
+        }
+        if self.node_health.is_penalized(p).await || self.node_health.is_penalized(s).await {
+            return None;
+        }
+        Some([p, s])
+    }
+
     /// The order tag for each of the chunk's two ISR members among `patch_addrs`, or an empty
     /// map when the chunk has no committed ISR (yet) or its members aren't both targets of
     /// this write — the write then goes out unordered, as without the flag.
@@ -7575,22 +7616,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         addr_to_node_id: &HashMap<SocketAddr, dfs_common::NodeId>,
     ) -> HashMap<SocketAddr, dfs_common::WriteOrderTag> {
         let mut tags = HashMap::new();
-        let isr = match self.slot_isr_cache.get(&(file_id, chunk_idx)).map(|e| e.value().clone()) {
-            Some(isr) => isr,
-            None => {
-                let Some(&ask) = patch_addrs.first() else { return tags };
-                match self.send_request(ask, Request::GetSlotIsr { slots: vec![(file_id, chunk_idx)] }).await {
-                    Ok(Response::SlotIsrRecords { records }) => match records.into_iter().next().flatten() {
-                        Some(isr) => {
-                            self.slot_isr_cache.insert((file_id, chunk_idx), isr.clone());
-                            isr
-                        }
-                        None => return tags,
-                    },
-                    _ => return tags,
-                }
-            }
-        };
+        let Some(&ask) = patch_addrs.first() else { return tags };
+        let Some(isr) = self.slot_isr_for(file_id, chunk_idx, ask).await else { return tags };
         let (Some(&primary), Some(&secondary)) = (isr.members.first(), isr.members.get(1)) else { return tags };
         let addr_of = |n: dfs_common::NodeId| addr_to_node_id.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
         let (Some(p), Some(s)) = (addr_of(primary), addr_of(secondary)) else { return tags };
@@ -7786,7 +7813,16 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Dual-RF: patch the first 2 replicas; the 3rd is tombstoned (synchronously, below)
         // so the healer cannot use it as a source before metadata commits.
-        let patch_addrs: Vec<SocketAddr> = if dual_rf && replica_addrs.len() > 2 {
+        let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
+        let isr_pair = match chunk_idx {
+            Some(cidx) if dual_rf && Self::ordered_writes_enabled() =>
+                self.isr_patch_pair(file_id, cidx, &replica_addrs, &addr_to_node_id_snap).await,
+            _ => None,
+        };
+        let patch_addrs: Vec<SocketAddr> = if let Some(pair) = isr_pair {
+            skip_addrs = replica_addrs.iter().copied().filter(|a| !pair.contains(a)).collect();
+            pair.to_vec()
+        } else if dual_rf && replica_addrs.len() > 2 {
             skip_addrs = replica_addrs[2..].to_vec();
             replica_addrs[..2].to_vec()
         } else {
@@ -7794,7 +7830,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             replica_addrs.clone()
         };
 
-        let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
         let order_tags = match chunk_idx {
             Some(cidx) if Self::ordered_writes_enabled() =>
                 self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await,

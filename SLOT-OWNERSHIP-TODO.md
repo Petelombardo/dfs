@@ -191,6 +191,10 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       flag-on run hit the T13b rename flake → T14 aborts the suite). RESUME: add disk space, rerun
       both full suites (`{ time DFS_ORDERED_WRITES=1 ./scripts/test_local_suite.sh; } > ...`,
       then =0, `rm -rf /tmp/dfs-test` between), push if clean, update Legata (3d task).
+      UPDATE: flag-on suite on fc37440 = 183/1, **T61d 9 disagreements** (storm start after T60
+      chaos, with ghost-chunk-guard trips = unordered patches). Investigate before pushing:
+      run `DFS_ORDERED_WRITES=1 ./scripts/test_local_suite.sh T60 T61` repeatedly, count
+      unordered MultiPatch sends and GetOrSeedSlotIsr outcomes.
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

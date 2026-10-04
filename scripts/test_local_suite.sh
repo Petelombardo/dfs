@@ -5380,7 +5380,16 @@ mountpoint -q "$T64_MOUNT2" || check "T64 second client mounted" FAIL
 T64_FILE=t64_shared.bin
 dd if=/dev/urandom of="$MOUNT/$T64_FILE" bs=4M count=2 status=none
 dfs_sync
-sleep 5   # let the ISR seeder (3s in this suite) commit the chunks' ISRs, which ordering needs
+# Ordering needs chunk 1's committed ISR, on whichever node the client asks: wait until every
+# node reports it. A fixed 5s sleep wasn't enough under full-suite load: the writers then ran
+# unordered (the pre-3c two-writer bug, which the flag-off run covers) and drew EIO.
+for _ in $(seq 1 30); do
+    "$BIN/dfs-admin" --cluster 127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904 \
+        isr get --file "/$T64_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; rs=[json.loads(l) for l in sys.stdin]; sys.exit(0 if len(rs)==5 and all(r.get('isr') and r['isr'][1] for r in rs) else 1)" \
+        2>/dev/null && break
+    sleep 1
+done
 t64_writer() {  # mount tag: 150 fsync'd 4K writes of this client's own content to one block
     # Prints the last write whose fsync succeeded (its ack), or NONE, then FAILED:<error> if a
     # write or fsync failed. A failed fsync means that write was never acked, so T64b judges
@@ -5685,6 +5694,146 @@ done
 fusermount -u "$T66_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T66_PID2"
 fi # should_run T66
+
+# ── Test 67: the chunk's secondary restarts mid-stream (ordered-write resync) ───────────
+# A restarted secondary has no ordering state: its head can't continue the slot's version
+# stream, so the first ordered write it sees after rejoining must resync it from the primary
+# (ResyncSlot: the primary materializes its head as a real chunk; the secondary pulls it
+# hash-verified). Two writers hammer one block of chunk 1; the secondary is killed -9 and
+# restarted mid-storm. Checks: (a) no acked write lost; (b) both ISR replicas end
+# byte-identical; (c) both writers make progress after the restart. How it rejoined
+# (resync vs. an anchor the primary re-issued) is reported.
+if should_run T67; then
+snapshot_log T67
+echo ""
+echo "=== T67: the chunk's secondary restarts mid-stream; it must resync, not diverge (SLOT-OWNERSHIP 3c) ==="
+T67_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T67_FILE=t67_restart.bin
+T67_MOUNT2=/tmp/dfs-mount2
+mkdir -p "$T67_MOUNT2"
+RUST_LOG=info "$BIN/dfs-client" mount "$T67_MOUNT2" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t67b.log" --allow-other --log-level debug &
+T67_PID2=$!
+sleep 2
+mountpoint -q "$T67_MOUNT2" || check "T67 second client mounted" FAIL
+t67_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T66)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t67_writer() {  # mount file tag seconds out: fsync'd 4K writes to one block until the deadline
+    python3 - "$1/$2" "$3" "$4" > "$5" 2>&1 <<'PY'
+import os, sys, time, json
+path, tag, secs = sys.argv[1], sys.argv[2].encode(), float(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+off = 4 * 1024 * 1024 + 8192
+start = time.time(); i = 0
+acked = []; failed = []; worst = 0.0
+while time.time() - start < secs:
+    t0 = time.time()
+    try:
+        os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
+        os.fsync(fd)
+        acked.append((i, time.time() - start))
+    except OSError:
+        failed.append(i)
+        time.sleep(0.2)
+    worst = max(worst, time.time() - t0)
+    i += 1
+os.close(fd)
+print(json.dumps({"acked": [a for a, _ in acked], "late": sum(1 for _, t in acked if t > secs - 4),
+                  "failed": failed, "worst_s": round(worst, 2)}))
+PY
+}
+dd if=/dev/urandom of="$MOUNT/$T67_FILE" bs=4M count=2 status=none
+dfs_sync
+T67_ISR=""
+for _ in $(seq 1 30); do
+    T67_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T67_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+    [ -n "$T67_ISR" ] && break
+    sleep 1
+done
+T67_MAP=$("$BIN/dfs-admin" --cluster "$T67_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+read -r T67_PID_NODE T67_SID_NODE <<< "$T67_ISR"
+T67_P=$(echo "$T67_MAP" | awk -v n="$T67_PID_NODE" '$1==n{print $2}')
+T67_S=$(echo "$T67_MAP" | awk -v n="$T67_SID_NODE" '$1==n{print $2}')
+if [ -z "$T67_P" ] || [ -z "$T67_S" ]; then
+    check "T67 setup: chunk 1's ISR found ($T67_P,$T67_S)" FAIL
+else
+    T67_N=$(( ${T67_S##*:} - 8900 + 1 ))
+    T67_MARK=$(cat "$LOG"/server*.log | wc -l)
+    echo "  T67: ISR primary=$T67_P secondary=$T67_S (node$T67_N); killing the secondary 3s in, restarting it 2s later"
+    t67_writer "$MOUNT" "$T67_FILE" A 20 "$LOG/t67_w1.out" & T67_W1=$!
+    t67_writer "$T67_MOUNT2" "$T67_FILE" B 20 "$LOG/t67_w2.out" & T67_W2=$!
+    sleep 3
+    pkill -9 -f "dfs-server start --config $BASE/node${T67_N}/config.toml" 2>/dev/null || true
+    sleep 2
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T67_N}/config.toml" \
+        >> "$LOG/server${T67_N}.log" 2>&1 &
+    wait "$T67_W1" "$T67_W2" 2>/dev/null || true
+    dfs_sync; sync "$T67_MOUNT2" 2>/dev/null || true
+    sleep 5
+    T67_FRESH=$(python3 -c "f=open('$MOUNT/$T67_FILE','rb');f.seek(4*1024*1024+8192);print(f.read(10).decode(errors='replace'))" 2>/dev/null || true)
+    T67_VERDICT=$(python3 - "$LOG/t67_w1.out" "$LOG/t67_w2.out" "$T67_FRESH" <<'PY'
+import json, sys
+fresh = sys.argv[3]
+ok, summary = False, []
+for path, tag in ((sys.argv[1], "A"), (sys.argv[2], "B")):
+    try: r = json.loads(open(path).read().strip().splitlines()[-1])
+    except Exception as e: print("BAD", "writer %s output unreadable: %s" % (tag, e)); sys.exit()
+    last = max(r["acked"]) if r["acked"] else -1
+    allowed = {last} | {f for f in r["failed"] if f > last}
+    if fresh[:1] == tag and fresh[1:7].isdigit() and int(fresh[1:7]) in allowed: ok = True
+    summary.append("%s: %d acked (last %d, %d in the last 4s), %d failed, worst %.1fs"
+                   % (tag, len(r["acked"]), last, r["late"], len(r["failed"]), r["worst_s"]))
+    if r["late"] == 0: summary.append("NOPROGRESS-" + tag)
+print("OK" if ok else "LOST", "; ".join(summary))
+PY
+)
+    echo "  T67: servers hold $T67_FRESH; ${T67_VERDICT#* }"
+    case "$T67_VERDICT" in
+        OK*) t67_check "T67a no acked write lost across the secondary's restart (servers hold $T67_FRESH)" PASS ;;
+        *)   t67_check "T67a servers hold $T67_FRESH, not a writer's last acked write -- acked write lost" FAIL ;;
+    esac
+    T67_READ_RAW=$("$BIN/dfs-admin" --cluster "$T67_P,$T67_S" isr read --file "/$T67_FILE" --chunk 1 2>&1 || true)
+    T67_HASHES=$(echo "$T67_READ_RAW" | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T67_H1 T67_H2 <<< "$T67_HASHES"
+    # Informational until SLOT-OWNERSHIP Phase 3b: after the restart the client picks its write
+    # pair from the leader's locations, not the ISR, and can move to a pair without the ISR
+    # primary (seen 2026-10-03: [secondary, other node]); those writes go out unordered and the
+    # ISR primary is left stale. Making the client write exactly the ISR pair is 3b's job; then
+    # this becomes required.
+    if [ -n "$T67_H1" ] && [ "$T67_H1" = "$T67_H2" ] && [ "$T67_H1" != ERR ]; then
+        echo "  (informational until Phase 3b) T67b both ISR replicas hold identical bytes after the restart ($T67_H1)"
+    else
+        echo "  (informational until Phase 3b) T67b ISR replicas differ or unreadable after the restart: $T67_HASHES"
+        echo "$T67_READ_RAW" | cut -c1-260 | sed 's/^/    read: /'
+    fi
+    # Informational until Phase 3b too: off the ISR pair the client writes unordered, and two
+    # unordered writers on one chunk can stall (the pre-3c two-writer bug; seen 1 run in 2 on
+    # 2026-10-03, ~720 unordered writes vs ~43 ordered after the kill).
+    case "$T67_VERDICT" in
+        *NOPROGRESS*) echo "  (informational until Phase 3b) T67c a writer made no progress in the last 4s after the restart" ;;
+        *)            echo "  (informational until Phase 3b) T67c both writers made progress after the restart" ;;
+    esac
+    T67_SINCE=$(cat "$LOG"/server*.log | tail -n +"$((T67_MARK + 1))" | sed 's/\x1b\[[0-9;]*m//g')
+    T67_RESYNCS=$(echo "$T67_SINCE" | grep -ac "resync anchor" || true)
+    T67_ADOPT=$(echo "$T67_SINCE" | grep -ac "resynced from the primary" || true)
+    echo "  T67: $T67_RESYNCS resync(s) served by the primary, $T67_ADOPT completed on the secondary"
+    # Informational: rejoining through an anchor the primary re-issued (no resync) is fine too.
+fi
+rm -f "$MOUNT/$T67_FILE"
+fusermount -u "$T67_MOUNT2" 2>/dev/null || true
+kill_client_and_wait "$T67_PID2"
+fi # should_run T67
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

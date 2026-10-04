@@ -1161,7 +1161,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::SlotIsrCommit { .. }
         | Request::GetSlotIsr { .. }
         | Request::WriteOrder { .. }
-        | Request::ReadSlotLocal { .. } => PeerOther,
+        | Request::ReadSlotLocal { .. }
+        | Request::ResyncSlot { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -3985,6 +3986,8 @@ impl OverlayForkCtx {
         // cleanup or cluster-wide dissemination that doesn't gate local correctness.
         if let Err(e) = self.metadata.update_patch_state_folded_async(public_token, new_chunk_id).await {
             warn!("single fold: failed to flip patch_state to Folded for {} -> {}: {}", public_token, new_chunk_id, e);
+        } else {
+            self.write_ordering.on_folded(file_id, chunk_idx, public_token, new_chunk_id);
         }
 
         // Clean up the delta's own (now dead) ChunkLocation + on-disk bytes.
@@ -7810,9 +7813,12 @@ impl Server {
                     None => Response::Error { message: format!("ReadSlotLocal: no entry here for file {} chunk {}", file_id, chunk_idx), code: ErrorCode::NotFound },
                 }
             }
-            Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version, base } => {
-                self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version, base);
+            Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version, base, stream } => {
+                self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version, base, stream);
                 Response::Ok { data: None }
+            }
+            Request::ResyncSlot { file_id, chunk_idx, isr_epoch } => {
+                self.handle_resync_slot(file_id, chunk_idx, isr_epoch).await
             }
             Request::ProposeFold { file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint } => {
                 self.handle_propose_fold(file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint).await
@@ -10350,6 +10356,11 @@ impl Server {
             Ok(Some(PatchState::Pending { .. }))
         );
 
+        // The ordered head follows the fold only when the result is held here: an ordered
+        // write needs its base locally (otherwise the head stays and the next write re-anchors).
+        if self.storage.has_chunk(&real_chunk_id) {
+            self.write_ordering.on_folded(file_id, chunk_idx, public_token, real_chunk_id);
+        }
         if let Err(e) = self.metadata.update_patch_state_folded_async(public_token, real_chunk_id).await {
             warn!("handle_replicate_patch_fold: failed to record {} -> {}: {}", public_token, real_chunk_id, e);
             return Response::Error {
@@ -15734,6 +15745,12 @@ impl Server {
     /// applies it only in that order. Either way the patch itself goes through
     /// handle_multi_patch unchanged.
     async fn handle_ordered(&self, tag: dfs_common::WriteOrderTag, request: Request) -> Response {
+        if let Request::ForceFold { file_id, chunk_idx } = request {
+            if file_id != tag.file_id || chunk_idx != tag.chunk_idx {
+                return Response::Error { message: "Ordered: tag does not match the fold".into(), code: ErrorCode::InvalidRequest };
+            }
+            return self.handle_ordered_fold(tag).await;
+        }
         let Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq } = request else {
             return Response::Error { message: "Ordered: only MultiPatch can be ordered".into(), code: ErrorCode::InvalidRequest };
         };
@@ -15767,6 +15784,7 @@ impl Server {
                     let msg = Request::WriteOrder {
                         file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
                         write_id: tag.write_id, version: crate::write_order::REFUSED, base: chunk_id,
+                        stream: self.write_ordering.boot,
                     };
                     tokio::spawn(async move { let _ = client.send_message(addr, Message::Request(msg)).await; });
                 }
@@ -15784,15 +15802,33 @@ impl Server {
             if version == 1 {
                 info!("[ORDER] primary: ordering file {} chunk {} epoch {} (secondary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.secondary);
             }
-            let base = match slot.head() {
-                Some(head) => head,
-                None => self.ordered_stream_start(file_id, tag.chunk_idx, chunk_id).await,
+            // A head that can't be continued (stream start, or one of our own applies failed)
+            // restarts from a real chunk: an anchor the secondary can adopt or pull verified.
+            let base = match (slot.head(), slot.head_version()) {
+                (Some(head), Some(_)) => head,
+                (head, _) => {
+                    let start = match head {
+                        Some(h) => h,
+                        None => self.ordered_stream_start(file_id, tag.chunk_idx, chunk_id).await,
+                    };
+                    match self.materialize_anchor(file_id, tag.chunk_idx, start).await {
+                        Some(anchor) => {
+                            slot.set_anchor(anchor, version - 1);
+                            anchor
+                        }
+                        None => {
+                            warn!("[ORDER] primary: file {} chunk {} v{}: couldn't materialize {} as an anchor; the secondary will resync",
+                                file_id, tag.chunk_idx, version, start);
+                            start
+                        }
+                    }
+                }
             };
             if let Some(addr) = self.cluster.get_node(&tag.secondary).await.map(|n| n.addr) {
                 let client = self.client.clone();
                 let msg = Request::WriteOrder {
                     file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
-                    write_id: tag.write_id, version, base,
+                    write_id: tag.write_id, version, base, stream: self.write_ordering.boot,
                 };
                 tokio::spawn(async move {
                     if let Err(e) = client.send_message(addr, Message::Request(msg)).await {
@@ -15812,17 +15848,12 @@ impl Server {
             const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
             let (version, primary_base) = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
                 Ok(v) => v,
-                Err(crate::write_order::TurnError::Gap { version, applied }) => {
-                    warn!("[ORDER] file {} chunk {} epoch {}: versions {}..{} never arrived; applying v{} past the gap",
-                        tag.file_id, tag.chunk_idx, tag.isr_epoch, applied + 1, version - 1, version);
-                    slot.skip_to(version);
-                    match slot.wait_turn(tag.write_id, std::time::Duration::ZERO).await {
-                        Ok(v) => v,
-                        Err(_) => return Response::Error {
-                            message: format!("Ordered: lost write {:x}'s order after skipping a gap", tag.write_id),
-                            code: ErrorCode::InternalError,
-                        },
-                    }
+                // An earlier version never arrived (the client wrote around us during a stall,
+                // or a WriteOrder was lost): the head can't continue; resync below.
+                Err(crate::write_order::TurnError::Gap { version, base, applied }) => {
+                    warn!("[ORDER] file {} chunk {} epoch {}: versions {}..{} never arrived; resyncing from the primary",
+                        tag.file_id, tag.chunk_idx, tag.isr_epoch, applied + 1, version - 1);
+                    (version, base)
                 }
                 Err(crate::write_order::TurnError::Refused) => {
                     return Response::Error {
@@ -15841,13 +15872,39 @@ impl Server {
                 info!("[ORDER] secondary: following file {} chunk {} epoch {} (primary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.primary);
             }
             let _order = slot.order_lock.lock().await;
-            // Our own head keeps the content right even where the ids differ: a replica-local
-            // fold between versions gives the same bytes a new id. Patch-token ids are local to
-            // each replica's accumulator, so comparing ids can't tell "behind" from "same bytes,
-            // different id" (tried 2026-10-03: refusing on an id mismatch fired on nearly every
-            // write once ids drifted). A secondary that fell behind (a stall; the client wrote
-            // around it) still diverges here -- suite T66[secondary] -- which needs version-based
-            // continuity and catch-up from the primary (SLOT-OWNERSHIP-TODO, durable versions).
+            // A real base is the primary's exact state after version-1 (real ids are content
+            // hashes): adopt it, pulling it verified if we lack it. Token ids prove nothing
+            // either way (see write_order.rs), so they are never compared.
+            if !primary_base.looks_like_patch_token() && slot.head() != Some(primary_base)
+                && self.ensure_anchor_local(file_id, tag.chunk_idx, primary_base, tag.primary).await
+            {
+                slot.set_anchor(primary_base, version - 1);
+            }
+            if slot.head_version() != Some(version - 1) {
+                let behind = slot.head_version().is_none_or(|hv| hv < version);
+                if behind {
+                    match self.resync_from_primary(&tag).await {
+                        Some((anchor, at)) => {
+                            info!("[ORDER] secondary: file {} chunk {}: resynced from the primary at v{} ({})",
+                                file_id, tag.chunk_idx, at, anchor);
+                            slot.set_anchor(anchor, at);
+                        }
+                        None => warn!("[ORDER] secondary: file {} chunk {} v{}: resync from the primary failed",
+                            file_id, tag.chunk_idx, version),
+                    }
+                }
+                if slot.head_version() != Some(version - 1) {
+                    // Either v is already in our state (a resync covered it) or we couldn't
+                    // resync. Refuse: the client backfills this write from the primary's copy.
+                    let resp = Response::Error {
+                        message: format!("Ordered: secondary can't apply v{} of file {} chunk {} here (head at {:?}); backfill it",
+                            version, file_id, tag.chunk_idx, slot.head_version()),
+                        code: ErrorCode::InvalidRequest,
+                    };
+                    slot.finish(tag.write_id, version, &resp);
+                    return resp;
+                }
+            }
             let base = slot.head().unwrap_or(primary_base);
             let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
@@ -15855,6 +15912,122 @@ impl Server {
             resp
         } else {
             Response::Error { message: "Ordered: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
+        }
+    }
+
+    /// An ordered ForceFold: a version of the slot's stream like any write, so both replicas fold
+    /// at exactly the same point. Unordered, the client's ForceFold reached the two replicas at
+    /// different points of the stream; they folded different bytes, their accumulators parted,
+    /// and every later write came back with different ids (suite T64a, 59 disagreements).
+    /// The primary materializes its head at the fold's version as a real, content-addressed
+    /// chunk C and announces C as that version's base. The secondary, at its turn, materializes
+    /// its own head: equal to C means identical content, nothing moves (else it pulls C,
+    /// hash-verified). Both anchor at C, so later writes mint identical ids again.
+    async fn handle_ordered_fold(&self, tag: dfs_common::WriteOrderTag) -> Response {
+        let (file_id, chunk_idx) = (tag.file_id, tag.chunk_idx);
+        let me = self.cluster.local_node_id();
+        let slot = self.write_ordering.slot(file_id, chunk_idx, tag.isr_epoch);
+        let fold_result = |c: ChunkId, size: Option<u64>| match size {
+            Some(size) => Response::ForceFoldResult { real_chunk_id: c, size: size as usize },
+            None => Response::Error { message: format!("Ordered fold: {} not stored here", c), code: ErrorCode::InternalError },
+        };
+        let send_order = |version: u64, base: ChunkId| {
+            let client = self.client.clone();
+            let cluster = self.cluster.clone();
+            let msg = Request::WriteOrder { file_id, chunk_idx, isr_epoch: tag.isr_epoch, write_id: tag.write_id, version, base, stream: self.write_ordering.boot };
+            let secondary = tag.secondary;
+            tokio::spawn(async move {
+                if let Some(addr) = cluster.get_node(&secondary).await.map(|n| n.addr) {
+                    let _ = client.send_message(addr, Message::Request(msg)).await;
+                }
+            });
+        };
+        if me == tag.primary {
+            if let Some(prev) = slot.decided(tag.write_id) {
+                return Self::ordered_resend_response(tag.write_id, prev);
+            }
+            let still_primary = self.slot_isr.get(file_id, chunk_idx).is_some_and(|isr| {
+                isr.epoch == tag.isr_epoch && isr.members.first() == Some(&me) && isr.members.get(1) == Some(&tag.secondary)
+            }) && self.lease.holds_own_lease();
+            if !still_primary {
+                if let Some(prev) = slot.refuse_once(tag.write_id) {
+                    return Self::ordered_resend_response(tag.write_id, prev);
+                }
+                send_order(crate::write_order::REFUSED, ChunkId { hash: [0; 32] });
+                return Response::Error { message: format!("Ordered fold: not the primary of file {} chunk {}", file_id, chunk_idx), code: ErrorCode::InvalidRequest };
+            }
+            let _order = slot.order_lock.lock().await;
+            let version = match slot.assign_once(tag.write_id) {
+                Ok(v) => v,
+                Err(prev) => return Self::ordered_resend_response(tag.write_id, prev),
+            };
+            let start = slot.head().or_else(|| self.chunk_map.get(&file_id).and_then(|e| {
+                let (locs, _) = e.value();
+                Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+            }));
+            let anchor = match start {
+                Some(start) => self.materialize_anchor(file_id, chunk_idx, start).await,
+                None => None,
+            };
+            let Some(anchor) = anchor else {
+                // The secondary is told now (not left to time out); the version it never
+                // applies makes it resync on the next write.
+                slot.applied(tag.write_id, version, None);
+                send_order(crate::write_order::REFUSED, ChunkId { hash: [0; 32] });
+                let resp = Response::Error { message: format!("Ordered fold: couldn't materialize file {} chunk {}", file_id, chunk_idx), code: ErrorCode::InternalError };
+                slot.finish(tag.write_id, version, &resp);
+                return resp;
+            };
+            slot.set_anchor(anchor, version);
+            let size = self.storage.get_chunk_size(&anchor);
+            if let Some(sz) = size {
+                advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, sz as usize, None);
+            }
+            send_order(version, anchor);
+            let resp = fold_result(anchor, size);
+            slot.finish(tag.write_id, version, &resp);
+            resp
+        } else if me == tag.secondary {
+            if let Some(prev @ crate::write_order::Decision::Ordered { response: Some(_), .. }) = slot.decided(tag.write_id) {
+                return Self::ordered_resend_response(tag.write_id, prev);
+            }
+            let (version, anchor) = match slot.wait_turn(tag.write_id, std::time::Duration::from_secs(3)).await {
+                Ok(v) => v,
+                Err(crate::write_order::TurnError::Gap { version, base, .. }) => (version, base),
+                Err(e) => return Response::Error {
+                    message: format!("Ordered fold: no usable order for file {} chunk {}: {:?}", file_id, chunk_idx, e),
+                    code: ErrorCode::InvalidRequest,
+                },
+            };
+            let _order = slot.order_lock.lock().await;
+            // Our own content at version-1, if our head is there, is the cheap way to C.
+            let mut held = false;
+            if slot.head_version() == Some(version - 1) {
+                if let Some(head) = slot.head() {
+                    match self.materialize_anchor(file_id, chunk_idx, head).await {
+                        Some(mine) if mine == anchor => held = true,
+                        Some(mine) => warn!("[ORDER] secondary: file {} chunk {} fold v{}: our content {} differs from the primary's {} -- pulling the primary's",
+                            file_id, chunk_idx, version, mine, anchor),
+                        None => {}
+                    }
+                }
+            }
+            if !held && !self.ensure_anchor_local(file_id, chunk_idx, anchor, tag.primary).await {
+                slot.applied(tag.write_id, version, None);
+                let resp = Response::Error { message: format!("Ordered fold: couldn't get the primary's {} for file {} chunk {}", anchor, file_id, chunk_idx), code: ErrorCode::InternalError };
+                slot.finish(tag.write_id, version, &resp);
+                return resp;
+            }
+            slot.set_anchor(anchor, version);
+            let size = self.storage.get_chunk_size(&anchor);
+            if let Some(sz) = size {
+                advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, sz as usize, None);
+            }
+            let resp = fold_result(anchor, size);
+            slot.finish(tag.write_id, version, &resp);
+            resp
+        } else {
+            Response::Error { message: "Ordered fold: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
         }
     }
 
@@ -15878,6 +16051,128 @@ impl Server {
         match resp {
             Response::MultiPatchResult { new_chunk_id, .. } => Some(*new_chunk_id),
             _ => None,
+        }
+    }
+
+    /// This node's bytes for `id` as a real, content-addressed chunk of slot (file, chunk_idx),
+    /// stored locally: `id` itself if it already is one, else its materialized content (a patch
+    /// token resolves through the read path) written under its content hash. The anchor of an
+    /// ordered stream (see write_order.rs).
+    async fn materialize_anchor(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> Option<ChunkId> {
+        if !id.looks_like_patch_token() && self.storage.has_chunk(&id) {
+            return self.register_anchor_location(file_id, chunk_idx, id).await.then_some(id);
+        }
+        // By exact id first. If this node can't resolve it (at stream start `id` can be the
+        // client's chunk id, which an earlier unordered phase left this replica without), the
+        // anchor is this primary's own current content for the slot: the slot backstop
+        // (resolve_by_slot, local). Without it a stream starting after unordered writes had
+        // no anchor, every ordered write failed, and both writers got EIO (suite T63+T64).
+        let mut resp = self.handle_read_chunk(id, None, None).await;
+        if !matches!(resp, Response::ChunkData { .. }) {
+            info!("[ORDER] materialize_anchor: {} unreadable here for file {} chunk {}; anchoring on this node's current content for the slot",
+                id, file_id, chunk_idx);
+            resp = self.handle_read_chunk(id, None, Some((file_id, chunk_idx))).await;
+        }
+        let data: Vec<u8> = match resp {
+            Response::ChunkData { arc_data: Some(arc), arc_range: Some((a, b)), .. } => arc[a..b].to_vec(),
+            Response::ChunkData { arc_data: Some(arc), .. } => arc.as_ref().clone(),
+            Response::ChunkData { data, .. } => data,
+            other => {
+                warn!("[ORDER] materialize_anchor: can't read {} or the slot's content for file {} chunk {}: {:?}", id, file_id, chunk_idx, other);
+                return None;
+            }
+        };
+        let anchor = ChunkId { hash: dfs_common::compute_chunk_hash_at(&data, chunk_idx * (4 * 1024 * 1024), file_id) };
+        if !self.storage.has_chunk(&anchor) {
+            if let Response::Error { message, .. } = self.handle_write_chunk(anchor, data, anchor.hash, false).await {
+                warn!("[ORDER] materialize_anchor: storing {} for file {} chunk {} failed: {}", anchor, file_id, chunk_idx, message);
+                return None;
+            }
+        }
+        self.register_anchor_location(file_id, chunk_idx, anchor).await.then_some(anchor)
+    }
+
+    /// Hold the real chunk `id` locally, pulling it from `from` (verified by its content hash)
+    /// if we don't.
+    async fn ensure_anchor_local(&self, file_id: FileId, chunk_idx: u64, id: ChunkId, from: NodeId) -> bool {
+        let held = self.storage.has_chunk(&id)
+            || pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, id, &[from], file_id, chunk_idx * (4 * 1024 * 1024))
+                .await.is_some();
+        held && self.register_anchor_location(file_id, chunk_idx, id).await
+    }
+
+    /// Register a local ChunkLocation for an anchor if it has none. A fresh accumulator on a
+    /// real base requires its base's location (handle_multi_patch's "no registered location"
+    /// guard), and an anchor written or pulled here has none: without this every ordered write
+    /// onto a fresh anchor failed (suite T34 with DFS_ORDERED_WRITES=1).
+    async fn register_anchor_location(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> bool {
+        if matches!(self.metadata.get_chunk_location_async(id).await, Ok(Some(_))) {
+            return true;
+        }
+        let Some(size) = self.storage.get_chunk_size(&id) else { return false };
+        let loc = ChunkLocation {
+            chunk_id: id,
+            nodes: vec![self.cluster.local_node_id()],
+            size: size as usize,
+            checksum: id.hash,
+            file_offset: Some(chunk_idx * (4 * 1024 * 1024)),
+            written_at: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+        match self.metadata.put_chunk_location_async(loc).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("[ORDER] registering anchor {} for file {} chunk {} failed: {}", id, file_id, chunk_idx, e);
+                false
+            }
+        }
+    }
+
+    /// Secondary: ask the primary for its current state of the slot as a real chunk, and hold
+    /// it locally. Returns the chunk and the version it reflects.
+    async fn resync_from_primary(&self, tag: &dfs_common::WriteOrderTag) -> Option<(ChunkId, u64)> {
+        let addr = self.cluster.get_node(&tag.primary).await.map(|n| n.addr)?;
+        let req = Request::ResyncSlot { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch };
+        let (anchor, at) = match self.client.send_message(addr, Message::Request(req)).await.map(|e| e.message) {
+            Ok(Message::Response(Response::SlotResync { chunk_id, version })) => (chunk_id, version),
+            other => {
+                warn!("[ORDER] resync: primary {} answered {:?}", addr, other.map(|m| format!("{:?}", m).chars().take(200).collect::<String>()));
+                return None;
+            }
+        };
+        self.ensure_anchor_local(tag.file_id, tag.chunk_idx, anchor, tag.primary).await.then_some((anchor, at))
+    }
+
+    /// Primary side of `Request::ResyncSlot`.
+    async fn handle_resync_slot(&self, file_id: FileId, chunk_idx: u64, isr_epoch: u64) -> Response {
+        let me = self.cluster.local_node_id();
+        let is_primary = self.slot_isr.get(file_id, chunk_idx)
+            .is_some_and(|isr| isr.epoch == isr_epoch && isr.members.first() == Some(&me))
+            && self.lease.holds_own_lease();
+        if !is_primary {
+            return Response::Error {
+                message: format!("ResyncSlot: not the primary of file {} chunk {} at epoch {}", file_id, chunk_idx, isr_epoch),
+                code: ErrorCode::InvalidRequest,
+            };
+        }
+        let slot = self.write_ordering.slot(file_id, chunk_idx, isr_epoch);
+        let _order = slot.order_lock.lock().await;
+        let start = slot.head().or_else(|| self.chunk_map.get(&file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+        }));
+        let Some(start) = start else {
+            return Response::Error { message: format!("ResyncSlot: no state here for file {} chunk {}", file_id, chunk_idx), code: ErrorCode::NotFound };
+        };
+        match self.materialize_anchor(file_id, chunk_idx, start).await {
+            Some(anchor) => {
+                let at = slot.assigned();
+                slot.set_anchor(anchor, at);
+                info!("[ORDER] primary: file {} chunk {}: resync anchor {} at v{}", file_id, chunk_idx, anchor, at);
+                Response::SlotResync { chunk_id: anchor, version: at }
+            }
+            None => Response::Error { message: format!("ResyncSlot: couldn't materialize file {} chunk {}", file_id, chunk_idx), code: ErrorCode::InternalError },
         }
     }
 
@@ -15920,6 +16215,17 @@ impl Server {
         ordered: bool,
     ) -> Response {
         self.wait_if_compaction_quiescing().await;
+        // An unordered patch to a slot with an ordered stream (a client whose targets weren't
+        // exactly the ISR pair, e.g. after excluding a stalled member) is serialized with the
+        // stream: it holds the slot's order lock for its whole apply, and leaves the head
+        // cleared. Unserialized, it merged into the accumulator under an ordered write and
+        // retired the token that write took as its base or had just set as the head (suite
+        // T66[secondary]). The next ordered write then re-anchors (primary) or resyncs.
+        let ordered_slot = if ordered { None } else { chunk_idx.and_then(|cidx| self.write_ordering.latest_slot(file_id, cidx)) };
+        let _stream_guard = match &ordered_slot {
+            Some(slot) => Some(slot.order_lock.lock().await),
+            None => None,
+        };
         if !ordered {
             if let Some(cidx) = chunk_idx {
                 self.write_ordering.clear_head(file_id, cidx);

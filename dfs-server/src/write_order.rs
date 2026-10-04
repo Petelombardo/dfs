@@ -10,17 +10,23 @@
 //!
 //! Each replica applies version `n` onto its own result for version `n-1` (`head`), never onto
 //! the leader's chunk_map: that map is the leader's arbitration, propagated asynchronously, and
-//! routinely names an identity this replica doesn't hold (another replica's patch token). Built
-//! on it, a secondary rejected ordered writes as stale and two concurrent writers drew EIO
-//! (suite T64d). The primary sends the base it applied each version onto with `WriteOrder`;
-//! a replica with no head yet (first ordered write, or an unordered patch cleared it) uses that.
-//! Patch-token ids are local to each replica's accumulator, so the secondary follows its own
-//! head rather than comparing ids with the primary's base.
+//! routinely names an identity this replica doesn't hold (suite T64d).
 //!
-//! Still prototype limits: state is in memory only; a secondary that never received a version
-//! (primary crashed mid-send, or restarted) skips over it after `wait_turn`'s timeout and logs
-//! the gap instead of fetching the missing write from the primary; folds are not yet ordered,
-//! so a replica-local fold can give the same content a different id on the two replicas.
+//! Continuity is tracked BY VERSION, never by comparing chunk ids. A patch token's id is
+//! `hash(accumulated delta)`: it omits the base, so two replicas can share a token id while
+//! holding different bytes, and hold the same bytes under different ids (a fold on one side,
+//! a backfill). `head_version` says which version this replica's head reflects; the secondary
+//! applies `v` only onto a head at `v-1`. Real chunk ids are content hashes, so they ARE
+//! trustworthy: they are the anchors. The primary starts every stream (and restarts it after
+//! one of its own applies failed) from a real chunk, and a secondary handed a real base adopts
+//! it, pulling it hash-verified if it lacks it. A secondary whose head can't continue (an
+//! apply failed here, a version never arrived, it just started, an unordered write touched
+//! the slot) RESYNCS: the primary materializes its head as a real chunk at its current
+//! version and the secondary pulls it; writes up to that version are refused here (the client
+//! backfills them) and the stream continues from the shared anchor (suite T66[secondary]).
+//!
+//! `stream` is the primary's boot nonce: a restarted primary hands out versions from 1 again,
+//! which must never be read as continuing the old stream. State is in memory only.
 
 use dashmap::DashMap;
 use dfs_common::{ChunkId, FileId, Response};
@@ -46,12 +52,19 @@ pub enum Decision {
     Ordered { version: u64, response: Option<Response> },
 }
 
-#[derive(Default)]
 pub struct WriteOrdering {
+    /// This process's boot nonce, sent with every `WriteOrder` this node issues as a primary.
+    pub boot: u64,
     slots: DashMap<SlotKey, Arc<SlotOrder>>,
     /// Latest ISR epoch seen per (file, chunk_idx), so an unordered write can find the
     /// slot's stream without scanning every slot.
     latest_epoch: DashMap<(FileId, u64), u64>,
+}
+
+impl Default for WriteOrdering {
+    fn default() -> Self {
+        WriteOrdering { boot: uuid::Uuid::new_v4().as_u64_pair().0, slots: DashMap::new(), latest_epoch: DashMap::new() }
+    }
 }
 
 impl WriteOrdering {
@@ -76,12 +89,36 @@ impl WriteOrdering {
         self.slots.get(&(file_id, chunk_idx, epoch)).and_then(|slot| slot.inner.lock().unwrap().head)
     }
 
+    /// A fold turned the patch token `token` of slot (file, chunk_idx) into the real chunk
+    /// `result` (same bytes). If that token is still the slot's ordered head, the head becomes
+    /// `result`, at the same version: left on the token, the head pointed at a retired id once
+    /// the fold's cleanup removed it (suite T66: a replica's head unreadable), and the next
+    /// ordered write had to re-anchor or resync. Both replicas fold the same token into the
+    /// same content-addressed result, so this also re-converges their ids. Compare-and-set: an
+    /// ordered write that already moved the head past `token` wins.
+    pub fn on_folded(&self, file_id: FileId, chunk_idx: u64, token: ChunkId, result: ChunkId) {
+        if let Some(slot) = self.latest_slot(file_id, chunk_idx) {
+            let mut g = slot.inner.lock().unwrap();
+            if g.head == Some(token) {
+                g.head = Some(result);
+            }
+        }
+    }
+
+    /// The slot's newest ordered stream, if it has one (never creates one).
+    pub fn latest_slot(&self, file_id: FileId, chunk_idx: u64) -> Option<Arc<SlotOrder>> {
+        let epoch = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e)?;
+        self.slots.get(&(file_id, chunk_idx, epoch)).map(|s| s.clone())
+    }
+
     /// An unordered write changed this slot here: the ordered stream's head no longer
     /// names this replica's current state, so the next ordered write takes its base fresh.
     pub fn clear_head(&self, file_id: FileId, chunk_idx: u64) {
         let Some(epoch) = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e) else { return };
         if let Some(slot) = self.slots.get(&(file_id, chunk_idx, epoch)) {
-            slot.inner.lock().unwrap().head = None;
+            let mut g = slot.inner.lock().unwrap();
+            g.head = None;
+            g.head_version = None;
         }
     }
 }
@@ -106,6 +143,11 @@ struct Inner {
     orders: HashMap<u128, (u64, ChunkId)>,
     /// This replica's chunk id for the slot after the last version it applied.
     head: Option<ChunkId>,
+    /// The version `head` reflects (every version up to it applied here, in order). None: the
+    /// head can't be continued (nothing yet, an apply failed, an unordered write, a new stream).
+    head_version: Option<u64>,
+    /// Secondary: the primary's boot nonce for the stream being followed.
+    stream: Option<u64>,
     decided: HashMap<u128, Decision>,
     decided_order: VecDeque<u128>,
 }
@@ -130,9 +172,9 @@ pub enum TurnError {
     /// The primary refused to order this write (not the primary, no lease, stale ISR):
     /// it announced version `REFUSED`, so the secondary fails it at once.
     Refused,
-    /// This write is version `version`, but versions after `applied` and before it never
-    /// arrived.
-    Gap { version: u64, applied: u64 },
+    /// This write is version `version` on `base`, but versions after `applied` and before it
+    /// never arrived.
+    Gap { version: u64, base: ChunkId, applied: u64 },
 }
 
 impl SlotOrder {
@@ -178,11 +220,17 @@ impl SlotOrder {
         g.decide(write_id, Decision::Ordered { version, response: Some(response.clone()) });
     }
 
-    /// Secondary: the primary says `write_id` is `version`, applied onto `base`. The first
-    /// word on a write stands: the primary decides each write once, so a second message can
-    /// only be a resend.
-    pub fn record_order(&self, write_id: u128, version: u64, base: ChunkId) {
+    /// Secondary: the primary (boot nonce `stream`) says `write_id` is `version`, applied onto
+    /// `base`. The first word on a write stands: the primary decides each write once, so a
+    /// second message can only be a resend. A new nonce is a restarted primary: a new stream.
+    pub fn record_order(&self, write_id: u128, version: u64, base: ChunkId, stream: u64) {
         let mut g = self.inner.lock().unwrap();
+        if g.stream.is_some_and(|s| s != stream) {
+            g.applied = 0;
+            g.head_version = None;
+            g.orders.clear();
+        }
+        g.stream = Some(stream);
         if g.decided.contains_key(&write_id) {
             return;
         }
@@ -194,6 +242,28 @@ impl SlotOrder {
     /// This replica's chunk id for the slot after its last applied version, if it has one.
     pub fn head(&self) -> Option<ChunkId> {
         self.inner.lock().unwrap().head
+    }
+
+    /// The version this replica's head reflects, if the head can be continued.
+    pub fn head_version(&self) -> Option<u64> {
+        self.inner.lock().unwrap().head_version
+    }
+
+    /// Primary: the last version handed out.
+    pub fn assigned(&self) -> u64 {
+        self.inner.lock().unwrap().next
+    }
+
+    /// Either side: this replica now holds the real chunk `id` as its state after `version`
+    /// (stream start, a real base from the primary, or a resync). Orders up to it are moot.
+    pub fn set_anchor(&self, id: ChunkId, version: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.head = Some(id);
+        g.head_version = Some(version);
+        g.applied = g.applied.max(version);
+        g.orders.retain(|_, (v, _)| *v > version);
+        drop(g);
+        self.changed.notify_waiters();
     }
 
     /// Secondary: wait until `write_id` has a version and every earlier version is applied.
@@ -212,6 +282,9 @@ impl SlotOrder {
                         self.inner.lock().unwrap().orders.remove(&write_id);
                         return Err(TurnError::Refused);
                     }
+                    // Wait for every earlier version even when this replica's head can't be
+                    // continued: at stream start that is the normal state, and v2 must not
+                    // overtake v1 (a failed version counts as applied, so it never blocks).
                     if g.applied + 1 >= v {
                         return Ok((v, base));
                     }
@@ -220,32 +293,24 @@ impl SlotOrder {
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 let g = self.inner.lock().unwrap();
                 return Err(match g.orders.get(&write_id) {
-                    Some(&(version, _)) => TurnError::Gap { version, applied: g.applied },
+                    Some(&(version, base)) => TurnError::Gap { version, base, applied: g.applied },
                     None => TurnError::NoOrder,
                 });
             }
         }
     }
 
-    /// Either side: `version` is done here. `new_head` is the chunk id it produced, or None
-    /// if applying it failed (the head stays on the last version that did apply).
+    /// Either side: `version` was applied onto the head at `version - 1`. `new_head` is the
+    /// chunk id it produced, or None if applying it failed: the head no longer reflects the
+    /// stream (on the primary the next write re-anchors; a secondary resyncs).
     pub fn applied(&self, write_id: u128, version: u64, new_head: Option<ChunkId>) {
         let mut g = self.inner.lock().unwrap();
         g.applied = g.applied.max(version);
         g.orders.remove(&write_id);
-        if new_head.is_some() {
-            g.head = new_head;
+        match new_head {
+            Some(id) => { g.head = Some(id); g.head_version = Some(version); }
+            None => g.head_version = None,
         }
-        drop(g);
-        self.changed.notify_waiters();
-    }
-
-    /// Secondary skipping a gap: treat everything before `version` as applied. The head
-    /// misses the skipped writes, so drop it: the next write takes the primary's base.
-    pub fn skip_to(&self, version: u64) {
-        let mut g = self.inner.lock().unwrap();
-        g.applied = g.applied.max(version.saturating_sub(1));
-        g.head = None;
         drop(g);
         self.changed.notify_waiters();
     }
@@ -264,8 +329,9 @@ mod tests {
         let s2 = s.clone();
         let late = tokio::spawn(async move { s2.wait_turn(20, Duration::from_secs(2)).await });
         let (b1, b2) = (cid(1), cid(2));
-        s.record_order(20, 2, b2);
-        s.record_order(10, 1, b1);
+        s.set_anchor(cid(9), 0);
+        s.record_order(20, 2, b2, 1);
+        s.record_order(10, 1, b1, 1);
         assert_eq!(s.wait_turn(10, Duration::from_secs(1)).await, Ok((1, b1)));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!late.is_finished(), "version 2 must wait for version 1 to be applied");
@@ -278,10 +344,39 @@ mod tests {
         let o = WriteOrdering::default();
         let s = o.slot(FileId::new(), 0, 3);
         assert_eq!(s.wait_turn(7, Duration::from_millis(50)).await, Err(TurnError::NoOrder));
-        s.record_order(7, 3, cid(3)); // versions 1 and 2 never arrive
-        assert_eq!(s.wait_turn(7, Duration::from_millis(50)).await, Err(TurnError::Gap { version: 3, applied: 0 }));
-        s.skip_to(3);
-        assert_eq!(s.wait_turn(7, Duration::from_millis(50)).await, Ok((3, cid(3))));
+        s.record_order(7, 3, cid(3), 1); // versions 1 and 2 never arrive
+        assert_eq!(s.wait_turn(7, Duration::from_millis(50)).await, Err(TurnError::Gap { version: 3, base: cid(3), applied: 0 }),
+            "a fresh stream still waits for v1 and v2 before v3");
+        s.set_anchor(cid(1), 1);
+        s.record_order(8, 4, cid(4), 1);
+        assert_eq!(s.wait_turn(8, Duration::from_millis(50)).await, Err(TurnError::Gap { version: 4, base: cid(4), applied: 1 }));
+    }
+
+    #[test]
+    fn a_fold_of_the_head_token_moves_the_head_to_the_result() {
+        let o = WriteOrdering::default();
+        let f = FileId::new();
+        let s = o.slot(f, 2, 1);
+        s.set_anchor(cid(1), 0);
+        s.applied(1, 1, Some(cid(2)));
+        o.on_folded(f, 2, cid(9), cid(8));
+        assert_eq!(s.head(), Some(cid(2)), "a fold of another token leaves the head alone");
+        o.on_folded(f, 2, cid(2), cid(3));
+        assert_eq!((s.head(), s.head_version()), (Some(cid(3)), Some(1)), "same version, real id");
+    }
+
+    #[test]
+    fn a_restarted_primary_starts_a_new_stream() {
+        let o = WriteOrdering::default();
+        let s = o.slot(FileId::new(), 0, 1);
+        s.set_anchor(cid(1), 0);
+        s.record_order(1, 1, cid(1), 100);
+        s.applied(1, 1, Some(cid(2)));
+        assert_eq!(s.head_version(), Some(1));
+        // Same epoch, new boot nonce: versions restart at 1 and must not count as continuing.
+        s.record_order(2, 1, cid(3), 200);
+        assert_eq!(s.head_version(), None);
+        assert_eq!(s.inner.lock().unwrap().applied, 0);
     }
 
     fn cid(n: u8) -> ChunkId {
@@ -293,16 +388,18 @@ mod tests {
         let o = WriteOrdering::default();
         let f = FileId::new();
         let s = o.slot(f, 4, 2);
-        assert_eq!(s.head(), None, "no ordered write yet: take the primary's base");
+        assert_eq!((s.head(), s.head_version()), (None, None), "no ordered write yet");
+        s.set_anchor(cid(1), 0);
         s.applied(1, 1, Some(cid(1)));
-        assert_eq!(s.head(), Some(cid(1)));
+        assert_eq!((s.head(), s.head_version()), (Some(cid(1)), Some(1)));
         s.applied(2, 2, None);
-        assert_eq!(s.head(), Some(cid(1)), "a failed apply leaves the head on the last success");
+        assert_eq!(s.head_version(), None, "a failed apply: the head no longer reflects the stream");
+        s.record_order(3, 2, cid(5), 1);
+        s.record_order(4, 3, cid(5), 1);
+        s.set_anchor(cid(5), 2);
+        assert_eq!(s.inner.lock().unwrap().orders.len(), 1, "an anchor makes orders up to it moot");
         o.clear_head(f, 4);
-        assert_eq!(s.head(), None, "an unordered write to the slot drops the head");
-        s.applied(3, 3, Some(cid(3)));
-        s.skip_to(9);
-        assert_eq!(s.head(), None, "a skipped gap drops the head");
+        assert_eq!((s.head(), s.head_version()), (None, None), "an unordered write to the slot drops the head");
         o.slot(f, 4, 3).applied(1, 1, Some(cid(7)));
         assert!(o.is_head(f, 4, cid(7)) && !o.is_head(f, 4, cid(3)) && !o.is_head(f, 5, cid(7)));
         o.clear_head(f, 4);
@@ -316,7 +413,7 @@ mod tests {
         let s2 = s.clone();
         let waiting = tokio::spawn(async move { s2.wait_turn(5, Duration::from_secs(30)).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        s.record_order(5, REFUSED, cid(0));
+        s.record_order(5, REFUSED, cid(0), 1);
         let r = tokio::time::timeout(Duration::from_secs(1), waiting).await
             .expect("the refusal must end the wait, not the 30s timeout").unwrap();
         assert_eq!(r, Err(TurnError::Refused));
@@ -335,8 +432,8 @@ mod tests {
         s.finish(8, v, &Response::Ok { data: None });
         assert!(matches!(s.decided(8), Some(Decision::Ordered { response: Some(Response::Ok { .. }), .. })));
         // The secondary keeps the first word on a write.
-        s.record_order(9, 3, cid(3));
-        s.record_order(9, REFUSED, cid(0));
+        s.record_order(9, 3, cid(3), 1);
+        s.record_order(9, REFUSED, cid(0), 1);
         assert_eq!(s.inner.lock().unwrap().orders.get(&9).map(|o| o.0), Some(3));
     }
 

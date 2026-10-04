@@ -81,7 +81,11 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
 - [x] **Decided 2026-10-03: KEEP** (Pete)
 
 ### Step 2 — full 3c, if the numbers say keep it (L)
-- [x] ~~Folds go through the primary's order~~ — **not needed: no failing case** (2026-10-03).
+- [x] **Folds go through the primary's order** — REOPENED and DONE 2026-10-03 (ordered
+      ForceFold, see the catch-up item below). The morning's "not needed" was wrong: it compared
+      fold ids, not bytes. Under load the client's ForceFold reached the replicas at different
+      points of the stream (T64a, 59 disagreements, ~1 run in 3 after T63).
+      Morning note kept for history: ~~not needed: no failing case~~.
       Background folds already run as one coordinated fold per chunk (T61: ~74 folds/run, 0
       pulls), the client's ForceFold folds both replicas, and a fold on one replica alone is
       adopted by the other (T65, new: deterministic one-sided fold via `dfs-admin isr fold`, 0
@@ -132,8 +136,32 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       wrote unordered around it) — the next item. Until then T66[secondary]b can fail (~1 in 2
       sequences); tooling to see it: `ReadSlotLocal` / `dfs-admin isr read` (each replica's own
       bytes for a slot, blake3).
-- [ ] **NEXT — Durable versions per slot; a lagging secondary NACKs and the primary sends what it missed
-      (replaces the prototype's "skip the gap")
+- [x] **Catch-up by version + anchors (2026-10-03, uncommitted at time of writing)** — replaces the
+      prototype's "skip the gap". Token id = hash(accumulated delta), WITHOUT the base, so token
+      ids prove nothing either way; real (content-hash) ids are trustworthy. So:
+      - `head_version`: the secondary applies v only onto a head at v-1; never compares token ids.
+      - Anchors: the primary starts every stream (and restarts after one of its own applies
+        failed) from a real chunk, materialized from its head, or from its own slot content when
+        the client's id isn't held here (`materialize_anchor`, slot-backstop fallback). A real
+        base is adopted by the secondary (pulled hash-verified if missing). Anchors get a local
+        ChunkLocation (a fresh accumulator requires its base's location; without it every write
+        onto an anchor failed — T34).
+      - Resync (`ResyncSlot`/`SlotResync`, appended): a secondary that can't continue gets the
+        primary's head as a real chunk at the primary's current version; writes up to it are
+        refused here and the client backfills them.
+      - Ordered ForceFold: a version of the stream; both materialize at it; equal ids = identical
+        content, nothing moves (Pete's hash-and-converge), else the secondary pulls the primary's.
+      - An unordered patch to a slot with a stream holds the slot's order lock for its whole
+        apply and clears the head (it was retiring the token an ordered write built on).
+      - `stream` boot nonce on WriteOrder: a restarted primary's versions restart at 1.
+      Gates met: T66 freeze sequence 6/6 (was ~1 in 2 diverging), T63+T64 6/6 (was ~1 in 3),
+      T34, T64/T65. NOT yet: persisting versions across restarts (a restarted secondary waits
+      one 3s turn timeout, then resyncs); the primary-apply-fails-but-secondary-succeeds case
+      (an acked write can be dropped when the stream re-anchors; no test yet).
+- [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
+      until 3b — after the restart the client drifts to a pair without the ISR primary and writes
+      unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for
+      ~3s+, so its first writes are unordered → assign the ISR at chunk creation (3b).
 - [ ] Gates: T64 passes; the 2026-09-27 no-op-divergence repro ends with one version on both;
       lagging-secondary catch-up test; T60-style chaos with writes running and no acked write
       lost; T61d becomes required; **primary killed mid-storm**: no acked write lost, and say

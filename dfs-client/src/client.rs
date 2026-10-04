@@ -1808,7 +1808,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             ));
         }
 
-        debug!("Sending request to {}: {:?}", addr, request);
+        debug!("Sending request to {}: {}", addr, dfs_common::debug_truncated(&request, 600));
 
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
@@ -8563,8 +8563,19 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // blocks here until every target resolves — same overall
                     // synchronous-fold invariant as before, only the fan-out itself
                     // is parallel.
+                    // Ordered writes on this slot: the fold is a version of the same stream, so
+                    // both replicas fold at the same point (see the server's handle_ordered_fold).
+                    let fold_write_id = uuid::Uuid::new_v4().as_u128();
+                    let order_fold = fold_targets.len() == 2 && fold_targets.iter().all(|a| order_tags.contains_key(a));
                     let fold_requests: Vec<_> = fold_targets.iter().map(|&addr| {
-                        let req = Request::ForceFold { file_id, chunk_idx: cidx };
+                        let fold = Request::ForceFold { file_id, chunk_idx: cidx };
+                        let req = match order_tags.get(&addr) {
+                            Some(tag) if order_fold => Request::Ordered {
+                                tag: dfs_common::WriteOrderTag { write_id: fold_write_id, ..*tag },
+                                request: Box::new(fold),
+                            },
+                            _ => fold,
+                        };
                         async move { (addr, self.send_request(addr, req).await) }
                     }).collect();
                     let fold_responses = futures::future::join_all(fold_requests).await;

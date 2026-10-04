@@ -1091,6 +1091,9 @@ pub enum Request {
         write_id: u128,
         version: u64,
         base: ChunkId,
+        /// The primary's boot nonce: a restarted primary's versions restart at 1 and must not
+        /// read as continuing its old stream. (Added before this variant was ever deployed.)
+        stream: u64,
     },
 
     /// Diagnostic: THIS node's own bytes for a slot (its ordered head, else its local chunk_map
@@ -1100,6 +1103,17 @@ pub enum Request {
     ReadSlotLocal {
         file_id: FileId,
         chunk_idx: u64,
+    },
+
+    /// Secondary -> primary (ordered writes): this secondary's head can't continue the slot's
+    /// version stream (an apply failed, a version never arrived, it restarted). The primary
+    /// materializes its head as a real, content-addressed chunk, makes that its head, and
+    /// answers `SlotResync` with it and the version it reflects; the secondary pulls it
+    /// hash-verified and continues from there. APPENDED at end to preserve wire compatibility.
+    ResyncSlot {
+        file_id: FileId,
+        chunk_idx: u64,
+        isr_epoch: u64,
     },
 }
 
@@ -1705,6 +1719,13 @@ pub enum Response {
     /// APPENDED at end to preserve wire compatibility.
     SlotIsrRecords {
         records: Vec<Option<SlotIsr>>,
+    },
+
+    /// Answer to `Request::ResyncSlot`: the primary's state for the slot after `version`, as
+    /// the real chunk `chunk_id`. APPENDED at end to preserve wire compatibility.
+    SlotResync {
+        chunk_id: ChunkId,
+        version: u64,
     },
 }
 

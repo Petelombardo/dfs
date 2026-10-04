@@ -156,8 +156,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       - `stream` boot nonce on WriteOrder: a restarted primary's versions restart at 1.
       Gates met: T66 freeze sequence 6/6 (was ~1 in 2 diverging), T63+T64 6/6 (was ~1 in 3),
       T34, T64/T65. NOT yet: persisting versions across restarts (a restarted secondary waits
-      one 3s turn timeout, then resyncs); the primary-apply-fails-but-secondary-succeeds case
-      (an acked write can be dropped when the stream re-anchors; no test yet).
+      one 3s turn timeout, then resyncs); ~~the primary-apply-fails-but-secondary-succeeds case~~
+      — FIXED dca079f (T68: the client retries an ordered write its primary didn't apply,
+      instead of backfill-and-ack; before, 3/3 runs lost an acked write).
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

@@ -211,22 +211,10 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       unordered?) — Pete's 2026-10-03 question on the dual-stream durability guarantee
 - [ ] Make the flag the default (or drop it)
 
-## Outside the phases — waiting on Pete
+## Outside the phases
 
-- **Six fix branches off main, ready for review/merge** (nothing merged or deployed):
-  `fix/dir-rename-subtree`, `fix/is-leader-startup`, `fix/delete-resurrection`,
-  `fix/rename-lost-pending-write`, `fix/unit-test-fixtures`, `fix/async-metadata-reads`.
-  Combined on main they pass 122/0 (`scratch-integrate-main`); merging them into this branch
-  comes after that.
-- **Open bugs:**
-  - Fsync doesn't scale with writers: 16 fsyncing writers get ~45 IOPS total, the same as one
-    (fsync p50 ~16 ms alone, ~165 ms with 16). Something on the fsync path serializes across
-    files or writers. Same with the flag on or off, so it's not 3c. Worth its own investigation.
-  - Under full-suite load a metadata-db stall still sometimes costs a lease (T59a/T59e). The
-    blocking path hasn't been found; gdb's pause seems to hide it. `eu-stack` (elfutils) would
-    help — install is Pete's call.
-  - Two writers on one chunk get EIO on main today (flag off: T64d fails 2/3, plus 4-109
-    replica disagreements). Fixed with the flag on; the flag-off path is the reason to make
-    ordering the default.
-- **Deploy note for the delete fix:** clusters upgraded after files were already deleted fold
-  those leftover patch rows once.
+- **Six fix branches MERGED 2026-10-05** (fix/dir-rename-subtree, fix/is-leader-startup,
+  fix/delete-resurrection, fix/rename-lost-pending-write, fix/unit-test-fixtures,
+  fix/async-metadata-reads): main 7931eef (suite 122/0, unit tests all green); into this branch
+  05b4deb + T59e bbac84b + c87e287 (suite flag on 194/0 20m11s, flag off 161/1 = T64d baseline
+  20m27s). Not deployed to staging.

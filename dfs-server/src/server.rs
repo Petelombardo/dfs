@@ -22352,7 +22352,7 @@ mod tests {
         assert!(h.server.chunk_map.get(&dead).is_none(), "a late location must not re-create the entry");
 
         let resp = h.server.handle_multi_patch(
-            base, dead, Some(0), 0, vec![(0, vec![7u8; 16])], None, None, None, Some(2),
+            base, dead, Some(0), 0, vec![(0, vec![7u8; 16])], None, None, None, Some(2), false,
         ).await;
         assert!(!matches!(resp, Response::MultiPatchResult { .. }), "a late patch must be refused, got {:?}", resp);
         assert!(!h.server.dirty_patch_slots.iter().any(|e| e.key().0 == dead), "and must leave no dirty slot");

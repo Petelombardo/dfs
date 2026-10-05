@@ -7704,6 +7704,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         dual_rf: bool,
         per_server_hints: Arc<HashMap<SocketAddr, Vec<ChunkId>>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
+        // With ordered writes every patch to a known chunk goes to its ISR pair, whichever
+        // flusher sends it. The background flusher (dual_rf=false) patched every holder the
+        // location listed instead, so after a takeover, with the location still naming the
+        // dead primary and not the new secondary, its writes went out unordered (suite T73;
+        // the likely source of T61d's one-off disagreements). The skipped holders are left
+        // out of the new location, as on the fsync path, and the healer restores RF.
+        let dual_rf = dual_rf || (chunk_idx.is_some() && Self::ordered_writes_enabled());
         // Timing instrumentation added 2026-07-12 to find the actual dominant cost in
         // this function under real kdiskmark-style load — logged unconditionally (not
         // just on a slow threshold) so a full run's timing distribution can be pulled
@@ -7862,7 +7869,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await,
             _ => HashMap::new(),
         };
-        if let (Some(cidx), true, true) = (chunk_idx, dual_rf, Self::ordered_writes_enabled()) {
+        if let (Some(cidx), true) = (chunk_idx, Self::ordered_writes_enabled()) {
             if order_tags.is_empty() {
                 // Greppable: suite T61d counts these; an unordered write can diverge the pair.
                 info!("[ORDER] client: UNORDERED MultiPatch file {} chunk {} (isr pair {}; targets {:?}; cached isr {:?})",
@@ -8102,10 +8109,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                 None
             };
             if let Some((healthy, failed)) = ask {
-                let req = Request::ReplaceIsrMember { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch, failed };
-                match self.send_request(healthy, req).await {
-                    Ok(Response::SlotIsrRecords { records }) => {
-                        if let Some(next) = records.into_iter().next().flatten().filter(|n| n.epoch > tag.isr_epoch) {
+                // A dead primary can be taken over only once a majority has voted its lease
+                // expired (about lease + margin after it went silent). Until then the
+                // secondary declines, and that is a wait with a known end, not a failure:
+                // failing here sent the write down the flush path's one-retry ladder into
+                // the fresh-write fallback, whose safety check turned it into a guest EIO
+                // (suite T73). Keep asking within the outage budget instead.
+                const TAKEOVER_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+                loop {
+                    let req = Request::ReplaceIsrMember { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch, failed };
+                    let resp = self.send_request(healthy, req).await;
+                    if let Ok(Response::SlotIsrRecords { records }) = &resp {
+                        if let Some(next) = records.first().cloned().flatten().filter(|n| n.epoch > tag.isr_epoch) {
                             info!("ISR for file {} chunk {}: epoch {} -> {} after member {} failed (members {:?}) -- retrying on the new pair",
                                 tag.file_id, tag.chunk_idx, tag.isr_epoch, next.epoch, failed, next.members);
                             self.slot_isr_cache.insert((tag.file_id, tag.chunk_idx), next);
@@ -8113,12 +8128,22 @@ leader_addr: Arc::new(RwLock::new(None)),
                             // fail to read the token back and settle for ONE replica), resend
                             // the write to the new pair, where the replacement catches up from
                             // the primary first. The primary re-applies identical bytes.
-                            return Err(anyhow::anyhow!(
-                                "MultiPatch: ISR member replaced for file {} chunk {}; retry on the new pair", tag.file_id, tag.chunk_idx));
+                            // Resent from here: handing it back to the caller cost the flush
+                            // path's only retry.
+                            continue 'retry;
                         }
                     }
-                    other => info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",
-                        tag.file_id, tag.chunk_idx, failed, other.map(|r| dfs_common::debug_truncated(&r, 200)).unwrap_or_else(|e| e.to_string())),
+                    let awaiting_expiry = failed == tag.primary
+                        && matches!(&resp, Ok(Response::Error { message, .. }) if message.contains("isn't expired by a majority"));
+                    if awaiting_expiry && retry_started.elapsed() < CONNECT_RETRY_BUDGET {
+                        debug!("ReplaceIsrMember for file {} chunk {}: primary {} not expired by a majority yet; asking again in {:?}",
+                            tag.file_id, tag.chunk_idx, failed, TAKEOVER_POLL);
+                        tokio::time::sleep(TAKEOVER_POLL).await;
+                        continue;
+                    }
+                    info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",
+                        tag.file_id, tag.chunk_idx, failed, resp.map(|r| dfs_common::debug_truncated(&r, 200)).unwrap_or_else(|e| e.to_string()));
+                    break;
                 }
             }
         }

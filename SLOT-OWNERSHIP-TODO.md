@@ -200,6 +200,30 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       (`[ORDER] client: UNORDERED MultiPatch`, with the cached ISR); 0 in T61 of the clean run.
       The failing run's ghost-guard trips prove some storm writes went unordered (the guard
       only runs for unordered patches); cause still open. Next time T61d fails, grep T61.log.
+- [x] **T73 primary killed mid-storm (2026-10-05):** new suite
+      test (moved to run before T70-T72: T71 leaves the cluster leaderless). Run 1 on 4047393 found
+      two bugs: (1) EIO ~3s after the kill: the secondary declines a takeover until a majority
+      votes the primary expired, the client treated that as final, flush ladder -> fresh-write
+      fallback -> EIO; (2) the background flusher (dual_rf=false) never picked the ISR pair, so
+      after a takeover it wrote UNORDERED to the stale location (likely T61d's cause). Client fix
+      (client.rs): dual_rf forced on with ordering + chunk_idx; a "not expired by a majority"
+      decline is polled every 300ms within CONNECT_RETRY_BUDGET; an accepted replace resends in
+      place (`continue 'retry`, was `return Err`). T73 3/3 pass (0 EIO, 0 unordered; 3-6s stall).
+      **BLOCKER:** full suite flag on 196/3: T69[row3] I1 LOST acked writes A134/A135 (servers
+      held A133; secondary replaced, epoch 2). Passed in both suites before this change, so
+      suspect the change. Hypothesis: a background flush of A133 held in the new poll/resend
+      loop while fsync flushes acked A134/A135, then landed last. NEXT: `DFS_ORDERED_WRITES=1
+      T69_CASES=row3 ./scripts/test_local_suite.sh T69` x5 with the fix; keep logs on failure;
+      check for two concurrent flushes of chunk 1 for ino A. Then decide: serialize flushes
+      per chunk across the retry, or drop the in-place resend and only keep the takeover poll.
+      Flag off 158/6: T59a (known flake), T64a/b/d (unordered path, known), T73 x2 (ordering;
+      fixed by the move).
+      10-05 resume: did NOT reproduce. T69 row3 alone 8/8, full T69 6/6 (19/0 each; logs confirm
+      the secondary replace + in-place resend ran), flag-on full suite 203/0 in 21m58s
+      (/root/dfs-suite-t73fix-on2.log; T73 0 EIO, worst stall 6.2s). The one loss is unexplained
+      (logs were wiped) — the concurrent-flush overlap needs a flush >30s (FIFO/pipeline wait
+      timeouts), not seen. Flag-off full suite 162/0 (21m36s, /root/dfs-suite-t73fix-off2.log).
+      Committed + pushed. Watch T69[row3] for a recurrence: if it fails, keep the logs. Logs: /root/dfs-suite-t73fix-{on,off}.log, /root/dfs-t73-run{1..4}.log.
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

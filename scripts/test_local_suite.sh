@@ -6222,6 +6222,179 @@ done
 fusermount -u "$T69_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T69_PID2"
 fi # should_run T69
+if should_run T73; then
+snapshot_log T73
+echo ""
+echo "=== T73: the chunk's ISR primary is killed mid-storm; the secondary takes over, no acked write lost (SLOT-OWNERSHIP 3c gate) ==="
+# Pete's 2026-10-03 question: with the primary dead, what does a writer see until the secondary
+# is promoted (EIO, or a stall then success), and is any acked write lost? The primary is
+# SIGKILLed (not frozen as in T66) and stays down past its lease, so only a takeover (Phase 3d)
+# lets writes continue on two copies. A chunk whose primary isn't the leader is picked, so a
+# leader election doesn't confound the result.
+T73_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T73_FILE=t73_primary_kill.bin
+T73_CHUNKS=8
+T73_DOWN=10
+T73_SECS=26
+T73_MOUNT2=/tmp/dfs-mount2
+mkdir -p "$T73_MOUNT2"
+RUST_LOG=info "$BIN/dfs-client" mount "$T73_MOUNT2" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t73b.log" --allow-other --log-level debug &
+T73_PID2=$!
+sleep 2
+mountpoint -q "$T73_MOUNT2" || check "T73 second client mounted" FAIL
+t73_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T66/T67)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t73_writer() {  # mount file offset tag seconds out: fsync'd 4K writes to one block until the deadline
+    python3 - "$1/$2" "$3" "$4" "$5" > "$6" 2>&1 <<'PY'
+import os, sys, time, json
+path, off, tag, secs = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode(), float(sys.argv[4])
+fd = os.open(path, os.O_RDWR)
+start = time.time(); i = 0
+acked = []; failed = []; worst = 0.0
+while time.time() - start < secs:
+    t0 = time.time()
+    try:
+        os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), off)
+        os.fsync(fd)
+        acked.append((i, time.time() - start))
+    except OSError:
+        failed.append((i, round(time.time() - start, 1)))
+        time.sleep(0.2)
+    worst = max(worst, time.time() - t0)
+    i += 1
+os.close(fd)
+ts = [0.0] + [t for _, t in acked]
+gap = max((b - a for a, b in zip(ts, ts[1:])), default=secs)
+print(json.dumps({"acked": [a for a, _ in acked], "late": sum(1 for _, t in acked if t > secs - 4),
+                  "failed": [f for f, _ in failed], "failed_at": [t for _, t in failed],
+                  "worst_s": round(worst, 2), "max_ack_gap_s": round(gap, 2)}))
+PY
+}
+dd if=/dev/urandom of="$MOUNT/$T73_FILE" bs=4M count=$T73_CHUNKS status=none
+dfs_sync
+T73_LEADER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[0]['address'] if online else '')" 2>/dev/null || true)
+T73_MAP=$("$BIN/dfs-admin" --cluster "$T73_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+# First chunk (1..) with a committed ISR whose primary isn't the leader: "chunk primary secondary epoch".
+T73_PICK=""
+for _ in $(seq 1 30); do
+    T73_PICK=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T73_FILE" --chunks $T73_CHUNKS 2>/dev/null \
+        | python3 -c "
+import json, sys
+addr = dict(l.split() for l in '''$T73_MAP'''.strip().splitlines())
+isr = json.loads(sys.stdin.readline())['isr']
+for c in range(1, len(isr)):
+    r = isr[c]
+    if r and len(r['members']) >= 2 and addr.get(r['members'][0]) not in ('', None, '$T73_LEADER'):
+        print(c, addr[r['members'][0]], addr.get(r['members'][1], ''), r['epoch']); break" 2>/dev/null || true)
+    [ -n "$T73_PICK" ] && break
+    sleep 1
+done
+read -r T73_C T73_P T73_S T73_EPOCH0 <<< "$T73_PICK"
+if [ -z "$T73_P" ] || [ -z "$T73_S" ]; then
+    check "T73 setup: a chunk whose ISR primary isn't the leader ($T73_LEADER) found" FAIL
+else
+    T73_OFF=$(( T73_C * 4 * 1024 * 1024 + 8192 ))
+    T73_FILE_ID_PAT=$(grep -h "\[META SERVER\] put path=/$T73_FILE id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+    T73_FILE_ID_PAT=${T73_FILE_ID_PAT:-no-file-id}
+    T73_N=$(( ${T73_P##*:} - 8900 + 1 ))
+    T73_MARK=$(cat "$LOG"/server*.log | wc -l)
+    echo "  T73: chunk $T73_C ISR epoch $T73_EPOCH0 primary=$T73_P (node$T73_N) secondary=$T73_S leader=$T73_LEADER; killing the primary 4s in for ${T73_DOWN}s"
+    t73_writer "$MOUNT" "$T73_FILE" "$T73_OFF" A "$T73_SECS" "$LOG/t73_w1.out" & T73_W1=$!
+    t73_writer "$T73_MOUNT2" "$T73_FILE" "$T73_OFF" B "$T73_SECS" "$LOG/t73_w2.out" & T73_W2=$!
+    sleep 4
+    pkill -9 -f "dfs-server start --config $BASE/node${T73_N}/config.toml" 2>/dev/null || true
+    sleep "$T73_DOWN"
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T73_N}/config.toml" \
+        >> "$LOG/server${T73_N}.log" 2>&1 &
+    wait "$T73_W1" "$T73_W2" 2>/dev/null || true
+    dfs_sync; sync "$T73_MOUNT2" 2>/dev/null || true
+    sleep 5
+    T73_FRESH=$(fresh_read "$T73_FILE" "$T73_OFF" 10)
+    T73_VERDICT=$(python3 - "$LOG/t73_w1.out" "$LOG/t73_w2.out" "$T73_FRESH" <<'PY'
+import json, sys
+fresh = sys.argv[3]
+ok, summary = False, []
+for path, tag in ((sys.argv[1], "A"), (sys.argv[2], "B")):
+    try: r = json.loads(open(path).read().strip().splitlines()[-1])
+    except Exception as e: print("BAD", "writer %s output unreadable: %s" % (tag, e)); sys.exit()
+    last = max(r["acked"]) if r["acked"] else -1
+    allowed = {last} | {f for f in r["failed"] if f > last}
+    if fresh[:1] == tag and fresh[1:7].isdigit() and int(fresh[1:7]) in allowed: ok = True
+    summary.append("%s: %d acked (last %d, %d in the last 4s), %d failed%s, longest gap between acks %.1fs, worst op %.1fs"
+                   % (tag, len(r["acked"]), last, r["late"], len(r["failed"]),
+                      (" at %s s" % r["failed_at"][:6]) if r["failed"] else "", r["max_ack_gap_s"], r["worst_s"]))
+    if r["late"] == 0: summary.append("NOPROGRESS-" + tag)
+print("OK" if ok else "LOST", "; ".join(summary))
+PY
+)
+    echo "  T73: servers hold $T73_FRESH; ${T73_VERDICT#* }"
+    case "$T73_VERDICT" in
+        OK*) t73_check "T73a no acked write lost across the primary's death (servers hold $T73_FRESH)" PASS ;;
+        *)   t73_check "T73a servers hold $T73_FRESH, not a writer's last acked write -- acked write lost" FAIL ;;
+    esac
+    T73_NOW=$("$BIN/dfs-admin" --cluster "$T73_S" isr get --file "/$T73_FILE" --chunks $T73_CHUNKS 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][$T73_C]; print(r['epoch'], ' '.join(r['members']))" 2>/dev/null || true)
+    read -r T73_EPOCH T73_NP T73_NS <<< "$T73_NOW"
+    T73_MAP2=$("$BIN/dfs-admin" --cluster "$T73_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    T73_CP=$(echo "$T73_MAP2" | awk -v n="$T73_NP" '$1==n{print $2}')
+    T73_CS=$(echo "$T73_MAP2" | awk -v n="$T73_NS" '$1==n{print $2}')
+    echo "  T73: ISR now epoch ${T73_EPOCH:-?}: primary=${T73_CP:-?} secondary=${T73_CS:-?}"
+    if [ "${T73_EPOCH:-0}" -gt "${T73_EPOCH0:-0}" ] && [ "$T73_CP" = "$T73_S" ]; then
+        t73_check "T73b the secondary took over (epoch $T73_EPOCH0 -> $T73_EPOCH, primary $T73_S)" PASS
+    else
+        t73_check "T73b no takeover: epoch ${T73_EPOCH0:-?} -> ${T73_EPOCH:-?}, primary ${T73_CP:-?} (expected $T73_S)" FAIL
+    fi
+    case "$T73_VERDICT" in
+        *NOPROGRESS*) t73_check "T73c a writer made no progress in the last 4s after the takeover" FAIL ;;
+        *)            t73_check "T73c both writers made progress after the takeover" PASS ;;
+    esac
+    T73_HASHES=$("$BIN/dfs-admin" --cluster "${T73_CP:-$T73_S},${T73_CS:-$T73_P}" isr read --file "/$T73_FILE" --chunk "$T73_C" 2>/dev/null | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T73_H1 T73_H2 <<< "$T73_HASHES"
+    if [ -n "$T73_H1" ] && [ "$T73_H1" = "$T73_H2" ] && [ "$T73_H1" != ERR ]; then
+        t73_check "T73d the new ISR pair holds identical bytes ($T73_H1)" PASS
+    else
+        t73_check "T73d the new ISR pair differs or is unreadable: $T73_HASHES" FAIL
+    fi
+    # The primary's death must cost the writers a stall, never an error: a guest sees EIO
+    # as a disk failure. Before 2026-10-05 the client gave up while the takeover was still
+    # pending (the primary not yet voted expired) and fsync returned EIO.
+    T73_EIO=$(python3 -c "
+import json, sys
+print(sum(len(json.loads(open(p).read().strip().splitlines()[-1])['failed']) for p in sys.argv[1:]))" "$LOG/t73_w1.out" "$LOG/t73_w2.out" 2>/dev/null || echo "?")
+    [ "$T73_EIO" = 0 ] \
+        && t73_check "T73e no writer got an error while the secondary took over" PASS \
+        || t73_check "T73e $T73_EIO write(s) failed (EIO) while the secondary took over" FAIL
+    # Counted from the raw sends in the clients' debug logs, not from the client's own
+    # UNORDERED line: the background flusher once bypassed that line and the ISR pair both.
+    T73_RAW=$(cat "$CURRENT_CLIENT_LOG" "$LOG/client_t73b.log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep -aE "Sending request to [0-9.:]+: MultiPatch \{" | grep -ac "$T73_FILE_ID_PAT" || true)
+    [ "${T73_RAW:-1}" = 0 ] \
+        && t73_check "T73f every patch to the file went out ordered" PASS \
+        || t73_check "T73f $T73_RAW unordered MultiPatch send(s) to the file" FAIL
+    T73_SINCE=$(cat "$LOG"/server*.log | tail -n +"$((T73_MARK + 1))" | sed 's/\x1b\[[0-9;]*m//g')
+    echo "  T73: $(echo "$T73_SINCE" | grep -ac "resync anchor" || true) resync(s) served; $(grep -ac "ReplaceIsrMember" "$CURRENT_CLIENT_LOG" "$LOG/client_t73b.log" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}') ReplaceIsrMember mention(s) in the clients' logs; $(cat "$CURRENT_CLIENT_LOG" "$LOG/client_t73b.log" 2>/dev/null | grep -ac "UNORDERED MultiPatch" || true) unordered write(s)"
+fi
+rm -f "$MOUNT/$T73_FILE"
+fusermount -u "$T73_MOUNT2" 2>/dev/null || true
+kill_client_and_wait "$T73_PID2"
+fi # should_run T73
+
 if should_run T70; then
 snapshot_log T70
 echo ""

@@ -7862,6 +7862,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                 self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await,
             _ => HashMap::new(),
         };
+        if let (Some(cidx), true, true) = (chunk_idx, dual_rf, Self::ordered_writes_enabled()) {
+            if order_tags.is_empty() {
+                // Greppable: suite T61d counts these; an unordered write can diverge the pair.
+                info!("[ORDER] client: UNORDERED MultiPatch file {} chunk {} (isr pair {}; targets {:?}; cached isr {:?})",
+                    file_id, cidx, if isr_pair.is_some() { "chosen" } else { "unavailable" }, patch_addrs,
+                    self.slot_isr_cache.get(&(file_id, cidx)).map(|r| (r.epoch, r.members.clone())));
+            }
+        }
 
         // Consume a fresh write_seq for this patch so the leader can use it to order
         // concurrent RCL notifications from the same file without relying on wall clocks.

@@ -180,7 +180,7 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       T57a (the delete-resurrection divergence; fix on unmerged fix/delete-resurrection).
       Not yet: the flap guard (a replaced node is simply not re-added, so flapping costs nothing
       today); the plan's failure-matrix rows as their own tests.
-- [~] **Phase 3d failure-matrix test T69 (2026-10-04, committed locally, NOT pushed):** rows #2/#6,
+- [~] **Phase 3d failure-matrix test T69 (2026-10-04, pushed 2026-10-05):** rows #2/#6,
       #3, #5+#11, #10 with invariants I1 no acked write lost, I2 one primary per epoch, I3 no
       unclean promotion, I4 current ISR identical. 19/19 together; row #5 takeover 4/4. Fixes it
       drove: replace/takeover decided before the "no replica succeeded" bail-out; transport
@@ -195,6 +195,11 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       chaos, with ghost-chunk-guard trips = unordered patches). Investigate before pushing:
       run `DFS_ORDERED_WRITES=1 ./scripts/test_local_suite.sh T60 T61` repeatedly, count
       unordered MultiPatch sends and GetOrSeedSlotIsr outcomes.
+      2026-10-05: did NOT reproduce: T60+T61 4/4 pass, full suites flag-on 181/0 (17m53s),
+      flag-off 148/1 (T64d, = baseline; 17m41s). The client now logs every unordered write
+      (`[ORDER] client: UNORDERED MultiPatch`, with the cached ISR); 0 in T61 of the clean run.
+      The failing run's ghost-guard trips prove some storm writes went unordered (the guard
+      only runs for unordered patches); cause still open. Next time T61d fails, grep T61.log.
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for

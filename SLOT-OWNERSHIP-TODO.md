@@ -218,3 +218,15 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   fix/async-metadata-reads): main 7931eef (suite 122/0, unit tests all green); into this branch
   05b4deb + T59e bbac84b + c87e287 (suite flag on 194/0 20m11s, flag off 161/1 = T64d baseline
   20m27s). Not deployed to staging.
+- **Open bugs:**
+  - Fsync doesn't scale with writers: 16 fsyncing writers get ~45 IOPS total, the same as one
+    (fsync p50 ~16 ms alone, ~165 ms with 16). Something on the fsync path serializes across
+    files or writers. Same with the flag on or off, so it's not 3c. Worth its own investigation.
+  - Under full-suite load a metadata-db stall still sometimes costs a lease (T59a/T59e). The
+    blocking path hasn't been found; gdb's pause seems to hide it. `eu-stack` (elfutils) would
+    help — install is Pete's call.
+  - Two writers on one chunk get EIO on main today (flag off: T64d fails 2/3, plus 4-109
+    replica disagreements). Fixed with the flag on; the flag-off path is the reason to make
+    ordering the default.
+- **Deploy note for the delete fix:** clusters upgraded after files were already deleted fold
+  those leftover patch rows once.

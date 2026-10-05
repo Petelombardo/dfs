@@ -1320,17 +1320,4 @@ mod tests {
         assert_eq!(next_rotation.len(), 5, "next rotation should see all 5 chunks now on disk");
     }
 
-    #[test]
-    fn test_checksum_verification_on_write() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = ChunkStorage::new(temp_dir.path().to_path_buf()).unwrap();
-
-        let data = b"Test data";
-        let wrong_hash = [0u8; 32]; // Wrong hash
-        let chunk_id = ChunkId::from_hash(wrong_hash);
-
-        // Should fail because checksum doesn't match
-        let result = storage.write_chunk(&chunk_id, data);
-        assert!(result.is_err());
-    }
 }

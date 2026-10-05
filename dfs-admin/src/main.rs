@@ -286,7 +286,12 @@ enum FileCommands {
         chunk_id: String,
     },
     /// List all files in metadata database
-    List,
+    List {
+        /// Ask the first --cluster node about its own FILE_TABLE instead of the
+        /// leader's, to compare nodes' views.
+        #[arg(long)]
+        local: bool,
+    },
     /// Purge file metadata from database (without deleting chunks). Accepts path or UUID.
     Purge {
         /// File path or UUID
@@ -499,6 +504,7 @@ async fn handle_cluster_command(
                     total_nodes,
                     healthy_nodes,
                     local_node_id,
+                    leader_node_id,
                     ..
                 } => {
                     // Service age (process uptime, not host uptime) isn't carried by
@@ -535,11 +541,8 @@ async fn handle_cluster_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
-                        // Leader = online node with minimum NodeId (same logic as server)
-                        let leader_id = nodes.iter()
-                            .filter(|n| n.status == dfs_common::NodeStatus::Online)
-                            .map(|n| n.id)
-                            .min();
+                        // The server's own answer: None while it can't see a majority.
+                        let leader_id = leader_node_id;
 
                         println!("DFS Cluster Status");
                         println!("==================");
@@ -1317,10 +1320,10 @@ async fn handle_file_command(
                 }
             }
         }
-        FileCommands::List => {
+        FileCommands::List { local } => {
             // Query the leader, not cluster_addrs[0] — see FileCommands::Info's
-            // matching comment for why.
-            let leader = find_leader_addr(cluster_addrs).await;
+            // matching comment for why — unless asked for that node's own view.
+            let leader = if local { cluster_addrs[0] } else { find_leader_addr(cluster_addrs).await };
             let response = send_request(leader, Request::ListAllFiles).await?;
 
             match response {

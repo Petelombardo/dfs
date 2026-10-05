@@ -261,7 +261,7 @@ pub struct Server {
     /// second: merge_file_metadata's is_stale check is strict `>`, so a tie lets
     /// the later commit's scalar fields (including path) win outright. See
     /// wait_for_pending_metadata_write.
-    pending_metadata_writes: Arc<dashmap::DashSet<FileId>>,
+    pending_metadata_writes: Arc<PendingWrites>,
 
     /// Fired by the sled-write worker after every batch commits (regardless of
     /// which files were in it). Paired with pending_metadata_writes to let
@@ -1854,6 +1854,9 @@ pub(crate) enum SlotMergeOutcome {
     },
     /// Offset-less and unplaceable — see the legacy tail of the merge fn.
     Unplaceable,
+    /// The file was just deleted here; a location still in flight for it must not
+    /// re-create its chunk_map entry (see Server::file_recently_deleted).
+    FileDeleted,
 }
 
 impl SlotMergeOutcome {
@@ -1866,7 +1869,7 @@ impl SlotMergeOutcome {
         match self {
             SlotMergeOutcome::Applied { current } => Some(*current),
             SlotMergeOutcome::Rejected { current, .. } => Some(*current),
-            SlotMergeOutcome::Unplaceable => None,
+            SlotMergeOutcome::Unplaceable | SlotMergeOutcome::FileDeleted => None,
         }
     }
 }
@@ -3180,7 +3183,7 @@ impl OverlayForkCtx {
         // avoids drowning the real signal: a full-suite run logged 1179
         // "no longer exists" lines, which is what the first version of this
         // counted as urgent single-replica events.
-        let file_deleted = matches!(self.metadata.get_file(&file_id), Ok(None));
+        let file_deleted = matches!(self.metadata.get_file_async(file_id).await, Ok(None));
 
         if holders.len() < 2 && !file_deleted {
             // Push the bytes this fold just produced — already in memory, no
@@ -5309,6 +5312,35 @@ impl Drop for FoldHealingCancelGuard {
     }
 }
 
+/// How many metadata writes per file are queued in sled_write_tx and not yet committed
+/// (see Server::pending_metadata_writes). A count, not a set: two writes queued back to
+/// back for one file can land in different worker batches, and a set cleared by the
+/// first batch reported "nothing pending" while the second was still queued. A rename
+/// then read the stale record, tied the queued write's write_seq, and lost to it when it
+/// committed — the rename silently reverted to the old path (suite T12-T14 flake;
+/// pending_writes_count_every_queued_write).
+#[derive(Default)]
+pub(crate) struct PendingWrites(DashMap<FileId, usize>);
+
+impl PendingWrites {
+    pub(crate) fn queued(&self, id: FileId) {
+        *self.0.entry(id).or_insert(0) += 1;
+    }
+    /// One queued write for `id` is resolved (committed or dropped).
+    pub(crate) fn resolved(&self, id: FileId) {
+        self.0.remove_if_mut(&id, |_, n| { *n = n.saturating_sub(1); *n == 0 });
+    }
+    pub(crate) fn contains(&self, id: &FileId) -> bool {
+        self.0.contains_key(id)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl Server {
     /// True if this slot has crossed MAX_FOLD_FAILURES_BEFORE_ESCALATION and is
     /// still within its escalated backoff window (FOLD_ESCALATED_RETRY_INTERVAL
@@ -5379,7 +5411,7 @@ impl Server {
         tombstones_for_worker: Arc<DashMap<FileId, std::time::Instant>>,
         done_notify: Arc<tokio::sync::Notify>,
         backlog_for_worker: Arc<std::sync::atomic::AtomicUsize>,
-        pending_for_worker: Arc<dashmap::DashSet<FileId>>,
+        pending_for_worker: Arc<PendingWrites>,
         progress_for_worker: Arc<tokio::sync::Notify>,
         metadata_batch_drain_enabled: bool,
     ) -> tokio::sync::mpsc::UnboundedSender<FileMetadata> {
@@ -5479,7 +5511,7 @@ impl Server {
                     // committed above, or dropped as tombstoned. A read-modify-write op
                     // (rename) waiting on any of these can now safely re-read.
                     for id in ids_in_batch {
-                        pending_for_worker.remove(&id);
+                        pending_for_worker.resolved(id);
                     }
                     progress_for_worker.notify_waiters();
 
@@ -5515,7 +5547,7 @@ impl Server {
         // each other within a single literal).
         let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pending_metadata_writes: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
+        let pending_metadata_writes: Arc<PendingWrites> = Arc::new(PendingWrites::default());
         let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let pending_renames: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
         let rename_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
@@ -6439,6 +6471,10 @@ impl Server {
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) -> SlotMergeOutcome {
+        if self.file_recently_deleted(file_id) {
+            debug!("[CHUNK_MAP] file={} deleted — dropping in-flight location {}", file_id, location.chunk_id);
+            return SlotMergeOutcome::FileDeleted;
+        }
         // Backfill the slot's CURRENT occupant's generation before arbitrating, if this
         // node never directly recorded it. chunk_generations is in-memory, per-chunk_id,
         // and only ever populated by whichever node computed a patch/fold's merge
@@ -6721,7 +6757,7 @@ impl Server {
                 // accept leader data if it is strictly newer than our local copy.
                 // Applying stale leader metadata would regress our chunk_map from the
                 // current chunk_id (Y, just patched) back to the old one (X, pre-patch).
-                let local_seq = self.metadata.get_file(&file_id)
+                let local_seq = self.metadata.get_file_async(file_id).await
                     .ok().flatten()
                     .map(|m| m.write_seq)
                     .unwrap_or(0);
@@ -7892,7 +7928,7 @@ impl Server {
             Request::TriggerHealing => self.handle_trigger_healing().await,
             Request::TriggerPhantomReconciliation => self.handle_trigger_phantom_reconciliation().await,
             Request::DebugGetRawChunkLocation { chunk_id } => {
-                let location = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+                let location = self.metadata.get_chunk_location_async(chunk_id).await.ok().flatten();
                 Response::DebugRawChunkLocation { location }
             }
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
@@ -8885,7 +8921,7 @@ impl Server {
         // pushed replica's mtime ~1000x too far in the future (e.g. a chunk written
         // 2026-08-04 landed with an mtime of 2446-05-10) — confirmed live 2026-08-04
         // on staging chunks pushed via PushChunkTo during the VM-108 restore.
-        let loc = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+        let loc = self.metadata.get_chunk_location_async(chunk_id).await.ok().flatten();
         let written_at = loc.as_ref().and_then(|l| l.written_at).map(|ms| ms / 1000);
 
         // Pace this transfer against the configured heal bandwidth (DFS_HEAL_BANDWIDTH_MB)
@@ -9154,7 +9190,7 @@ impl Server {
         // to followers 100ms later, resurrecting the file there.
         self.pending_broadcasts.remove(&file_id);
 
-        if let Err(e) = self.metadata.delete_file_async(file_id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_async(file_id).await {
             warn!("Failed to delete file record {} on peer: {}", file_id, e);
         }
         if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
@@ -12836,6 +12872,22 @@ impl Server {
         });
     }
 
+    /// Age out FILE_TOMBSTONE_TABLE markers (see MetadataStore::prune_file_tombstones).
+    /// A day is far longer than any write stays queued or in flight here.
+    pub fn start_file_tombstone_prune_loop(self: Arc<Self>) {
+        const RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                match self.metadata.prune_file_tombstones_async(RETENTION).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("Pruned {} deleted-file markers older than {:?}", n, RETENTION),
+                    Err(e) => warn!("Pruning deleted-file markers failed: {}", e),
+                }
+            }
+        });
+    }
+
     pub fn start_metadata_healer_loop(self: Arc<Self>) {
         let server = self;
         tokio::spawn(async move {
@@ -13800,7 +13852,7 @@ impl Server {
             // Snap to the current canonical path so this push can't resurrect the
             // old path index entry or strand its fields (e.g. modified_at) under
             // a stale path key that get_file_by_path will never see again.
-            if let Ok(Some(existing)) = self.metadata.get_file(&m.id) {
+            if let Ok(Some(existing)) = self.metadata.get_file_async(m.id).await {
                 if existing.path != m.path {
                     m.path = existing.path;
                 }
@@ -13844,8 +13896,12 @@ impl Server {
                 // Must be set before send(): once the worker picks this item up it
                 // clears the id at the end of its batch cycle, so setting it after
                 // send() could race a very fast worker and leak "pending" forever.
-                self.pending_metadata_writes.insert(metadata.id);
-                let _ = tx.send(metadata);
+                self.pending_metadata_writes.queued(metadata.id);
+                let id = metadata.id;
+                if tx.send(metadata).is_err() {
+                    // Worker gone: nothing will ever resolve this entry.
+                    self.pending_metadata_writes.resolved(id);
+                }
             }
         }
         match resync_requested_for {
@@ -14011,6 +14067,8 @@ impl Server {
                         );
                         corrections.push(newer);
                     }
+                    // Deleted here; the sender's copy is the stale one.
+                    crate::metadata::PutFileResult::Deleted => {}
                 }
             }
             Ok::<_, anyhow::Error>((stored, corrections))
@@ -14152,7 +14210,7 @@ impl Server {
         self.wait_if_compaction_quiescing().await;
 
         // --- Step 1: Fetch current metadata ---
-        let mut metadata = match self.metadata.get_file(&file_id) {
+        let mut metadata = match self.metadata.get_file_async(file_id).await {
             Ok(Some(m)) => m,
             Ok(None) => return Response::Error {
                 message: format!("File not found: {}", file_id),
@@ -14795,6 +14853,10 @@ impl Server {
         // replica from silently building on stale-but-physically-present bytes.
         trust_local_base: bool,
     ) -> Result<(ChunkId, usize, Option<u64>, Option<Arc<Vec<u8>>>, Option<ChunkLocation>), (String, ErrorCode)> {
+        if self.file_recently_deleted(file_id) {
+            drop(patch_guard);
+            return Err((format!("File {} was deleted", file_id), ErrorCode::NotFound));
+        }
         let Some(cidx) = chunk_idx else {
             // No stable per-slot key to track a pending patch against — see
             // handle_multi_patch's original "No chunk_idx" comment for when this
@@ -17165,7 +17227,7 @@ impl Server {
     async fn handle_delete_file(&self, path: String) -> Response {
         debug!("Handling delete file: {}", path);
 
-        let metadata = match self.metadata.get_file_by_path(&path) {
+        let metadata = match self.metadata.get_file_by_path_async(path.clone()).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 return Response::Error {
@@ -17247,7 +17309,7 @@ impl Server {
         }
 
         // Step 3: remove metadata now that the chunk list is safely queued.
-        if let Err(e) = self.metadata.delete_file_async(metadata.id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_async(metadata.id).await {
             warn!("Failed to delete file metadata for {}: {}", path, e);
             // Queue entry is already written — drain worker will retry.
             // Still return error so client knows metadata removal may have failed.
@@ -17275,18 +17337,12 @@ impl Server {
         // slot (which never comes, since the file is gone). Confirmed root cause of the
         // gluster3 RSS growth during repeated create/delete/recreate benchmark runs
         // (2026-07-13).
-        const CHUNK_SIZE_DELETE: u64 = 4 * 1024 * 1024;
         for loc in file_chunk_locs.iter() {
-            // Computed from file_offset, not vector position: chunk_locations_for_info
-            // doesn't dedupe un-swept patch-rotation duplicates at the same offset, so
-            // enumerate() position would drift from the true chunk_idx once any exist.
-            let chunk_idx = loc.file_offset.unwrap_or(0) / CHUNK_SIZE_DELETE;
-            self.chunk_patch_locks.remove(&(metadata.id, chunk_idx));
-            self.dirty_patch_slots.remove(&(metadata.id, chunk_idx));
             self.pending_patch_ids.remove(&loc.chunk_id);
             self.pending_patch_fold_broadcasts.remove(&loc.chunk_id);
             self.chunk_io_locks.remove(&loc.chunk_id);
         }
+        self.forget_file_slots(metadata.id);
 
         // Notify the drain worker that there's a new entry (leader only acts on it,
         // but the notify is harmless on followers).
@@ -17311,7 +17367,7 @@ impl Server {
         self.pending_broadcasts.remove(&file_id);
 
         // Wipe metadata (idempotent — already gone on quorum nodes).
-        let _ = self.metadata.delete_file_async(file_id).await;
+        let _ = self.metadata.delete_file_for_good_async(file_id).await;
         let _ = self.metadata.delete_path_index_async(path).await;
         self.chunk_map_remove(&file_id).await;
 
@@ -17322,17 +17378,39 @@ impl Server {
                 // Not present locally — fine, log at debug.
                 debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
             }
-            // Partial cleanup of the same in-memory fold/patch bookkeeping purged in
-            // handle_delete_file — this RPC only carries chunk_id, not chunk_idx, so
-            // the (file_id, chunk_idx)-keyed chunk_patch_locks/dirty_patch_slots can't
-            // be targeted here without a protocol change. Those still leak on the
-            // follower-side drain path; tracked as a known follow-up.
+            // The chunk_id-keyed half of the fold/patch bookkeeping purged in
+            // handle_delete_file; the (file_id, chunk_idx)-keyed half is dropped for
+            // every slot of the file by forget_file_slots below.
             self.pending_patch_ids.remove(chunk_id);
             self.pending_patch_fold_broadcasts.remove(chunk_id);
             self.chunk_io_locks.remove(chunk_id);
         }
+        self.forget_file_slots(file_id);
 
         Response::Ok { data: None }
+    }
+
+    /// Drop every (file_id, chunk_idx)-keyed patch record of a deleted file. A dirty
+    /// slot left behind is folded by the patch-fold sweep once it looks abandoned, and
+    /// that fold re-installs the deleted file's chunk_map, from where its metadata
+    /// spread back to peers (Legata "deleted files persist"; follower_delete_forgets_
+    /// every_dirty_slot_of_the_file). Keyed by file, not by the chunk list: a slot can
+    /// be dirty without appearing in the file's chunk locations, and the follower's
+    /// DeleteChunksBatch doesn't carry chunk indexes at all.
+    /// True while this node's delete tombstone for the file is fresh. A patch or
+    /// location sent before the delete can land just after it (a writer's last
+    /// MultiPatch, its RCL broadcast); accepting one re-creates the slot's dirty record
+    /// or chunk_map entry, and a later fold then resurrects the file (suite T72b, one
+    /// fold 73s after a delete that landed 170ms behind a patch). In-flight means
+    /// milliseconds to seconds, well inside the tombstone's 30s.
+    fn file_recently_deleted(&self, file_id: FileId) -> bool {
+        self.delete_tombstones.get(&file_id)
+            .is_some_and(|t| t.value().elapsed() < std::time::Duration::from_secs(30))
+    }
+
+    fn forget_file_slots(&self, file_id: FileId) {
+        self.dirty_patch_slots.retain(|(f, _), _| *f != file_id);
+        self.chunk_patch_locks.retain(|(f, _), _| *f != file_id);
     }
 
     /// Handle ClearDeleteQueueEntry — leader broadcasts this after all nodes ack.
@@ -17458,7 +17536,7 @@ impl Server {
         // full-disk leader silently fails its own delete but still broadcasts
         // DeleteChunksBatch, causing followers to permanently lose the file while the
         // leader retains it.  The drain will retry on the next 30-second cycle.
-        if let Err(e) = self.metadata.delete_file_async(entry.file_id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_async(entry.file_id).await {
             warn!("drain_one_delete: local metadata delete failed for {} — will retry: {}", entry.path, e);
             return;
         }
@@ -17556,11 +17634,9 @@ impl Server {
             .count();
         let total_nodes = nodes.len();
         let chunk_size_mb = self.chunker.chunk_size() / (1024 * 1024);
-        let leader_node_id = nodes
-            .iter()
-            .filter(|n| n.status == dfs_common::NodeStatus::Online)
-            .map(|n| n.id)
-            .min();
+        // None while this node can't see a majority of the known cluster — the same
+        // answer is_leader() gives, rather than naming itself leader of a partition.
+        let leader_node_id = self.cluster.leader_with_quorum().await;
 
         Response::ClusterStatus {
             nodes,
@@ -18271,7 +18347,7 @@ impl Server {
         // Resolve file metadata — try UUID first, then path
         let file_meta = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
             let file_id = dfs_common::FileId::from_uuid(uuid);
-            match self.metadata.get_file(&file_id) {
+            match self.metadata.get_file_async(file_id).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -18283,7 +18359,7 @@ impl Server {
                 },
             }
         } else {
-            match self.metadata.get_file_by_path(&path) {
+            match self.metadata.get_file_by_path_async(path.clone()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -18340,7 +18416,7 @@ impl Server {
         // Resolve file metadata up front so we can report errors immediately.
         let file_meta = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
             let file_id = dfs_common::FileId::from_uuid(uuid);
-            match self.metadata.get_file(&file_id) {
+            match self.metadata.get_file_async(file_id).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -18352,7 +18428,7 @@ impl Server {
                 },
             }
         } else {
-            match self.metadata.get_file_by_path(&path) {
+            match self.metadata.get_file_by_path_async(path.clone()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Response::Error {
                     message: format!("File not found: {}", path),
@@ -18432,7 +18508,7 @@ impl Server {
                 chunks_checked += 1;
 
                 // Refresh the live location from sled (may have more nodes than inline).
-                let live_loc = metadata.get_chunk_location(&chunk_id)
+                let live_loc = metadata.get_chunk_location_async(chunk_id).await
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| chunk_loc.clone());
@@ -19253,7 +19329,7 @@ impl Server {
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
-        match self.metadata.get_file_by_path(&path) {
+        match self.metadata.get_file_by_path_async(path.clone()).await {
             Ok(Some(metadata)) => {
                 let chunk_locations = match self.chunk_locations_for_info_async(metadata.id).await {
                     Ok(locs) => locs,
@@ -19289,7 +19365,7 @@ impl Server {
     async fn handle_get_file_info_by_id(&self, file_id: dfs_common::FileId) -> Response {
         debug!("Handling get file info by id: {}", file_id);
 
-        match self.metadata.get_file(&file_id) {
+        match self.metadata.get_file_async(file_id).await {
             Ok(Some(metadata)) => {
                 let chunk_locations = match self.chunk_locations_for_info_async(file_id).await {
                     Ok(locs) => locs,
@@ -19335,7 +19411,22 @@ impl Server {
         // is !Sync, so a closure holding &Cell isn't Send; AtomicBool is
         // both Send and Sync).
         let found_purged_chunk_id = std::sync::atomic::AtomicBool::new(false);
-        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, write_seq: u64| {
+        // CHUNK_TABLE records for the window, fetched by the caller off the tokio worker
+        // (one batched spawn_blocking read). slice_response used to call get_chunk_location
+        // per entry synchronously on the worker; under a metadata-db stall every such read
+        // parked a worker, and enough of them starved the runtime (suite T59e).
+        let window_ids = |locations: &Vec<dfs_common::ChunkLocation>| -> Vec<ChunkId> {
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            locations.iter()
+                .filter(|l| {
+                    let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
+                    idx >= from_chunk && idx < from_chunk.saturating_add(count)
+                })
+                .map(|l| l.chunk_id)
+                .collect()
+        };
+        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, write_seq: u64,
+                              sled: &anyhow::Result<std::collections::HashMap<ChunkId, dfs_common::ChunkLocation>>| {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             // total_chunks = max chunk index + 1 (not list length) so the client knows
             // the true density of the file and can size its engine map correctly.
@@ -19375,9 +19466,9 @@ impl Server {
                     let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
                     idx >= from_chunk && idx < from_chunk.saturating_add(count)
                 })
-                .map(|l| match self.metadata.get_chunk_location(&l.chunk_id) {
+                .map(|l| match sled.as_ref().map(|m| m.get(&l.chunk_id)) {
                     Ok(Some(sled_loc)) => {
-                        Self::resolve_chunk_nodes(l, sled_loc)
+                        Self::resolve_chunk_nodes(l, sled_loc.clone())
                     }
                     Ok(None) => {
                         // The chunk_id itself has no CHUNK_TABLE record at all — not
@@ -19440,7 +19531,8 @@ impl Server {
             // (this exact class of bug has taken a node down before in this codebase,
             // see the black-hole-node incident memory around lock-across-await).
             drop(entry);
-            let response = slice_response(&locations, write_seq);
+            let sled = self.metadata.get_chunk_locations_batch_async(window_ids(&locations)).await;
+            let response = slice_response(&locations, write_seq, &sled);
 
             // A dangling patch token is the OTHER way a slot's identity dies, and the
             // Ok(None) test above is blind to it: the token's CHUNK_TABLE row outlives
@@ -19598,7 +19690,8 @@ impl Server {
                     let repaired = changed_a_slot || !reclaimable.is_empty();
                     self.note_self_heal_outcome(file_id, repaired);
                     self.reclaim_unresolvable_token_rows(file_id, reclaimable).await;
-                    return slice_response(&merged, fresh_write_seq);
+                    let sled = self.metadata.get_chunk_locations_batch_async(window_ids(&merged)).await;
+                    return slice_response(&merged, fresh_write_seq, &sled);
                 }
                 self.note_self_heal_outcome(file_id, false);
                 warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
@@ -19670,7 +19763,8 @@ impl Server {
                 for loc in &locations {
                     self.chunk_to_file.insert(loc.chunk_id, file_id);
                 }
-                slice_response(&locations, write_seq)
+                let sled = self.metadata.get_chunk_locations_batch_async(window_ids(&locations)).await;
+                slice_response(&locations, write_seq, &sled)
             }
             // The file itself exists (get_file found it) but a full CHUNK_TABLE scan
             // filtered to this file_id genuinely found zero rows — e.g. freshly
@@ -19747,7 +19841,7 @@ impl Server {
         info!("Handling purge file metadata: {}", path);
 
         // Get metadata to find file ID
-        match self.metadata.get_file_by_path(&path) {
+        match self.metadata.get_file_by_path_async(path.clone()).await {
             Ok(Some(metadata)) => {
                 let file_id = metadata.id;
 
@@ -19939,6 +20033,10 @@ impl Server {
                             put_result = Some(Ok(()));
                             break;
                         }
+                        Ok(PutFileResult::Deleted) => {
+                            put_result = Some(Err(anyhow::anyhow!("{} was deleted during the rename", old_path)));
+                            break;
+                        }
                         Ok(PutFileResult::Stale(existing)) => {
                             warn!("Rename {} -> {}: put_file_async dropped write_seq={} as stale against existing write_seq={} (attempt {}/{}) — retrying with a higher write_seq",
                                 old_path, new_path, metadata.write_seq, existing.write_seq, attempt + 1, MAX_RENAME_STALE_RETRIES);
@@ -20014,6 +20112,15 @@ impl Server {
                         }
 
                         info!("Renamed {} -> {} (file_id: {})", old_path, new_path, file_id);
+                        if metadata.file_type == dfs_common::types::FileType::Directory {
+                            if let Err(e) = self.rename_descendants(&old_path, &new_path).await {
+                                warn!("Rename {} -> {}: moving the directory's contents failed: {}", old_path, new_path, e);
+                                return Response::Error {
+                                    message: format!("Renamed directory but failed to move its contents: {}", e),
+                                    code: ErrorCode::InternalError,
+                                };
+                            }
+                        }
                         Response::Ok { data: None }
                     }
                     Err(e) => {
@@ -20039,6 +20146,79 @@ impl Server {
         }
     }
 
+    /// Move every entry below a renamed directory to the new prefix. Paths are stored in
+    /// full, so renaming only the directory's own entry left its contents on the old prefix,
+    /// listed under neither name (a user's `mv sobpoena subpoena` showed 0 files, and renaming
+    /// it back brought them all back). Each descendant is rewritten here with a bumped
+    /// write_seq (same stale-retry rule as the entry itself), replicated to every node in
+    /// batches, and its old path-index entry removed everywhere.
+    async fn rename_descendants(&self, old_dir: &str, new_dir: &str) -> anyhow::Result<()> {
+        let metadata = self.metadata.clone();
+        let old = old_dir.to_string();
+        let descendants = tokio::task::spawn_blocking(move || metadata.list_subtree(&old)).await??;
+        if descendants.is_empty() {
+            return Ok(());
+        }
+        let old_prefix = format!("{}/", old_dir.trim_end_matches('/'));
+        let new_prefix = format!("{}/", new_dir.trim_end_matches('/'));
+        let mut moved: Vec<FileMetadata> = Vec::with_capacity(descendants.len());
+        let mut old_paths: Vec<String> = Vec::with_capacity(descendants.len());
+        for listed in descendants {
+            // Same read-modify-write hazard as the directory's own entry: a push for
+            // this descendant may be acked but still queued in sled_write_tx. Read
+            // before it lands and our write_seq ties it, and the queued write's old
+            // path wins when it commits. Wait it out, then work from the fresh record.
+            self.wait_for_pending_metadata_write(listed.id).await;
+            let Some(mut m) = self.metadata.get_file_async(listed.id).await? else { continue };
+            let Some(rest) = m.path.strip_prefix(&old_prefix).map(str::to_string) else { continue };
+            old_paths.push(m.path.clone());
+            m.path = format!("{}{}", new_prefix, rest);
+            m.write_seq = m.write_seq.saturating_add(1);
+            let mut stored = false;
+            for _ in 0..5 {
+                match self.metadata.put_file_async(m.clone()).await? {
+                    PutFileResult::Stored => { stored = true; break; }
+                    PutFileResult::Stale(existing) => m.write_seq = existing.write_seq.saturating_add(1),
+                    // Deleted while we were renaming: nothing left to move.
+                    PutFileResult::Deleted => break,
+                }
+            }
+            if !stored && self.metadata.get_file_async(m.id).await?.is_none() {
+                continue;
+            }
+            if !stored {
+                anyhow::bail!("{} kept losing to concurrent writers", m.path);
+            }
+            moved.push(m);
+        }
+        for p in &old_paths {
+            self.metadata.delete_path_index_async(p.clone()).await?;
+        }
+
+        let local_id = self.cluster.local_node_id();
+        let peers: Vec<SocketAddr> = self.cluster.get_all_nodes().await.into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .map(|n| n.addr)
+            .collect();
+        for addr in peers {
+            for batch in moved.chunks(200) {
+                let req = Request::ReplicateMetadataBatch { items: batch.to_vec() };
+                if let Err(e) = self.client.send_message(addr, Message::Request(req)).await {
+                    warn!("rename_descendants: replicating to {} failed: {}", addr, e);
+                }
+            }
+            for p in &old_paths {
+                let req = Request::DeletePathIndex { path: p.clone() };
+                if let Err(e) = self.client.send_message(addr, Message::Request(req)).await {
+                    warn!("rename_descendants: removing old path {} on {} failed: {}", p, addr, e);
+                }
+            }
+        }
+        info!("Renamed directory contents {} -> {}: {} entr{} moved", old_dir, new_dir, moved.len(),
+            if moved.len() == 1 { "y" } else { "ies" });
+        Ok(())
+    }
+
     async fn handle_remove_node(&self, node_id: NodeId) -> Response {
         info!("Handling remove node request: {}", node_id);
 
@@ -20053,6 +20233,7 @@ impl Server {
         // Remove from cluster
         match self.cluster.remove_node(&node_id).await {
             Ok(_) => {
+                self.cluster.forget_cluster_member().await;
                 info!("Successfully removed node {} from cluster", node_id);
                 Response::Ok { data: None }
             }
@@ -20072,6 +20253,27 @@ mod tests {
     use super::*;
     use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
+
+    /// Two writes queued for one file, committed in separate worker batches: after the
+    /// first batch the file must still read as pending, or a rename proceeds on a stale
+    /// read and the second write's old path overwrites it (suite T12-T14 flake).
+    #[test]
+    fn pending_writes_count_every_queued_write() {
+        let p = PendingWrites::default();
+        let (f, g) = (FileId::new(), FileId::new());
+        p.queued(f);
+        p.queued(f);
+        p.queued(g);
+        p.resolved(f); // first batch committed
+        assert!(p.contains(&f), "the second queued write is still outstanding");
+        p.resolved(f);
+        assert!(!p.contains(&f));
+        assert!(p.contains(&g));
+        p.resolved(g);
+        assert!(p.is_empty());
+        p.resolved(g); // a stray resolve never underflows or re-adds
+        assert!(p.is_empty());
+    }
 
     /// classify_request (added 2026-08-06 for RpcClassCounts) — spot-checks
     /// representative variants from each bucket, plus the two fields-carry-
@@ -21201,7 +21403,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+        // RF=1: a lone node can never reach RF=3's write quorum of 2.
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 1, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         // Write data
         let data = b"Hello, distributed filesystem!";
@@ -22089,6 +22292,72 @@ mod tests {
     /// output), base X does not exist anywhere. Expected/fixed behavior: after
     /// abandoning, the slot must resolve back to `winner`, not stay parked on
     /// B's phantom token.
+    #[tokio::test]
+    async fn follower_delete_forgets_every_dirty_slot_of_the_file() {
+        // Legata "deleted files persist": DeleteChunksBatch only carries chunk ids, so it
+        // left the file's (file_id, chunk_idx)-keyed dirty_patch_slots behind. 60s later
+        // the fold sweep saw a slot "still dirty", folded it, and re-installed the deleted
+        // file's chunk_map (and from there its metadata spread back to peers).
+        let h = make_overlay_test_harness();
+        let dead = FileId::new();
+        let other = FileId::new();
+        let slot = |token: &[u8]| DirtyPatchSlot {
+            token: ChunkId::from_hash(compute_chunk_hash(token)),
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+            prior_chunk_id: None,
+        };
+        h.server.dirty_patch_slots.insert((dead, 0), slot(b"dead-0"));
+        h.server.dirty_patch_slots.insert((dead, 3), slot(b"dead-3"));
+        h.server.dirty_patch_slots.insert((other, 0), slot(b"other-0"));
+        h.server.chunk_patch_locks.insert((dead, 3), Default::default());
+
+        h.server.handle_delete_chunks_batch(dead, "/dead.bin".to_string(), vec![]).await;
+
+        assert!(!h.server.dirty_patch_slots.iter().any(|e| e.key().0 == dead),
+            "a deleted file must leave no dirty slot behind for the fold sweep to fold");
+        assert!(!h.server.chunk_patch_locks.iter().any(|e| e.key().0 == dead));
+        assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
+    }
+
+    /// A patch or location sent before a delete can land just after it. Accepting it
+    /// re-created the deleted file's chunk_map entry / dirty slot, and a fold 73s later
+    /// resurrected the file (suite T72b on the slot-ownership merge, 2026-09-29).
+    #[tokio::test]
+    async fn late_patch_or_location_after_delete_is_dropped() {
+        let h = make_overlay_test_harness();
+        let dead = FileId::new();
+        let data = vec![0u8; 4096];
+        let base = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&data, 0, dead));
+        h.storage.write_chunk(&base, &data).unwrap();
+        let loc = ChunkLocation {
+            chunk_id: base, nodes: vec![h.server.cluster.local_node_id()], size: 4096,
+            checksum: base.hash, file_offset: Some(0), written_at: Some(1000),
+            client_write_seq: Some(1), file_id: Some(dead),
+        };
+        h.server.chunk_map.insert(dead, (vec![loc.clone()], 1));
+        h.server.metadata.put_chunk_location(&loc).unwrap();
+
+        h.server.handle_delete_chunks_batch(dead, "/dead.bin".to_string(), vec![]).await;
+        assert!(h.server.chunk_map.get(&dead).is_none());
+
+        let late_loc = ChunkLocation { client_write_seq: Some(2), ..loc.clone() };
+        assert!(matches!(h.server.chunk_map_update_location_for_file(dead, &late_loc).await,
+            SlotMergeOutcome::FileDeleted));
+        assert!(h.server.chunk_map.get(&dead).is_none(), "a late location must not re-create the entry");
+
+        let resp = h.server.handle_multi_patch(
+            base, dead, Some(0), 0, vec![(0, vec![7u8; 16])], None, None, None, Some(2),
+        ).await;
+        assert!(!matches!(resp, Response::MultiPatchResult { .. }), "a late patch must be refused, got {:?}", resp);
+        assert!(!h.server.dirty_patch_slots.iter().any(|e| e.key().0 == dead), "and must leave no dirty slot");
+    }
+
     #[tokio::test]
     async fn test_run_single_fold_abandon_base_gone_restores_slot_to_prior_chunk() {
         let h = make_overlay_test_harness();
@@ -24565,8 +24834,10 @@ mod tests {
         let response = server.handle_read_chunk(chunk_id, None, None).await;
 
         match response {
-            Response::ChunkData { data: read_data, .. } => {
-                assert_eq!(data.as_slice(), read_data.as_slice());
+            // Zero-copy reply: the bytes ride in arc_data and `data` is left empty.
+            Response::ChunkData { data: read_data, arc_data, .. } => {
+                let read = arc_data.map(|a| a.to_vec()).unwrap_or(read_data);
+                assert_eq!(data.as_slice(), read.as_slice());
             }
             _ => panic!("Expected ChunkData response"),
         }
@@ -26445,11 +26716,17 @@ mod tests {
     mod overlay_stacking {
         use super::*;
 
-        /// Poll patch_state for `public_token` until it flips to Folded (or panic
-        /// after `timeout_ms`) — since every patch now folds immediately in the
-        /// background, tests that need to observe post-fold state can't control fold
-        /// timing directly the way the old below-the-depth-cap design allowed.
+        /// Fold `public_token`'s slot and wait for patch_state to flip to Folded (or
+        /// panic after `timeout_ms`). Folds are debounced (PATCH_DEBOUNCE_IDLE, 20s
+        /// after the slot's last patch), not immediate as when these tests were
+        /// written, so run now the fold that timer would eventually run.
         async fn wait_for_folded(h: &OverlayTestHarness, public_token: ChunkId, timeout_ms: u64) -> ChunkId {
+            let slot = h.server.dirty_patch_slots.iter()
+                .find(|e| e.value().token == public_token)
+                .map(|e| *e.key());
+            if let Some((file_id, chunk_idx)) = slot {
+                h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await;
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {
                 if let Ok(Some(PatchState::Folded(real))) = h.metadata.get_patch_state(&public_token) {
@@ -26578,10 +26855,15 @@ mod tests {
             let resp = h.server.handle_multi_patch(
                 ghost_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, None, None, None, false,
             ).await;
+            // Rejected either way: apply_patch refuses the ghost base with NotFound, and
+            // handle_multi_patch turns a slot-keyed NotFound into a retriable ChunkStale
+            // (2026-07-19, see its comment and chunk_seq_gap_onto_ghost_base_is_retriable_
+            // not_hard_eio) so a transient ghost backs off instead of EIO-ing the guest.
             match resp {
                 Response::Error { code, .. } => assert_eq!(code, dfs_common::ErrorCode::NotFound,
-                    "a ghost base (claimed by metadata, absent on disk) must be rejected as NotFound, not silently built on top of"),
-                other => panic!("expected Response::Error{{NotFound}}, got {:?}", other),
+                    "a ghost base (claimed by metadata, absent on disk) must be rejected, not silently built on top of"),
+                Response::ChunkStale { .. } => {}
+                other => panic!("a ghost base must be rejected (NotFound or ChunkStale), got {:?}", other),
             }
 
             // No patch_state should have been created for a base we never actually had.
@@ -26648,7 +26930,7 @@ mod tests {
             let file_id = dfs_common::FileId::new();
             let chunk_file_offset = 0u64;
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             let patch: (usize, Vec<u8>) = (0, vec![3u8; 64]);
 
@@ -27193,7 +27475,7 @@ mod tests {
             let chunk_file_offset = 0u64;
 
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
             let original_loc = ChunkLocation {
@@ -27284,7 +27566,7 @@ mod tests {
             let chunk_file_offset = 0u64;
 
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
             let original_loc = ChunkLocation {
@@ -27437,7 +27719,7 @@ mod tests {
             h.metadata.put_file(&file_meta).unwrap();
 
             let original_data = vec![0u8; 4096];
-            let original_hash = compute_chunk_hash(&original_data);
+            let original_hash = dfs_common::compute_chunk_hash_at(&original_data, chunk_idx * 4 * 1024 * 1024, file_id); // chunk ids are file-scoped
             let original_chunk_id = ChunkId::from_hash(original_hash);
             h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
 
@@ -27907,8 +28189,10 @@ mod tests {
         // Simulate the state right after an in-place patch: chunk_map (the fresh
         // source) knows this chunk is file_id's current content at offset 0, but
         // FILE_TABLE was never rewritten to say so — no FileMetadata exists for
-        // file_id at all here, the extreme case of that staleness gap.
-        server.chunk_map.insert(file_id, (vec![ChunkLocation {
+        // file_id at all here, the extreme case of that staleness gap. Installed via
+        // commit_chunk_map, as production does, so chunk_to_file (the index
+        // handle_confirm_chunks_live consults) moves in lockstep with chunk_map.
+        server.commit_chunk_map(file_id, vec![ChunkLocation {
             chunk_id,
             nodes: vec![node_id],
             size: 33,
@@ -27917,7 +28201,7 @@ mod tests {
             written_at: Some(dfs_common::types::current_timestamp() * 1000),
             client_write_seq: Some(1),
             file_id: Some(file_id),
-        }], 1));
+        }], 1);
 
         let response = server.handle_confirm_chunks_live(vec![chunk_id]).await;
         let live = match response {

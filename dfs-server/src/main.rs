@@ -391,6 +391,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_chunk_location_sync_loop();
     server.clone().start_metadata_gossip_loop();
     server.clone().start_metadata_healer_loop();
+    server.clone().start_file_tombstone_prune_loop();
     server.clone().start_patch_fold_sweep_loop();
     server.clone().start_chunk_patch_locks_sweep_loop();
     server.clone().start_fold_lock_grants_sweep_loop();
@@ -494,6 +495,15 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             }
         }
         Err(e) => debug!("Failed to load persisted peers: {}", e),
+    }
+
+    // Size majorities against the cluster this node belongs to, not the peers it has
+    // heard from yet — see ClusterManager::known_cluster_size.
+    {
+        let distinct: std::collections::HashSet<_> = all_join_targets.iter()
+            .filter(|a| **a != local_addr)
+            .collect();
+        server.cluster().init_known_cluster_size(&config_dir, distinct.len() + 1).await;
     }
 
     // Join cluster if we have any targets (seeds or peers)

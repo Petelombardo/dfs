@@ -174,6 +174,15 @@ const PATCH_STATE_SLOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::ne
 /// needed, not in the startup table-open list.
 const CHUNK_SEQ_TABLE: TableDefinition<&str, u64> = TableDefinition::new("chunk_seq");
 
+/// file_id -> unix secs when the file was deleted cluster-wide. Written in the same
+/// transaction that removes the FILE_TABLE row (delete_file_for_good) and checked by
+/// put_file_in_txn inside every put's own transaction, so no write queued before a
+/// delete — a replicate, a group-commit batch, a leader pull, a healer push — can
+/// commit after it and resurrect the row (Legata "deleted files persist"; suite T72).
+/// File ids are never reused, so a marker can't block a later create. Pruned after
+/// FILE_TOMBSTONE_RETENTION by prune_file_tombstones.
+const FILE_TOMBSTONE_TABLE: TableDefinition<&str, u64> = TableDefinition::new("file_tombstone");
+
 // ---------------------------------------------------------------------------
 
 /// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
@@ -209,6 +218,8 @@ pub enum PutFileResult {
     /// The existing (newer) record is returned so the caller can propagate
     /// it back to whoever sent the stale write, converging the cluster.
     Stale(FileMetadata),
+    /// Write was dropped because the file was deleted (see FILE_TOMBSTONE_TABLE).
+    Deleted,
 }
 
 /// What a PATCH_STATE_TABLE public token currently resolves to. See
@@ -913,9 +924,10 @@ impl MetadataStore {
                         let mut results = Vec::with_capacity(items.len());
                         let mut file_table = txn.open_table(FILE_TABLE)?;
                         let mut path_table = txn.open_table(PATH_TABLE)?;
+                        let tombstones = txn.open_table(FILE_TOMBSTONE_TABLE)?;
                         for metadata in &items {
                             let (r, old_id_str, item_bytes) =
-                                Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
+                                Self::put_file_in_txn(&mut file_table, &mut path_table, &tombstones, metadata)?;
                             touched_file_ids.push(format!("{}", metadata.id));
                             touched_paths.push(metadata.path.clone());
                             if let Some(old_id) = old_id_str {
@@ -1462,10 +1474,13 @@ impl MetadataStore {
     fn put_file_in_txn(
         file_table: &mut redb::Table<&str, &[u8]>,
         path_table: &mut redb::Table<&str, &[u8]>,
+        tombstones: &redb::Table<&str, u64>,
         metadata: &FileMetadata,
     ) -> Result<(PutFileResult, Option<String>, usize)> {
         let file_id_str = format!("{}", metadata.id);
-        let path_str = metadata.path.as_str();
+        if tombstones.get(file_id_str.as_str())?.is_some() {
+            return Ok((PutFileResult::Deleted, None, 0));
+        }
 
         // TEMP PROFILING (2026-07-07): timing instrumentation to find the per-push
         // server-side cost under sustained concurrent writes (32-way pipeline) — see
@@ -1482,6 +1497,11 @@ impl MetadataStore {
         let incoming_chunk_count = metadata.chunk_locations.len();
 
         let (metadata_to_store, is_stale) = Self::merge_file_metadata(existing_opt.as_ref(), metadata);
+        // Index the path the record is actually stored under. For a stale write that is
+        // existing's path, not incoming's: indexing incoming's re-created a renamed-away
+        // path (a late pre-rename push re-pointed "/old" at the file, so lookups of the
+        // old name found it again — suite T13b).
+        let path_str = metadata_to_store.path.as_str();
 
         // Never persist the full chunk_locations array — CHUNK_TABLE (via put_chunk_location)
         // is the sole authoritative per-chunk store, updated O(1) per touch. Before this fix,
@@ -1569,7 +1589,8 @@ impl MetadataStore {
         let (result, old_id_str, payload_bytes) = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut path_table = txn.open_table(PATH_TABLE)?;
-            Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?
+            let tombstones = txn.open_table(FILE_TOMBSTONE_TABLE)?;
+            Self::put_file_in_txn(&mut file_table, &mut path_table, &tombstones, metadata)?
         };
         let t_txn_body_done = t_put_start.elapsed();
 
@@ -1633,8 +1654,9 @@ impl MetadataStore {
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut path_table = txn.open_table(PATH_TABLE)?;
+            let tombstones = txn.open_table(FILE_TOMBSTONE_TABLE)?;
             for metadata in items {
-                let (result, old_id_str, item_bytes) = Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
+                let (result, old_id_str, item_bytes) = Self::put_file_in_txn(&mut file_table, &mut path_table, &tombstones, metadata)?;
                 // Stale results still mutate (chunk_locations union — see put_file_in_txn),
                 // so they must be marked dirty too, same as Stored.
                 touched_file_ids.push(format!("{}", metadata.id));
@@ -1788,8 +1810,22 @@ impl MetadataStore {
             .context("spawn_blocking panicked in get_file_by_path_async")?
     }
 
-    /// Delete file metadata (removes both file and path index entries).
+    /// Remove a file's metadata row and path index entry WITHOUT marking the file
+    /// deleted: a later put of the same id is accepted again. For repair tools that
+    /// drop a local record the cluster may legitimately push back (admin purge).
+    /// A real delete uses delete_file_for_good.
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
+        self.delete_file_inner(file_id, false)
+    }
+
+    /// The file was deleted cluster-wide: remove its row, path index entry and
+    /// outstanding patch state, and record a FILE_TOMBSTONE_TABLE marker, all in one
+    /// transaction, so no put queued before this delete can commit after it.
+    pub fn delete_file_for_good(&self, file_id: &FileId) -> Result<()> {
+        self.delete_file_inner(file_id, true)
+    }
+
+    fn delete_file_inner(&self, file_id: &FileId, for_good: bool) -> Result<()> {
         let file_id_str = format!("{}", file_id);
         let mut removed_path: Option<String> = None;
         let _db = self.db.read();
@@ -1807,6 +1843,32 @@ impl MetadataStore {
                 }
             }
             file_table.remove(file_id_str.as_str())?;
+        }
+        // A real delete also records the tombstone (see FILE_TOMBSTONE_TABLE) and takes
+        // the file's outstanding patches with it, in the same transaction. A Pending
+        // row left behind is found by the patch_state resume sweep after the next
+        // restart (or by the fold sweeps before one), folded, and the fold re-installs
+        // the deleted file's chunk_map and spreads it to peers (Legata "deleted files
+        // persist"; suite T72b).
+        if for_good {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            txn.open_table(FILE_TOMBSTONE_TABLE)?.insert(file_id_str.as_str(), now)?;
+            let mut slot_table = txn.open_table(PATCH_STATE_SLOT_TABLE)?;
+            let lo = format!("{}:", file_id);
+            let hi = format!("{};", file_id); // ';' sorts right after ':'
+            let slots: Vec<(String, String)> = slot_table.range(lo.as_str()..hi.as_str())?
+                .filter_map(|r| r.ok())
+                .filter_map(|(k, v)| std::str::from_utf8(v.value()).ok()
+                    .map(|t| (k.value().to_string(), t.to_string())))
+                .collect();
+            if !slots.is_empty() {
+                let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
+                for (slot_key, token_key) in &slots {
+                    slot_table.remove(slot_key.as_str())?;
+                    state_table.remove(token_key.as_str())?;
+                }
+            }
         }
         txn.commit()?;
         self.note_txn("delete_file", 0);
@@ -1858,6 +1920,48 @@ impl MetadataStore {
         tokio::task::spawn_blocking(move || store.delete_file(&file_id))
             .await
             .context("spawn_blocking panicked in delete_file_async")?
+    }
+
+    /// Async wrapper for delete_file_for_good — see put_file_async.
+    pub async fn delete_file_for_good_async(self: &Arc<Self>, file_id: FileId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_file_for_good(&file_id))
+            .await
+            .context("spawn_blocking panicked in delete_file_for_good_async")?
+    }
+
+    /// Drop FILE_TOMBSTONE_TABLE markers older than `max_age`. A marker only has to
+    /// outlive every write that could have been in flight when its file was deleted;
+    /// a node offline longer than that is brought back in line by metadata
+    /// reconciliation, not by replaying old writes. Returns how many were dropped.
+    pub fn prune_file_tombstones(&self, max_age: std::time::Duration) -> Result<usize> {
+        let cutoff = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0).saturating_sub(max_age.as_secs());
+        let _db = self.db.read();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        let pruned = {
+            let mut table = txn.open_table(FILE_TOMBSTONE_TABLE)?;
+            let old: Vec<String> = table.iter()?
+                .filter_map(|r| r.ok())
+                .filter(|(_, v)| v.value() < cutoff)
+                .map(|(k, _)| k.value().to_string())
+                .collect();
+            for k in &old {
+                table.remove(k.as_str())?;
+            }
+            old.len()
+        };
+        txn.commit()?;
+        self.note_txn("prune_file_tombstones", 0);
+        Ok(pruned)
+    }
+
+    pub async fn prune_file_tombstones_async(self: &Arc<Self>, max_age: std::time::Duration) -> Result<usize> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.prune_file_tombstones(max_age))
+            .await
+            .context("spawn_blocking panicked in prune_file_tombstones_async")?
     }
 
     /// Async wrapper for delete_path_index — see put_file_async.
@@ -2003,6 +2107,32 @@ impl MetadataStore {
     }
 
     /// List direct children of `dir_path`.
+    /// Every entry strictly below `dir_path`, at any depth (list_directory returns only
+    /// direct children). A directory rename has to move all of them: paths are stored in
+    /// full, so a descendant left on the old prefix is invisible under the new name.
+    pub fn list_subtree(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
+        let dir_path = if dir_path.ends_with('/') { dir_path.to_string() } else { format!("{}/", dir_path) };
+        let end = prefix_next(&dir_path);
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let path_table = txn.open_table(PATH_TABLE)?;
+        let file_table = txn.open_table(FILE_TABLE)?;
+        let mut out = Vec::new();
+        for item in path_table.range(dir_path.as_str()..end.as_str())? {
+            let (k, v) = item?;
+            let Ok(file_id) = Self::resolve_path_entry_file_id(v.value()) else {
+                warn!("list_subtree: could not resolve path index entry for {}", k.value());
+                continue;
+            };
+            if let Some(fv) = file_table.get(format!("{}", file_id).as_str())? {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(fv.value()) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn list_directory(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
         let dir_path = if dir_path.ends_with('/') {
             dir_path.to_string()
@@ -5017,6 +5147,28 @@ mod tests {
     /// comment): this candidate's target has no ChunkLocation registered at
     /// all, so it must come back `safe_without_leader_check = true` — the one
     /// case a caller may remove without ever consulting a leader.
+    /// A deleted file's Pending patches must go with it: the patch_state resume sweep
+    /// folds every Pending row it finds, and folding a deleted file re-installs its
+    /// chunk_map and spreads it back to peers (Legata "deleted files persist").
+    #[test]
+    fn delete_file_drops_the_files_pending_patch_state() {
+        let temp = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
+        let (dead, other) = (FileId::new(), FileId::new());
+        let tok = |s: &[u8]| ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(s));
+        let base = tok(b"base");
+        store.put_patch_state_pending(dead, 0, &tok(b"d0"), base, base, 4096, 1000, Some(1)).unwrap();
+        store.put_patch_state_pending(dead, 7, &tok(b"d7"), base, base, 4096, 1000, Some(1)).unwrap();
+        store.put_patch_state_pending(other, 0, &tok(b"o0"), base, base, 4096, 1000, Some(1)).unwrap();
+
+        store.delete_file_for_good(&dead).unwrap();
+
+        assert!(store.get_patch_state_for_slot(dead, 0).unwrap().is_none());
+        assert!(store.get_patch_state_for_slot(dead, 7).unwrap().is_none());
+        assert!(store.get_patch_state(&tok(b"d7")).unwrap().is_none(), "the token row goes too, not just the slot index");
+        assert!(store.get_patch_state_for_slot(other, 0).unwrap().is_some(), "other files' patches are untouched");
+    }
+
     #[test]
     fn find_and_remove_stale_folded_patch_state_prunes_unconditionally_safe_candidate() {
         let temp = TempDir::new().unwrap();
@@ -6211,6 +6363,68 @@ mod tests {
              — should be near-instant, not scale with table size",
             elapsed, NEW_COUNT, SEED_COUNT
         );
+    }
+
+    /// Legata "deleted files persist" (suite T72): a put queued before a delete —
+    /// replicate, group-commit batch, leader pull — committed after it and brought the
+    /// row back. After delete_file_for_good no put of that id may store, on any put
+    /// path; a plain delete_file (admin purge) still lets the cluster push it back.
+    #[test]
+    fn put_after_delete_for_good_cannot_resurrect_the_file() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut f = FileMetadata::new("/gone.bin".to_string(), FileType::RegularFile);
+        f.write_seq = 3;
+        store.put_file(&f).unwrap();
+        store.delete_file_for_good(&f.id).unwrap();
+
+        let mut late = f.clone();
+        late.write_seq = 9; // newer than anything stored: only the tombstone can stop it
+        assert!(matches!(store.put_file(&late).unwrap(), PutFileResult::Deleted));
+        let batch = store.put_files_batch(&[late.clone()]).unwrap();
+        assert!(matches!(batch[0], PutFileResult::Deleted));
+        assert!(store.get_file(&f.id).unwrap().is_none(), "the deleted file stays deleted");
+        assert!(store.get_file_by_path("/gone.bin").unwrap().is_none(), "and so does its path");
+
+        // A purge is not a delete: the cluster may legitimately push the record back.
+        let g = FileMetadata::new("/purged.bin".to_string(), FileType::RegularFile);
+        store.put_file(&g).unwrap();
+        store.delete_file(&g.id).unwrap();
+        assert!(matches!(store.put_file(&g).unwrap(), PutFileResult::Stored));
+
+        // Markers age out.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(store.prune_file_tombstones(std::time::Duration::ZERO).unwrap(), 1);
+        assert!(matches!(store.put_file(&late).unwrap(), PutFileResult::Stored));
+    }
+
+    /// A pre-rename push that arrives after the rename is stale (lower write_seq). The
+    /// record keeps the renamed path, and so must the path index: indexing the stale
+    /// write's own path re-created "/old -> file", and lookups of the renamed-away name
+    /// found the file again (suite T13b "src still exists after rename").
+    #[test]
+    fn stale_put_does_not_reindex_a_renamed_away_path() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut before = FileMetadata::new("/old.bin".to_string(), FileType::RegularFile);
+        before.write_seq = 2;
+        store.put_file(&before).unwrap();
+
+        let mut renamed = before.clone();
+        renamed.path = "/new.bin".to_string();
+        renamed.write_seq = 3;
+        store.put_file(&renamed).unwrap();
+        store.delete_path_index("/old.bin").unwrap();
+
+        let late = before.clone(); // write_seq 2 < 3: stale
+        assert!(matches!(store.put_file(&late).unwrap(), PutFileResult::Stale(_)));
+        assert!(store.get_file_by_path("/old.bin").unwrap().is_none(),
+            "a stale write must not bring back the renamed-away path");
+        assert_eq!(store.get_file_by_path("/new.bin").unwrap().map(|m| m.id), Some(before.id));
     }
 
     /// Regression test for a real deployment finding: a rejoining follower (gluster2)

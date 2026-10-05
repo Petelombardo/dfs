@@ -7538,8 +7538,11 @@ mod tests {
 
         // Drop the flaky peer entirely (simplest way to make the leader-side
         // stability fetch resolve definitively again — a single-node "cluster" has
-        // no peer to fail the check).
+        // no peer to fail the check). An operator remove, as handle_remove_node does
+        // it: dropping the peer from the map alone leaves the known cluster size at 2,
+        // and 1 of 2 is not a majority (see ClusterManager::known_cluster_size).
         healing.cluster.remove_node(&id_b).await.unwrap();
+        healing.cluster.forget_cluster_member().await;
 
         // Pass 3: with the flaky peer gone, this must delete IMMEDIATELY — proving no
         // sighting progress was lost. Under the old bug, this pass would only log

@@ -425,7 +425,7 @@ while [ "$T14A_ELAPSED" -le "$T14A_MAX_WAIT" ]; do
     OK=PASS
     FAILURES=""
     for port in 8900 8901 8902 8903 8904; do
-        LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null)
+        LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null)
         echo "$LIST" | grep -q "t12_after.txt" || { OK=FAIL; FAILURES="${FAILURES}  Node $port missing t12_after.txt\n"; }
         echo "$LIST" | grep -q "t12_before.txt" && { OK=FAIL; FAILURES="${FAILURES}  Node $port still has t12_before.txt\n"; }
         echo "$LIST" | grep -q "t13_dst.bin"   || { OK=FAIL; FAILURES="${FAILURES}  Node $port missing t13_dst.bin\n"; }
@@ -3219,7 +3219,31 @@ else
     check "T42 leader hung under chunk-write flood ($T42_TIMEOUTS/$T42_CALLS cluster-status calls timed out, max ${T42_MAX_MS}ms)" FAIL
 fi
 
+# Prove the per-node probe below sees the files while they exist, so its "none"
+# after the delete means something.
+T42B_BEFORE=""
+for port in 8900 8901 8902 8903 8904; do
+    T42B_BEFORE="${T42B_BEFORE} $port:$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -c "t42_flood_" || true)"
+done
+echo "  T42b: flood files listed per node before delete:${T42B_BEFORE}"
+
 for i in $(seq 0 $((T42_NUM_PROCS-1))); do rm -f "$MOUNT/t42_flood_${i}.bin" 2>/dev/null || true; done
+
+# T42b (Legata bug): files deleted right after the flood lingered on some nodes'
+# FILE_TABLE for minutes. Wait past the 30s delete-tombstone TTL, so an update
+# that was still in flight at delete time has had its chance to re-create the
+# row, then every node must have forgotten every flood file.
+dfs_sync 2>/dev/null || true
+sleep 40
+T42B_LEFT=""
+for port in 8900 8901 8902 8903 8904; do
+    n=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -c "t42_flood_" || true)
+    [ "$n" -gt 0 ] && T42B_LEFT="${T42B_LEFT} $port:$n"
+done
+echo "  T42b: flood files still listed 40s after delete:${T42B_LEFT:- none}"
+[ -z "$T42B_LEFT" ] \
+    && check "T42b every node forgot the deleted flood files" PASS \
+    || check "T42b deleted flood files resurrected/lingered on:${T42B_LEFT}" FAIL
 fi # should_run T42
 
 if should_run T43; then
@@ -6172,6 +6196,136 @@ done
 fusermount -u "$T69_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T69_PID2"
 fi # should_run T69
+if should_run T70; then
+snapshot_log T70
+echo ""
+echo "=== T70: renaming a directory keeps its contents (Legata bug: sobpoena -> subpoena showed 0 files) ==="
+rm -rf "$MOUNT/t70_sob" "$MOUNT/t70_sub" 2>/dev/null || true
+mkdir -p "$MOUNT/t70_sob/sub"
+dd if=/dev/urandom of="$MOUNT/t70_sob/a.bin" bs=1M count=1 status=none
+dd if=/dev/urandom of="$MOUNT/t70_sob/sub/b.bin" bs=1M count=1 status=none
+dfs_sync
+T70_A=$(md5sum < "$MOUNT/t70_sob/a.bin" | cut -c1-32)
+T70_B=$(md5sum < "$MOUNT/t70_sob/sub/b.bin" | cut -c1-32)
+# Hold a file open across the rename and write through it afterwards, as a VM with its
+# disk image in the directory would: its later writes must not resurrect the old path.
+T70_INO_BEFORE=$(ls -i "$MOUNT/t70_sob/sub/b.bin" | awk '{print $1}')
+exec 7>>"$MOUNT/t70_sob/sub/b.bin"
+mv "$MOUNT/t70_sob" "$MOUNT/t70_sub"
+head -c 65536 /dev/urandom >&7
+exec 7>&-
+dfs_sync
+T70_B=$(md5sum < "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null | cut -c1-32)
+T70_LS=$(ls "$MOUNT/t70_sub" 2>/dev/null | tr '\n' ' ')
+T70_LS_SUB=$(ls "$MOUNT/t70_sub/sub" 2>/dev/null | tr '\n' ' ')
+echo "  T70: ls t70_sub = [$T70_LS], ls t70_sub/sub = [$T70_LS_SUB]"
+[[ "$T70_LS" == *"a.bin"* && "$T70_LS" == *"sub"* && "$T70_LS_SUB" == *"b.bin"* ]] \
+    && check "T70a renamed directory lists its file and its subdirectory's file" PASS \
+    || check "T70a renamed directory lost its contents" FAIL
+[ "$(md5sum < "$MOUNT/t70_sub/a.bin" 2>/dev/null | cut -c1-32)" = "$T70_A" ] && \
+[ "$(md5sum < "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null | cut -c1-32)" = "$T70_B" ] \
+    && check "T70b file contents intact under the new name" PASS \
+    || check "T70b file contents unreadable or changed under the new name" FAIL
+[ ! -e "$MOUNT/t70_sob" ] \
+    && check "T70c old directory name is gone" PASS \
+    || check "T70c old directory name still exists" FAIL
+# The servers' own metadata, independent of any client cache.
+T70_SRV=$("$BIN/dfs-admin" --cluster "$CLUSTER" file list 2>/dev/null | grep -oE "/t70_(sob|sub)[^ ]*" | sort -u | tr '\n' ' ')
+echo "  T70: server paths: $T70_SRV"
+[[ "$T70_SRV" == *"/t70_sub/a.bin"* && "$T70_SRV" == *"/t70_sub/sub/b.bin"* && "$T70_SRV" != *"/t70_sob"* ]] \
+    && check "T70d server metadata moved every descendant to the new path" PASS \
+    || check "T70d server metadata still has old descendant paths or lacks new ones" FAIL
+T70_INO_AFTER=$(ls -i "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null | awk '{print $1}')
+echo "  T70: b.bin inode before rename $T70_INO_BEFORE, after $T70_INO_AFTER"
+[ -n "$T70_INO_BEFORE" ] && [ "$T70_INO_BEFORE" = "$T70_INO_AFTER" ] \
+    && check "T70f a child keeps its inode number across the directory rename" PASS \
+    || check "T70f a child's inode number changed across the directory rename" FAIL
+T70_BSIZE=$(stat -c %s "$MOUNT/t70_sub/sub/b.bin" 2>/dev/null || echo 0)
+[ "$T70_BSIZE" = $((1048576 + 65536)) ] \
+    && check "T70e a file held open across the rename takes writes under its new name" PASS \
+    || check "T70e write through a handle held across the rename was lost (size $T70_BSIZE)" FAIL
+rm -rf "$MOUNT/t70_sub" "$MOUNT/t70_sob" 2>/dev/null || true
+fi # should_run T70
+
+# ── Test 72: no node keeps a file the cluster deleted ────────────────────────
+# Legata bug: files deleted by earlier tests (T36/T37/T39 in one run, T42's
+# flood in others) stayed in some nodes' FILE_TABLE/chunk_map for the rest of
+# the run, where the slot audit kept reporting them. Every file a node lists as
+# its own must also be on the leader. Runs after every other test, so each
+# test's deletes are long past the 30s tombstone TTL.
+snapshot_log T72
+if should_run T72; then
+echo "=== T72: every node's file table matches the leader's (no lingering deleted files) ==="
+dfs_sync 2>/dev/null || true
+T72_LEADER=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" file list 2>/dev/null | grep -oE "^[0-9a-f-]{36}" | sort -u)
+echo "  T72: leader lists $(echo "$T72_LEADER" | grep -c . || true) files"
+T72_EXTRA=""
+for port in 8900 8901 8902 8903 8904; do
+    extra=$(comm -13 <(echo "$T72_LEADER") <("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -oE "^[0-9a-f-]{36}" | sort -u))
+    if [ -n "$extra" ]; then
+        T72_EXTRA="${T72_EXTRA} $port:$(echo "$extra" | grep -c .)"
+        echo "  T72: node $port keeps files the leader doesn't have: $(echo $extra | cut -c1-200)"
+    fi
+done
+[ -z "$T72_EXTRA" ] \
+    && check "T72 no node keeps a file the leader has deleted" PASS \
+    || check "T72 nodes keep deleted files:${T72_EXTRA}" FAIL
+
+# T72b: the mechanism behind it. A patch slot still dirty when its file was deleted
+# was later folded by the patch-fold sweep, which re-installed the deleted file's
+# chunk_map. No node may fold a file after it processed that file's delete.
+T72B_VIOLATIONS=""
+for f in "$LOG"/server[0-9].log; do
+    T72B_VIOLATIONS="${T72B_VIOLATIONS}$(sed -E 's/\x1b\[[0-9;]*m//g' "$f" | awk -v node="$(basename "$f" .log)" '
+        /DeleteChunksBatch: / { id=$NF; gsub(/[()]/, "", id); if (!(id in del)) del[id]=$1 }
+        /Single fold: file / {
+            for (i=1; i<=NF; i++) if ($i=="file") { id=$(i+1); break }
+            if ((id in del) && $1 > del[id]) print "  T72b: " node " folded deleted file " id " at " $1 " (deleted " del[id] ")"
+        }')"$'\n'
+done
+T72B_BAD=$(echo "$T72B_VIOLATIONS" | grep -c "T72b:" || true)
+echo "$T72B_VIOLATIONS" | grep "T72b:" | head -10 || true
+[ "$T72B_BAD" -eq 0 ] \
+    && check "T72b no node folds a file after deleting it" PASS \
+    || check "T72b $T72B_BAD fold(s) of already-deleted files re-created their chunk maps" FAIL
+fi # should_run T72
+
+# ── Test 71: a node restarted while its peers are down must not lead ─────────
+# Legata bug: is_leader()/has_quorum() sized the majority from the peers this
+# process has heard from so far, not from the cluster it belongs to — a node
+# that restarts alone sees {self}, computes quorum = 1 of 1, and runs leader-only
+# healing (including has_quorum-gated destructive cleanup) against a partition of
+# one. Runs LAST: it stops the whole cluster and restarts only node5 (alone,
+# any node is the min-id online node, so which one we pick doesn't matter).
+snapshot_log T71
+if should_run T71; then
+echo "=== T71: a node restarted alone (peers down) must not claim leadership ==="
+dfs_sync
+fusermount -u "$MOUNT" 2>/dev/null || true
+pkill -f "dfs-client mount $MOUNT" 2>/dev/null || true
+pkill -f "dfs-server start" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start" >/dev/null || break; sleep 0.1; done
+[ -s "$BASE/node5/peers.json" ] \
+    && check "T71a node5 persisted its peers before the restart" PASS \
+    || check "T71a node5 has no peers.json — cannot know its cluster size" FAIL
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+    > "$LOG/server5_t71.log" 2>&1 &
+T71_PID=$!
+# The healer's discovery loop re-evaluates leadership on a 60s tick; wait past
+# the first one so a lone node that believes it leads has had its chance to say so.
+sleep 70
+T71_LED=$(grep -c "now the cluster leader" "$LOG/server5_t71.log" || true)
+echo "  T71: lone node5 'now the cluster leader' lines: $T71_LED"
+[ "$T71_LED" -eq 0 ] \
+    && check "T71b lone restarted node does not take over healing coordination" PASS \
+    || check "T71b lone restarted node declared itself leader of a partition of one" FAIL
+T71_STATUS=$(timeout 5 "$BIN/dfs-admin" --cluster "127.0.0.1:8904" cluster status 2>/dev/null | grep -E "^(Total Nodes|Leader):" || true)
+echo "  T71: node5 status: $(echo $T71_STATUS)"
+echo "$T71_STATUS" | grep -q "^Leader:" \
+    && check "T71c lone node reports a leader it cannot have (no quorum)" FAIL \
+    || check "T71c lone node reports no leader while it lacks a majority" PASS
+kill "$T71_PID" 2>/dev/null || true
+fi # should_run T71
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

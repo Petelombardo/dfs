@@ -484,6 +484,11 @@ pub struct MetadataStore {
     /// thread) had no visibility at all. This makes that visible directly instead
     /// of inferring it from client-side write timing.
     committer_stats: Mutex<CommitterStats>,
+    /// In-memory mirror of FILE_TOMBSTONE_TABLE's keys (file ids deleted for good, until
+    /// pruned): loaded at open, added in the same call that writes a marker, trimmed by
+    /// the prune. Lets the server refuse a write to a deleted file on its hot patch path
+    /// without a redb read per patch (see is_file_tombstoned).
+    tombstoned_files: dashmap::DashSet<String>,
 }
 
 /// See MetadataStore::committer_stats' doc comment. Reset to defaults every time
@@ -591,6 +596,21 @@ impl MetadataStore {
             txn.commit()?;
         }
 
+        let tombstoned_files = dashmap::DashSet::new();
+        {
+            let txn = db.begin_read()?;
+            match txn.open_table(FILE_TOMBSTONE_TABLE) {
+                Ok(table) => {
+                    for row in table.iter()? {
+                        let (k, _) = row?;
+                        tombstoned_files.insert(k.value().to_string());
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
         info!("Initialized redb metadata store at {:?}", db_path);
 
         Ok(Self {
@@ -602,6 +622,7 @@ impl MetadataStore {
             txn_stats: Mutex::new(std::collections::HashMap::new()),
             committer: OnceLock::new(),
             committer_stats: Mutex::new(CommitterStats::default()),
+            tombstoned_files,
         })
     }
 
@@ -1893,6 +1914,9 @@ impl MetadataStore {
         }
         txn.commit()?;
         self.note_txn("delete_file", 0);
+        if for_good {
+            self.tombstoned_files.insert(file_id_str.clone());
+        }
 
         // See put_file's matching comment: must happen while `_db` is still held.
         self.dirty_files.lock().unwrap().insert(file_id_str.clone());
@@ -1955,6 +1979,12 @@ impl MetadataStore {
     /// outlive every write that could have been in flight when its file was deleted;
     /// a node offline longer than that is brought back in line by metadata
     /// reconciliation, not by replaying old writes. Returns how many were dropped.
+    /// Whether `file_id` was deleted for good (a FILE_TOMBSTONE_TABLE marker exists). In
+    /// memory, no redb read: safe on the hot write path.
+    pub fn is_file_tombstoned(&self, file_id: &FileId) -> bool {
+        self.tombstoned_files.contains(&file_id.to_string())
+    }
+
     pub fn prune_file_tombstones(&self, max_age: std::time::Duration) -> Result<usize> {
         let cutoff = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs()).unwrap_or(0).saturating_sub(max_age.as_secs());
@@ -1971,11 +2001,14 @@ impl MetadataStore {
             for k in &old {
                 table.remove(k.as_str())?;
             }
-            old.len()
+            old
         };
         txn.commit()?;
         self.note_txn("prune_file_tombstones", 0);
-        Ok(pruned)
+        for k in &pruned {
+            self.tombstoned_files.remove(k);
+        }
+        Ok(pruned.len())
     }
 
     pub async fn prune_file_tombstones_async(self: &Arc<Self>, max_age: std::time::Duration) -> Result<usize> {

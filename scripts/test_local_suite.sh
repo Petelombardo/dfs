@@ -6611,6 +6611,140 @@ fusermount -u "$T74_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T74_PID2"
 fi # should_run T74
 
+# ── Test 75: no-op rewrites after a one-sided fold leave the pair on ONE version ──────────
+# The 2026-09-27 VM-108 disk-1 chunk 9 shape. A guest rewrote bytes the chunk already held. One
+# replica had no accumulator for the slot (it had just folded), so it started a fresh one and
+# returned a new id; the others still held a warm merge buffer, saw the rewrite change nothing,
+# and returned the old id (9c40 -> 9c40). The pair split on identity with identical bytes, and the
+# split later fed a self-fold (a294+delta -> a294) and an abandoned patch: a permanent EIO.
+# Deterministic: write, fold ONE member, rewrite the same bytes, then fold the other. Each case
+# requires (a) no replica disagreement or backfill, (b) both ISR members report the same head
+# id, (c) identical bytes, (d) every block reads back; then a fold on both keeps (b) and (c).
+if should_run T75; then
+snapshot_log T75
+echo ""
+echo "=== T75: no-op rewrites after a one-sided fold leave both ISR members on one version (09-27 repro) ==="
+T75_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+t75_writes() {  # file first last: fsync'd 4K writes of "W<n>" to distinct blocks of chunk 1
+    python3 - "$MOUNT/$1" "$2" "$3" <<'PY'
+import os, sys
+path, a, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fd = os.open(path, os.O_RDWR)
+for i in range(a, b + 1):
+    os.pwrite(fd, (b"W%06d" % i).ljust(4096, b"w"), 4 * 1024 * 1024 + i * 8192)
+    os.fsync(fd)
+os.close(fd)
+PY
+}
+t75_pair() {  # file: "<primary addr> <secondary addr>" of chunk 1's committed ISR
+    python3 - "$("$BIN/dfs-admin" --cluster "$T75_ALL" lease status 2>/dev/null)" \
+        "$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$1" --chunks 2 2>/dev/null)" <<'PY'
+import json, sys
+addr = {}
+for l in sys.argv[1].splitlines():
+    r = json.loads(l)
+    if "node" in r: addr[r["node"]] = r["addr"]
+isr = json.loads(sys.argv[2].splitlines()[0])["isr"][1]
+print(" ".join(addr.get(m, "?") for m in isr["members"]) if isr else "")
+PY
+}
+t75_heads() {  # file pair: "<id>/<blake3> <id>/<blake3>" as each member reports chunk 1
+    "$BIN/dfs-admin" --cluster "$(echo "$2" | tr ' ' ',')" isr read --file "/$1" --chunk 1 2>/dev/null \
+        | python3 -c "
+import json, sys
+print(' '.join(r.get('chunk_id', 'ERR')[:12] + '/' + r.get('blake3', r.get('error', '?'))[:12] for r in map(json.loads, sys.stdin)))"
+}
+t75_same() { set -- $1; [ $# = 2 ] && [ "$1" = "$2" ] && [ "${1#ERR}" = "$1" ]; }
+t75_same_bytes() { set -- $1; [ $# = 2 ] && [ "${1#*/}" = "${2#*/}" ] && [ "${1#ERR}" = "$1" ] && [ "${2#ERR}" = "$2" ]; }
+for T75_CASE in primary secondary; do
+    T75_FILE=t75_noop_$T75_CASE.bin
+    dd if=/dev/urandom of="$MOUNT/$T75_FILE" bs=4M count=2 status=none
+    dfs_sync
+    for _ in $(seq 1 30); do [ -n "$(t75_pair "$T75_FILE" 2>/dev/null)" ] && break; sleep 1; done
+    T75_PAIR=$(t75_pair "$T75_FILE")
+    if [ -z "$T75_PAIR" ]; then check "T75[$T75_CASE] chunk 1 has a committed ISR" FAIL; rm -f "${MOUNT:?}/${T75_FILE:?}"; continue; fi
+    t75_writes "$T75_FILE" 0 4          # real changes: both members hold an accumulator
+    t75_writes "$T75_FILE" 0 4          # the same bytes again: both warm their merge buffer
+    dfs_sync
+    T75_MARK=$(wc -l < "$CURRENT_CLIENT_LOG")
+    set -- $T75_PAIR
+    [ "$T75_CASE" = primary ] && T75_FOLD=$1 T75_OTHER=$2 || T75_FOLD=$2 T75_OTHER=$1
+    echo "  T75[$T75_CASE]: pair $T75_PAIR; heads before: $(t75_heads "$T75_FILE" "$T75_PAIR")"
+    # A one-sided fold is refused while the ordered stream is active (ORDERED_STREAM_QUIET, 10s);
+    # after that an idle-fold timer can fold one member alone, which is what happened on 09-27.
+    sleep 12
+    echo "  T75[$T75_CASE]: folding $T75_FOLD alone after the stream went quiet, then rewriting the same 5 blocks"
+    "$BIN/dfs-admin" --cluster "$T75_FOLD" isr fold --file "/$T75_FILE" --chunk 1 | sed 's/^/    /'
+    t75_writes "$T75_FILE" 0 4          # no-op rewrites: one member cold, one warm
+    dfs_sync
+    T75_H1=$(t75_heads "$T75_FILE" "$T75_PAIR")
+    echo "  T75[$T75_CASE]: after the no-op rewrites, heads: $T75_H1"
+    t75_writes "$T75_FILE" 5 6          # and a real write on top
+    dfs_sync
+    T75_H2=$(t75_heads "$T75_FILE" "$T75_PAIR")
+    echo "  T75[$T75_CASE]: after a real write on top, heads: $T75_H2"
+    sleep 12   # quiet again, so both unordered folds run (the 09-27 a294+delta -> a294 self-fold)
+    "$BIN/dfs-admin" --cluster "$T75_OTHER" isr fold --file "/$T75_FILE" --chunk 1 | sed 's/^/    /'
+    "$BIN/dfs-admin" --cluster "$T75_FOLD" isr fold --file "/$T75_FILE" --chunk 1 | sed 's/^/    /'
+    # The second ForceFold finds the slot folded elsewhere and heals the result rather than
+    # folding again, so its member holds the bytes only once that heal lands. Until the next
+    # write, that member's ordered head may still name the pre-fold token: same version, same
+    # bytes (the next write lands on one id on both, check e), so c compares bytes.
+    T75_WAITED=0
+    for _ in $(seq 1 30); do
+        T75_H3=$(t75_heads "$T75_FILE" "$T75_PAIR")
+        t75_same_bytes "$T75_H3" && break
+        sleep 1; T75_WAITED=$((T75_WAITED + 1))
+    done
+    echo "  T75[$T75_CASE]: after folding both, heads (${T75_WAITED}s): $T75_H3"
+    # 09-27 step 3: the patch after the self-fold is where the replicas split (9c40 -> 8195 on
+    # one, 9c40 -> 9c40 on the others). Rewrite the same bytes again, then make a real change.
+    t75_writes "$T75_FILE" 0 4
+    dfs_sync
+    T75_H4=$(t75_heads "$T75_FILE" "$T75_PAIR")
+    t75_writes "$T75_FILE" 7 7
+    dfs_sync
+    T75_H5=$(t75_heads "$T75_FILE" "$T75_PAIR")
+    echo "  T75[$T75_CASE]: after the folds, a no-op rewrite: $T75_H4; then a real write: $T75_H5"
+    T75_SINCE=$(tail -n +"$((T75_MARK + 1))" "$CURRENT_CLIENT_LOG" | sed 's/\x1b\[[0-9;]*m//g')
+    T75_DIS=$(echo "$T75_SINCE" | grep -ac "REPLICA DISAGREEMENT" || true)
+    T75_BACKFILL=$(echo "$T75_SINCE" | grep -ac "landed on only" || true)
+    echo "$T75_SINCE" | grep -a "REPLICA DISAGREEMENT\|landed on only" | head -2 | cut -c1-240 | sed 's/^/    /'
+    [ "$T75_DIS" = 0 ] && [ "$T75_BACKFILL" = 0 ] \
+        && check "T75[$T75_CASE]a no-op rewrites caused no replica disagreement or backfill" PASS \
+        || check "T75[$T75_CASE]a no-op rewrites split the pair: $T75_DIS disagreement(s), $T75_BACKFILL backfill(s)" FAIL
+    t75_same "$T75_H1" && t75_same "$T75_H2" \
+        && check "T75[$T75_CASE]b both ISR members report one version (same head id and bytes)" PASS \
+        || check "T75[$T75_CASE]b ISR members on different versions: [$T75_H1] then [$T75_H2]" FAIL
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+        t75_same_bytes "$T75_H3" \
+            && check "T75[$T75_CASE]c after a fold on both, both ISR members hold the same bytes" PASS \
+            || check "T75[$T75_CASE]c after a fold on both, members still differ after 30s: [$T75_H3]" FAIL
+    else
+        # Unordered, a fold's result is re-replicated by the leader's placement, not to the
+        # ISR pair, so the other member may legitimately not hold the slot any more.
+        t75_same_bytes "$T75_H3" || echo "  T75[$T75_CASE]c (informational without DFS_ORDERED_WRITES): after a fold on both: [$T75_H3]"
+    fi
+    t75_same "$T75_H4" && t75_same "$T75_H5" \
+        && check "T75[$T75_CASE]e writes after the folds keep the pair on one version" PASS \
+        || check "T75[$T75_CASE]e writes after the folds split the pair: [$T75_H4] then [$T75_H5]" FAIL
+    T75_BAD=$(python3 - "$MOUNT/$T75_FILE" <<'PY'
+import sys
+f = open(sys.argv[1], "rb")
+bad = []
+for i in range(8):
+    f.seek(4 * 1024 * 1024 + i * 8192)
+    if f.read(4096) != (b"W%06d" % i).ljust(4096, b"w"): bad.append(i)
+print(" ".join(map(str, bad)))
+PY
+)
+    [ -z "$T75_BAD" ] \
+        && check "T75[$T75_CASE]d all 8 blocks read back" PASS \
+        || check "T75[$T75_CASE]d blocks $T75_BAD read back wrong" FAIL
+    rm -f "${MOUNT:?}/${T75_FILE:?}"
+done
+fi # should_run T75
+
 if should_run T70; then
 snapshot_log T70
 echo ""

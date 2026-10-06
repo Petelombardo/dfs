@@ -275,6 +275,27 @@ pub struct StaleFoldedPatchCandidate {
     pub safe_without_leader_check: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs once, right after a compaction catch-up pass opens its read snapshot,
+    /// so a test can commit a write exactly in the window between snapshot and diff.
+    static AFTER_CATCHUP_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn after_catchup_snapshot() {
+    if let Some(f) = AFTER_CATCHUP_SNAPSHOT.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
+/// Value type of a metadata table, for compaction's generic copy (see live_tables).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TableKind {
+    Bytes,
+    U64,
+}
+
 /// A fully-converged shadow database, ready for compact_db_finish's exclusive-locked
 /// atomic swap. Produced by compact_db_prepare (Phases 1-2, shared-lock only) and
 /// consumed by compact_db_finish (Phase 3, exclusive lock) — see their doc comments
@@ -4395,24 +4416,28 @@ impl MetadataStore {
     // Misc
     // -------------------------------------------------------------------------
 
-    /// Bytes-valued tables copied/diffed as a unit by compact_db()'s shadow-copy pass.
-    const BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 8] = [
-        FILE_TABLE, PATH_TABLE, CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX,
-        DELETE_QUEUE_TABLE, PATCH_STATE_TABLE, PATCH_STATE_SLOT_TABLE,
-    ];
-
-    /// u64-valued tables copied/diffed as a unit by compact_db()'s shadow-copy pass.
-    const U64_TABLES: [TableDefinition<'static, &'static str, u64>; 3] =
-        [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE];
-
-    /// BYTES_TABLES minus FILE_TABLE/PATH_TABLE — the tables diff_all_tables_tracked
-    /// still diffs via a full scan, since only FILE_TABLE/PATH_TABLE have dirty-key
-    /// tracking (see dirty_files/dirty_paths). Individually much smaller per-row than
-    /// full serialized FileMetadata blobs, so their O(size) cost isn't the bottleneck.
-    const OTHER_BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 6] = [
-        CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX, DELETE_QUEUE_TABLE,
-        PATCH_STATE_TABLE, PATCH_STATE_SLOT_TABLE,
-    ];
+    /// Every table in `src`, with its value type. Compaction copies whatever the live db
+    /// actually holds, not a hand-kept list: the lists it used to keep had fallen behind
+    /// (chunk_seq, file_tombstone, patch_fold_timestamp and pending_fold_announce were
+    /// missing), so every online compaction silently dropped those tables. A table whose
+    /// type compaction can't copy fails the compaction instead of vanishing.
+    fn live_tables(src: &redb::ReadTransaction) -> Result<Vec<(String, TableKind)>> {
+        use redb::TableHandle;
+        let mut out = Vec::new();
+        for handle in src.list_tables()? {
+            let name = handle.name().to_string();
+            let kind = match src.open_table(TableDefinition::<&str, &[u8]>::new(&name)) {
+                Ok(_) => TableKind::Bytes,
+                Err(redb::TableError::TableTypeMismatch { .. }) => match src.open_table(TableDefinition::<&str, u64>::new(&name)) {
+                    Ok(_) => TableKind::U64,
+                    Err(e) => anyhow::bail!("compact: table {} has a type compaction can't copy: {}", name, e),
+                },
+                Err(e) => return Err(e.into()),
+            };
+            out.push((name, kind));
+        }
+        Ok(out)
+    }
 
     /// Copy every row of `def` from `src` into `dst`, overwriting whatever's there.
     /// Used for compact_db()'s initial full snapshot copy.
@@ -4483,7 +4508,7 @@ impl MetadataStore {
     /// passes to bring the shadow copy current with writes that landed during/after the
     /// initial snapshot copy — schema-agnostic by design (compares raw bytes, never
     /// needs to know what a table's values mean), so a future table needs no special
-    /// handling here beyond being added to BYTES_TABLES/U64_TABLES.
+    /// handling here (live_tables finds it).
     fn diff_bytes_table(
         src: &redb::ReadTransaction,
         dst: &redb::WriteTransaction,
@@ -4576,13 +4601,13 @@ impl MetadataStore {
     /// bails and defers within its stated budget regardless of table size or
     /// contention, the same "try again next cycle" contract Phase 2 already honors.
     fn copy_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction, deadline: std::time::Instant) -> Result<bool> {
-        for def in Self::BYTES_TABLES {
+        for (name, kind) in Self::live_tables(src)? {
             if std::time::Instant::now() >= deadline { return Ok(false); }
-            if !Self::copy_bytes_table(src, dst, def, deadline)? { return Ok(false); }
-        }
-        for def in Self::U64_TABLES {
-            if std::time::Instant::now() >= deadline { return Ok(false); }
-            if !Self::copy_u64_table(src, dst, def, deadline)? { return Ok(false); }
+            let done = match kind {
+                TableKind::Bytes => Self::copy_bytes_table(src, dst, TableDefinition::new(&name), deadline)?,
+                TableKind::U64 => Self::copy_u64_table(src, dst, TableDefinition::new(&name), deadline)?,
+            };
+            if !done { return Ok(false); }
         }
         Ok(true)
     }
@@ -4636,8 +4661,9 @@ impl MetadataStore {
 
     /// Same as the old diff_all_tables, but FILE_TABLE/PATH_TABLE go through the
     /// dirty-key-tracked incremental path (O(recent writes), not O(table size)) while
-    /// every other table still uses the full-scan diff_bytes_table/diff_u64_table —
-    /// see OTHER_BYTES_TABLES's doc comment for why that's an acceptable tradeoff.
+    /// every other table still uses the full-scan diff_bytes_table/diff_u64_table: they
+    /// are individually much smaller per row than full serialized FileMetadata blobs, so
+    /// their O(size) scan isn't the bottleneck.
     ///
     /// Fixes the 2026-07-06 T44 finding: diff_bytes_table's full-table scan meant
     /// Phase 3's exclusive lock was held for however long it took to re-scan the
@@ -4649,22 +4675,48 @@ impl MetadataStore {
     /// duplicated across both tables), so tracking just those two turns their part of
     /// Phase 3's cost into O(writes since the last pass).
     ///
-    /// Drains (not just reads) the dirty sets each call — see dirty_files's field doc
-    /// comment for why doing this while holding `db`'s exclusive lock (Phase 3) or a
-    /// shared lock started before this snapshot (Phase 2) is race-free against
-    /// concurrent writers: every writer marks its keys dirty before releasing its own
-    /// `db.read()` guard, so nothing committed-but-unmarked can exist by the time this
-    /// runs under Phase 3's exclusive `db.write()`.
-    fn diff_all_tables_tracked(&self, src: &redb::ReadTransaction, dst: &redb::WriteTransaction) -> Result<usize> {
-        let dirty_file_keys = std::mem::take(&mut *self.dirty_files.lock().unwrap());
-        let dirty_path_keys = std::mem::take(&mut *self.dirty_paths.lock().unwrap());
+    /// `dirty` must be drained (take_dirty_keys) BEFORE `src` is opened. Writers mark a key
+    /// dirty right after their commit, so a key drained before the snapshot was committed
+    /// before it and its value is in `src`; a key committed after the snapshot is marked
+    /// after the drain and stays for the next pass. Draining after opening `src` (the old
+    /// order) lost writes: a key committed after the snapshot but marked before the drain
+    /// was drained, read from a snapshot that predates it ("deleted"), and never copied by
+    /// any later pass, so the swap discarded it. Phase 2 holds only the shared lock, which
+    /// writers hold too, so that window was open (test_compact_db_preserves_concurrent_writes
+    /// failed ~1 run in 5). Under Phase 3's exclusive lock no writer is mid-commit, so its
+    /// drain is complete.
+    fn diff_all_tables_tracked(
+        &self,
+        src: &redb::ReadTransaction,
+        dst: &redb::WriteTransaction,
+        dirty: (std::collections::HashSet<String>, std::collections::HashSet<String>),
+    ) -> Result<usize> {
+        use redb::TableHandle;
+        let (dirty_file_keys, dirty_path_keys) = dirty;
 
         let mut changed = 0usize;
         changed += Self::diff_bytes_table_by_keys(src, dst, FILE_TABLE, &dirty_file_keys)?;
         changed += Self::diff_bytes_table_by_keys(src, dst, PATH_TABLE, &dirty_path_keys)?;
-        for def in Self::OTHER_BYTES_TABLES { changed += Self::diff_bytes_table(src, dst, def)?; }
-        for def in Self::U64_TABLES { changed += Self::diff_u64_table(src, dst, def)?; }
+        // Every other table by full scan (FILE_TABLE/PATH_TABLE have dirty-key tracking).
+        for (name, kind) in Self::live_tables(src)? {
+            if name == FILE_TABLE.name() || name == PATH_TABLE.name() {
+                continue;
+            }
+            changed += match kind {
+                TableKind::Bytes => Self::diff_bytes_table(src, dst, TableDefinition::new(&name))?,
+                TableKind::U64 => Self::diff_u64_table(src, dst, TableDefinition::new(&name))?,
+            };
+        }
         Ok(changed)
+    }
+
+    /// Drain the FILE_TABLE/PATH_TABLE dirty-key sets for one catch-up pass. Call before
+    /// opening that pass's read snapshot; see diff_all_tables_tracked.
+    fn take_dirty_keys(&self) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+        (
+            std::mem::take(&mut *self.dirty_files.lock().unwrap()),
+            std::mem::take(&mut *self.dirty_paths.lock().unwrap()),
+        )
     }
 
     /// Compact the database without blocking concurrent metadata I/O.
@@ -4792,9 +4844,12 @@ impl MetadataStore {
         let mut converged = false;
         loop {
             let live = self.db.read();
+            let dirty = self.take_dirty_keys();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase2 begin_read: {}", e))?;
+            #[cfg(test)]
+            after_catchup_snapshot();
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase2 begin_write: {}", e))?;
-            let changed = self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
+            let changed = self.diff_all_tables_tracked(&src_txn, &dst_txn, dirty)?;
             dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase2 commit: {}", e))?;
             self.note_txn("compact_db_prepare_phase2", 0);
             if changed <= convergence_threshold {
@@ -4829,9 +4884,10 @@ impl MetadataStore {
         {
             let mut live = self.db.write();
             {
+                let dirty = self.take_dirty_keys();
                 let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase3 begin_read: {}", e))?;
                 let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase3 begin_write: {}", e))?;
-                self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
+                self.diff_all_tables_tracked(&src_txn, &dst_txn, dirty)?;
                 dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase3 commit: {}", e))?;
                 self.note_txn("compact_db_finish_phase3", 0);
             }
@@ -6342,11 +6398,12 @@ mod tests {
         }
 
         let live = store.db.read();
+        let dirty = store.take_dirty_keys();
         let src_txn = live.begin_read().unwrap();
         let dst_txn = shadow_db.begin_write().unwrap();
 
         let start = std::time::Instant::now();
-        let changed = store.diff_all_tables_tracked(&src_txn, &dst_txn).unwrap();
+        let changed = store.diff_all_tables_tracked(&src_txn, &dst_txn, dirty).unwrap();
         let elapsed = start.elapsed();
 
         dst_txn.commit().unwrap();
@@ -6547,6 +6604,65 @@ mod tests {
                 store.get_file_by_path(&path).unwrap().is_some(),
                 "lost seeded file {} during compact_db()", path
             );
+        }
+    }
+
+    /// Compaction must keep every table, not just the ones a list remembered: the lists
+    /// had fallen behind, so chunk_seq, file_tombstone, patch_fold_timestamp and
+    /// pending_fold_announce were dropped by every online compaction.
+    #[test]
+    fn test_compact_db_preserves_every_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let bytes = [FILE_TABLE, PATH_TABLE, CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX,
+                     DELETE_QUEUE_TABLE, PATCH_STATE_TABLE, PENDING_FOLD_ANNOUNCE_TABLE, PATCH_STATE_SLOT_TABLE];
+        let u64s = [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE, PATCH_FOLD_TIMESTAMP_TABLE,
+                    CHUNK_SEQ_TABLE, FILE_TOMBSTONE_TABLE];
+        {
+            let db = store.db.read();
+            let txn = db.begin_write().unwrap();
+            for def in bytes { txn.open_table(def).unwrap().insert("k", b"v".as_slice()).unwrap(); }
+            for def in u64s { txn.open_table(def).unwrap().insert("k", 7u64).unwrap(); }
+            txn.commit().unwrap();
+        }
+        store.compact_db().unwrap();
+        let db = store.db.read();
+        let txn = db.begin_read().unwrap();
+        let mut dropped = Vec::new();
+        for def in bytes {
+            if txn.open_table(def).ok().and_then(|t| t.get("k").unwrap().map(|v| v.value().to_vec())).is_none() {
+                dropped.push(def.to_string());
+            }
+        }
+        for def in u64s {
+            if txn.open_table(def).ok().and_then(|t| t.get("k").unwrap().map(|v| v.value())).is_none() {
+                dropped.push(def.to_string());
+            }
+        }
+        assert!(dropped.is_empty(), "compaction dropped table(s): {:?}", dropped);
+    }
+
+    /// The catch-up race, deterministically: a file is committed right after a Phase 2
+    /// pass opens its snapshot. Draining the dirty keys after the snapshot (the old order)
+    /// drained this file's key, read it as deleted from the older snapshot, and no later
+    /// pass ever copied it: the swap discarded the write.
+    #[test]
+    fn test_compact_db_keeps_a_write_committed_after_a_catchup_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+        for i in 0..100 {
+            store.put_file(&FileMetadata::new(format!("/seed_{}", i), FileType::RegularFile)).unwrap();
+        }
+        let store2 = std::sync::Arc::clone(&store);
+        AFTER_CATCHUP_SNAPSHOT.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+            store2.put_file(&FileMetadata::new("/after_snapshot".to_string(), FileType::RegularFile)).unwrap();
+        })));
+        store.compact_db().unwrap();
+        assert!(AFTER_CATCHUP_SNAPSHOT.with(|h| h.borrow().is_none()), "the hook never ran");
+        assert!(store.get_file_by_path("/after_snapshot").unwrap().is_some(),
+            "a write committed after a catch-up pass's snapshot was lost by compact_db()");
+        for i in 0..100 {
+            assert!(store.get_file_by_path(&format!("/seed_{}", i)).unwrap().is_some());
         }
     }
 

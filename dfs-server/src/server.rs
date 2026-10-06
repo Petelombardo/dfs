@@ -16069,9 +16069,14 @@ impl Server {
     /// or chunk_map entry, and a later fold then resurrects the file (suite T72b, one
     /// fold 73s after a delete that landed 170ms behind a patch). In-flight means
     /// milliseconds to seconds, well inside the tombstone's 30s.
+    /// Deleted within the last 30s (in-memory, set as the delete is processed), or deleted
+    /// for good (a durable tombstone, mirrored in memory). The 30s window alone let a write
+    /// still being retried after it reopen the file: the fresh accumulator's fold re-created
+    /// the deleted file's chunk map (suite T72b), and after a restart the window is empty.
     fn file_recently_deleted(&self, file_id: FileId) -> bool {
         self.delete_tombstones.get(&file_id)
             .is_some_and(|t| t.value().elapsed() < std::time::Duration::from_secs(30))
+            || self.metadata.is_file_tombstoned(&file_id)
     }
 
     fn forget_file_slots(&self, file_id: FileId) {
@@ -22139,6 +22144,54 @@ mod tests {
              apply_patch call) — this test would pass even if no-op detection were entirely \
              removed, making it worthless as a regression guard",
         );
+    }
+
+    /// Suite T72b (2026-10-06): a client kept retrying a patch to a deleted file; once the
+    /// in-memory 30s delete window passed, the next retry started a fresh accumulator and
+    /// its fold re-created the deleted file's chunk map. A file deleted for good (durable
+    /// tombstone) must refuse patches for as long as the tombstone exists, including after
+    /// the window, and after a restart (both: no in-memory entry, as here).
+    #[tokio::test]
+    async fn patch_to_a_file_deleted_for_good_is_refused_after_the_delete_window() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let mut file = FileMetadata::new("/deleted-for-good".to_string(), dfs_common::FileType::RegularFile);
+        file.id = dfs_common::FileId::new();
+        metadata.put_file(&file).unwrap();
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base_content, 0, file.id));
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id, nodes: vec![node_id], size: base_content.len(),
+            checksum: base_chunk_id.hash, file_offset: Some(0), written_at: None,
+            client_write_seq: None, file_id: Some(file.id),
+        }).unwrap();
+
+        metadata.delete_file_for_good(&file.id).unwrap();
+        assert!(metadata.is_file_tombstoned(&file.id), "test setup: the delete didn't tombstone the file");
+
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let result = server.apply_patch(
+            Some(lock), base_chunk_id, file.id, Some(0), 0,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
+        ).await;
+        match result {
+            Err((msg, _)) => assert!(msg.contains("was deleted"), "refused, but not as deleted: {}", msg),
+            Ok((token, ..)) => panic!("a patch to a file deleted for good was applied (token {}): its fold \
+                would re-create the deleted file's chunk map", token),
+        }
     }
 
     /// Direct proof that a genuine merge-time no-op is detected and skips the

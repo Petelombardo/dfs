@@ -4960,6 +4960,81 @@ impl OverlayForkCtx {
     /// its doc comment. false only from fold_slot_coordinated's shared
     /// Wave/Async call site (which announces via announce_fold_result right
     /// after); true from every other caller.
+    /// This replica adopted a fold another replica ran (`token` -> `real`, same bytes) and does
+    /// not hold `real`. Pull it from a holder now, move the ordered head onto it, and tell the
+    /// leader this node holds it. Leaving it to the leader's under-replicated heal (suite T75)
+    /// left this ISR member unable to read its own head for ~30s: the fold broadcast flips the
+    /// token to Folded(real), so reading the token redirects to bytes it lacks, and the heal
+    /// places copies by the leader's placement, not on the member that asked. Falls back to
+    /// that heal if no holder answers.
+    async fn adopt_fold_result(&self, file_id: FileId, chunk_idx: u64, token: ChunkId, real: ChunkId, hint: Vec<NodeId>) {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        if !self.storage.has_chunk(&real) {
+            let mut candidates = hint;
+            if let Some(entry) = self.chunk_map.get(&file_id) {
+                let (locs, _) = entry.value();
+                if let Some(loc) = locs.iter().find(|l| l.chunk_id == real) {
+                    candidates.extend(loc.nodes.iter().copied());
+                }
+            }
+            for n in self.cluster.get_all_nodes().await {
+                candidates.push(n.id);
+            }
+            let mut seen = std::collections::HashSet::new();
+            candidates.retain(|n| seen.insert(*n));
+            if pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, real, &candidates, file_id, chunk_idx * CHUNK_SIZE).await.is_none() {
+                warn!("adopt_fold_result: file {} chunk {}: no holder served fold result {} — queueing a heal",
+                    file_id, chunk_idx, real);
+                if let Some(healing) = self.healing.read().await.as_ref() {
+                    healing.queue_chunks_immediate(vec![real]).await;
+                }
+                return;
+            }
+        }
+        self.write_ordering.on_folded(file_id, chunk_idx, token, real);
+
+        // Register this node as a holder, here and on the leader, so the leader's view counts it
+        // instead of healing the fold result onto other nodes.
+        let me = self.cluster.local_node_id();
+        let mut location = match self.metadata.get_chunk_location_async(real).await {
+            Ok(Some(loc)) => loc,
+            _ => match self.chunk_map.get(&file_id).and_then(|e| e.value().0.iter().find(|l| l.chunk_id == real).cloned()) {
+                Some(loc) => loc,
+                None => {
+                    debug!("adopt_fold_result: no location for {} yet; the leader's heal will register it", real);
+                    return;
+                }
+            },
+        };
+        if !location.nodes.contains(&me) {
+            location.nodes.push(me);
+        }
+        if let Err(e) = self.metadata.put_chunk_location_async(location.clone()).await {
+            warn!("adopt_fold_result: failed to persist location for {}: {}", real, e);
+        }
+        if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
+            let (locs, _) = entry.value_mut();
+            if let Some(loc) = locs.iter_mut().find(|l| l.chunk_id == real) {
+                if !loc.nodes.contains(&me) {
+                    loc.nodes.push(me);
+                }
+            }
+        }
+        if let Some(leader) = self.cluster.get_leader_addr().await {
+            let req = Request::ReplicateChunkLocation {
+                location,
+                file_id: Some(file_id),
+                generation: self.chunk_generations.get(&real).map(|v| *v),
+            };
+            if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(2), self.client.send_message(leader, Message::Request(req))).await
+                .map_err(|_| anyhow::anyhow!("timed out")).and_then(|r| r.map(|_| ()))
+            {
+                warn!("adopt_fold_result: telling leader {} this node holds {} failed: {}", leader, real, e);
+            }
+        }
+        info!("adopt_fold_result: file {} chunk {}: holding fold result {} (token {})", file_id, chunk_idx, real, token);
+    }
+
     async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64, is_client_initiated: bool, broadcast_to_peers: bool) -> FoldSlotOutcome {
         self.wait_if_compaction_quiescing().await;
 
@@ -5030,13 +5105,16 @@ impl OverlayForkCtx {
                 // never had, fail, and raise a spurious URGENT_SINGLE_REPLICA for
                 // a chunk the real coordinator elsewhere was already handling.
                 self.dirty_patch_slots.remove(&(file_id, chunk_idx));
-                if !self.storage.has_chunk(&real_chunk_id) {
-                    if let Some(healing) = self.healing.read().await.as_ref() {
-                        warn!("fold_slot_now: file {} chunk {} was folded elsewhere to {} which this node does not \
-                               hold — queueing immediate heal rather than reporting a replica it has no bytes for",
-                            file_id, chunk_idx, real_chunk_id);
-                        healing.queue_chunks_immediate(vec![real_chunk_id]).await;
-                    }
+                if self.storage.has_chunk(&real_chunk_id) {
+                    self.write_ordering.on_folded(file_id, chunk_idx, public_token, real_chunk_id);
+                } else {
+                    warn!("fold_slot_now: file {} chunk {} was folded elsewhere to {} which this node does not \
+                           hold — fetching it rather than reporting a replica it has no bytes for",
+                        file_id, chunk_idx, real_chunk_id);
+                    let ctx = self.clone();
+                    tokio::spawn(async move {
+                        ctx.adopt_fold_result(file_id, chunk_idx, public_token, real_chunk_id, Vec::new()).await;
+                    });
                 }
                 return FoldSlotOutcome::AdoptedElsewhere;
             }
@@ -9087,6 +9165,20 @@ impl Server {
         if let Some(err) = self.validate_leader(leader_id).await {
             return err;
         }
+        // The leader trims by its own placement preference, which knows nothing of the slot's
+        // ISR: never delete this node's ordered head (acked data, see WriteOrdering::is_head).
+        if let Ok(Some(loc)) = self.metadata.get_chunk_location_async(chunk_id).await {
+            if let (Some(file_id), Some(offset)) = (loc.file_id, loc.file_offset) {
+                if self.write_ordering.is_head(file_id, offset / (4 * 1024 * 1024), chunk_id) {
+                    warn!("DeleteChunkReplica: refusing to delete {} — it is this node's ordered head for file {} chunk {}",
+                        chunk_id, file_id, offset / (4 * 1024 * 1024));
+                    return Response::Error {
+                        message: format!("{} is this node's ordered head; not deleting", chunk_id),
+                        code: ErrorCode::InvalidRequest,
+                    };
+                }
+            }
+        }
         info!("DeleteChunkReplica: deleting excess replica of {} on this node", chunk_id);
         let storage = self.storage.clone();
         let result = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id, "leader_delete_chunk_replica_rpc"))
@@ -10475,6 +10567,8 @@ impl Server {
             self.metadata.get_patch_state_async(public_token).await,
             Ok(Some(PatchState::Pending { .. }))
         );
+        // The folder's holder set, for fetching the result if this node lacks it.
+        let fold_holders: Vec<NodeId> = location.as_ref().map(|l| l.nodes.clone()).unwrap_or_default();
 
         // The ordered head follows the fold only when the result is held here: an ordered
         // write needs its base locally (otherwise the head stays and the next write re-anchors).
@@ -10588,11 +10682,12 @@ impl Server {
                     })
                     .unwrap_or(true);
             if should_heal {
-                if let Some(healing) = self.healing.read().await.as_ref() {
-                    warn!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {} — queueing immediate heal",
-                        real_chunk_id, self.cluster.local_node_id());
-                    healing.queue_chunks_immediate(vec![real_chunk_id]).await;
-                }
+                warn!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {} — fetching it",
+                    real_chunk_id, self.cluster.local_node_id());
+                let ctx = self.overlay_ctx();
+                tokio::spawn(async move {
+                    ctx.adopt_fold_result(file_id, chunk_idx, public_token, real_chunk_id, fold_holders).await;
+                });
             } else {
                 debug!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {}, but this node \
                     isn't in the file's known replica set — skipping phantom heal",

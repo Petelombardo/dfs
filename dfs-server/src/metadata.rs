@@ -6609,13 +6609,15 @@ mod tests {
 
     /// Compaction must keep every table, not just the ones a list remembered: the lists
     /// had fallen behind, so chunk_seq, file_tombstone, patch_fold_timestamp and
-    /// pending_fold_announce were dropped by every online compaction.
+    /// pending_fold_announce were dropped by every online compaction (and slot_isr, the
+    /// ISR's Paxos acceptor state, would have been too).
     #[test]
     fn test_compact_db_preserves_every_table() {
         let temp_dir = TempDir::new().unwrap();
         let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
         let bytes = [FILE_TABLE, PATH_TABLE, CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX,
-                     DELETE_QUEUE_TABLE, PATCH_STATE_TABLE, PENDING_FOLD_ANNOUNCE_TABLE, PATCH_STATE_SLOT_TABLE];
+                     DELETE_QUEUE_TABLE, PATCH_STATE_TABLE, PENDING_FOLD_ANNOUNCE_TABLE, PATCH_STATE_SLOT_TABLE,
+                     SLOT_ISR_TABLE];
         let u64s = [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE, PATCH_FOLD_TIMESTAMP_TABLE,
                     CHUNK_SEQ_TABLE, FILE_TOMBSTONE_TABLE];
         {

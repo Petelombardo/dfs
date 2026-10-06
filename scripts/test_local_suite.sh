@@ -6035,7 +6035,8 @@ fi # should_run T68
 
 # ── Test 69: the failure matrix under ordered writes (SLOT-OWNERSHIP-PLAN §7, Phase 3d) ──────
 # Rows #2/#6 (P–S link cut, both reach the majority), #3 (S isolated from everyone), #5+#11 (P cut
-# off from the majority but reachable by clients; then healed), #10 (P and S both frozen). Each
+# off from the majority but reachable by clients; then healed), #10 (P and S both frozen), #12 (P
+# and S both cut off from every peer, clients reach both: no lease anywhere in the pair). Each
 # case: fresh file, two writers on one block of chunk 1 for 18s, the fault 4s in for 7s. Checked
 # for every case:
 #   I1 no acked write lost (read through a fresh client)
@@ -6047,7 +6048,7 @@ fi # should_run T68
 if should_run T69; then
 snapshot_log T69
 echo ""
-echo "=== T69: failure matrix rows #2/#6, #3, #5+#11, #10 under ordered writes (SLOT-OWNERSHIP 3d) ==="
+echo "=== T69: failure matrix rows #2/#6, #3, #5+#11, #10, #12 under ordered writes (SLOT-OWNERSHIP 3d) ==="
 T69_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
 T69_ALL="$(IFS=,; echo "${T69_NODES[*]}")"
 T69_MOUNT2=/tmp/dfs-mount2
@@ -6117,7 +6118,7 @@ PY
 t69_heal() {
     for n in "${T69_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
 }
-T69_CASES=${T69_CASES:-row2 row3 row5 row10}
+T69_CASES=${T69_CASES:-row2 row3 row5 row10 row12}
 for T69_CASE in $T69_CASES; do
     T69_FILE=t69_$T69_CASE.bin
     dd if=/dev/urandom of="$MOUNT/$T69_FILE" bs=4M count=2 status=none
@@ -6154,6 +6155,15 @@ for T69_CASE in $T69_CASES; do
         row10)  # P and S both frozen
             T69_PP=$(t69_pid_of "$T69_P"); T69_SP=$(t69_pid_of "$T69_S")
             kill -STOP $T69_PP $T69_SP; sleep 7; kill -CONT $T69_PP $T69_SP ;;
+        row12)  # P and S both cut off from every peer (and each other); clients reach both.
+                # Neither holds a lease, so P refuses and S can't take over: a wait, not an error.
+            for m in "$T69_P" "$T69_S"; do
+                "$BIN/dfs-admin" --cluster "$m" fault set --drop-to "$(t69_others "$m")" >/dev/null 2>&1 || true
+            done
+            for n in "${T69_NODES[@]}"; do
+                [ "$n" != "$T69_P" ] && [ "$n" != "$T69_S" ] && "$BIN/dfs-admin" --cluster "$n" fault set --drop-to "$T69_P,$T69_S" >/dev/null 2>&1
+            done
+            sleep 6; t69_heal ;;
     esac
     wait "$T69_W1" "$T69_W2" 2>/dev/null || true
     dfs_sync; sync "$T69_MOUNT2" 2>/dev/null || true
@@ -6214,6 +6224,10 @@ print(' '.join(hs))" || true)
         row5) [ "$T69_CP" != "$T69_P" ] && [ "${T69_E1:-0}" -gt "$T69_E0" ] \
             && t69_check "T69[row5] takeover: primary $T69_P -> $T69_CP at epoch $T69_E1" PASS \
             || t69_check "T69[row5] no takeover after the primary was cut off (epoch ${T69_E1:-?}, primary ${T69_CP:-?})" FAIL ;;
+        row12) T69_NFAIL=$(echo "$T69_V" | grep -oP '[AB]:[0-9]+ acked/\K[0-9]+' | awk '{s+=$1} END{print s+0}')
+            [ "$T69_NFAIL" = 0 ] \
+            && t69_check "T69[row12] no writer error while both members were cut off (a 6s wait)" PASS \
+            || t69_check "T69[row12] $T69_NFAIL write(s) failed while both members were cut off" FAIL ;;
     esac
     t69_heal
     rm -f "${MOUNT:?}/${T69_FILE:?}"
@@ -6606,6 +6620,11 @@ T74_RAW=$( { tail -n +"$((T74_CLIENT_MARK + 1))" "$CURRENT_CLIENT_LOG"; cat "$LO
     | grep -aE "Sending request to [0-9.:]+: MultiPatch \{" | grep -ac "$T74_FILE_ID_PAT" || true)
 T74_ERR=$(echo "$T74_VERDICT" | grep -oP 'ERRORS=\K[0-9?]+' || echo "?")
 echo "  T74 (informational): $T74_ERR writer error(s); ${T74_RAW:-?} unordered MultiPatch send(s) to the file"
+# Every fault here ends within the client's 20s outage budget, so a writer should only ever wait.
+# Was 0-11 errors per run: ordering refusals (a pair with no lease) weren't treated as a wait.
+[ "$T74_ERR" = 0 ] \
+    && t74_check "T74d no writer got an error (every outage was waited out)" PASS \
+    || t74_check "T74d $T74_ERR writer error(s) during the chaos" FAIL
 rm -f "${MOUNT:?}/${T74_FILE:?}"
 fusermount -u "$T74_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T74_PID2"

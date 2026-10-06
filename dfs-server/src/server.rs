@@ -3022,6 +3022,22 @@ impl OverlayForkCtx {
     ///   * `Local` — fold only here, no fan-out. For serving another node's
     ///     ForceFold, which is already being coordinated by whoever sent it;
     ///     this is what stops peer→peer recursion.
+    /// True when the chunk has a committed ISR and this node isn't in it. Such a node's
+    /// accumulator for the slot is a former member's (or a bystander's) leftover, not the
+    /// slot's state: folding and announcing it published old bytes as a new location (suite
+    /// T74: a member replaced at epoch 3 folded its epoch-2 leftovers a minute later, and the
+    /// leader served them over the pair's head). `stream_active` can't catch this: a node
+    /// that left the pair no longer sees the stream.
+    ///
+    /// Only for a node that has been in the slot's ordered stream (since boot): ISRs are
+    /// seeded with ordering off too, and there every holder takes the client's unordered
+    /// patches and must keep folding them, ISR member or not.
+    fn outside_slot_isr(&self, file_id: FileId, chunk_idx: u64) -> bool {
+        let me = self.cluster.local_node_id();
+        self.write_ordering.latest_slot(file_id, chunk_idx).is_some()
+            && self.slot_isr.get(file_id, chunk_idx).is_some_and(|isr| !isr.members.contains(&me))
+    }
+
     async fn fold_slot_coordinated(
         &self,
         file_id: FileId,
@@ -3033,6 +3049,10 @@ impl OverlayForkCtx {
         // forced this fold on the new secondary alone). The ordered ForceFold folds while it is.
         if self.write_ordering.stream_active(file_id, chunk_idx, ORDERED_STREAM_QUIET) {
             debug!("fold_slot_coordinated: file {} chunk {} has an active ordered stream; not folding now", file_id, chunk_idx);
+            return false;
+        }
+        if self.outside_slot_isr(file_id, chunk_idx) {
+            debug!("fold_slot_coordinated: file {} chunk {}: this node isn't in its ISR; not folding", file_id, chunk_idx);
             return false;
         }
         if matches!(mode, FoldCoordination::Local) {
@@ -4861,6 +4881,11 @@ impl OverlayForkCtx {
                 file_id, chunk_idx);
             return CoordinatedFoldOutcome::Deferred;
         }
+        if self.outside_slot_isr(file_id, chunk_idx) {
+            debug!("coordinate_and_fold_slot: file {} chunk {}: this node isn't in its ISR; background fold deferred",
+                file_id, chunk_idx);
+            return CoordinatedFoldOutcome::Deferred;
+        }
         match self.fold_role(file_id, chunk_idx, idle) {
             FoldRole::Wait(owner) => {
                 // The owner's fold may already be here (its announcement flipped this
@@ -6321,10 +6346,27 @@ impl Server {
                         Self::chunk_map_find_by_idx(existing_locs, cidx).map(|i| &existing_locs[i])
                     }) {
                         if old_loc.chunk_id == loc.chunk_id { continue; }
+                        // The slot generation, when both sides have one, is the authoritative
+                        // order, as in location_supersedes: client_write_seq is one client's
+                        // per-file counter, meaningless across two writers' clients. A client
+                        // whose view of a chunk was a write behind committed its file metadata
+                        // with a higher counter and reverted the other client's newer chunk
+                        // (suite T74, ordered writes: the pair held the last acked write,
+                        // readers got an older one).
+                        let gen_of = |id: &ChunkId| self.chunk_generations.get(id).map(|g| *g);
+                        let by_generation = match (gen_of(&loc.chunk_id), gen_of(&old_loc.chunk_id)) {
+                            (Some(inc), Some(ext)) if inc != ext => Some(inc < ext),
+                            _ => None,
+                        };
                         // Staleness guard: prefer client_write_seq (monotone, clock-agnostic)
                         // then fall back to written_at. Rejects stale follower metadata that
                         // arrives via push_held_file_metadata_to with a lower write_seq.
-                        let stale = match (loc.client_write_seq, old_loc.client_write_seq) {
+                        if by_generation.is_none() && (gen_of(&loc.chunk_id).is_some() || gen_of(&old_loc.chunk_id).is_some()) {
+                            info!("[GEN-PARTIAL] chunk_map_update: path={} offset={:?} incoming {} gen={:?} vs current {} gen={:?}: arbitrating by client_write_seq ({:?} vs {:?})",
+                                metadata.path, loc.file_offset, loc.chunk_id, gen_of(&loc.chunk_id), old_loc.chunk_id, gen_of(&old_loc.chunk_id),
+                                loc.client_write_seq, old_loc.client_write_seq);
+                        }
+                        let stale = if let Some(stale) = by_generation { stale } else { match (loc.client_write_seq, old_loc.client_write_seq) {
                             (Some(inc), Some(ext)) => inc < ext,
                             (Some(_), None)        => false, // incoming has seq → newer
                             (None, Some(_))        => true,  // existing has seq, incoming doesn't → stale
@@ -6339,7 +6381,7 @@ impl Server {
                                     !self.storage.get_chunk_path(&loc.chunk_id).exists()
                                 }
                             }
-                        };
+                        } };
                         if stale {
                             let incoming_missing = !self.storage.get_chunk_path(&loc.chunk_id).exists();
                             if incoming_missing {
@@ -9449,7 +9491,7 @@ impl Server {
     }
 
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>, generation: Option<u64>) -> Response {
-        info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
+        info!("Handling replicate chunk location: {} (nodes: {:?}, generation {:?})", location.chunk_id, location.nodes, generation);
 
         // Fix S: record the incoming chunk's per-slot generation BEFORE any chunk_map
         // arbitration below, so `location_supersedes` (which reads chunk_generations)
@@ -9470,13 +9512,14 @@ impl Server {
             // traffic happens to touch this exact slot again.
             if let (Some(fid), Some(offset)) = (file_id, location.file_offset) {
                 let chunk_idx = offset / self.chunker.chunk_size() as u64;
-                // See the matching comment in run_single_fold: the returned effective
-                // value can exceed `g` if CHUNK_SEQ_TABLE already held something higher;
-                // re-bump in-memory so it never trails the durable table.
+                // Unlike run_single_fold (whose result is the newest state the folding node
+                // knows), a RECEIVED location keeps the generation its sender stated: the
+                // durable table holds the slot's max, and stamping that onto this chunk
+                // promoted every late arrival to the slot's current generation. A stale
+                // fold broadcast by a former ISR member then tied with the ordered head and
+                // won on client_write_seq; readers got its old bytes (suite T74, chunk 2:
+                // pair at A605, leader serving a fold at A509).
                 match self.metadata.put_chunk_seq_async(fid, chunk_idx, g).await {
-                    Ok(effective_g) if effective_g > g => {
-                        self.record_chunk_generation(location.chunk_id, effective_g);
-                    }
                     Ok(_) => {}
                     Err(e) => {
                         warn!("handle_replicate_chunk_location: failed to durably record generation {} for file {} chunk {}: {}",
@@ -11183,11 +11226,32 @@ impl Server {
             Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].nodes.clone())
         });
         let isr_size = self.replication_factor.load(Ordering::Relaxed).clamp(1, 2);
-        let Some(holders) = holders.filter(|h| h.contains(&me) && h.len() >= isr_size) else {
+        let usable = |h: &Vec<NodeId>| h.contains(&me) && h.len() >= isr_size;
+        // This node's chunk map can lag a brand-new chunk (its location not replicated here
+        // yet): ask the leader before answering "none". Answering "none" sent the client's
+        // first writes to a new chunk out unordered, beside the other client's ordered
+        // stream once the ISR appeared a second later (suite T74, ~100 per run).
+        let leader_holders = || async {
+            self.leader_slot_location(file_id, chunk_idx).await
+                .filter(|l| l.file_offset.map(|o| o / (4 * 1024 * 1024)) == Some(chunk_idx))
+                .map(|l| l.nodes)
+                .filter(usable)
+        };
+        let (holders, from_leader) = match holders.filter(usable) {
+            Some(h) => (Some(h), false),
+            None => (leader_holders().await, true),
+        };
+        let Some(mut holders) = holders else {
             return Response::SlotIsrRecords { records: vec![None] };
         };
+        // Likewise this node's metadata can lag a new file; the leader naming a location
+        // for the chunk is the proof the file exists (a deleted file has none).
         if !self.metadata.file_exists_by_id_async(file_id).await.unwrap_or(false) {
-            return Response::SlotIsrRecords { records: vec![None] };
+            match (from_leader, leader_holders().await) {
+                (true, _) => {}
+                (false, Some(h)) => holders = h,
+                (false, None) => return Response::SlotIsrRecords { records: vec![None] },
+            }
         }
         let members = crate::slot_isr::initial_members(file_id, chunk_idx, &holders, isr_size);
         let wanted = vec![((file_id, chunk_idx), crate::slot_isr::SlotIsr { epoch: 1, members })];
@@ -14682,25 +14746,31 @@ impl Server {
     /// the leader has no fresher answer, or if its answer is the same stale value
     /// we already tried (nothing gained by retrying).
     async fn refresh_slot_from_leader(&self, file_id: FileId, chunk_idx: u64, stale_chunk_id: ChunkId) -> Option<ChunkLocation> {
-        let loc = if self.cluster.is_leader().await {
+        let loc = self.leader_slot_location(file_id, chunk_idx).await?;
+        (loc.chunk_id != stale_chunk_id).then_some(loc)
+    }
+
+    /// The leader's current location for (file_id, chunk_idx): read locally on the leader,
+    /// else asked of it (GetFileChunkMap for the one chunk).
+    async fn leader_slot_location(&self, file_id: FileId, chunk_idx: u64) -> Option<ChunkLocation> {
+        if self.cluster.is_leader().await {
             let entry = self.chunk_map.get(&file_id)?;
             let (locations, _) = entry.value();
-            Self::chunk_map_find_by_idx(locations, chunk_idx).map(|pos| locations[pos].clone())?
+            Self::chunk_map_find_by_idx(locations, chunk_idx).map(|pos| locations[pos].clone())
         } else {
             let leader_addr = self.cluster.get_leader_addr().await?;
             let req = Request::GetFileChunkMap { file_id, from_chunk: chunk_idx as u32, count: 1 };
             match self.client.send_message(leader_addr, Message::Request(req)).await {
                 Ok(envelope) => match envelope.message {
-                    Message::Response(Response::FileChunkMap { locations, .. }) => locations.into_iter().next()?,
-                    _ => return None,
+                    Message::Response(Response::FileChunkMap { locations, .. }) => locations.into_iter().next(),
+                    _ => None,
                 },
                 Err(e) => {
-                    warn!("refresh_slot_from_leader: failed to query leader for file {} chunk {}: {}", file_id, chunk_idx, e);
-                    return None;
+                    warn!("leader_slot_location: failed to query leader for file {} chunk {}: {}", file_id, chunk_idx, e);
+                    None
                 }
             }
-        };
-        (loc.chunk_id != stale_chunk_id).then_some(loc)
+        }
     }
 
     /// Whether `base` can serve as a patch base on THIS node's evidence alone —
@@ -16044,11 +16114,12 @@ impl Server {
                     }
                 });
             }
+            let generation = self.ordered_generation(file_id, tag.chunk_idx, tag.isr_epoch, version, new_chunk_seq).await;
             let resp = if crate::write_order::take_injected_apply_failure() {
                 warn!("FAULT INJECTION: primary failing its apply of v{} for file {} chunk {}", version, file_id, tag.chunk_idx);
                 Response::Error { message: "FAULT INJECTION: ordered apply failed on the primary".into(), code: ErrorCode::InternalError }
             } else {
-                self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await
+                self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, Some(generation), true).await
             };
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             slot.finish(tag.write_id, version, &resp);
@@ -16137,6 +16208,21 @@ impl Server {
         } else {
             Response::Error { message: "Ordered: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
         }
+    }
+
+    /// The slot generation the primary stamps on ordered write `version` at `epoch`: the
+    /// leader's authoritative order for the slot's locations (`location_supersedes`).
+    /// Each client used to send its own per-slot counter, and with two writers on a chunk
+    /// those counters are unrelated: a newer write could carry a lower number, the leader
+    /// kept the older location, and readers saw a write the ISR pair had already moved past
+    /// (suite T74: the pair stored B099, every fresh read returned B095). Assigned here
+    /// under the slot's order lock, so it rises strictly in stream order; the epoch in the
+    /// high bits keeps it rising across a takeover (whose new primary's own counter can lag
+    /// the old primary's), and the slot's stored counter + 1 keeps it rising across a
+    /// primary restart that restarts versions. Unordered-era counters are far below 1<<40.
+    async fn ordered_generation(&self, file_id: FileId, chunk_idx: u64, epoch: u64, version: u64, client_seq: Option<u64>) -> u64 {
+        let stored = self.metadata.get_chunk_seq_async(file_id, chunk_idx).await.ok().flatten().unwrap_or(0);
+        (epoch << 40 | version).max(stored + 1).max(client_seq.unwrap_or(0))
     }
 
     /// Refuse an ordered write or fold tagged with an ISR epoch older than this node's current

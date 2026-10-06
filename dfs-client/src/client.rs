@@ -925,6 +925,18 @@ fn upsert_chunk_location(
     }
 }
 
+/// pending_ordered_locations' upsert: per slot, the highest slot generation wins.
+fn upsert_ordered_location(
+    pending: &mut HashMap<ChunkLocationSlotKey, (dfs_common::ChunkLocation, u64)>,
+    location: dfs_common::ChunkLocation,
+    generation: u64,
+) {
+    let key = (location.file_id, location.file_offset);
+    if pending.get(&key).is_none_or(|(_, g)| generation >= *g) {
+        pending.insert(key, (location, generation));
+    }
+}
+
 /// Client for communicating with DFS cluster
 #[derive(Clone)]
 pub struct DfsClient {
@@ -1138,6 +1150,16 @@ pub struct DfsClient {
     /// produced ~9.6 chunk-location-replicated completions per actual patch applied
     /// before this dedup existed.
     pending_chunk_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, dfs_common::ChunkLocation>>>,
+
+    /// Ordered writes' new locations, each with the slot generation its primary stamped,
+    /// coalesced per slot (highest generation wins) and sent as ReplicateChunkLocation
+    /// carrying that generation, by the same drains as pending_chunk_locations. They don't
+    /// go in the batch: ReplicateChunkLocations has no generation, and a leader that
+    /// doesn't hold the chunk then arbitrated by client_write_seq, one client's own
+    /// counter: with two writers a newer write lost to an older one and readers saw bytes
+    /// the ISR pair had moved past (suite T74). Coalescing keeps T54's invariant (never
+    /// more location updates than patches).
+    pending_ordered_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, (dfs_common::ChunkLocation, u64)>>>,
 
     /// Whether the current leader understands Request::ReplicateChunkLocationsWithReceipts.
     /// Starts optimistic; latches off only on positive evidence of an older peer (see
@@ -1478,6 +1500,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             single_replica_emergency_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             single_replica_followup_exhausted_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pending_ordered_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             chunk_location_receipts_supported: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             declined_chunk_locations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             write_seq: Arc::new(DashMap::new()),
@@ -1807,7 +1830,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                 addr
             ));
         }
+        self.send_request_unpenalized(addr, request).await
+    }
 
+    /// send_request without the penalty short-circuit: for an ordered write's ISR members,
+    /// where skipping one on the client's own failure history isn't an option (the write
+    /// must reach both, or the member be replaced; see multi_patch_chunk_on_replicas_inner).
+    async fn send_request_unpenalized(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         debug!("Sending request to {}: {}", addr, dfs_common::debug_truncated(&request, 600));
 
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -2332,6 +2361,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                 addr
             ));
         }
+        self.send_split_frame_write_request_unpenalized(addr, encoded_envelope, raw_data).await
+    }
+
+    /// send_split_frame_write_request without the penalty short-circuit; see
+    /// send_request_unpenalized.
+    async fn send_split_frame_write_request_unpenalized(&self, addr: SocketAddr, encoded_envelope: &[u8], raw_data: &[u8]) -> Result<Response> {
 
         debug!("Sending split-frame write request to {} ({} bytes data)", addr, raw_data.len());
 
@@ -2569,7 +2604,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // ServerBusy on write path: retry with backoff rather than EIO.
         if let Response::Error { code: dfs_common::ErrorCode::ServerBusy, .. } = &response {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            return Box::pin(self.send_split_frame_write_request(addr, encoded_envelope, raw_data)).await;
+            return Box::pin(self.send_split_frame_write_request_unpenalized(addr, encoded_envelope, raw_data)).await;
         }
 
         self.node_health.record_success(addr).await;
@@ -7564,27 +7599,38 @@ leader_addr: Arc::new(RwLock::new(None)),
         *ON.get_or_init(|| std::env::var("DFS_ORDERED_WRITES").map(|v| v == "1").unwrap_or(false))
     }
 
-    /// The chunk's committed ISR: cached, else asked of `ask` (a holder), which seeds one on
-    /// the spot if the chunk has none yet (GetOrSeedSlotIsr). Misses aren't cached: the next
-    /// write asks again.
-    async fn slot_isr_for(&self, file_id: dfs_common::FileId, chunk_idx: u64, ask: SocketAddr) -> Option<dfs_common::SlotIsr> {
+    /// The chunk's committed ISR: cached, else asked of each of `ask` (the chunk's holders) in
+    /// turn, any of which seeds one on the spot if the chunk has none yet (GetOrSeedSlotIsr).
+    /// Asking only the first holder missed an ISR that existed: a node whose chunk map didn't
+    /// list it as a holder yet, or that was cut off, answered "none", and the write went out
+    /// unordered beside the other client's ordered stream (suite T74). Misses aren't cached.
+    async fn slot_isr_for(&self, file_id: dfs_common::FileId, chunk_idx: u64, ask: &[SocketAddr]) -> Option<dfs_common::SlotIsr> {
         if let Some(isr) = self.slot_isr_cache.get(&(file_id, chunk_idx)).map(|e| e.value().clone()) {
             return Some(isr);
         }
-        match self.send_request(ask, Request::GetOrSeedSlotIsr { file_id, chunk_idx }).await {
-            Ok(Response::SlotIsrRecords { records }) => {
-                let isr = records.into_iter().next().flatten()?;
-                self.slot_isr_cache.insert((file_id, chunk_idx), isr.clone());
-                Some(isr)
+        for &addr in ask {
+            if let Ok(Response::SlotIsrRecords { records }) = self.send_request(addr, Request::GetOrSeedSlotIsr { file_id, chunk_idx }).await {
+                if let Some(isr) = records.into_iter().next().flatten() {
+                    self.slot_isr_cache.insert((file_id, chunk_idx), isr.clone());
+                    return Some(isr);
+                }
             }
-            _ => None,
         }
+        None
     }
 
-    /// With ordered writes, the chunk's ISR pair as patch targets (primary first), when both
-    /// members are among the chunk's known holders and neither is penalized. Without this the
-    /// client patched whatever pair its location view gave and wrote unordered whenever that
-    /// wasn't the ISR (after a restart it drifted to a pair without the primary: suite T67).
+    /// With ordered writes, the chunk's ISR pair as patch targets (primary first), whenever the
+    /// chunk has a committed ISR. Without this the client patched whatever pair its location
+    /// view gave and wrote unordered whenever that wasn't the ISR (after a restart it drifted
+    /// to a pair without the primary: suite T67).
+    ///
+    /// The agreed ISR wins over the location and over the client's health view. Both used to
+    /// send the write out unordered instead: the location doesn't learn of a member
+    /// replacement, and under churn some member is penalized most of the time. Under T74's
+    /// chaos that was 2000+ unordered patches. Each was applied on one replica beside the
+    /// other client's ordered stream and rolled it back: lost acked writes. A member that
+    /// really is down fails at the transport level, and the write path then replaces it or
+    /// takes over (Phase 3d) without lowering the two-copy floor.
     async fn isr_patch_pair(
         &self,
         file_id: dfs_common::FileId,
@@ -7592,8 +7638,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         replica_addrs: &[SocketAddr],
         addr_to_node_id: &HashMap<SocketAddr, dfs_common::NodeId>,
     ) -> Option<[SocketAddr; 2]> {
-        let ask = *replica_addrs.first()?;
-        let mut isr = self.slot_isr_for(file_id, chunk_idx, ask).await?;
+        let mut isr = self.slot_isr_for(file_id, chunk_idx, replica_addrs).await?;
         let addr_of = |n: dfs_common::NodeId| addr_to_node_id.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
         let (mut p, mut s) = (addr_of(*isr.members.first()?)?, addr_of(*isr.members.get(1)?)?);
         let (p_bad, s_bad) = (self.node_health.is_penalized(p).await, self.node_health.is_penalized(s).await);
@@ -7605,30 +7650,23 @@ leader_addr: Arc::new(RwLock::new(None)),
             let req = Request::ReplaceIsrMember { file_id, chunk_idx, isr_epoch: isr.epoch, failed };
             match self.send_request(healthy, req).await {
                 Ok(Response::SlotIsrRecords { records }) => {
-                    let next = records.into_iter().next().flatten()?;
-                    if next.epoch <= isr.epoch {
-                        return None;
+                    if let Some(next) = records.into_iter().next().flatten().filter(|n| n.epoch > isr.epoch) {
+                        info!("ISR for file {} chunk {}: epoch {} -> {} (replaced a down member)", file_id, chunk_idx, isr.epoch, next.epoch);
+                        self.slot_isr_cache.insert((file_id, chunk_idx), next.clone());
+                        isr = next;
+                        p = addr_of(*isr.members.first()?)?;
+                        s = addr_of(*isr.members.get(1)?)?;
                     }
-                    info!("ISR for file {} chunk {}: epoch {} -> {} (replaced a down member)", file_id, chunk_idx, isr.epoch, next.epoch);
-                    self.slot_isr_cache.insert((file_id, chunk_idx), next.clone());
-                    isr = next;
-                    p = addr_of(*isr.members.first()?)?;
-                    s = addr_of(*isr.members.get(1)?)?;
                 }
-                other => {
-                    info!("ReplaceIsrMember for file {} chunk {} declined: {:?}", file_id, chunk_idx, other.map(|r| dfs_common::debug_truncated(&r, 200)));
-                    return None;
-                }
+                // Declined (e.g. the member answers the healthy one's ping): write to the
+                // pair anyway; a real failure surfaces on the write itself.
+                other => info!("ReplaceIsrMember for file {} chunk {} declined: {:?}", file_id, chunk_idx, other.map(|r| dfs_common::debug_truncated(&r, 200))),
             }
         }
-        // The primary must hold the chunk; a fresh secondary (a replacement) catches up from
-        // the primary through the ordered stream's anchor before any write is acked.
-        if !replica_addrs.contains(&p) {
-            return None;
-        }
-        if self.node_health.is_penalized(p).await || self.node_health.is_penalized(s).await {
-            return None;
-        }
+        // Not checked against the location: the primary always holds the stream (seeded from
+        // holders, or took over as a caught-up secondary), and a fresh secondary (a
+        // replacement) catches up from the primary through the stream's anchor before any
+        // write is acked.
         Some([p, s])
     }
 
@@ -7643,8 +7681,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         addr_to_node_id: &HashMap<SocketAddr, dfs_common::NodeId>,
     ) -> HashMap<SocketAddr, dfs_common::WriteOrderTag> {
         let mut tags = HashMap::new();
-        let Some(&ask) = patch_addrs.first() else { return tags };
-        let Some(isr) = self.slot_isr_for(file_id, chunk_idx, ask).await else { return tags };
+        let Some(isr) = self.slot_isr_for(file_id, chunk_idx, patch_addrs).await else { return tags };
         let (Some(&primary), Some(&secondary)) = (isr.members.first(), isr.members.get(1)) else { return tags };
         let addr_of = |n: dfs_common::NodeId| addr_to_node_id.iter().find(|(_, id)| **id == n).map(|(a, _)| *a);
         let (Some(p), Some(s)) = (addr_of(primary), addr_of(secondary)) else { return tags };
@@ -7762,6 +7799,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         // the only thing we could do.
         let mut self_referential_revalidate_done = false;
         let retry_started = std::time::Instant::now();
+        // The slot generation the ordered primary stamped on the write that finally landed
+        // (see pending_ordered_locations).
+        let mut ordered_generation: Option<u64> = None;
         // Attempt count is now just a hard safety backstop against a genuine infinite
         // loop bug — the real gate on connection-failure retries is CONNECT_RETRY_BUDGET
         // (wall-clock), and each such retry consumes one attempt here.
@@ -7930,9 +7970,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                     prefetch_hints: hints,
                     new_chunk_seq,
                 };
-                let patch_req_split = match order_tags.get(&addr) {
-                    Some(tag) => Request::Ordered { tag: *tag, request: Box::new(patch_req_split) },
-                    None => patch_req_split,
+                let (patch_req_split, ordered) = match order_tags.get(&addr) {
+                    Some(tag) => (Request::Ordered { tag: *tag, request: Box::new(patch_req_split) }, true),
+                    None => (patch_req_split, false),
                 };
                 async move {
                     let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -7941,7 +7981,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                         Ok(b) => b,
                         Err(e) => return (addr, Err(e)),
                     };
-                    (addr, client.send_split_frame_write_request(addr, &encoded, &raw).await)
+                    // An ISR member of an ordered write is always tried: skipping it on the
+                    // client's penalty history left the write on the primary alone (T74).
+                    let resp = if ordered {
+                        client.send_split_frame_write_request_unpenalized(addr, &encoded, &raw).await
+                    } else {
+                        client.send_split_frame_write_request(addr, &encoded, &raw).await
+                    };
+                    (addr, resp)
                 }
             }).collect();
             futures::future::join_all(futures).await
@@ -7960,11 +8007,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                     prefetch_hints: hints,
                     new_chunk_seq,
                 };
-                let req = match order_tags.get(&addr) {
-                    Some(tag) => Request::Ordered { tag: *tag, request: Box::new(req) },
-                    None => req,
+                let (req, ordered) = match order_tags.get(&addr) {
+                    Some(tag) => (Request::Ordered { tag: *tag, request: Box::new(req) }, true),
+                    None => (req, false),
                 };
-                async move { (addr, client.send_request(addr, req).await) }
+                async move {
+                    let resp = if ordered { client.send_request_unpenalized(addr, req).await } else { client.send_request(addr, req).await };
+                    (addr, resp)
+                }
             }).collect();
             futures::future::join_all(futures).await
         };
@@ -8013,6 +8063,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // matching comment in patch_chunk_on_replicas_inner.
                     if let (Some(cidx), Some(seq)) = (chunk_idx, returned_seq) {
                         self.seed_chunk_seq(file_id, cidx, seq);
+                    }
+                    if order_tags.get(&addr).is_some_and(|t| addr_to_node_id_snap.get(&addr) == Some(&t.primary)) {
+                        ordered_generation = returned_seq;
                     }
                 }
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
@@ -8323,6 +8376,25 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tag.file_id, tag.chunk_idx, tag.primary);
                 return Err(anyhow::anyhow!(
                     "MultiPatch: the primary didn't apply ordered write to file {} chunk {}; retry", tag.file_id, tag.chunk_idx));
+            }
+            // Nor is it acked on the primary alone. A raw backfill onto a third node puts the
+            // bytes beside the stream, not in it: if the primary is then voted out, the old
+            // secondary takes over without the write, the newcomer resyncs from it, and the
+            // acked write is gone (suite T74: B25 lived on the old primary and a raw copy on
+            // 8904, then 8904 resynced from 8903). Send it again on the pair instead, as a new
+            // version both apply, until the secondary takes it or is replaced (Phase 3d above),
+            // within the outage budget.
+            if !patched_node_ids.contains(&tag.secondary) {
+                if retry_started.elapsed() < CONNECT_RETRY_BUDGET {
+                    debug!("MultiPatch: ordered write to file {} chunk {} missed its secondary {}; sending it again on the pair",
+                        tag.file_id, tag.chunk_idx, tag.secondary);
+                    tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                    continue 'retry;
+                }
+                warn!("MultiPatch: ordered write to file {} chunk {} missed its secondary {} for the whole outage budget — failing it, not backfilling",
+                    tag.file_id, tag.chunk_idx, tag.secondary);
+                return Err(anyhow::anyhow!(
+                    "MultiPatch: the secondary didn't apply ordered write to file {} chunk {}", tag.file_id, tag.chunk_idx));
             }
         }
 
@@ -8854,7 +8926,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // is None right now" behavior — not a new gap, flush_metadata_sync is still the
         // authoritative backstop regardless.
         let enqueue_start = std::time::Instant::now();
-        self.enqueue_chunk_location(new_location.clone()).await;
+        match ordered_generation {
+            Some(generation) => self.enqueue_ordered_location(new_location.clone(), generation).await,
+            None => self.enqueue_chunk_location(new_location.clone()).await,
+        }
         let timing_enqueue = enqueue_start.elapsed();
 
         // Collect skip pairs for deferred tombstone+delete after metadata commits.
@@ -9423,6 +9498,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
+        // This file's ordered locations too, before its metadata: a metadata commit that
+        // reaches the leader ahead of a chunk's generation is arbitrated without it.
+        self.drain_ordered_locations(Some(metadata.id), Duration::from_secs(1)).await;
+
         let stamped = self.stamp_write_seq(metadata);
         self.metadata_queue.push_and_wait(stamped).await;
     }
@@ -9450,6 +9529,11 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// FlushHandle::drain's Step 1 comment): an unreachable leader must cost one
     /// bounded wait, not an indefinite hang of the SIGTERM path.
     pub async fn drain_pending_chunk_locations_for_shutdown(&self, deadline: tokio::time::Instant) {
+        while tokio::time::Instant::now() < deadline
+            && self.drain_ordered_locations(None, Duration::from_secs(3)).await > 0
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         loop {
             let batch: Vec<dfs_common::ChunkLocation> = {
                 let mut pending = self.pending_chunk_locations.lock().await;
@@ -9522,6 +9606,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut interval = tokio::time::interval(Duration::from_millis(10));
             loop {
                 interval.tick().await;
+                client.drain_ordered_locations(None, Duration::from_secs(3)).await;
                 let mut batch: Vec<dfs_common::ChunkLocation> = {
                     let mut pending = client.pending_chunk_locations.lock().await;
                     if pending.is_empty() {
@@ -9591,6 +9676,54 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn enqueue_chunk_location(&self, location: dfs_common::ChunkLocation) {
         let mut pending = self.pending_chunk_locations.lock().await;
         upsert_chunk_location(&mut pending, location);
+    }
+
+    /// See pending_ordered_locations.
+    async fn enqueue_ordered_location(&self, location: dfs_common::ChunkLocation, generation: u64) {
+        let mut pending = self.pending_ordered_locations.lock().await;
+        upsert_ordered_location(&mut pending, location, generation);
+    }
+
+    /// Send the pending ordered locations (all, or only `file`'s) to the leader, each with
+    /// its generation; anything not confirmed goes back in the queue. Returns how many are
+    /// still unsent.
+    async fn drain_ordered_locations(&self, file: Option<FileId>, per_send: Duration) -> usize {
+        let entries: Vec<(dfs_common::ChunkLocation, u64)> = {
+            let mut pending = self.pending_ordered_locations.lock().await;
+            if pending.is_empty() {
+                return 0;
+            }
+            let taken = std::mem::take(&mut *pending);
+            let (mine, rest): (HashMap<_, _>, HashMap<_, _>) = taken.into_iter()
+                .partition(|(k, _)| file.is_none() || k.0 == file);
+            *pending = rest;
+            mine.into_values().collect()
+        };
+        if entries.is_empty() {
+            return 0;
+        }
+        let failed: Vec<(dfs_common::ChunkLocation, u64)> = match *self.leader_addr.read().await {
+            None => entries,
+            Some(leader) => futures::future::join_all(entries.into_iter().map(|(location, generation)| {
+                let client = self.clone();
+                async move {
+                    let req = Request::ReplicateChunkLocation { location: location.clone(), file_id: location.file_id, generation: Some(generation) };
+                    match tokio::time::timeout(per_send, client.send_request(leader, req)).await {
+                        Ok(Ok(Response::Error { .. })) | Ok(Err(_)) | Err(_) => Some((location, generation)),
+                        Ok(Ok(_)) => None,
+                    }
+                }
+            })).await.into_iter().flatten().collect(),
+        };
+        let unsent = failed.len();
+        if unsent > 0 {
+            debug!("ordered chunk locations: {} not confirmed by the leader; re-queued", unsent);
+            let mut pending = self.pending_ordered_locations.lock().await;
+            for (location, generation) in failed {
+                upsert_ordered_location(&mut pending, location, generation);
+            }
+        }
+        unsent
     }
 
     /// Spawn the background metadata queue worker onto the given runtime.

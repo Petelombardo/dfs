@@ -224,6 +224,43 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       (logs were wiped) — the concurrent-flush overlap needs a flush >30s (FIFO/pipeline wait
       timeouts), not seen. Flag-off full suite 162/0 (21m36s, /root/dfs-suite-t73fix-off2.log).
       Committed + pushed. Watch T69[row3] for a recurrence: if it fails, keep the logs. Logs: /root/dfs-suite-t73fix-{on,off}.log, /root/dfs-t73-run{1..4}.log.
+- [x] **T74 chaos with writes running (2026-10-05):** T60's chaos for 60s while two clients
+      fsync-write their own block in chunks 1-4; required with ordering: no acked write lost
+      (T74a), every chunk's ISR pair byte-identical (T74b), both writers progress after the heal
+      (T74c). On f171417: 2 acked writes lost, 19 EIO, 2082 unordered sends. Found and fixed:
+      1. Client fell back to UNORDERED when the pair's primary wasn't in the (stale) location,
+         a member was penalized, or the one holder asked didn't know the ISR: one client's
+         unordered patch rolled back the other's ordered stream. Now the agreed pair wins and
+         every holder is asked.
+      2. The leader arbitrated a chunk's locations by client_write_seq (per-client counters):
+         the pair stored the last acked write, readers got an older one (stale pointer, also
+         seen as zero reads). The primary now stamps a slot generation in stream order
+         ((epoch<<40|version) floored at stored+1); the client sends ordered locations with it
+         (own coalesced queue, pending_ordered_locations); the leader's metadata path
+         (chunk_map_update) arbitrates by generation when both sides have one; a received
+         location keeps its stated generation (it was promoted to the slot max on receipt,
+         making late stale updates tie with the head).
+      3. An ordered write was acked on the primary + a RAW BACKFILL onto a non-member when the
+         client skipped a penalized secondary; a later takeover lost it. Now ISR members are
+         never skipped on client penalty, and the write is resent on the pair until the
+         secondary takes it or is replaced (CONNECT_RETRY_BUDGET), never backfilled off-pair.
+      4. A node outside a chunk's ISR folded its leftover accumulator and announced old bytes;
+         background folds now skip slots whose ISR excludes this node.
+      5. On-demand ISR seeding answered "none" for a brand-new file (holder's chunk map and
+         metadata lag the leader): the first writes went unordered. Seeding now falls back to
+         the leader's location.
+      After: T74 6/6 + 6/6 + 4/4, 0 unordered sends. Final suites: flag on 205/1 (T38b, the
+      long-standing heal-timing flake; 23m34s), flag off 161/1 (T64d baseline; 22m47s).
+      Background folds skip only on a node that has been in the slot's ordered stream: ISRs
+      are seeded with ordering off too. Ordering off, T74 is bad before AND after this work
+      (f171417 baseline: 29-111 EIOs, acked writes lost 2/3 runs) — the unordered path does
+      not survive chaos, which is the case for flipping the default. Diagnostics kept: T74 prints stored bytes on
+      loss (`dfs-admin isr read --range`), [GEN-PARTIAL] log when the leader arbitrates a
+      slot by client_write_seq with only one side's generation known.
+      FOLLOW-UPS: (a) 0-10 writer EIOs per T74 run (outage budget exhausted while both
+      members unreachable? not yet analysed); (b) ISR epoch flapping under chaos (up to 107
+      epochs in 60s) = the Phase 3d flap guard; (c) non-member leftover accumulators are now
+      never folded: trim them (healer/GC); (d) T38b is a long-standing heal-timing flake.
 - [ ] **T67 secondary restart:** T67a required (no acked write lost); T67b/T67c informational
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for
@@ -236,6 +273,14 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
 - [ ] Make the flag the default (or drop it)
 
 ## Outside the phases
+
+- **Failure-scenario test coverage (2026-10-05, Pete: "test every scenario"):** tracked on the
+  Legata roadmap as "Failure-scenario test coverage" (external_ref testing/*), one subtask per
+  gap. Quick wins: whole-cluster crash, client SIGKILL mid-flush, bit-flip corruption,
+  ENOSPC on one node then all. High value: power loss (LazyFS / dm-flakey: unsynced writes
+  really dropped), mixed-version rolling upgrade. Also: network latency/loss, slow disk,
+  clock skew, hours-long soak with random faults. Each fails first, then joins the suite
+  (both flag settings, every change).
 
 - **Six fix branches MERGED 2026-10-05** (fix/dir-rename-subtree, fix/is-leader-startup,
   fix/delete-resurrection, fix/rename-lost-pending-write, fix/unit-test-fixtures,

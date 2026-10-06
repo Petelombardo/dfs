@@ -265,7 +265,21 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       until 3b — after the restart the client drifts to a pair without the ISR primary and writes
       unordered (the pre-3c two-writer bug). Also found by T64: a brand-new chunk has no ISR for
       ~3s+, so its first writes are unordered → assign the ISR at chunk creation (3b).
-- [ ] Gates: T64 passes; the 2026-09-27 no-op-divergence repro ends with one version on both;
+- [x] **T75 the 2026-09-27 no-op-divergence repro (2026-10-06):** write, let the stream go
+      quiet (10s), fold ONE ISR member, rewrite the same bytes, write, fold both, rewrite and
+      write again. Ordering on: the no-op rewrites never split the pair (same head id on both,
+      0 disagreements). The 09-27 split is structurally gone. But it found a real gap: a member
+      that ADOPTS another replica's fold (ForceFold, the read path's Local fold) didn't hold the
+      result. The broadcast flipped its head token to Folded(result), so it couldn't read its own
+      head for ~30s, and the leader's under-replicated heal placed copies by ring placement, not
+      on that member (3 of 5 ordering-on runs pre-fix). Fix: adopt_fold_result pulls the result from the
+      folder (hash-verified), moves the ordered head onto it, and registers this node as a
+      holder with the leader; the leader heal is only the fallback. DeleteChunkReplica now
+      refuses to delete a node's ordered head (the excess trim is not ISR-aware). T75 3/3 on,
+      2/2 off; pairs converge in 1s. FOLLOW-UPS: (a) the excess-replica trim's "lowest two
+      NodeIds" pair ignores the slot ISR; (b) Local/ForceFold folds don't push their result
+      to the slot peer the way Wave folds do (the adopter now pulls instead).
+- [ ] Gates: T64 passes; ~~the 2026-09-27 no-op-divergence repro ends with one version on both~~ (T75);
       lagging-secondary catch-up test; T60-style chaos with writes running and no acked write
       lost; T61d becomes required; **primary killed mid-storm**: no acked write lost, and say
       what the client does until 3d promotes the secondary (fails/retries, or falls back to

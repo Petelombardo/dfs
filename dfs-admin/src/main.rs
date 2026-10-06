@@ -121,6 +121,10 @@ enum IsrCommands {
         file: String,
         #[arg(long)]
         chunk: u64,
+        /// Also print these bytes of each node's copy, as hex: OFFSET:LEN within the chunk
+        /// (tells stored bytes apart from what a client's read path returned).
+        #[arg(long)]
+        range: Option<String>,
     },
     /// Test-only: ForceFold one chunk on exactly the given node(s) (--cluster), e.g. only one
     /// of its ISR members, to fold the replicas at different points of the write stream.
@@ -1754,14 +1758,26 @@ async fn handle_isr_command(cmd: IsrCommands, cluster_addrs: &[SocketAddr]) -> R
                 println!("{}", serde_json::json!({"addr": addr.to_string(), "committed": out}));
             }
         }
-        IsrCommands::Read { file, chunk } => {
+        IsrCommands::Read { file, chunk, range } => {
             let (file_id, _) = isr_file(first, &file).await?;
+            let range = match range.as_deref().map(|r| r.split_once(':')) {
+                None => None,
+                Some(Some((o, l))) => Some((o.parse::<usize>()?, l.parse::<usize>()?)),
+                Some(None) => anyhow::bail!("--range wants OFFSET:LEN"),
+            };
             for &addr in cluster_addrs {
                 let out = match send_request(addr, Request::ReadSlotLocal { file_id, chunk_idx: chunk }).await {
-                    Ok(Response::ChunkData { chunk_id, data, .. }) => serde_json::json!({
-                        "addr": addr.to_string(), "chunk_id": chunk_id.to_string(),
-                        "len": data.len(), "blake3": blake3::hash(&data).to_hex().to_string(),
-                    }),
+                    Ok(Response::ChunkData { chunk_id, data, .. }) => {
+                        let mut j = serde_json::json!({
+                            "addr": addr.to_string(), "chunk_id": chunk_id.to_string(),
+                            "len": data.len(), "blake3": blake3::hash(&data).to_hex().to_string(),
+                        });
+                        if let Some((o, l)) = range {
+                            let bytes = data.get(o..(o + l).min(data.len())).unwrap_or(&[]);
+                            j["range_hex"] = serde_json::json!(bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+                        }
+                        j
+                    }
                     other => serde_json::json!({"addr": addr.to_string(), "error": format!("{:?}", other)}),
                 };
                 println!("{}", out);

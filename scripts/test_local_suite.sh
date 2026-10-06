@@ -6394,6 +6394,222 @@ rm -f "$MOUNT/$T73_FILE"
 fusermount -u "$T73_MOUNT2" 2>/dev/null || true
 kill_client_and_wait "$T73_PID2"
 fi # should_run T73
+if should_run T74; then
+snapshot_log T74
+echo ""
+echo "=== T74: lease chaos while two clients write: no acked write lost, every ISR pair identical (SLOT-OWNERSHIP 3c gate) ==="
+# T60's chaos (random partitions, black-holes, one-way cuts and freezes of 1-2 nodes) with
+# writes running. Each writer fsyncs its own 4K block in chunks 1..4 in turn, so "the last
+# acked write" of every block is exact, and each chunk still sees two writers interleaved.
+T74_SECONDS="${DFS_T74_SECONDS:-60}"
+T74_NODES=(127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903 127.0.0.1:8904)
+T74_ALL="$(IFS=,; echo "${T74_NODES[*]}")"
+T74_FILE=t74_chaos.bin
+T74_CHUNKS=5
+T74_MOUNT2=/tmp/dfs-mount2
+mkdir -p "$T74_MOUNT2"
+RUST_LOG=info "$BIN/dfs-client" mount "$T74_MOUNT2" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t74b.log" --allow-other --log-level debug &
+T74_PID2=$!
+sleep 2
+mountpoint -q "$T74_MOUNT2" || check "T74 second client mounted" FAIL
+t74_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T69/T73)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t74_filter() {   # t74_filter <node> <drop-to-csv> [--black-hole]
+    [ -n "$2" ] && "$BIN/dfs-admin" --cluster "$1" fault set --drop-to "$2" $3 >/dev/null 2>&1 || true
+}
+t74_heal() { for n in "${T74_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done; }
+t74_pid() {   # t74_pid <node-index 1..5>
+    for p in $(pgrep -x dfs-server || true); do
+        tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q "node$1/config.toml" && echo "$p"
+    done
+    true
+}
+t74_writer() {  # mount file block-offset-in-chunk tag stop-file out: until the stop file appears
+    python3 - "$1/$2" "$3" "$4" "$5" > "$6" 2>&1 <<'PY'
+import os, sys, time, json
+path, base, tag, stop = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode(), sys.argv[4]
+fd = os.open(path, os.O_RDWR)
+start = time.time(); i = 0
+per = {c: {"acked": [], "failed": []} for c in range(1, 5)}
+errors = 0; worst = 0.0; ack_at = []
+while not os.path.exists(stop) and time.time() - start < 600:
+    c = 1 + i % 4
+    t0 = time.time()
+    try:
+        os.pwrite(fd, (tag + b"%06d" % i).ljust(4096, tag[:1]), c * 4 * 1024 * 1024 + base)
+        os.fsync(fd)
+        per[c]["acked"].append(i); ack_at.append(time.time())
+    except OSError:
+        per[c]["failed"].append(i); errors += 1
+        time.sleep(0.2)
+    worst = max(worst, time.time() - t0)
+    i += 1
+os.close(fd)
+end = time.time()
+late = sum(1 for t in ack_at if t > end - 4)
+print(json.dumps({"per": per, "errors": errors, "late": late, "worst_s": round(worst, 2)}))
+PY
+}
+dd if=/dev/urandom of="$MOUNT/$T74_FILE" bs=4M count=$T74_CHUNKS status=none
+dfs_sync
+T74_FILE_ID_PAT=$(grep -h "\[META SERVER\] put path=/$T74_FILE id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+T74_FILE_ID_PAT=${T74_FILE_ID_PAT:-no-file-id}
+T74_CLIENT_MARK=$(wc -l < "$CURRENT_CLIENT_LOG" 2>/dev/null || echo 0)
+T74_STOP="$LOG/t74.stop"
+rm -f "$T74_STOP"
+t74_writer "$MOUNT" "$T74_FILE" 8192 A "$T74_STOP" "$LOG/t74_w1.out" & T74_W1=$!
+t74_writer "$T74_MOUNT2" "$T74_FILE" 16384 B "$T74_STOP" "$LOG/t74_w2.out" & T74_W2=$!
+sleep 2
+T74_END=$(( $(date +%s) + T74_SECONDS ))
+T74_ROUNDS=0; T74_MODES=""
+while [ "$(date +%s)" -lt "$T74_END" ]; do
+    T74_ROUNDS=$((T74_ROUNDS + 1))
+    victims=$(printf '%s\n' 0 1 2 3 4 | shuf -n $(( RANDOM % 2 + 1 )) | tr '\n' ' ')
+    inside=""; outside=""
+    for i in 0 1 2 3 4; do
+        if [[ " $victims " == *" $i "* ]]; then inside="${inside:+$inside,}${T74_NODES[$i]}"; else outside="${outside:+$outside,}${T74_NODES[$i]}"; fi
+    done
+    case $(( RANDOM % 4 )) in
+        0) mode=partition;  for i in 0 1 2 3 4; do
+               if [[ " $victims " == *" $i "* ]]; then t74_filter "${T74_NODES[$i]}" "$outside"; else t74_filter "${T74_NODES[$i]}" "$inside"; fi; done ;;
+        1) mode=blackhole;  for i in 0 1 2 3 4; do
+               if [[ " $victims " == *" $i "* ]]; then t74_filter "${T74_NODES[$i]}" "$outside" --black-hole; else t74_filter "${T74_NODES[$i]}" "$inside" --black-hole; fi; done ;;
+        2) mode=oneway;     for i in 0 1 2 3 4; do [[ " $victims " != *" $i "* ]] && t74_filter "${T74_NODES[$i]}" "$inside"; done ;;
+        3) mode=freeze;     for i in $victims; do p=$(t74_pid $((i + 1))); [ -n "$p" ] && kill -STOP "$p"; done ;;
+    esac
+    T74_MODES="$T74_MODES $mode($(echo $victims | tr ' ' '+'))"
+    sleep $(( RANDOM % 6 + 2 ))
+    if [ "$mode" = freeze ]; then for i in $victims; do p=$(t74_pid $((i + 1))); [ -n "$p" ] && kill -CONT "$p"; done; fi
+    [ $(( RANDOM % 3 )) -ne 0 ] && t74_heal
+    sleep $(( RANDOM % 3 + 1 ))
+done
+t74_heal
+for i in 1 2 3 4 5; do p=$(t74_pid $i); [ -n "$p" ] && kill -CONT "$p" 2>/dev/null; done
+echo "  T74: $T74_ROUNDS chaos rounds over ${T74_SECONDS}s:$T74_MODES"
+sleep 10   # writers keep going on a healed cluster; T74c wants acks in their last 4s
+touch "$T74_STOP"
+wait "$T74_W1" "$T74_W2" 2>/dev/null || true
+dfs_sync; sync "$T74_MOUNT2" 2>/dev/null || true
+sleep 5
+# Every writer block through one fresh mount (no writer's cache can answer).
+T74_FM=/tmp/dfs-mount-fresh
+mkdir -p "$T74_FM"
+RUST_LOG=info "$BIN/dfs-client" mount "$T74_FM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_fresh.log" --allow-other --log-level debug &
+T74_FPID=$!
+sleep 2
+T74_FRESH=$(python3 -c "
+f = open('$T74_FM/$T74_FILE', 'rb')
+for c in range(1, 5):
+    for base in (8192, 16384):
+        f.seek(c * 4 * 1024 * 1024 + base)
+        print(c, base, f.read(10).hex())" 2>/dev/null || true)   # hex: \$(...) drops NUL bytes
+fusermount -u "$T74_FM" 2>/dev/null || true
+kill_client_and_wait "$T74_FPID"
+T74_VERDICT=$(python3 - "$LOG/t74_w1.out" "$LOG/t74_w2.out" "$T74_FRESH" <<'PY'
+import json, sys
+fresh = {}
+for l in sys.argv[3].splitlines():
+    p = l.split(" ", 2)
+    if len(p) == 3: fresh[(int(p[0]), int(p[1]))] = bytes.fromhex(p[2]).decode(errors="replace").replace("\x00", "\\0")
+lost, summary, noprog, errors = [], [], [], 0
+for path, tag, base in ((sys.argv[1], "A", 8192), (sys.argv[2], "B", 16384)):
+    try: r = json.loads(open(path).read().strip().splitlines()[-1])
+    except Exception as e: print("BAD NOPROG=? ERRORS=? | writer %s output unreadable: %s |" % (tag, e)); sys.exit()
+    acked = sum(len(v["acked"]) for v in r["per"].values())
+    errors += r["errors"]
+    summary.append("%s: %d acked, %d failed, %d in the last 4s, worst op %.1fs" % (tag, acked, r["errors"], r["late"], r["worst_s"]))
+    if r["late"] == 0: noprog.append(tag)
+    for c, v in r["per"].items():
+        c = int(c)
+        last = max(v["acked"]) if v["acked"] else -1
+        allowed = {last} | {f for f in v["failed"] if f > last}
+        got = fresh.get((c, base), "")
+        if not (got[:1] == tag and got[1:7].isdigit() and int(got[1:7]) in allowed):
+            lost.append("chunk %d %s: servers hold %r, last acked %s%06d" % (c, tag, got, tag, last))
+print("LOST" if lost else "OK", "NOPROG=%s" % (",".join(noprog) or "none"), "ERRORS=%d" % errors, "|", "; ".join(summary), "|", "; ".join(lost))
+PY
+)
+echo "  T74: $(echo "$T74_VERDICT" | cut -d'|' -f2)"
+case "$T74_VERDICT" in
+    OK*) t74_check "T74a no acked write lost across the chaos (8 blocks, 4 chunks)" PASS ;;
+    *)   t74_check "T74a acked write(s) lost:$(echo "$T74_VERDICT" | cut -d'|' -f3)" FAIL
+         echo "  T74: the leader's view of the file after the loss:"
+         "$BIN/dfs-admin" --cluster "$CLUSTER" file info "/$T74_FILE" 2>&1 | sed 's/^/    /' | head -40 ;;
+esac
+case "$T74_VERDICT" in
+    *NOPROG=none*) t74_check "T74c both writers made progress after the chaos healed" PASS ;;
+    *)             t74_check "T74c a writer made no progress in the last 4s after the heal: $(echo "$T74_VERDICT" | cut -d'|' -f1)" FAIL ;;
+esac
+# Each chunk's current ISR (highest epoch any node reports) must hold identical bytes.
+T74_MAP=$("$BIN/dfs-admin" --cluster "$T74_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+T74_PAIRS=$("$BIN/dfs-admin" --cluster "$T74_ALL" isr get --file "/$T74_FILE" --chunks $T74_CHUNKS 2>/dev/null | python3 -c "
+import json, sys
+addr = dict(l.split() for l in '''$T74_MAP'''.strip().splitlines())
+best = {}
+for l in sys.stdin:
+    try: isr = json.loads(l)['isr']
+    except Exception: continue
+    for c in range(1, 5):
+        r = isr[c] if c < len(isr) else None
+        if r and len(r['members']) >= 2 and (c not in best or r['epoch'] > best[c]['epoch']): best[c] = r
+for c in range(1, 5):
+    r = best.get(c)
+    print(c, r['epoch'] if r else '?', ','.join(addr.get(m, '?') for m in r['members'][:2]) if r else '?')" 2>/dev/null || true)
+T74_BAD=""
+while read -r c e pair; do
+    [ -z "$c" ] && continue
+    hs=$("$BIN/dfs-admin" --cluster "$pair" isr read --file "/$T74_FILE" --chunk "$c" 2>/dev/null | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r h1 h2 <<< "$hs"
+    echo "  T74: chunk $c ISR epoch $e [$pair]: ${hs:-unreadable}"
+    if echo "$T74_VERDICT" | grep -q "chunk $c "; then   # a loss here: what each member stores
+        for base in 8192 16384; do
+            "$BIN/dfs-admin" --cluster "$pair" isr read --file "/$T74_FILE" --chunk "$c" --range "$base:10" 2>/dev/null | python3 -c "
+import json,sys
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    print('    stored on', r.get('addr'), 'at +$base:', repr(bytes.fromhex(r.get('range_hex',''))), r.get('chunk_id','')[:16], r.get('error','')[:120])" || true
+        done
+    fi
+    { [ -n "$h1" ] && [ "$h1" = "$h2" ] && [ "$h1" != ERR ]; } || T74_BAD="$T74_BAD chunk$c($hs)"
+done <<< "$T74_PAIRS"
+case "$T74_VERDICT" in OK*) ;; *)   # and through a second fresh client, 4K preads, no readahead
+    RUST_LOG=info "$BIN/dfs-client" mount "$T74_FM" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_fresh2.log" --allow-other --log-level debug &
+    T74_FPID=$!
+    sleep 2
+    python3 -c "
+import os
+fd = os.open('$T74_FM/$T74_FILE', os.O_RDONLY)
+for c in range(1, 5):
+    for base in (8192, 16384):
+        print('    second fresh read chunk', c, '+%d:' % base, repr(os.pread(fd, 10, c * 4 * 1024 * 1024 + base)))" 2>&1 || true
+    fusermount -u "$T74_FM" 2>/dev/null || true
+    kill_client_and_wait "$T74_FPID" ;;
+esac
+[ -n "$T74_PAIRS" ] && [ -z "$T74_BAD" ] \
+    && t74_check "T74b every chunk's current ISR pair holds identical bytes" PASS \
+    || t74_check "T74b ISR pair(s) differ or unreadable:${T74_BAD:- no ISR found}" FAIL
+T74_RAW=$( { tail -n +"$((T74_CLIENT_MARK + 1))" "$CURRENT_CLIENT_LOG"; cat "$LOG/client_t74b.log"; } 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -aE "Sending request to [0-9.:]+: MultiPatch \{" | grep -ac "$T74_FILE_ID_PAT" || true)
+T74_ERR=$(echo "$T74_VERDICT" | grep -oP 'ERRORS=\K[0-9?]+' || echo "?")
+echo "  T74 (informational): $T74_ERR writer error(s); ${T74_RAW:-?} unordered MultiPatch send(s) to the file"
+rm -f "${MOUNT:?}/${T74_FILE:?}"
+fusermount -u "$T74_MOUNT2" 2>/dev/null || true
+kill_client_and_wait "$T74_PID2"
+fi # should_run T74
 
 if should_run T70; then
 snapshot_log T70

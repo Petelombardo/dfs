@@ -1351,6 +1351,21 @@ fn is_transient_write_failure(err_msg: &str) -> bool {
         || s.contains("i/o error on retry")            // connection dropped on write-retry
 }
 
+/// An ordered write's replica refused because the ISR pair is mid-handover: the primary lost
+/// its lease or was superseded, a takeover is pending, or the order never arrived. Each of these
+/// ends (the lease comes back, the takeover commits, the link heals), so within the outage
+/// budget it is a wait, like a connect timeout. Failing it instead sent the write down the
+/// flush path's one-retry ladder into the fresh-write fallback, whose safety check turned it
+/// into an EIO (suite T69 row #12: both members cut off, neither holds a lease; T74 chaos).
+fn is_ordered_handover_failure(err_msg: &str) -> bool {
+    err_msg.contains("Ordered: not the primary")
+        || err_msg.contains("Ordered: stale ISR epoch")
+        || err_msg.contains("the primary refused write")
+        || err_msg.contains("primary never ordered write")
+        || err_msg.contains("is expired by a majority; ask the secondary to take over")
+        || err_msg.contains("is still being applied")
+}
+
 impl DfsClient {
     /// Create a new DFS client
     pub fn new(cluster_nodes: Vec<SocketAddr>) -> Result<Self> {
@@ -8304,15 +8319,19 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // leader is precisely the case to wait out. A genuinely dead node still
                 // surfaces the error, just after CONNECT_RETRY_BUDGET instead of
                 // instantly.
+                let ordered = !order_tags.is_empty();
                 let all_transient_failures = !replica_results.is_empty()
                     && replica_results.iter().all(|(_, r)| {
                         r.as_ref().err()
-                            .map(|e| is_transient_write_failure(&e.to_string()))
+                            .map(|e| {
+                                let e = e.to_string();
+                                is_transient_write_failure(&e) || (ordered && is_ordered_handover_failure(&e))
+                            })
                             .unwrap_or(false)
                     });
                 if all_transient_failures && retry_started.elapsed() < CONNECT_RETRY_BUDGET {
                     warn!("MultiPatch: all {} replica(s) unavailable for chunk {} (transient \
-                           connect/timeout failure, elapsed {:?}/{:?}) — retrying in {:?}",
+                           connect/timeout failure or ordered handover, elapsed {:?}/{:?}) — retrying in {:?}",
                         replica_results.len(), old_chunk_id, retry_started.elapsed(),
                         CONNECT_RETRY_BUDGET, CONNECT_RETRY_BACKOFF);
                     tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
@@ -10781,6 +10800,20 @@ mod tests {
     /// fell through to the lossy "all replicas failed" fallback that drops the write.
     /// Timeouts and connection-drops must count as transient (ride out via
     /// CONNECT_RETRY_BUDGET); genuine server-side data errors must NOT.
+    /// Suite T69 row #12: with both ISR members cut off, the replies are ordering refusals,
+    /// not transport errors; they must count as a wait for an ordered write.
+    #[test]
+    fn is_ordered_handover_failure_matches_refusals_not_data_errors() {
+        assert!(is_ordered_handover_failure("Ordered: not the primary of file f chunk 1 at epoch 1 (this node has None)"));
+        assert!(is_ordered_handover_failure("Ordered: the primary refused write 35a6 for file f chunk 2"));
+        assert!(is_ordered_handover_failure("Ordered: primary never ordered write 35a6 for file f chunk 2"));
+        assert!(is_ordered_handover_failure("Ordered: primary n of file f chunk 1 is expired by a majority; ask the secondary to take over"));
+        assert!(is_ordered_handover_failure("Ordered: write 35a6 (v3) is still being applied"));
+        assert!(!is_ordered_handover_failure("chunk stale"));
+        assert!(!is_ordered_handover_failure("chunk 224 fresh-write safety check found real existing data"));
+        assert!(!is_ordered_handover_failure("Timeout reading chunk from 10.0.0.1:8900"));
+    }
+
     #[test]
     fn is_transient_write_failure_matches_timeouts_not_data_errors() {
         // Slow / black-holing leader — the exact case that was silently dropping writes:

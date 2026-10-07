@@ -4849,27 +4849,37 @@ snapshot_log T72
 if should_run T72; then
 echo "=== T72: every node's file table matches the leader's (no lingering deleted files) ==="
 dfs_sync 2>/dev/null || true
-T72_LEADER=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" file list 2>/dev/null | grep -oE "^[0-9a-f-]{36}" | sort -u)
-echo "  T72: leader lists $(echo "$T72_LEADER" | grep -c . || true) files"
-T72_EXTRA=""
-for port in 8900 8901 8902 8903 8904; do
-    extra=$(comm -13 <(echo "$T72_LEADER") <("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -oE "^[0-9a-f-]{36}" | sort -u))
-    if [ -n "$extra" ]; then
-        T72_EXTRA="${T72_EXTRA} $port:$(echo "$extra" | grep -c .)"
-        echo "  T72: node $port keeps files the leader doesn't have: $(echo $extra | cut -c1-200)"
-    fi
+# T70 (just before this) ends by deleting its tree, so give a delete still propagating
+# up to 10s: the property is that no node KEEPS a deleted file.
+for T72_TRY in $(seq 1 10); do
+    T72_LEADER=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" file list 2>/dev/null | grep -oE "^[0-9a-f-]{36}" | sort -u)
+    T72_EXTRA=""; T72_DETAIL=""
+    for port in 8900 8901 8902 8903 8904; do
+        extra=$(comm -13 <(echo "$T72_LEADER") <("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list --local 2>/dev/null | grep -oE "^[0-9a-f-]{36}" | sort -u))
+        if [ -n "$extra" ]; then
+            T72_EXTRA="${T72_EXTRA} $port:$(echo "$extra" | grep -c .)"
+            T72_DETAIL="${T72_DETAIL}  T72: node $port keeps files the leader doesn't have: $(echo $extra | cut -c1-200)"$'\n'
+        fi
+    done
+    [ -z "$T72_EXTRA" ] && break
+    sleep 1
 done
+echo "  T72: leader lists $(echo "$T72_LEADER" | grep -c . || true) files (check $T72_TRY)"
+printf "%s" "$T72_DETAIL"
 [ -z "$T72_EXTRA" ] \
     && check "T72 no node keeps a file the leader has deleted" PASS \
     || check "T72 nodes keep deleted files:${T72_EXTRA}" FAIL
 
 # T72b: the mechanism behind it. A patch slot still dirty when its file was deleted
 # was later folded by the patch-fold sweep, which re-installed the deleted file's
-# chunk_map. No node may fold a file after it processed that file's delete.
+# chunk_map. No node may fold a file after its delete committed there ("tombstoned for
+# good"; the DeleteChunksBatch line is logged when the delete ARRIVES, and a fold that
+# commits before the delete does is legitimate: the delete then removes its rows).
+# Measured from arrival, durable commits made that window show up (2026-10-07).
 T72B_VIOLATIONS=""
 for f in "$LOG"/server[0-9].log; do
     T72B_VIOLATIONS="${T72B_VIOLATIONS}$(sed -E 's/\x1b\[[0-9;]*m//g' "$f" | awk -v node="$(basename "$f" .log)" '
-        /DeleteChunksBatch: / { id=$NF; gsub(/[()]/, "", id); if (!(id in del)) del[id]=$1 }
+        /tombstoned for good/ { for (i=1; i<=NF; i++) if ($i=="file") { id=$(i+1); break }; if (!(id in del)) del[id]=$1 }
         /Single fold: file / {
             for (i=1; i<=NF; i++) if ($i=="file") { id=$(i+1); break }
             if ((id in del) && $1 > del[id]) print "  T72b: " node " folded deleted file " id " at " $1 " (deleted " del[id] ")"

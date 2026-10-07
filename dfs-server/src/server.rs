@@ -3389,6 +3389,16 @@ impl OverlayForkCtx {
     /// RPC class cluster-wide — a coordinated fold was announcing itself via
     /// two separate mechanisms to overlapping recipients.
     #[allow(clippy::too_many_arguments)]
+    /// A fold whose file was deleted while it ran: remove the result's location row
+    /// and bytes, and announce nothing (see run_single_fold's two call sites).
+    async fn drop_fold_result_of_deleted_file(&self, file_id: FileId, chunk_idx: u64, new_chunk_id: ChunkId) {
+        info!("single fold: file {} deleted while chunk_idx {} folded — dropping result {}",
+            file_id, chunk_idx, new_chunk_id);
+        let _ = self.metadata.delete_chunk_location_async(new_chunk_id).await;
+        let storage = self.storage.clone();
+        let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&new_chunk_id, "fold_result_of_deleted_file")).await;
+    }
+
     async fn run_single_fold(
         &self,
         file_id: FileId,
@@ -3595,6 +3605,17 @@ impl OverlayForkCtx {
                 return None;
             }
         };
+
+        // The file may have been deleted while this fold consolidated (the check at the
+        // top is age-gated, and a fold takes long enough to straddle a delete). Drop the
+        // result before any durable write or announcement: those would leave patch-state,
+        // generation and fold-announce rows behind for a deleted file (suite T72b, seen
+        // 3 times once metadata commits became durable, 2026-10-06). A cheap early exit;
+        // the Folded flip below re-checks inside its transaction to close the race.
+        if self.metadata.is_file_tombstoned(&file_id) {
+            self.drop_fold_result_of_deleted_file(file_id, chunk_idx, new_chunk_id).await;
+            return None;
+        }
 
         // Read the slot's CURRENT seq from chunk_map here, strictly before
         // update_chunk_map_after_patch below overwrites it with new_chunk_id — see
@@ -3823,7 +3844,11 @@ impl OverlayForkCtx {
         // Everything above this line is local metadata a concurrent reader could
         // observe the instant Folded becomes visible; everything below is either
         // cleanup or cluster-wide dissemination that doesn't gate local correctness.
-        if let Err(e) = self.metadata.update_patch_state_folded_async(public_token, new_chunk_id).await {
+        if let Err(e) = self.metadata.update_patch_state_folded_for_file_async(file_id, public_token, new_chunk_id).await {
+            if e.downcast_ref::<crate::metadata::FileDeletedDuringFold>().is_some() {
+                self.drop_fold_result_of_deleted_file(file_id, chunk_idx, new_chunk_id).await;
+                return None;
+            }
             warn!("single fold: failed to flip patch_state to Folded for {} -> {}: {}", public_token, new_chunk_id, e);
         }
 
@@ -6176,6 +6201,26 @@ impl Server {
                         }
                     }
                 }
+                // Keep the slots this record does not mention. A record names what changed,
+                // or what a lagging node holds, never necessarily the whole file; replacing
+                // the entry with it dropped every other slot, and after a whole-cluster
+                // restart the dropped tail read as zeros (T76D, 2026-10-06). The one
+                // legitimate drop is a shrink: a record NEWER than the map whose size ends
+                // before the slot.
+                let (existing_locs, map_seq) = existing_entry.value();
+                let shrinks = metadata.write_seq > *map_seq;
+                for old_loc in existing_locs.iter() {
+                    let Some(old_off) = old_loc.file_offset else { continue };
+                    let cidx = old_off / CHUNK_SIZE_4M;
+                    let mentioned = locs.iter().any(|l| l.file_offset.map(|o| o / CHUNK_SIZE_4M) == Some(cidx));
+                    if mentioned { continue; }
+                    if shrinks && old_off >= metadata.size {
+                        superseded_chunk_ids.push(old_loc.chunk_id);
+                        continue;
+                    }
+                    locs.push(old_loc.clone());
+                }
+                locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
                 locs
             } else {
                 metadata.chunk_locations.as_ref().clone()
@@ -6214,9 +6259,19 @@ impl Server {
             for old_id in superseded_chunk_ids {
                 self.chunk_to_file.remove(&old_id);
             }
-            self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq));
+            // Never lower the entry's write_seq: the truncate guards above compare against it.
+            let map_seq = self.chunk_map.get(&metadata.id).map(|e| e.value().1).unwrap_or(0);
+            self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq.max(map_seq)));
         } else if metadata.size == 0 {
-            if let Some((old_locs, _)) = self.chunk_map.get(&metadata.id).map(|e| e.value().clone()) {
+            // Only a truncate NEWER than the map may clear it. Stored file records never
+            // carry chunk_locations, so a replayed copy of the file's create record
+            // (write_seq 0, size 0) looks exactly like a truncate-to-zero; after a
+            // whole-cluster restart one wiped a freshly rebuilt leader map and the
+            // file's tail read as zeros (T76D, 2026-10-06).
+            let old = self.chunk_map.get(&metadata.id)
+                .map(|e| e.value().clone())
+                .filter(|(_, map_seq)| metadata.write_seq > *map_seq);
+            if let Some((old_locs, _)) = old {
                 // Empty chunk_locations AND size==0 on a file that already has a chunk_map
                 // entry means truncate-to-zero. Reset the entry instead of leaving it
                 // untouched — otherwise the stale pre-truncate chunks would linger in
@@ -12635,6 +12690,14 @@ impl Server {
                     .checked_sub(MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK);
                 let mut entries = Vec::with_capacity(candidates.len());
                 for (token, entry) in candidates {
+                    // Deleted for good: retire at once (an in-memory check, so no age gate).
+                    if server.metadata.is_file_tombstoned(&entry.file_id) {
+                        server.pending_patch_fold_broadcasts.remove(&token);
+                        if let Err(e) = server.metadata.delete_pending_fold_announce_async(token).await {
+                            warn!("patch_fold_rebroadcast: failed to clear durable record for {} (file deleted): {}", token, e);
+                        }
+                        continue;
+                    }
                     let old_enough = file_check_cutoff.is_some_and(|cutoff| entry.first_seen <= cutoff);
                     if !old_enough {
                         entries.push((token, entry));
@@ -16069,9 +16132,14 @@ impl Server {
     /// or chunk_map entry, and a later fold then resurrects the file (suite T72b, one
     /// fold 73s after a delete that landed 170ms behind a patch). In-flight means
     /// milliseconds to seconds, well inside the tombstone's 30s.
+    /// Deleted within the last 30s (in-memory, set as the delete is processed), or deleted
+    /// for good (a durable tombstone, mirrored in memory). The 30s window alone let a write
+    /// still being retried after it reopen the file: the fresh accumulator's fold re-created
+    /// the deleted file's chunk map (suite T72b), and after a restart the window is empty.
     fn file_recently_deleted(&self, file_id: FileId) -> bool {
         self.delete_tombstones.get(&file_id)
             .is_some_and(|t| t.value().elapsed() < std::time::Duration::from_secs(30))
+            || self.metadata.is_file_tombstoned(&file_id)
     }
 
     fn forget_file_slots(&self, file_id: FileId) {
@@ -22141,6 +22209,54 @@ mod tests {
         );
     }
 
+    /// Suite T72b (2026-10-06): a client kept retrying a patch to a deleted file; once the
+    /// in-memory 30s delete window passed, the next retry started a fresh accumulator and
+    /// its fold re-created the deleted file's chunk map. A file deleted for good (durable
+    /// tombstone) must refuse patches for as long as the tombstone exists, including after
+    /// the window, and after a restart (both: no in-memory entry, as here).
+    #[tokio::test]
+    async fn patch_to_a_file_deleted_for_good_is_refused_after_the_delete_window() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let mut file = FileMetadata::new("/deleted-for-good".to_string(), dfs_common::FileType::RegularFile);
+        file.id = dfs_common::FileId::new();
+        metadata.put_file(&file).unwrap();
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base_content, 0, file.id));
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id, nodes: vec![node_id], size: base_content.len(),
+            checksum: base_chunk_id.hash, file_offset: Some(0), written_at: None,
+            client_write_seq: None, file_id: Some(file.id),
+        }).unwrap();
+
+        metadata.delete_file_for_good(&file.id).unwrap();
+        assert!(metadata.is_file_tombstoned(&file.id), "test setup: the delete didn't tombstone the file");
+
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let result = server.apply_patch(
+            Some(lock), base_chunk_id, file.id, Some(0), 0,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
+        ).await;
+        match result {
+            Err((msg, _)) => assert!(msg.contains("was deleted"), "refused, but not as deleted: {}", msg),
+            Ok((token, ..)) => panic!("a patch to a file deleted for good was applied (token {}): its fold \
+                would re-create the deleted file's chunk map", token),
+        }
+    }
+
     /// Direct proof that a genuine merge-time no-op is detected and skips the
     /// disk append entirely: a fresh accumulator's first patch, then a second
     /// (merge) patch with byte-identical content at a higher seq. Asserts the
@@ -25964,6 +26080,82 @@ mod tests {
             let current = last_chunk_id.unwrap();
             assert_eq!(h.server.chunk_to_file.get(&current).map(|e| *e.value()), Some(file_id),
                 "the current (latest) chunk_id must still resolve to this file");
+        }
+
+        /// T76D, 2026-10-06: after a whole-cluster restart the new leader's rebuild
+        /// indexed chunks 0 and 1 of a file correctly, and half a second later a
+        /// replayed copy of the file's CREATE record (write_seq 0, size 0) arrived.
+        /// Stored file records never carry chunk_locations, so that record looked
+        /// exactly like a truncate-to-zero, and the truncate branch wiped the whole
+        /// entry; only chunk 0 came back (via its own RCL), so chunk 1 read as zeros
+        /// for ~40s. A size-0 record may clear the map only if it is NEWER than it.
+        #[tokio::test]
+        async fn chunk_map_update_stale_size_zero_record_does_not_wipe_newer_map() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let loc = |idx: u64, byte: u8, cws: u64| {
+                let hash = compute_chunk_hash(&vec![byte; 64]);
+                ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash), nodes: vec![], size: 4 * 1024 * 1024,
+                    checksum: hash, file_offset: Some(idx * 4 * 1024 * 1024),
+                    written_at: Some(1000 + cws), client_write_seq: Some(cws), file_id: Some(file_id),
+                }
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc(0, 1, 1), loc(1, 2, 190)], 190));
+            let mk = |seq: u64| {
+                let mut m = dfs_common::FileMetadata::new("/t76d.bin".to_string(), dfs_common::FileType::RegularFile);
+                m.id = file_id;
+                m.size = 0;
+                m.write_seq = seq;
+                m
+            };
+
+            // The replayed create record: older than the map, must not touch it.
+            h.server.chunk_map_update(&mk(0)).await;
+            let n = h.server.chunk_map.get(&file_id).map(|e| e.value().0.len()).unwrap_or(0);
+            assert_eq!(n, 2, "a size-0 record older than the chunk map wiped it (stale create replay)");
+
+            // A real truncate-to-zero is newer than everything the map holds: it clears.
+            h.server.chunk_map_update(&mk(191)).await;
+            let n = h.server.chunk_map.get(&file_id).map(|e| e.value().0.len()).unwrap_or(99);
+            assert_eq!(n, 0, "a newer truncate-to-zero must still clear the chunk map");
+        }
+
+        /// Same class as the test above: a record naming only SOME of a file's chunks
+        /// (callers send what changed, or what a lagging node holds) must not drop the
+        /// chunk_map entries for the slots it does not mention.
+        #[tokio::test]
+        async fn chunk_map_update_partial_record_keeps_unmentioned_slots() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let loc = |idx: u64, byte: u8, cws: u64| {
+                let hash = compute_chunk_hash(&vec![byte; 64]);
+                ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash), nodes: vec![], size: 4 * 1024 * 1024,
+                    checksum: hash, file_offset: Some(idx * 4 * 1024 * 1024),
+                    written_at: Some(1000 + cws), client_write_seq: Some(cws), file_id: Some(file_id),
+                }
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc(0, 1, 1), loc(1, 2, 190)], 190));
+            let mut m = dfs_common::FileMetadata::new("/t76d.bin".to_string(), dfs_common::FileType::RegularFile);
+            m.id = file_id;
+            m.size = 8 * 1024 * 1024;
+            m.write_seq = 191;
+            m.chunk_locations = std::sync::Arc::new(vec![loc(0, 3, 191)]);
+            h.server.chunk_map_update(&m).await;
+            let offs: Vec<Option<u64>> = h.server.chunk_map.get(&file_id)
+                .map(|e| e.value().0.iter().map(|l| l.file_offset).collect()).unwrap_or_default();
+            assert!(offs.contains(&Some(4 * 1024 * 1024)),
+                "a record naming only chunk 0 dropped chunk 1 from the chunk map: {:?}", offs);
+
+            // A newer record that shrank the file below chunk 1 does drop it.
+            m.write_seq = 300;
+            m.size = 4 * 1024 * 1024;
+            m.chunk_locations = std::sync::Arc::new(vec![loc(0, 4, 300)]);
+            h.server.chunk_map_update(&m).await;
+            let offs: Vec<Option<u64>> = h.server.chunk_map.get(&file_id)
+                .map(|e| e.value().0.iter().map(|l| l.file_offset).collect()).unwrap_or_default();
+            assert_eq!(offs, vec![Some(0)], "a newer shrink to 4MiB must drop chunk 1");
         }
 
         /// Regression for the 2026-07-18 chunk_patch_locks leak: nothing removes a

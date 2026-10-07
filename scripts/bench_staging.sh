@@ -11,6 +11,9 @@
 #                                                   (DFS_METADATA_DURABLE=0 in the env: old commit cadence)
 #   scripts/bench_staging.sh run <label>            fio jobs on the client -> /root/dfs-staging-bench-<label>.txt
 #   scripts/bench_staging.sh teardown               unmount, stop, delete everything
+#
+# BENCH_SERVER_BIN_DIR / BENCH_CLIENT_BIN deploy other binaries (e.g. production's own, copied
+# read-only, for a prod-vs-new comparison). A redeploy over a running bench needs teardown first.
 set -e
 NODES="gluster2 gluster3 gluster4 gluster5"   # not gluster1: production leader, least free memory
 CLIENT=server4   # x86_64: client binary from dist/bench-x86_64 (build-x86.sh)
@@ -19,7 +22,8 @@ DIR=/mnt/gluster/dfs-bench            # on each storage node (persistent disk, n
 CDIR=/root/dfs-bench                  # on the client
 MNT=/mnt/dfs-bench
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-BIN="$REPO/target/release"
+BIN="${BENCH_SERVER_BIN_DIR:-$REPO/target/release}"           # dfs-server + dfs-admin (aarch64)
+CLIENT_BIN="${BENCH_CLIENT_BIN:-$REPO/dist/bench-x86_64/dfs-client}"  # x86_64
 MIN_FREE_MB=3000
 # Same per-process cache caps as the local suite: this runs next to production.
 SERVER_ENV="DFS_CHUNK_RING_CAPACITY=8 DFS_DELTA_RING_CAPACITY=8 DFS_MAX_CACHE_CHUNKS=8 DFS_LEASE_CLUSTER_SIZE=4 DFS_SLOT_ISR_SEED_SECS=3"
@@ -75,7 +79,7 @@ deploy)
             grep -E '^(listen_addr|seed_nodes)' $DIR/config/config.toml"
     done
     ssh root@"$CLIENT" "mkdir -p $CDIR"
-    scp -q "$REPO/dist/bench-x86_64/dfs-client" root@"$CLIENT":$CDIR/
+    scp -q "$CLIENT_BIN" root@"$CLIENT":$CDIR/dfs-client
     start_servers "$ORDERED"
     start_client "$ORDERED"
     ;;
@@ -92,7 +96,7 @@ run)
     ssh root@"$CLIENT" "cd $MNT && rm -f bench.bin && \
         fio --name=layout --filename=bench.bin --size=64m --bs=1m --rw=write --ioengine=psync --output=/dev/null && \
         sleep 10 && \
-        for job in 'rand4k_fsync --rw=randwrite --bs=4k --numjobs=1' 'rand4k_16w_fsync --rw=randwrite --bs=4k --numjobs=16' 'seq1m_fsync --rw=write --bs=1m --numjobs=1'; do
+        for job in 'rand4k_fsync --rw=randwrite --bs=4k --numjobs=1' 'rand4k_16w_fsync --rw=randwrite --bs=4k --numjobs=16' 'seq1m_fsync --rw=write --bs=1m --numjobs=1' 'rand4k_read --rw=randread --bs=4k --numjobs=1' 'rand4k_16r_read --rw=randread --bs=4k --numjobs=16' 'seq1m_read --rw=read --bs=1m --numjobs=1'; do
             set -- \$job; name=\$1; shift
             fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --direct=1 --fsync=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null 2>&1 \
               || fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --fsync=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null
@@ -106,7 +110,8 @@ print(f"== {sys.argv[2]}")
 for part in raw:
     part = part.strip()
     if not part: continue
-    j = json.loads(part[part.index("{"):]); job = j["jobs"][0]; w = job["write"]
+    j = json.loads(part[part.index("{"):]); job = j["jobs"][0]
+    w = job["read"] if job["read"]["io_bytes"] > 0 else job["write"]
     c = w["clat_ns"]; p = c.get("percentile", {})
     print(f"{job['jobname']:<12} iops={w['iops']:9.1f}  lat_us mean={c['mean']/1000:8.1f} "
           f"p50={p.get('50.000000',0)/1000:8.1f} p99={p.get('99.000000',0)/1000:9.1f}  MBps={w['bw']/1024:7.1f}"

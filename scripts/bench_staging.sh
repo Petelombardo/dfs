@@ -8,6 +8,7 @@
 #   scripts/bench_staging.sh check                  free disk/mem per node, fio on the client
 #   scripts/bench_staging.sh deploy [0|1]           copy binaries, init, start servers, mount
 #   scripts/bench_staging.sh restart 0|1            restart servers+client with DFS_ORDERED_WRITES
+#                                                   (DFS_METADATA_DURABLE=0 in the env: old commit cadence)
 #   scripts/bench_staging.sh run <label>            fio jobs on the client -> /root/dfs-staging-bench-<label>.txt
 #   scripts/bench_staging.sh teardown               unmount, stop, delete everything
 set -e
@@ -38,9 +39,9 @@ stop_bench_client() {
 }
 # Each remote start must background ONE simple command: `x && y &` backgrounds a subshell that
 # keeps ssh's stdout open, so ssh never returns.
-start_servers() {  # $1 = DFS_ORDERED_WRITES
+start_servers() {  # $1 = DFS_ORDERED_WRITES; DFS_METADATA_DURABLE from the caller's env (default 1)
     for n in $NODES; do
-        ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
+        ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV DFS_ORDERED_WRITES=$1 DFS_METADATA_DURABLE=${DFS_METADATA_DURABLE:-1} RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
     done
     sleep 8
 }

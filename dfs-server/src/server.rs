@@ -6176,6 +6176,26 @@ impl Server {
                         }
                     }
                 }
+                // Keep the slots this record does not mention. A record names what changed,
+                // or what a lagging node holds, never necessarily the whole file; replacing
+                // the entry with it dropped every other slot, and after a whole-cluster
+                // restart the dropped tail read as zeros (T76D, 2026-10-06). The one
+                // legitimate drop is a shrink: a record NEWER than the map whose size ends
+                // before the slot.
+                let (existing_locs, map_seq) = existing_entry.value();
+                let shrinks = metadata.write_seq > *map_seq;
+                for old_loc in existing_locs.iter() {
+                    let Some(old_off) = old_loc.file_offset else { continue };
+                    let cidx = old_off / CHUNK_SIZE_4M;
+                    let mentioned = locs.iter().any(|l| l.file_offset.map(|o| o / CHUNK_SIZE_4M) == Some(cidx));
+                    if mentioned { continue; }
+                    if shrinks && old_off >= metadata.size {
+                        superseded_chunk_ids.push(old_loc.chunk_id);
+                        continue;
+                    }
+                    locs.push(old_loc.clone());
+                }
+                locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
                 locs
             } else {
                 metadata.chunk_locations.as_ref().clone()
@@ -6214,9 +6234,19 @@ impl Server {
             for old_id in superseded_chunk_ids {
                 self.chunk_to_file.remove(&old_id);
             }
-            self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq));
+            // Never lower the entry's write_seq: the truncate guards above compare against it.
+            let map_seq = self.chunk_map.get(&metadata.id).map(|e| e.value().1).unwrap_or(0);
+            self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq.max(map_seq)));
         } else if metadata.size == 0 {
-            if let Some((old_locs, _)) = self.chunk_map.get(&metadata.id).map(|e| e.value().clone()) {
+            // Only a truncate NEWER than the map may clear it. Stored file records never
+            // carry chunk_locations, so a replayed copy of the file's create record
+            // (write_seq 0, size 0) looks exactly like a truncate-to-zero; after a
+            // whole-cluster restart one wiped a freshly rebuilt leader map and the
+            // file's tail read as zeros (T76D, 2026-10-06).
+            let old = self.chunk_map.get(&metadata.id)
+                .map(|e| e.value().clone())
+                .filter(|(_, map_seq)| metadata.write_seq > *map_seq);
+            if let Some((old_locs, _)) = old {
                 // Empty chunk_locations AND size==0 on a file that already has a chunk_map
                 // entry means truncate-to-zero. Reset the entry instead of leaving it
                 // untouched — otherwise the stale pre-truncate chunks would linger in
@@ -26017,6 +26047,82 @@ mod tests {
             let current = last_chunk_id.unwrap();
             assert_eq!(h.server.chunk_to_file.get(&current).map(|e| *e.value()), Some(file_id),
                 "the current (latest) chunk_id must still resolve to this file");
+        }
+
+        /// T76D, 2026-10-06: after a whole-cluster restart the new leader's rebuild
+        /// indexed chunks 0 and 1 of a file correctly, and half a second later a
+        /// replayed copy of the file's CREATE record (write_seq 0, size 0) arrived.
+        /// Stored file records never carry chunk_locations, so that record looked
+        /// exactly like a truncate-to-zero, and the truncate branch wiped the whole
+        /// entry; only chunk 0 came back (via its own RCL), so chunk 1 read as zeros
+        /// for ~40s. A size-0 record may clear the map only if it is NEWER than it.
+        #[tokio::test]
+        async fn chunk_map_update_stale_size_zero_record_does_not_wipe_newer_map() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let loc = |idx: u64, byte: u8, cws: u64| {
+                let hash = compute_chunk_hash(&vec![byte; 64]);
+                ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash), nodes: vec![], size: 4 * 1024 * 1024,
+                    checksum: hash, file_offset: Some(idx * 4 * 1024 * 1024),
+                    written_at: Some(1000 + cws), client_write_seq: Some(cws), file_id: Some(file_id),
+                }
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc(0, 1, 1), loc(1, 2, 190)], 190));
+            let mk = |seq: u64| {
+                let mut m = dfs_common::FileMetadata::new("/t76d.bin".to_string(), dfs_common::FileType::RegularFile);
+                m.id = file_id;
+                m.size = 0;
+                m.write_seq = seq;
+                m
+            };
+
+            // The replayed create record: older than the map, must not touch it.
+            h.server.chunk_map_update(&mk(0)).await;
+            let n = h.server.chunk_map.get(&file_id).map(|e| e.value().0.len()).unwrap_or(0);
+            assert_eq!(n, 2, "a size-0 record older than the chunk map wiped it (stale create replay)");
+
+            // A real truncate-to-zero is newer than everything the map holds: it clears.
+            h.server.chunk_map_update(&mk(191)).await;
+            let n = h.server.chunk_map.get(&file_id).map(|e| e.value().0.len()).unwrap_or(99);
+            assert_eq!(n, 0, "a newer truncate-to-zero must still clear the chunk map");
+        }
+
+        /// Same class as the test above: a record naming only SOME of a file's chunks
+        /// (callers send what changed, or what a lagging node holds) must not drop the
+        /// chunk_map entries for the slots it does not mention.
+        #[tokio::test]
+        async fn chunk_map_update_partial_record_keeps_unmentioned_slots() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let loc = |idx: u64, byte: u8, cws: u64| {
+                let hash = compute_chunk_hash(&vec![byte; 64]);
+                ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash), nodes: vec![], size: 4 * 1024 * 1024,
+                    checksum: hash, file_offset: Some(idx * 4 * 1024 * 1024),
+                    written_at: Some(1000 + cws), client_write_seq: Some(cws), file_id: Some(file_id),
+                }
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc(0, 1, 1), loc(1, 2, 190)], 190));
+            let mut m = dfs_common::FileMetadata::new("/t76d.bin".to_string(), dfs_common::FileType::RegularFile);
+            m.id = file_id;
+            m.size = 8 * 1024 * 1024;
+            m.write_seq = 191;
+            m.chunk_locations = std::sync::Arc::new(vec![loc(0, 3, 191)]);
+            h.server.chunk_map_update(&m).await;
+            let offs: Vec<Option<u64>> = h.server.chunk_map.get(&file_id)
+                .map(|e| e.value().0.iter().map(|l| l.file_offset).collect()).unwrap_or_default();
+            assert!(offs.contains(&Some(4 * 1024 * 1024)),
+                "a record naming only chunk 0 dropped chunk 1 from the chunk map: {:?}", offs);
+
+            // A newer record that shrank the file below chunk 1 does drop it.
+            m.write_seq = 300;
+            m.size = 4 * 1024 * 1024;
+            m.chunk_locations = std::sync::Arc::new(vec![loc(0, 4, 300)]);
+            h.server.chunk_map_update(&m).await;
+            let offs: Vec<Option<u64>> = h.server.chunk_map.get(&file_id)
+                .map(|e| e.value().0.iter().map(|l| l.file_offset).collect()).unwrap_or_default();
+            assert_eq!(offs, vec![Some(0)], "a newer shrink to 4MiB must drop chunk 1");
         }
 
         /// Regression for the 2026-07-18 chunk_patch_locks leak: nothing removes a

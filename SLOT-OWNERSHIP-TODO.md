@@ -295,6 +295,15 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   really dropped), mixed-version rolling upgrade. Also: network latency/loss, slow disk,
   clock skew, hours-long soak with random faults. Each fails first, then joins the suite
   (both flag settings, every change).
+  - [x] **Whole-cluster crash, T76 (2026-10-06):** failed first: acked writes lost, a file read
+        as zeros. Fixed on fix/durable-acks (off fix/patch-after-delete, merged c9a3ac3):
+        metadata commits durable before ack (bench 2026-10-07: no measurable cost; opt-out
+        DFS_METADATA_DURABLE=0), chunk_map_update stale/partial-record wipes, fold/delete race.
+        T76 required with ordering on; informational off (the unordered path loses writes).
+  - [x] **Client SIGKILL, T77 (2026-10-06):** passes with ordering on; with ordering off a killed
+        client's fsync'd writes are lost (Legata bug, open). Watch: the killed client sometimes
+        finishes no fsync in its first 5s (2 of 10 runs).
+  - [ ] Bit flip, ENOSPC one node / all nodes, power loss, mixed versions, and the rest.
 
 - **Six fix branches MERGED 2026-10-05** (fix/dir-rename-subtree, fix/is-leader-startup,
   fix/delete-resurrection, fix/rename-lost-pending-write, fix/unit-test-fixtures,

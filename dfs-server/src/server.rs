@@ -4051,6 +4051,10 @@ impl OverlayForkCtx {
             warn!("single fold: failed to flip patch_state to Folded for {} -> {}: {}", public_token, new_chunk_id, e);
         } else {
             self.write_ordering.on_folded(file_id, chunk_idx, public_token, new_chunk_id);
+            // Load-bearing for suite T72b: the moment this fold committed. "Single fold"
+            // below is logged only after the leader notification, which can take hundreds
+            // of ms, so a fold that committed before its file's delete looked like one after.
+            info!("Fold committed: file {} chunk_idx {} -> {}", file_id, chunk_idx, new_chunk_id);
         }
 
         // Clean up the delta's own (now dead) ChunkLocation + on-disk bytes.

@@ -333,6 +333,8 @@ enum MetaWriteOp {
     UpdatePatchStateFolded {
         public_token: ChunkId,
         new_chunk_id: ChunkId,
+        /// When set, refuse with FileDeletedDuringFold if the file is tombstoned.
+        file_id: Option<FileId>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
     DeletePatchStateAbandoned {
@@ -410,6 +412,18 @@ impl MetaWriteOp {
 /// the per-op apply result is held here until commit() succeeds (send it as-is)
 /// or fails (replace tentative Ok with the commit error; a per-op apply error is
 /// authoritative either way, that op wrote nothing).
+/// update_patch_state_folded_for_file_async refused: the file was deleted for good.
+#[derive(Debug)]
+pub struct FileDeletedDuringFold(pub FileId);
+
+impl std::fmt::Display for FileDeletedDuringFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "file {} was deleted while its slot folded", self.0)
+    }
+}
+
+impl std::error::Error for FileDeletedDuringFold {}
+
 enum PendingReply {
     Unit(tokio::sync::oneshot::Sender<Result<()>>, Result<()>),
     RetiredToken(tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>, Result<Option<ChunkId>>),
@@ -877,8 +891,11 @@ impl MetadataStore {
                     self.note_txn("op:put_patch_state_pending", 0);
                     replies.push(PendingReply::RetiredToken(reply, result));
                 }
-                MetaWriteOp::UpdatePatchStateFolded { public_token, new_chunk_id, reply } => {
+                MetaWriteOp::UpdatePatchStateFolded { public_token, new_chunk_id, file_id, reply } => {
                     let result = (|| -> Result<()> {
+                        if let Some(file_id) = file_id {
+                            Self::refuse_fold_of_deleted_file_in_txn(&txn, file_id)?;
+                        }
                         let token_key = format!("{}", public_token);
                         let value = bincode::serialize(&PatchState::Folded(new_chunk_id))
                             .context("Failed to serialize patch state")?;
@@ -1994,6 +2011,14 @@ impl MetadataStore {
     /// reconciliation, not by replaying old writes. Returns how many were dropped.
     /// Whether `file_id` was deleted for good (a FILE_TOMBSTONE_TABLE marker exists). In
     /// memory, no redb read: safe on the hot write path.
+    fn refuse_fold_of_deleted_file_in_txn(txn: &redb::WriteTransaction, file_id: FileId) -> Result<()> {
+        let tombstones = txn.open_table(FILE_TOMBSTONE_TABLE)?;
+        if tombstones.get(format!("{}", file_id).as_str())?.is_some() {
+            return Err(anyhow::Error::new(FileDeletedDuringFold(file_id)));
+        }
+        Ok(())
+    }
+
     pub fn is_file_tombstoned(&self, file_id: &FileId) -> bool {
         self.tombstoned_files.contains(&file_id.to_string())
     }
@@ -2695,12 +2720,19 @@ impl MetadataStore {
     /// change — the slot's outstanding token doesn't change, only what it
     /// resolves to.
     pub fn update_patch_state_folded(&self, public_token: &ChunkId, new_chunk_id: ChunkId) -> Result<()> {
+        self.update_patch_state_folded_inner(public_token, new_chunk_id, None)
+    }
+
+    fn update_patch_state_folded_inner(&self, public_token: &ChunkId, new_chunk_id: ChunkId, file_id: Option<FileId>) -> Result<()> {
         let token_key = format!("{}", public_token);
         let value = bincode::serialize(&PatchState::Folded(new_chunk_id))
             .context("Failed to serialize patch state")?;
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
+        if let Some(file_id) = file_id {
+            Self::refuse_fold_of_deleted_file_in_txn(&txn, file_id)?;
+        }
         {
             let mut table = txn.open_table(PATCH_STATE_TABLE)?;
             table.insert(token_key.as_str(), value.as_slice())?;
@@ -2774,14 +2806,28 @@ impl MetadataStore {
     /// Async wrapper for update_patch_state_folded — see put_chunk_location_async
     /// (group-committed since 2026-07-15; fires once per completed fold).
     pub async fn update_patch_state_folded_async(self: &Arc<Self>, public_token: ChunkId, new_chunk_id: ChunkId) -> Result<()> {
+        self.update_patch_state_folded_opt_async(public_token, new_chunk_id, None).await
+    }
+
+    /// update_patch_state_folded_async for a fold of `file_id`'s slot: fails with
+    /// FileDeletedDuringFold, writing nothing, if the file was deleted for good. The
+    /// check runs inside the flip's own transaction, so a delete either commits first
+    /// (and the flip is refused) or after (and removes the Folded row with the rest of
+    /// the file's patch state). A fold straddling a delete left rows behind and announced
+    /// itself (suite T72b, 2026-10-06).
+    pub async fn update_patch_state_folded_for_file_async(self: &Arc<Self>, file_id: FileId, public_token: ChunkId, new_chunk_id: ChunkId) -> Result<()> {
+        self.update_patch_state_folded_opt_async(public_token, new_chunk_id, Some(file_id)).await
+    }
+
+    async fn update_patch_state_folded_opt_async(self: &Arc<Self>, public_token: ChunkId, new_chunk_id: ChunkId, file_id: Option<FileId>) -> Result<()> {
         if !Self::group_commit_enabled() {
             let store = Arc::clone(self);
-            return tokio::task::spawn_blocking(move || store.update_patch_state_folded(&public_token, new_chunk_id))
+            return tokio::task::spawn_blocking(move || store.update_patch_state_folded_inner(&public_token, new_chunk_id, file_id))
                 .await
                 .context("spawn_blocking panicked in update_patch_state_folded_async")?;
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.committer_tx().send(MetaWriteOp::UpdatePatchStateFolded { public_token, new_chunk_id, reply }).await
+        self.committer_tx().send(MetaWriteOp::UpdatePatchStateFolded { public_token, new_chunk_id, file_id, reply }).await
             .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
         rx.await.context("metadata group-commit thread dropped its reply")?
     }
@@ -5784,6 +5830,38 @@ mod tests {
     /// instead. Uses spawn_blocking to call it, mirroring spawn_sled_write_worker's
     /// own std::thread — blocking_send/blocking_recv panic if called from a tokio
     /// async task directly.
+    /// Suite T72b (2026-10-06): a fold that straddled its file's delete flipped the
+    /// token to Folded after the delete had removed the file's patch state, leaving a
+    /// row behind. The flip for a fold of a deleted file must be refused and write
+    /// nothing, through the committer and the direct path alike.
+    #[tokio::test]
+    async fn folded_flip_for_a_deleted_file_is_refused_and_writes_nothing() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+        let chunk = |s: &str| ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(s.as_bytes()));
+
+        let live = FileMetadata::new("/live.bin".to_string(), FileType::RegularFile);
+        let gone = FileMetadata::new("/gone.bin".to_string(), FileType::RegularFile);
+        store.put_file(&live).unwrap();
+        store.put_file(&gone).unwrap();
+        store.delete_file_for_good(&gone.id).unwrap();
+
+        // A live file's fold flips as before.
+        let (tok, res) = (chunk("live-token"), chunk("live-result"));
+        store.put_patch_state_pending(live.id, 1, &tok, chunk("b1"), chunk("d1"), 4096, 1, Some(1)).unwrap();
+        store.update_patch_state_folded_for_file_async(live.id, tok, res).await.unwrap();
+        assert!(matches!(store.get_patch_state(&tok).unwrap(), Some(PatchState::Folded(r)) if r == res));
+
+        // A deleted file's fold is refused, by both paths, and leaves no row.
+        let (tok, res) = (chunk("gone-token"), chunk("gone-result"));
+        let err = store.update_patch_state_folded_for_file_async(gone.id, tok, res).await.unwrap_err();
+        assert!(err.downcast_ref::<FileDeletedDuringFold>().is_some(), "wrong error: {err}");
+        let err = store.update_patch_state_folded_inner(&tok, res, Some(gone.id)).unwrap_err();
+        assert!(err.downcast_ref::<FileDeletedDuringFold>().is_some(), "wrong error: {err}");
+        assert!(store.get_patch_state(&tok).unwrap().is_none(), "a refused flip wrote a patch_state row");
+    }
+
     #[tokio::test]
     async fn put_files_batch_via_committer_uses_group_commit_not_solo_transaction() {
         use dfs_common::FileType;

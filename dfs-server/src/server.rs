@@ -3389,6 +3389,16 @@ impl OverlayForkCtx {
     /// RPC class cluster-wide — a coordinated fold was announcing itself via
     /// two separate mechanisms to overlapping recipients.
     #[allow(clippy::too_many_arguments)]
+    /// A fold whose file was deleted while it ran: remove the result's location row
+    /// and bytes, and announce nothing (see run_single_fold's two call sites).
+    async fn drop_fold_result_of_deleted_file(&self, file_id: FileId, chunk_idx: u64, new_chunk_id: ChunkId) {
+        info!("single fold: file {} deleted while chunk_idx {} folded — dropping result {}",
+            file_id, chunk_idx, new_chunk_id);
+        let _ = self.metadata.delete_chunk_location_async(new_chunk_id).await;
+        let storage = self.storage.clone();
+        let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&new_chunk_id, "fold_result_of_deleted_file")).await;
+    }
+
     async fn run_single_fold(
         &self,
         file_id: FileId,
@@ -3595,6 +3605,17 @@ impl OverlayForkCtx {
                 return None;
             }
         };
+
+        // The file may have been deleted while this fold consolidated (the check at the
+        // top is age-gated, and a fold takes long enough to straddle a delete). Drop the
+        // result before any durable write or announcement: those would leave patch-state,
+        // generation and fold-announce rows behind for a deleted file (suite T72b, seen
+        // 3 times once metadata commits became durable, 2026-10-06). A cheap early exit;
+        // the Folded flip below re-checks inside its transaction to close the race.
+        if self.metadata.is_file_tombstoned(&file_id) {
+            self.drop_fold_result_of_deleted_file(file_id, chunk_idx, new_chunk_id).await;
+            return None;
+        }
 
         // Read the slot's CURRENT seq from chunk_map here, strictly before
         // update_chunk_map_after_patch below overwrites it with new_chunk_id — see
@@ -3823,7 +3844,11 @@ impl OverlayForkCtx {
         // Everything above this line is local metadata a concurrent reader could
         // observe the instant Folded becomes visible; everything below is either
         // cleanup or cluster-wide dissemination that doesn't gate local correctness.
-        if let Err(e) = self.metadata.update_patch_state_folded_async(public_token, new_chunk_id).await {
+        if let Err(e) = self.metadata.update_patch_state_folded_for_file_async(file_id, public_token, new_chunk_id).await {
+            if e.downcast_ref::<crate::metadata::FileDeletedDuringFold>().is_some() {
+                self.drop_fold_result_of_deleted_file(file_id, chunk_idx, new_chunk_id).await;
+                return None;
+            }
             warn!("single fold: failed to flip patch_state to Folded for {} -> {}: {}", public_token, new_chunk_id, e);
         }
 

@@ -8998,16 +8998,9 @@ impl Server {
         // to followers 100ms later, resurrecting the file there.
         self.pending_broadcasts.remove(&file_id);
 
-        if let Err(e) = self.metadata.delete_file_for_good_async(file_id).await {
-            warn!("Failed to delete file record {} on peer: {}", file_id, e);
-        }
-        if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
-            warn!("Failed to delete path index {} on peer: {}", path, e);
-        }
-        for chunk_id in &chunk_ids {
-            if let Err(e) = self.metadata.delete_chunk_location_async(*chunk_id).await {
-                warn!("Failed to delete chunk location {} on peer: {}", chunk_id, e);
-            }
+        // One transaction (one fsync) for the record, path index and chunk locations.
+        if let Err(e) = self.metadata.delete_file_for_good_with_async(file_id, path.clone(), chunk_ids.clone()).await {
+            warn!("Failed to delete file {} ({}) on peer: {}", file_id, path, e);
         }
         self.chunk_map_remove(&file_id).await;
 
@@ -16042,8 +16035,9 @@ impl Server {
             };
         }
 
-        // Step 3: remove metadata now that the chunk list is safely queued.
-        if let Err(e) = self.metadata.delete_file_for_good_async(metadata.id).await {
+        // Step 3: remove metadata now that the chunk list is safely queued: the record,
+        // path index and chunk locations in one transaction (one fsync, not one per chunk).
+        if let Err(e) = self.metadata.delete_file_for_good_with_async(metadata.id, path.clone(), chunk_ids.clone()).await {
             warn!("Failed to delete file metadata for {}: {}", path, e);
             // Queue entry is already written — drain worker will retry.
             // Still return error so client knows metadata removal may have failed.
@@ -16051,14 +16045,6 @@ impl Server {
                 message: format!("Failed to delete file: {}", e),
                 code: ErrorCode::InternalError,
             };
-        }
-        if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
-            warn!("Failed to delete path index for {}: {}", path, e);
-        }
-        for chunk_id in &chunk_ids {
-            if let Err(e) = self.metadata.delete_chunk_location_async(*chunk_id).await {
-                warn!("Failed to delete chunk location {}: {}", chunk_id, e);
-            }
         }
 
         // Step 4: in-memory chunk_map removal (tombstone already set in step 1).
@@ -16100,14 +16086,12 @@ impl Server {
         self.delete_tombstones.insert(file_id, std::time::Instant::now());
         self.pending_broadcasts.remove(&file_id);
 
-        // Wipe metadata (idempotent — already gone on quorum nodes).
-        let _ = self.metadata.delete_file_for_good_async(file_id).await;
-        let _ = self.metadata.delete_path_index_async(path).await;
+        // Wipe metadata (idempotent — already gone on quorum nodes), in one transaction.
+        let _ = self.metadata.delete_file_for_good_with_async(file_id, path, chunk_ids.clone()).await;
         self.chunk_map_remove(&file_id).await;
 
         for chunk_id in &chunk_ids {
             self.chunk_tombstones.remove(chunk_id);
-            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
             if let Err(e) = self.storage.delete_chunk(chunk_id, "delete_file_batch_follower") {
                 // Not present locally — fine, log at debug.
                 debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
@@ -16275,15 +16259,12 @@ impl Server {
         // full-disk leader silently fails its own delete but still broadcasts
         // DeleteChunksBatch, causing followers to permanently lose the file while the
         // leader retains it.  The drain will retry on the next 30-second cycle.
-        if let Err(e) = self.metadata.delete_file_for_good_async(entry.file_id).await {
+        if let Err(e) = self.metadata.delete_file_for_good_with_async(
+            entry.file_id, entry.path.clone(), entry.chunk_ids.clone()).await {
             warn!("drain_one_delete: local metadata delete failed for {} — will retry: {}", entry.path, e);
             return;
         }
-        if let Err(e) = self.metadata.delete_path_index_async(entry.path.clone()).await {
-            warn!("drain_one_delete: local path index delete failed for {} — will retry: {}", entry.path, e);
-        }
         for chunk_id in &entry.chunk_ids {
-            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
             if let Err(e) = self.storage.delete_chunk(chunk_id, "delete_file_drain_leader") {
                 debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
             }
@@ -16297,22 +16278,27 @@ impl Server {
             healing.clear_pending_for_deleted_chunks(&entry.chunk_ids).await;
         }
 
-        // Send DeleteChunksBatch to every online peer (not just chunk holders).
+        // Send DeleteChunksBatch to every online peer (not just chunk holders), all at
+        // once: one after another, each peer's durable commit added to the next's wait.
+        let sends = nodes.iter()
+            .filter(|node| node.id != local_id && node.status == dfs_common::NodeStatus::Online)
+            .map(|node| {
+                let req = Request::DeleteChunksBatch {
+                    file_id: entry.file_id,
+                    path: entry.path.clone(),
+                    chunk_ids: entry.chunk_ids.clone(),
+                };
+                async move {
+                    let result = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(30),
+                        self.send_req(node.addr, req),
+                    ).await;
+                    (node, result)
+                }
+            });
         let mut all_acked = true;
-        for node in &nodes {
-            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                continue;
-            }
-
-            let req = Request::DeleteChunksBatch {
-                file_id: entry.file_id,
-                path: entry.path.clone(),
-                chunk_ids: entry.chunk_ids.clone(),
-            };
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(30),
-                self.send_req(node.addr, req),
-            ).await {
+        for (node, result) in futures::future::join_all(sends).await {
+            match result {
                 Ok(Ok(Response::Ok { .. })) => {
                     debug!("drain_one_delete: node {} acked delete of {}", node.id, entry.path);
                 }
@@ -21062,6 +21048,40 @@ mod tests {
             "a deleted file must leave no dirty slot behind for the fold sweep to fold");
         assert!(!h.server.chunk_patch_locks.iter().any(|e| e.key().0 == dead));
         assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
+    }
+
+    /// Every metadata commit is durable (an fsync), so a delete must be one commit, not one
+    /// for the record, one for the path index and one per chunk location: T21's 2101-file
+    /// delete storm drained 3x slower (35s -> 108s), and the half-applied deletes it left
+    /// for a minute were most of the suite's slot-audit [DIVERGENCE] findings (2026-10-07).
+    #[tokio::test]
+    async fn follower_delete_is_one_metadata_commit() {
+        let h = make_overlay_test_harness();
+        let file_meta = dfs_common::FileMetadata::new("/doomed.bin".to_string(), dfs_common::types::FileType::RegularFile);
+        let file_id = file_meta.id;
+        h.metadata.put_file(&file_meta).unwrap();
+        let chunk_ids: Vec<ChunkId> = (0..8u64).map(|i| {
+            let id = ChunkId::from_hash(compute_chunk_hash(format!("doomed-{}", i).as_bytes()));
+            h.metadata.put_chunk_location(&ChunkLocation {
+                chunk_id: id, nodes: vec![h.server.cluster.local_node_id()],
+                size: 4096, checksum: id.hash,
+                file_offset: Some(i * 4 * 1024 * 1024), written_at: Some(dfs_common::types::current_timestamp()),
+                client_write_seq: Some(1), file_id: Some(file_id),
+            }).unwrap();
+            id
+        }).collect();
+        let commits = |m: &MetadataStore| m.txn_stats_snapshot().iter().map(|(_, n, _)| n).sum::<u64>();
+        let before = commits(&h.metadata);
+
+        h.server.handle_delete_chunks_batch(file_id, "/doomed.bin".to_string(), chunk_ids.clone()).await;
+
+        assert_eq!(commits(&h.metadata) - before, 1, "the record, path index and 8 chunk locations go in one commit");
+        assert!(h.metadata.get_file(&file_id).unwrap().is_none());
+        assert!(h.metadata.get_file_by_path("/doomed.bin").unwrap().is_none());
+        for id in &chunk_ids {
+            assert!(h.metadata.get_chunk_location(id).unwrap().is_none(), "chunk location {} left behind", id);
+        }
+        assert!(h.metadata.is_file_tombstoned(&file_id));
     }
 
     /// A patch or location sent before a delete can land just after it. Accepting it

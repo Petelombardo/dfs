@@ -1912,17 +1912,26 @@ impl MetadataStore {
     /// drop a local record the cluster may legitimately push back (admin purge).
     /// A real delete uses delete_file_for_good.
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
-        self.delete_file_inner(file_id, false)
+        self.delete_file_inner(file_id, false, None, &[])
     }
 
     /// The file was deleted cluster-wide: remove its row, path index entry and
     /// outstanding patch state, and record a FILE_TOMBSTONE_TABLE marker, all in one
     /// transaction, so no put queued before this delete can commit after it.
     pub fn delete_file_for_good(&self, file_id: &FileId) -> Result<()> {
-        self.delete_file_inner(file_id, true)
+        self.delete_file_inner(file_id, true, None, &[])
     }
 
-    fn delete_file_inner(&self, file_id: &FileId, for_good: bool) -> Result<()> {
+    /// delete_file_for_good plus the path index entry under `path` and the file's chunk
+    /// locations, in the same transaction. They were separate commits, one per chunk
+    /// location, and since every commit is durable (an fsync) a delete cost one fsync
+    /// per chunk on every node and T21's 2101-file storm drained 3x slower (35s -> 108s,
+    /// 2026-10-07). Like delete_path_index, `path` is removed whatever file it names.
+    pub fn delete_file_for_good_with(&self, file_id: &FileId, path: &str, chunk_ids: &[ChunkId]) -> Result<()> {
+        self.delete_file_inner(file_id, true, Some(path), chunk_ids)
+    }
+
+    fn delete_file_inner(&self, file_id: &FileId, for_good: bool, path: Option<&str>, chunk_ids: &[ChunkId]) -> Result<()> {
         let file_id_str = format!("{}", file_id);
         let mut removed_path: Option<String> = None;
         let _db = self.db.read();
@@ -1940,6 +1949,15 @@ impl MetadataStore {
                 }
             }
             file_table.remove(file_id_str.as_str())?;
+            if let Some(p) = path {
+                path_table.remove(p)?;
+            }
+        }
+        if !chunk_ids.is_empty() {
+            let mut chunk_table = txn.open_table(CHUNK_TABLE)?;
+            for chunk_id in chunk_ids {
+                chunk_table.remove(format!("{}", chunk_id).as_str())?;
+            }
         }
         // A real delete also records the tombstone (see FILE_TOMBSTONE_TABLE) and takes
         // the file's outstanding patches with it, in the same transaction. A Pending
@@ -2004,6 +2022,9 @@ impl MetadataStore {
         if let Some(path) = &removed_path {
             self.dirty_paths.lock().unwrap().insert(path.clone());
         }
+        if let Some(p) = path {
+            self.dirty_paths.lock().unwrap().insert(p.to_string());
+        }
 
         debug!("Deleted metadata for file: {}", file_id);
         Ok(())
@@ -2054,6 +2075,14 @@ impl MetadataStore {
         tokio::task::spawn_blocking(move || store.delete_file_for_good(&file_id))
             .await
             .context("spawn_blocking panicked in delete_file_for_good_async")?
+    }
+
+    /// Async wrapper for delete_file_for_good_with — see put_file_async.
+    pub async fn delete_file_for_good_with_async(self: &Arc<Self>, file_id: FileId, path: String, chunk_ids: Vec<ChunkId>) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_file_for_good_with(&file_id, &path, &chunk_ids))
+            .await
+            .context("spawn_blocking panicked in delete_file_for_good_with_async")?
     }
 
     /// Drop FILE_TOMBSTONE_TABLE markers older than `max_age`. A marker only has to

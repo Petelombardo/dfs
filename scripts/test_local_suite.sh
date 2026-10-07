@@ -126,7 +126,12 @@ fresh_read() {
 pkill -f "dfs-server" 2>/dev/null || true
 pkill -f "dfs-client" 2>/dev/null || true
 sleep 0.5
-fusermount -u $MOUNT 2>/dev/null || true
+# Every mount the suite uses, not just $MOUNT: a run killed mid-test leaves its second
+# client's mount dead ("Transport endpoint is not connected"), and the next run's first
+# mkdir there aborts the whole suite (T64, 2026-10-07). Lazy, since the client is gone.
+for m in "$MOUNT" /tmp/dfs-mount2 /tmp/dfs-mount3 /tmp/dfs-mount-fresh; do
+    fusermount -uz "$m" 2>/dev/null || true
+done
 # Remove all artifacts from previous runs: $BASE/$MOUNT/$T, any stale
 # dfs-suite-tmp-* dirs left behind by a crashed/interrupted run (different
 # $$), and last run's $LOG so debug-level logs don't accumulate across runs.

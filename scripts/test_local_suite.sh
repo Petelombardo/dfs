@@ -4872,11 +4872,14 @@ printf "%s" "$T72_DETAIL"
 
 # T72b: the mechanism behind it. A patch slot still dirty when its file was deleted
 # was later folded by the patch-fold sweep, which re-installed the deleted file's
-# chunk_map. No node may fold a file after it processed that file's delete.
+# chunk_map. No node may fold a file after its delete committed there ("tombstoned for
+# good"; the DeleteChunksBatch line is logged when the delete ARRIVES, and a fold that
+# commits before the delete does is legitimate: the delete then removes its rows).
+# Measured from arrival, durable commits made that window show up (2026-10-07).
 T72B_VIOLATIONS=""
 for f in "$LOG"/server[0-9].log; do
     T72B_VIOLATIONS="${T72B_VIOLATIONS}$(sed -E 's/\x1b\[[0-9;]*m//g' "$f" | awk -v node="$(basename "$f" .log)" '
-        /DeleteChunksBatch: / { id=$NF; gsub(/[()]/, "", id); if (!(id in del)) del[id]=$1 }
+        /tombstoned for good/ { for (i=1; i<=NF; i++) if ($i=="file") { id=$(i+1); break }; if (!(id in del)) del[id]=$1 }
         /Single fold: file / {
             for (i=1; i<=NF; i++) if ($i=="file") { id=$(i+1); break }
             if ((id in del) && $1 > del[id]) print "  T72b: " node " folded deleted file " id " at " $1 " (deleted " del[id] ")"

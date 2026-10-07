@@ -869,7 +869,7 @@ impl MetadataStore {
                         // caused the T28 regression — see handle_multi_patch).
                         let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
                         let effective = seq.max(current);
-                        if seq > current {
+                        if seq > current && !Self::file_tombstoned_in_txn(&txn, file_id)? {
                             table.insert(key.as_str(), seq)?;
                         }
                         Ok(effective)
@@ -1936,16 +1936,42 @@ impl MetadataStore {
                 .collect();
             if !slots.is_empty() {
                 let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
+                let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
                 for (slot_key, token_key) in &slots {
                     slot_table.remove(slot_key.as_str())?;
                     state_table.remove(token_key.as_str())?;
+                    ts_table.remove(token_key.as_str())?;
                 }
+            }
+            // The file's per-slot generations and fold-announce obligations go too. Left
+            // behind they leaked for every deleted file (2026-10-07), and a fold that
+            // committed just before this delete re-announced a dead file until the
+            // rebroadcast loop's age-gated file check caught it.
+            let mut seq_table = txn.open_table(CHUNK_SEQ_TABLE)?;
+            let seq_keys: Vec<String> = seq_table.range(lo.as_str()..hi.as_str())?
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k.value().to_string())
+                .collect();
+            for k in &seq_keys {
+                seq_table.remove(k.as_str())?;
+            }
+            let mut announce_table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
+            let announce_keys: Vec<String> = announce_table.range::<&str>(..)?
+                .filter_map(|r| r.ok())
+                .filter(|(_, v)| bincode::deserialize::<PendingFoldAnnounce>(v.value())
+                    .is_ok_and(|a| a.file_id == *file_id))
+                .map(|(k, _)| k.value().to_string())
+                .collect();
+            for k in &announce_keys {
+                announce_table.remove(k.as_str())?;
             }
         }
         txn.commit()?;
         self.note_txn("delete_file", 0);
         if for_good {
             self.tombstoned_files.insert(file_id_str.clone());
+            // Load-bearing for suite T72b: the moment no fold of this file may commit after.
+            info!("file {} tombstoned for good", file_id);
         }
 
         // See put_file's matching comment: must happen while `_db` is still held.
@@ -2012,11 +2038,19 @@ impl MetadataStore {
     /// Whether `file_id` was deleted for good (a FILE_TOMBSTONE_TABLE marker exists). In
     /// memory, no redb read: safe on the hot write path.
     fn refuse_fold_of_deleted_file_in_txn(txn: &redb::WriteTransaction, file_id: FileId) -> Result<()> {
-        let tombstones = txn.open_table(FILE_TOMBSTONE_TABLE)?;
-        if tombstones.get(format!("{}", file_id).as_str())?.is_some() {
+        if Self::file_tombstoned_in_txn(txn, file_id)? {
             return Err(anyhow::Error::new(FileDeletedDuringFold(file_id)));
         }
         Ok(())
+    }
+
+    /// Whether `file_id` was deleted for good, as seen by this write transaction. Rows
+    /// keyed by a file must not be written once its delete has committed: the delete
+    /// removed the file's rows in its own transaction, and nothing revisits them after.
+    fn file_tombstoned_in_txn(txn: &redb::WriteTransaction, file_id: FileId) -> Result<bool> {
+        let tombstones = txn.open_table(FILE_TOMBSTONE_TABLE)?;
+        let found = tombstones.get(format!("{}", file_id).as_str())?.is_some();
+        Ok(found)
     }
 
     pub fn is_file_tombstoned(&self, file_id: &FileId) -> bool {
@@ -2571,7 +2605,7 @@ impl MetadataStore {
             // why: a stale/out-of-order push must never lower the per-slot generation.
             let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
             effective = seq.max(current);
-            if seq > current {
+            if seq > current && !Self::file_tombstoned_in_txn(&txn, file_id)? {
                 table.insert(key.as_str(), seq)?;
             }
         }
@@ -3364,7 +3398,8 @@ impl MetadataStore {
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
-        {
+        // A deleted file's fold has nothing to announce (see file_tombstoned_in_txn).
+        if !Self::file_tombstoned_in_txn(&txn, announce.file_id)? {
             let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
@@ -5830,6 +5865,59 @@ mod tests {
     /// instead. Uses spawn_blocking to call it, mirroring spawn_sled_write_worker's
     /// own std::thread — blocking_send/blocking_recv panic if called from a tokio
     /// async task directly.
+    /// Suite T72b (2026-10-07): a fold that committed just BEFORE its file's delete left
+    /// the slot's generation, fold timestamp and fold-announce obligation behind (the
+    /// delete only took patch_state rows), and fold writes landing just AFTER it wrote
+    /// them again. A delete for good must take every row keyed by the file, and none
+    /// may be written for it afterwards, through the committer or the direct path.
+    #[tokio::test]
+    async fn delete_for_good_takes_every_fold_row_and_refuses_late_ones() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+        let chunk = |s: &str| ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(s.as_bytes()));
+        let file = FileMetadata::new("/fold-then-delete.bin".to_string(), FileType::RegularFile);
+        store.put_file(&file).unwrap();
+        let announce = |token: ChunkId, result: ChunkId| PendingFoldAnnounce {
+            public_token: token, real_chunk_id: result, file_id: file.id, chunk_idx: 1,
+            location: ChunkLocation {
+                chunk_id: result, nodes: vec![NodeId::new()], size: 4096, checksum: [0u8; 32],
+                file_offset: Some(4 * 1024 * 1024), written_at: Some(1), client_write_seq: Some(1),
+                file_id: Some(file.id),
+            },
+            first_seen_ms: 1,
+        };
+        let fold_ts = |token: ChunkId| {
+            let db = store.db.read();
+            let txn = db.begin_read().unwrap();
+            let table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE).unwrap();
+            let found = table.get(format!("{}", token).as_str()).unwrap().is_some();
+            found
+        };
+
+        // A fold of slot 1 commits completely, then the file is deleted.
+        let (tok, res) = (chunk("tok"), chunk("res"));
+        store.put_patch_state_pending(file.id, 1, &tok, chunk("base"), chunk("delta"), 4096, 1, Some(1)).unwrap();
+        store.put_chunk_seq_async(file.id, 1, 7).await.unwrap();
+        store.update_patch_state_folded_for_file_async(file.id, tok, res).await.unwrap();
+        store.put_pending_fold_announce(&announce(tok, res)).unwrap();
+        assert!(fold_ts(tok), "test setup: the flip didn't record its fold time");
+        store.delete_file_for_good(&file.id).unwrap();
+
+        assert!(store.get_patch_state(&tok).unwrap().is_none(), "patch_state row left behind");
+        assert!(!fold_ts(tok), "fold timestamp row left behind");
+        assert_eq!(store.get_chunk_seq(file.id, 1).unwrap(), None, "chunk_seq row left behind");
+        assert!(store.scan_pending_fold_announces().unwrap().is_empty(), "fold-announce obligation left behind");
+
+        // Fold writes landing after the delete write nothing.
+        store.put_chunk_seq_async(file.id, 1, 9).await.unwrap();
+        store.put_chunk_seq(file.id, 2, 9).unwrap();
+        store.put_pending_fold_announce(&announce(chunk("tok2"), chunk("res2"))).unwrap();
+        assert_eq!(store.get_chunk_seq(file.id, 1).unwrap(), None, "late chunk_seq written (committer)");
+        assert_eq!(store.get_chunk_seq(file.id, 2).unwrap(), None, "late chunk_seq written (direct)");
+        assert!(store.scan_pending_fold_announces().unwrap().is_empty(), "late fold-announce written");
+    }
+
     /// Suite T72b (2026-10-06): a fold that straddled its file's delete flipped the
     /// token to Folded after the delete had removed the file's patch state, leaving a
     /// row behind. The flip for a fold of a deleted file must be refused and write

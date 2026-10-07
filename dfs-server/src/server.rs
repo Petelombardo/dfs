@@ -12690,6 +12690,14 @@ impl Server {
                     .checked_sub(MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK);
                 let mut entries = Vec::with_capacity(candidates.len());
                 for (token, entry) in candidates {
+                    // Deleted for good: retire at once (an in-memory check, so no age gate).
+                    if server.metadata.is_file_tombstoned(&entry.file_id) {
+                        server.pending_patch_fold_broadcasts.remove(&token);
+                        if let Err(e) = server.metadata.delete_pending_fold_announce_async(token).await {
+                            warn!("patch_fold_rebroadcast: failed to clear durable record for {} (file deleted): {}", token, e);
+                        }
+                        continue;
+                    }
                     let old_enough = file_check_cutoff.is_some_and(|cutoff| entry.first_seen <= cutoff);
                     if !old_enough {
                         entries.push((token, entry));

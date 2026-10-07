@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId};
 use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 // On Linux, Durability::Eventual calls fdatasync (same as Immediate). Only the macOS
-// backend (F_BARRIERFSYNC) distinguishes them. Durability::None writes to the OS page
-// cache without fdatasync — fast, immediately visible to reads, survives process crashes,
-// only lost on kernel panic/power failure. Acceptable with 5-way replication.
+// backend (F_BARRIERFSYNC) distinguishes them. Durability::None does NOT survive a
+// process crash: redb records a None commit only in its in-memory header, so a reopen
+// returns to the last durable commit (verified 2026-10-06, suite T76). Commits are
+// durable by default; see durable_commits_enabled.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -424,6 +425,8 @@ pub struct MetadataStore {
     /// Counts Durability::None commits since the last Durability::Immediate one.
     /// See next_write_durability() for why this exists.
     non_durable_commits: AtomicU64,
+    /// Whether every commit is durable before it returns; see durable_commits_enabled.
+    durable_commits: std::sync::atomic::AtomicBool,
     /// FILE_TABLE keys (file_id strings) written or removed since the dirty set was
     /// last drained. Populated by every FILE_TABLE mutator (put_file, delete_file,
     /// remove_unlisted_files) immediately after a successful commit, while that
@@ -592,6 +595,7 @@ impl MetadataStore {
             db: RwLock::new(db),
             db_path,
             non_durable_commits: AtomicU64::new(0),
+            durable_commits: std::sync::atomic::AtomicBool::new(Self::durable_commits_enabled()),
             dirty_files: Mutex::new(std::collections::HashSet::new()),
             dirty_paths: Mutex::new(std::collections::HashSet::new()),
             txn_stats: Mutex::new(std::collections::HashMap::new()),
@@ -1073,6 +1077,9 @@ impl MetadataStore {
     /// the single-op path always used. Counting group commits as 1 would stretch
     /// "every 200" to "every 200 batches" (up to ~256x more unflushed writes).
     fn next_write_durability_n(&self, ops: u64) -> Durability {
+        if self.durable_commits.load(Ordering::Relaxed) {
+            return Durability::Immediate;
+        }
         let start = self.non_durable_commits.fetch_add(ops, Ordering::Relaxed);
         let end = start + ops;
         if start / Self::DURABILITY_FLUSH_INTERVAL != end / Self::DURABILITY_FLUSH_INTERVAL {
@@ -1080,6 +1087,37 @@ impl MetadataStore {
         } else {
             Durability::None
         }
+    }
+
+    /// Every metadata commit is durable before it returns (default). A write's ack
+    /// waits on the commits it made, so an acknowledged write survives a crash of
+    /// every replica at once (suite T76, 2026-10-06). Durability::None is NOT
+    /// crash-safe even for a process crash: redb keeps a None commit reachable only
+    /// in memory, and reopening the file returns to the last durable commit. On
+    /// Linux redb's Eventual is the same fdatasync as Immediate, so there is no
+    /// cheaper middle level; the cost is paid down by batching instead: concurrent
+    /// writers queue behind the group committer and share one fsync per batch.
+    ///
+    /// DFS_METADATA_DURABLE=0 restores the old cadence (one durable commit per
+    /// DURABILITY_FLUSH_INTERVAL ops, plus the 2s timer) for measuring the cost.
+    /// Read once; changing it needs a restart.
+    fn durable_commits_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let off = std::env::var("DFS_METADATA_DURABLE").map(|v| v == "0").unwrap_or(false);
+            if off {
+                warn!("metadata commits NOT durable at ack (DFS_METADATA_DURABLE=0): a crash of every \
+                       replica can lose up to ~2s of acknowledged writes");
+            }
+            !off
+        })
+    }
+
+    /// Test-only: switch this store to the old non-durable cadence, for tests about
+    /// the page churn that cadence produces (fragmentation, compaction).
+    #[cfg(test)]
+    fn use_non_durable_commits_for_test(&self) {
+        self.durable_commits.store(false, Ordering::Relaxed);
     }
 
     /// How often start_durability_flush_timer checks whether a forced flush is
@@ -4943,6 +4981,37 @@ mod tests {
     use dfs_common::{ChunkId, FileType, NodeId};
     use tempfile::TempDir;
 
+    /// A put_file that has returned (what a write's ack waits on) must survive the
+    /// process dying right after, with no clean shutdown. Durability::None did not:
+    /// redb keeps a None commit only in its in-memory header, so a whole-cluster
+    /// SIGKILL lost acknowledged writes on every replica (suite T76, 2026-10-06).
+    /// The child half of this test re-runs this same test in a fresh process that
+    /// commits one record and aborts; the parent reopens the database.
+    #[test]
+    fn acked_metadata_write_survives_a_process_crash() {
+        const CHILD_DIR: &str = "DFS_CRASH_TEST_CHILD_DIR";
+        if let Ok(dir) = std::env::var(CHILD_DIR) {
+            let store = MetadataStore::new(PathBuf::from(dir)).unwrap();
+            let mut m = FileMetadata::new("/crash.bin".to_string(), FileType::RegularFile);
+            m.size = 4242;
+            store.put_file(&m).unwrap();
+            std::process::abort();
+        }
+        let tmp = TempDir::new().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "metadata::tests::acked_metadata_write_survives_a_process_crash", "--test-threads=1"])
+            .env(CHILD_DIR, tmp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "the child must die by abort, not finish cleanly");
+        let store = MetadataStore::new(tmp.path().to_path_buf()).unwrap();
+        let got = store.get_file_by_path("/crash.bin").unwrap();
+        assert_eq!(got.map(|m| m.size), Some(4242),
+            "a committed (acknowledged) metadata write was lost when the process died");
+    }
+
 
     /// 2026-09-05, gluster1 6h wedge. `scan_all_files` held one `self.db.read()`
     /// across the whole scan *including the caller's callback*, and its only caller
@@ -5078,6 +5147,10 @@ mod tests {
     /// chunk-ID rotation (write then delete) to leave real dead pages behind.
     #[cfg(test)]
     fn churn_for_compaction_test(store: &MetadataStore) {
+        // Durable commits free their pages for reuse at once, so this churn leaves
+        // almost nothing to reclaim (measured 2026-10-06: 2.65MB durable vs 14.51MB
+        // non-durable). The old cadence is what builds a compactable file.
+        store.use_non_durable_commits_for_test();
         let node = NodeId::new();
         for i in 0..8000u64 {
             let hash = dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i).as_bytes());
@@ -5596,8 +5669,10 @@ mod tests {
         };
 
         // Store A: 500 single-record transactions (the pre-fix hot-path shape).
+        // Stores A and B use the old non-durable cadence, where this churn lives.
         let temp_a = TempDir::new().unwrap();
         let store_a = MetadataStore::new(temp_a.path().to_path_buf()).unwrap();
+        store_a.use_non_durable_commits_for_test();
         for i in 0..500u32 {
             store_a.put_chunk_location(&make_loc(i)).unwrap();
         }
@@ -5609,6 +5684,7 @@ mod tests {
         // committer produces for a concurrent burst).
         let temp_b = TempDir::new().unwrap();
         let store_b = MetadataStore::new(temp_b.path().to_path_buf()).unwrap();
+        store_b.use_non_durable_commits_for_test();
         let locations: Vec<_> = (0..500u32).map(make_loc).collect();
         store_b.put_chunk_locations_batch(&locations).unwrap();
         let (live_b, frag_b) = store_b.redb_fragmentation_stats().unwrap();
@@ -5625,6 +5701,23 @@ mod tests {
             "batched writes should fragment far less than per-record commits \
              (per-record: {}B / {:.1}%, batched: {}B / {:.1}%)",
             frag_a, frag_pct_a * 100.0, frag_b, frag_pct_b * 100.0
+        );
+
+        // Store C: the same 500 per-record commits, durable (the default since
+        // 2026-10-06). A durable commit frees its pages for reuse at once, so
+        // per-record durable commits must not rebuild the non-durable churn.
+        let temp_c = TempDir::new().unwrap();
+        let store_c = MetadataStore::new(temp_c.path().to_path_buf()).unwrap();
+        assert!(store_c.durable_commits.load(Ordering::Relaxed));
+        for i in 0..500u32 {
+            store_c.put_chunk_location(&make_loc(i)).unwrap();
+        }
+        let (_, frag_c) = store_c.redb_fragmentation_stats().unwrap();
+        assert!(
+            frag_c * 3 < frag_a,
+            "durable per-record commits should fragment far less than non-durable ones \
+             (non-durable: {}B, durable: {}B)",
+            frag_a, frag_c
         );
     }
 

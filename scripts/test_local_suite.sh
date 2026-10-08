@@ -4788,6 +4788,86 @@ echo "  T55: $T55_PUT_COUNT metadata PUTs over ${T55_ELAPSED}s wall time (bound:
 rm -f "$T55_FILE"
 fi # should_run T55
 
+
+if should_run T78; then
+snapshot_log T78
+echo ""
+echo "=== T78: a bit-flipped replica on disk is never served, and gets repaired ==="
+# Flip bytes in one stored copy of every chunk of a fully-written (never patched) file, then
+# restart the nodes holding those copies so nothing can come from a server's RAM cache.
+# Required: a fresh client reads the original bytes. Then a scrub on those nodes must find
+# every flipped copy ([CORRUPT]), and within 120s every copy left on disk must be good again
+# (byte-identical to the source's slice) with at least 2 per chunk: the bad copy quarantined
+# and replaced by healing, and the corruption never spread to a good one.
+T78_SRC="$BASE/t78_src.bin"
+dd if=/dev/urandom of="$T78_SRC" bs=1M count=12 status=none
+T78_SUM=$(md5sum < "$T78_SRC" | cut -d' ' -f1)
+T78_SLICES=$(for i in 0 1 2; do dd if="$T78_SRC" bs=4M skip=$i count=1 status=none | md5sum | cut -d' ' -f1; done | tr '\n' ' ')
+cp "$T78_SRC" "$MOUNT/t78.bin"
+dfs_sync
+sleep 5
+T78_CHUNKS=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t78.bin 2>/dev/null \
+    | python3 -c "import json,sys; print(' '.join(c['chunk_id'] for c in json.load(sys.stdin)['chunk_locations']))" 2>/dev/null)
+T78_NODES=""
+T78_FLIPPED=0
+for c in $T78_CHUNKS; do
+    v=$(find "$BASE"/node*/data -name "$c" 2>/dev/null | sort | head -1)
+    [ -n "$v" ] || continue
+    python3 -c "
+f=open('$v','r+b'); f.seek(1000); b=bytearray(f.read(64)); f.seek(1000); f.write(bytes(x ^ 0xff for x in b)); f.close()"
+    T78_FLIPPED=$((T78_FLIPPED + 1))
+    T78_NODES="$T78_NODES $(echo "$v" | grep -oP 'node\K[0-9]+')"
+done
+T78_NODES=$(echo $T78_NODES | tr ' ' '\n' | sort -u | tr '\n' ' ')
+echo "  T78: $T78_FLIPPED of $(echo $T78_CHUNKS | wc -w) chunks got one copy flipped; restarting node(s) $T78_NODES"
+for n in $T78_NODES; do
+    pkill -9 -f "dfs-server start --config $BASE/node${n}/config.toml" 2>/dev/null || true
+done
+sleep 1
+for n in $T78_NODES; do
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 DFS_SCRUB_PACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${n}/config.toml" \
+        >> "$LOG/server${n}.log" 2>&1 &
+done
+sleep 8
+T78_FRESH_MNT=/tmp/dfs-mount-fresh
+mkdir -p "$T78_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T78_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t78.log" --allow-other --log-level debug &
+T78_CPID=$!
+sleep 2
+T78_READ=$(timeout 60 md5sum < "$T78_FRESH_MNT/t78.bin" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T78_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T78_CPID"
+[ "$T78_FLIPPED" -gt 0 ] && [ "$T78_READ" = "$T78_SUM" ] \
+    && check "T78a a fresh client reads the original bytes despite a flipped copy of every chunk" PASS \
+    || check "T78a fresh read returned ${T78_READ:-nothing}, expected $T78_SUM (flipped $T78_FLIPPED)" FAIL
+for n in $T78_NODES; do
+    "$BIN/dfs-admin" --cluster "127.0.0.1:$((8899 + n))" storage scrub >/dev/null 2>&1 || true
+done
+t78_state() {   # prints nothing when every chunk is right, else what's still wrong
+    for c in $T78_CHUNKS; do
+        local good=0 bad=0
+        for f in $(find "$BASE"/node*/data -name "$c" 2>/dev/null); do
+            case " $T78_SLICES " in *" $(md5sum < "$f" | cut -d' ' -f1) "*) good=$((good + 1));; *) bad=$((bad + 1));; esac
+        done
+        [ "$bad" -eq 0 ] && [ "$good" -ge 2 ] || printf '%s good=%s bad=%s; ' "${c:0:12}" "$good" "$bad"
+    done
+}
+T78_STATE=x
+for _ in $(seq 1 60); do
+    T78_STATE=$(t78_state)
+    [ -z "$T78_STATE" ] && break
+    sleep 2
+done
+[ -z "$T78_STATE" ] \
+    && check "T78b every flipped copy was repaired or dropped, at least 2 good copies of each chunk" PASS \
+    || check "T78b after 120s: $T78_STATE" FAIL
+T78_CORRUPT=$(cat "$LOG"/server*.log 2>/dev/null | grep "\[CORRUPT\]" | grep -c "quarantined" || true)
+[ "$T78_CORRUPT" -ge "$T78_FLIPPED" ] \
+    && check "T78c every flipped copy was reported [CORRUPT] and quarantined ($T78_CORRUPT)" PASS \
+    || check "T78c only $T78_CORRUPT of $T78_FLIPPED flipped copies reported [CORRUPT]" FAIL
+rm -f "$MOUNT/t78.bin" "$T78_SRC"
+fi # should_run T78
 if should_run T70; then
 snapshot_log T70
 echo ""

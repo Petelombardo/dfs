@@ -653,11 +653,18 @@ async fn handle_storage_command(
             }
         }
         StorageCommands::Scrub => {
-            let response = send_request(cluster_addrs[0], Request::TriggerScrub).await?;
+            // Every node scrubs its own disk, so ask each one.
+            let mut response = Response::Ok { data: None };
+            for addr in cluster_addrs {
+                response = send_request(*addr, Request::TriggerScrub).await?;
+                if !matches!(response, Response::Ok { .. }) {
+                    break;
+                }
+            }
 
             match response {
                 Response::Ok { .. } => {
-                    println!("Scrub triggered successfully");
+                    println!("Scrub triggered on {} node(s)", cluster_addrs.len());
                 }
                 Response::Error { message, .. } => {
                     error!("Error: {}", message);

@@ -237,6 +237,12 @@ pub struct ChunkStorage {
     /// Cache configuration
     cache_capacity_chunks: usize,
 
+    /// Chunks whose on-disk bytes this process has checked against their content-addressed
+    /// id (see verify_on_disk_once). Chunk files are never rewritten in place, so a checked
+    /// id stays checked; bounded so a node with millions of chunks can't grow it without
+    /// limit (an evicted id is simply checked again on its next cold read).
+    verified: Mutex<LruCache<ChunkId, ()>>,
+
     /// Live-maintained index for list_chunks() — see that method's doc comment.
     /// None until the first list_chunks() call populates it via a real directory
     /// walk; Some(set) thereafter, kept correct incrementally by write_chunk /
@@ -350,6 +356,7 @@ impl ChunkStorage {
             data_dir,
             cache,
             cache_capacity_chunks,
+            verified: Mutex::new(LruCache::new(NonZeroUsize::new(262_144).unwrap())),
             list_chunks_cache: parking_lot::RwLock::new(None),
             list_chunks_population_lock: parking_lot::Mutex::new(()),
             coalescer,
@@ -669,6 +676,61 @@ impl ChunkStorage {
             }
             Err(_) => false,
         }
+    }
+
+    /// Check `chunk_id`'s file on disk against its id, once per process: Ok(true) = good
+    /// (now, or already checked), Ok(false) = the bytes don't hash to the id, Err = the file
+    /// couldn't be read. Reads the file itself, never a cache: the caches hold what was
+    /// written or composed, and composed content is cached under patch-token ids, which are
+    /// not content hashes (the 2026-07-23 and 2026-08-03 false "disk corruption" storms).
+    /// Callers pass only ids that are content hashes, with the file_offset and file_id the
+    /// hash was made with (the chunk's ChunkLocation).
+    pub fn verify_on_disk_once(&self, chunk_id: &ChunkId, file_offset: u64, file_id: FileId) -> Result<bool> {
+        if self.verified.lock().unwrap().get(chunk_id).is_some() {
+            return Ok(true);
+        }
+        let path = self.get_chunk_path(chunk_id);
+        let data = fs::read(&path).with_context(|| format!("Failed to read chunk file for verification: {:?}", path))?;
+        if dfs_common::compute_chunk_hash_at(&data, file_offset, file_id) != chunk_id.hash {
+            return Ok(false);
+        }
+        self.verified.lock().unwrap().put(*chunk_id, ());
+        Ok(true)
+    }
+
+    /// The scrub's check: like verify_on_disk_once but always re-reads (rot can set in after
+    /// a first check), and hashes on this one thread. compute_chunk_hash_at's rayon would
+    /// take every core of a 4-core storage node for a background pass; this is the same hash.
+    pub fn verify_on_disk_for_scrub(&self, chunk_id: &ChunkId, file_offset: u64, file_id: FileId) -> Result<bool> {
+        let path = self.get_chunk_path(chunk_id);
+        let data = fs::read(&path).with_context(|| format!("Failed to read chunk file for scrub: {:?}", path))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(file_id.0.as_bytes());
+        hasher.update(&file_offset.to_le_bytes());
+        hasher.update(&data);
+        let good = *hasher.finalize().as_bytes() == chunk_id.hash;
+        if good {
+            self.verified.lock().unwrap().put(*chunk_id, ());
+        }
+        Ok(good)
+    }
+
+    /// Move a chunk file whose bytes failed verification out of the chunk tree, into
+    /// `<data_dir>/quarantine/`, kept for inspection rather than deleted. To the rest of
+    /// the node it is gone exactly as after delete_chunk (cache and presence index too), so
+    /// healing sees a missing replica and copies a good one back.
+    pub fn quarantine_chunk(&self, chunk_id: &ChunkId) -> Result<PathBuf> {
+        let path = self.get_chunk_path(chunk_id);
+        let dir = self.data_dir.join("quarantine");
+        fs::create_dir_all(&dir).with_context(|| format!("Failed to create {:?}", dir))?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let dest = dir.join(format!("{}.{}", chunk_id, now));
+        fs::rename(&path, &dest).with_context(|| format!("Failed to quarantine {:?}", path))?;
+        self.verified.lock().unwrap().pop(chunk_id);
+        self.invalidate_cache(chunk_id);
+        self.forget_chunk_in_index(chunk_id);
+        Ok(dest)
     }
 
     /// Check if a chunk exists in local storage
@@ -1046,6 +1108,39 @@ mod tests {
     use super::*;
     use dfs_common::compute_chunk_hash;
     use tempfile::TempDir;
+
+    /// Suite T78: bit rot on disk must be found by the hash check, not served, and the copy
+    /// quarantined so the node no longer claims it (cache and presence index included).
+    #[test]
+    fn rotted_chunk_fails_verification_and_quarantine_removes_it_everywhere() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = ChunkStorage::new(temp_dir.path().to_path_buf()).unwrap();
+        let file_id = FileId::new();
+        let offset = 4 * 1024 * 1024;
+        let data = vec![0x5au8; 64 * 1024];
+        let good = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&data, offset, file_id));
+        storage.write_chunk(&good, &data).unwrap();
+        assert!(storage.verify_on_disk_once(&good, offset, file_id).unwrap());
+        assert!(storage.verify_on_disk_for_scrub(&good, offset, file_id).unwrap());
+
+        // A second chunk, correctly named for its bytes, then one byte rots on disk.
+        let data2 = vec![0x33u8; 64 * 1024];
+        let bad = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&data2, offset, file_id));
+        storage.write_chunk(&bad, &data2).unwrap();
+        let mut rotted = data2.clone();
+        rotted[1000] ^= 0xff;
+        std::fs::write(storage.get_chunk_path(&bad), &rotted).unwrap();
+        assert!(storage.list_chunks().unwrap().contains(&bad), "precondition: indexed");
+        assert!(!storage.verify_on_disk_once(&bad, offset, file_id).unwrap(), "rot must fail the check");
+        assert!(!storage.verify_on_disk_for_scrub(&bad, offset, file_id).unwrap());
+
+        let dest = storage.quarantine_chunk(&bad).unwrap();
+        assert!(dest.exists() && dest.starts_with(temp_dir.path().join("quarantine")));
+        assert!(!storage.has_chunk(&bad));
+        assert!(!storage.list_chunks().unwrap().contains(&bad), "presence index must forget it");
+        assert!(storage.read_chunk(&bad).is_err(), "no cached copy may still be served");
+        assert!(storage.has_chunk(&good), "other chunks untouched");
+    }
 
     #[test]
     fn test_write_and_read_chunk() {

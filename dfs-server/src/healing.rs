@@ -3344,6 +3344,11 @@ impl HealingManager {
 
         // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
         let mut work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = Vec::new();
+        // Every chunk this pass probed, with the holders it confirmed and whether it is
+        // off-RF. drain_heal_queue heals whatever is pending from alive_nodes_cache, not
+        // only what lands in `work`, so the cache must take this pass's answer for chunks
+        // held back (push-failure backoff, healing delay, stalled) too.
+        let mut observed_alive: Vec<(ChunkId, Vec<NodeId>, bool)> = Vec::new();
         let mut pending_count = 0;
 
         // Pending DB writes — applied in a single spawn_blocking after all classification.
@@ -3821,6 +3826,7 @@ impl HealingManager {
             } else {
                 ReplicationStatus::Ok
             };
+            observed_alive.push((chunk_id, confirmed_alive_nodes.clone(), status != ReplicationStatus::Ok));
 
             match status {
                 ReplicationStatus::UnderReplicated => {
@@ -3980,8 +3986,21 @@ impl HealingManager {
         // Update alive_nodes_cache so drain_heal_queue can read fresh presence data
         // without waiting for another scan. Under-replicated and over-replicated chunks
         // both need this; drain_heal_queue() reads the cache for all work it executes.
+        //
+        // That includes chunks this pass held back rather than queued: drain_heal_queue
+        // heals every due pending chunk from the cache. Refreshing only `work` left a
+        // chunk in push-failure backoff on the holder list from before its corrupt copy
+        // was quarantined, so every drain asked the node that no longer had it, and the
+        // chunk stayed at one good copy (suite T78b, 2026-10-08). An at-RF chunk only
+        // refreshes an entry that already exists, so the cache doesn't grow with every
+        // healthy chunk.
         {
             let mut cache = self.alive_nodes_cache.write().await;
+            for (chunk_id, confirmed_alive, off_rf) in observed_alive {
+                if off_rf || cache.contains_key(&chunk_id) {
+                    cache.insert(chunk_id, confirmed_alive);
+                }
+            }
             for (chunk_id, _status, confirmed_alive) in &work {
                 cache.insert(*chunk_id, confirmed_alive.clone());
             }
@@ -4577,6 +4596,8 @@ impl HealingManager {
             }
         }
 
+        let committed_holders: Vec<(ChunkId, Vec<NodeId>)> =
+            puts.iter().map(|l| (l.chunk_id, l.nodes.clone())).collect();
         let commit_ok = match self.metadata
             .batch_update_chunk_locations_async(puts, deletes, pending_clears.clone())
             .await
@@ -4587,6 +4608,19 @@ impl HealingManager {
                 false
             }
         };
+
+        // A committed put is the healer's newest word on who holds the chunk: a holder
+        // it found without the chunk is gone from it, a target it filled is in it. The
+        // next drain reads alive_nodes_cache, so without this it asked the missing
+        // holder again every cycle until a discovery pass happened to refresh the entry.
+        if commit_ok && !committed_holders.is_empty() {
+            let mut cache = self.alive_nodes_cache.write().await;
+            for (chunk_id, nodes) in committed_holders {
+                if let Some(entry) = cache.get_mut(&chunk_id) {
+                    *entry = nodes;
+                }
+            }
+        }
 
         // In-memory pending_healing clear happens regardless of commit success,
         // matching the old per-chunk behavior (clear_pending_static ran even when
@@ -7911,6 +7945,82 @@ mod tests {
             "a manual trigger must discover a never-before-seen under-replicated chunk \
              even when pending_healing already has unrelated entries in it — a fast \
              scan can never find this, only a deep one"
+        );
+    }
+
+    /// One under-replicated chunk this node holds, referenced by a live file — the
+    /// shape a deep discovery pass classifies rather than skips.
+    fn seed_under_replicated_chunk(
+        storage: &ChunkStorage, metadata: &MetadataStore, node_id: NodeId, tag: &[u8],
+    ) -> ChunkLocation {
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(tag));
+        storage.write_chunk(&chunk_id, b"some real chunk data").unwrap();
+        let mut file_meta = FileMetadata::new(format!("/{}.bin", chunk_id), FileType::RegularFile);
+        file_meta.size = 21;
+        let location = ChunkLocation {
+            chunk_id, nodes: vec![node_id], size: 21, checksum: chunk_id.hash, file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp() * 1000),
+            client_write_seq: None, file_id: Some(file_meta.id),
+        };
+        metadata.put_chunk_location(&location).unwrap();
+        file_meta.chunk_locations = Arc::new(vec![location.clone()]);
+        metadata.put_file(&file_meta).unwrap();
+        location
+    }
+
+    /// Suite T78b, 2026-10-08: a corrupt copy was quarantined after the healer had
+    /// cached its node as a holder. The push from it failed, which armed the
+    /// push-failure backoff, so discovery held the chunk back instead of queueing it —
+    /// and refreshed alive_nodes_cache only for what it queued. drain_heal_queue kept
+    /// healing from the stale entry, asking the node that no longer had the chunk every
+    /// 15 s, and the chunk never got its second good copy back.
+    #[tokio::test]
+    async fn discovery_refreshes_holders_of_a_chunk_it_holds_back() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let location = seed_under_replicated_chunk(&storage, &metadata, node_id, b"held-back-stale-holder");
+        let chunk_id = location.chunk_id;
+
+        let quarantined_holder = NodeId::new();
+        healing.alive_nodes_cache.write().await.insert(chunk_id, vec![quarantined_holder, node_id]);
+        healing.heal_push_failure.insert(chunk_id, (Instant::now(), 1));
+
+        healing.run_discovery_pass(true).await.unwrap();
+
+        assert_eq!(
+            healing.alive_nodes_cache.read().await.get(&chunk_id),
+            Some(&vec![node_id]),
+            "discovery must replace a held-back chunk's cached holders with the ones it just confirmed"
+        );
+    }
+
+    /// The healer's own NotFound from a source commits a location without that holder;
+    /// the next drain must not pick the same missing source from alive_nodes_cache.
+    #[tokio::test]
+    async fn a_committed_heal_outcome_updates_the_cached_holders() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let location = seed_under_replicated_chunk(&storage, &metadata, node_id, b"dropped-holder-outcome");
+        let chunk_id = location.chunk_id;
+
+        let missing_holder = NodeId::new();
+        healing.alive_nodes_cache.write().await.insert(chunk_id, vec![missing_holder, node_id]);
+
+        let mut outcomes = vec![HealOutcome {
+            chunk_id,
+            location_put: Some(location),
+            location_delete: None,
+            clear_pending: false,
+            broadcast: false,
+        }];
+        healing.flush_heal_outcomes(&mut outcomes).await;
+
+        assert_eq!(
+            healing.alive_nodes_cache.read().await.get(&chunk_id),
+            Some(&vec![node_id]),
+            "a committed heal outcome must replace the cached holders the next drain heals from"
         );
     }
 

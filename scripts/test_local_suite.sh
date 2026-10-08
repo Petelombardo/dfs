@@ -174,6 +174,212 @@ GOT=$(cat "$MOUNT/t1.txt")
 [ "$GOT" = "hello distributed world" ] && check "T1 small write/read" PASS || check "T1 small write/read (got: $GOT)" FAIL
 fi # should_run T1
 
+if should_run T79; then
+snapshot_log T79
+echo ""
+echo "=== T79: one node's disk fills up (ENOSPC): writes still land, it stays up, and recovers once space is freed ==="
+# A real full filesystem, not an injected error: ENOSPC hits chunk writes AND the node's
+# redb metadata commits. node3's whole directory moves onto a small loop-mounted ext4,
+# which is then filled to ~8 MB free. Runs right after T1, while node3 holds only a few MB:
+# placed after T77 it needed ~3 GB extra (node3's ~1.5 GB, copied and imaged) and filled
+# the dev box's disk mid-suite (2026-10-08).
+T79_N=3
+T79_DIR="$BASE/node$T79_N"
+T79_IMG="$BASE/t79.img"
+T79_SAVE="$BASE/t79_save"
+t79_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T79_DIR/config.toml" \
+        >> "$LOG/server${T79_N}.log" 2>&1 &
+}
+t79_stop() {
+    pkill -9 -f "dfs-server start --config $T79_DIR/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null || break; sleep 0.1; done
+}
+t79_stop
+rm -rf "$T79_SAVE"; mv "$T79_DIR" "$T79_SAVE"; mkdir "$T79_DIR"   # a rename: no copy on disk
+T79_USED=$(du -sm "$T79_SAVE" | cut -f1)
+truncate -s $(( T79_USED + 160 ))M "$T79_IMG"
+mkfs.ext4 -q -F -m 0 "$T79_IMG" >/dev/null 2>&1
+T79_MOUNTED=0
+if ! mount -o loop "$T79_IMG" "$T79_DIR" 2>/dev/null; then
+    rmdir "$T79_DIR"; mv "$T79_SAVE" "$T79_DIR"   # couldn't mount: put it back as it was
+else
+    T79_MOUNTED=1
+    cp -a "$T79_SAVE"/. "$T79_DIR"/
+    rm -rf "$T79_SAVE"
+    T79_AVAIL=$(df -Pm "$T79_DIR" | awk 'NR==2{print $4}')
+    fallocate -l $(( T79_AVAIL - 8 ))M "$T79_DIR/filler" 2>/dev/null || true
+fi
+echo "  T79: node$T79_N on a loop fs, $(df -Pm "$T79_DIR" | awk 'NR==2{print $4}') MB free"
+t79_start
+sleep 8
+# Which nodes take a file's chunks depends on placement, so keep writing new 16 MB files
+# (fsync each) until the full node has refused at least one write: only then has the
+# write path met a full replica. Each file must be written without error.
+T79_RC=0
+T79_FILES=0
+T79_SUMS=""
+for i in $(seq 1 16); do
+    dd if=/dev/urandom of="$BASE/t79_src.bin" bs=1M count=16 status=none
+    T79_SUMS="$T79_SUMS $(md5sum < "$BASE/t79_src.bin" | cut -d' ' -f1)"
+    timeout 120 dd if="$BASE/t79_src.bin" of="$MOUNT/t79_$i.bin" bs=1M conv=fsync status=none 2>"$LOG/t79_dd.err" || { T79_RC=$?; break; }
+    T79_FILES=$i
+    T79_FULL_ERRS=$(grep -ci "no space left\|os error 28" "$LOG/server${T79_N}.log" || true)
+    [ "$T79_FULL_ERRS" -gt 0 ] && break
+done
+rm -f "$BASE/t79_src.bin"
+T79_FULL_ERRS=$(grep -ci "no space left\|os error 28" "$LOG/server${T79_N}.log" || true)
+echo "  T79: $T79_FILES file(s) of 16 MB written (rc=$T79_RC), node$T79_N refused $T79_FULL_ERRS write(s) with ENOSPC $(head -c 200 "$LOG/t79_dd.err")"
+[ "$T79_MOUNTED" = 1 ] && [ "$T79_RC" = 0 ] && [ "$T79_FULL_ERRS" -gt 0 ] \
+    && check "T79a fsynced writes complete while one node's disk is full (it refused $T79_FULL_ERRS)" PASS \
+    || check "T79a rc=$T79_RC after $T79_FILES file(s), node$T79_N refused $T79_FULL_ERRS (mounted=$T79_MOUNTED; 0 = the full node was never asked): $(head -c 200 "$LOG/t79_dd.err")" FAIL
+pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null \
+    && ! grep -q "panicked" "$LOG/server${T79_N}.log" \
+    && check "T79b the full node stayed up, no panic" PASS \
+    || check "T79b the full node died or panicked (see server${T79_N}.log)" FAIL
+# Free the space and restart it: its metadata db must reopen, and it must rejoin.
+rm -f "$T79_DIR/filler"
+t79_stop
+T79_MARK=$(wc -l < "$LOG/server${T79_N}.log")
+t79_start
+sleep 10
+T79_FRESH_MNT=/tmp/dfs-mount-fresh
+mkdir -p "$T79_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T79_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t79.log" --allow-other --log-level debug &
+T79_CPID=$!
+sleep 2
+T79_READ=$(for i in $(seq 1 "$T79_FILES"); do timeout 60 md5sum < "$T79_FRESH_MNT/t79_$i.bin" 2>/dev/null | cut -d' ' -f1; done | tr '\n' ' ')
+fusermount -u "$T79_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T79_CPID"
+T79_EXPECT=$(echo $T79_SUMS | tr ' ' '\n' | head -n "$T79_FILES" | tr '\n' ' ')
+[ "$T79_FILES" -gt 0 ] && [ "$T79_READ" = "$T79_EXPECT" ] \
+    && check "T79c after space is freed, a fresh client reads every file intact" PASS \
+    || check "T79c fresh reads [$T79_READ] expected [$T79_EXPECT]" FAIL
+T79_RESTART_LOG=$(tail -n +"$((T79_MARK + 1))" "$LOG/server${T79_N}.log")
+pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null \
+    && ! echo "$T79_RESTART_LOG" | grep -qi "panicked\|failed to open metadata\|corrupt" \
+    && check "T79d the node restarts cleanly on the disk it filled (metadata db opens)" PASS \
+    || check "T79d node$T79_N did not restart cleanly: $(echo "$T79_RESTART_LOG" | grep -i "panicked\|failed to open\|corrupt\|error" | head -2 | cut -c1-200)" FAIL
+# Put node3 back on the ordinary disk with what it has now.
+t79_stop
+if [ "$T79_MOUNTED" = 1 ]; then
+    rm -rf "$T79_SAVE"; mkdir -p "$T79_SAVE"; cp -a "$T79_DIR"/. "$T79_SAVE"/
+    umount "$T79_DIR" 2>/dev/null || umount -l "$T79_DIR"
+    rmdir "$T79_DIR"; mv "$T79_SAVE" "$T79_DIR"
+fi
+rm -rf "$T79_SAVE" "$T79_IMG"
+t79_start
+sleep 5
+rm -f "$MOUNT"/t79_*.bin
+fi # should_run T79
+
+if should_run T80; then
+snapshot_log T80
+echo ""
+echo "=== T80: the LEADER's disk fills up: no fsync is acked unless it is durable, and writes resume once space is freed ==="
+# The leader commits every file record. While its disk is full those commits fail. The
+# leader used to ack a metadata put before committing it, and redb refuses every write
+# after one I/O error until reopened, so an fsynced 16 MB write read back EMPTY after
+# recovery (seen in T79, 2026-10-08, when the full node happened to be the leader).
+# Required: whatever was acked reads back intact; after space is freed (no restart)
+# writes work again.
+T80_ADDR=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[0]['address'] if online else '')
+" 2>/dev/null)
+T80_N=$(( ${T80_ADDR##*:} - 8899 ))
+T80_DIR="$BASE/node$T80_N"
+T80_IMG="$BASE/t80.img"
+T80_SAVE="$BASE/t80_save"
+t80_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T80_DIR/config.toml" \
+        >> "$LOG/server${T80_N}.log" 2>&1 &
+}
+t80_stop() {
+    pkill -9 -f "dfs-server start --config $T80_DIR/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $T80_DIR/config.toml" >/dev/null || break; sleep 0.1; done
+}
+echo "  T80: leader is node$T80_N ($T80_ADDR)"
+t80_stop
+rm -rf "$T80_SAVE"; mv "$T80_DIR" "$T80_SAVE"; mkdir "$T80_DIR"
+truncate -s $(( $(du -sm "$T80_SAVE" | cut -f1) + 160 ))M "$T80_IMG"
+mkfs.ext4 -q -F -m 0 "$T80_IMG" >/dev/null 2>&1
+T80_MOUNTED=0
+if ! mount -o loop "$T80_IMG" "$T80_DIR" 2>/dev/null; then
+    rmdir "$T80_DIR"; mv "$T80_SAVE" "$T80_DIR"
+else
+    T80_MOUNTED=1
+    cp -a "$T80_SAVE"/. "$T80_DIR"/
+    rm -rf "$T80_SAVE"
+fi
+t80_start
+sleep 8
+# Fill only now: the node restarted with space, is the leader again (lowest id), and its
+# peers see it healthy. The fs has no root-reserved blocks (-m 0): the servers run as
+# root, and ext4's default 5% reserve let them keep writing on a "full" disk.
+T80_AVAIL=$(df -Pm "$T80_DIR" | awk 'NR==2{print $4}')
+if [ "$T80_MOUNTED" = 1 ]; then
+    fallocate -l $(( T80_AVAIL - 2 ))M "$T80_DIR/filler" 2>/dev/null
+    dd if=/dev/zero of="$T80_DIR/filler2" bs=64K status=none 2>/dev/null || true   # the last bytes too
+fi
+echo "  T80: node$T80_N $(df -Pm "$T80_DIR" | awk 'NR==2{print $4}') MB free"
+T80_ACKED=""
+T80_SUMS=""
+for i in 1 2 3; do
+    dd if=/dev/urandom of="$BASE/t80_src.bin" bs=1M count=16 status=none
+    sum=$(md5sum < "$BASE/t80_src.bin" | cut -d' ' -f1)
+    # fsync waits up to 60s for the leader to commit, then reports EIO: never acked unless durable.
+    if timeout 90 dd if="$BASE/t80_src.bin" of="$MOUNT/t80_$i.bin" bs=1M conv=fsync status=none 2>/dev/null; then
+        T80_ACKED="$T80_ACKED $i"; T80_SUMS="$T80_SUMS $i:$sum"
+    fi
+done
+T80_COMMIT_FAILS=$(grep -c "group commit.*No space left\|os error 28" "$LOG/server${T80_N}.log" || true)
+echo "  T80: acked while the leader was full:${T80_ACKED:- none}; ENOSPC on the leader: $T80_COMMIT_FAILS"
+# Free the space WITHOUT restarting: the store must recover on its own.
+rm -f "$T80_DIR/filler" "$T80_DIR/filler2"
+sleep 10
+dd if=/dev/urandom of="$BASE/t80_src.bin" bs=1M count=4 status=none
+T80_AFTER_SUM=$(md5sum < "$BASE/t80_src.bin" | cut -d' ' -f1)
+T80_AFTER_RC=0
+timeout 60 dd if="$BASE/t80_src.bin" of="$MOUNT/t80_after.bin" bs=1M conv=fsync status=none 2>/dev/null || T80_AFTER_RC=$?
+sleep 3
+T80_FRESH_MNT=/tmp/dfs-mount-fresh
+mkdir -p "$T80_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T80_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t80.log" --allow-other --log-level debug &
+T80_CPID=$!
+sleep 2
+T80_BAD=""
+for pair in $T80_SUMS; do
+    i=${pair%%:*}; want=${pair#*:}
+    got=$(timeout 60 md5sum < "$T80_FRESH_MNT/t80_$i.bin" 2>/dev/null | cut -d' ' -f1)
+    [ "$got" = "$want" ] || T80_BAD="$T80_BAD t80_$i.bin(${got:-unreadable})"
+done
+T80_AFTER_READ=$(timeout 60 md5sum < "$T80_FRESH_MNT/t80_after.bin" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T80_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T80_CPID"
+[ "$T80_MOUNTED" = 1 ] && [ "$T80_COMMIT_FAILS" -gt 0 ] && [ -z "$T80_BAD" ] \
+    && check "T80a every write acked while the leader's disk was full reads back intact (acked:${T80_ACKED:- none})" PASS \
+    || check "T80a acked but not intact:${T80_BAD:- none} (mounted=$T80_MOUNTED, leader ENOSPC=$T80_COMMIT_FAILS; 0 = the leader never hit ENOSPC)" FAIL
+[ "$T80_AFTER_RC" = 0 ] && [ "$T80_AFTER_READ" = "$T80_AFTER_SUM" ] \
+    && check "T80b once space is freed, without a restart, an fsynced write lands and reads back" PASS \
+    || check "T80b after freeing space: write rc=$T80_AFTER_RC, read ${T80_AFTER_READ:-failed} vs $T80_AFTER_SUM" FAIL
+# Back onto the ordinary disk.
+t80_stop
+if [ "$T80_MOUNTED" = 1 ]; then
+    rm -rf "$T80_SAVE"; mkdir -p "$T80_SAVE"; cp -a "$T80_DIR"/. "$T80_SAVE"/
+    umount "$T80_DIR" 2>/dev/null || umount -l "$T80_DIR"
+    rmdir "$T80_DIR"; mv "$T80_SAVE" "$T80_DIR"
+fi
+rm -rf "$T80_SAVE" "$T80_IMG" "$BASE/t80_src.bin"
+t80_start
+sleep 5
+rm -f "$MOUNT"/t80_*.bin
+fi # should_run T80
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then
@@ -7183,90 +7389,6 @@ T78_CORRUPT=$(cat "$LOG"/server*.log 2>/dev/null | grep "\[CORRUPT\]" | grep -c 
     || check "T78c only $T78_CORRUPT of $T78_FLIPPED flipped copies reported [CORRUPT]" FAIL
 rm -f "$MOUNT/t78.bin" "$T78_SRC"
 fi # should_run T78
-
-if should_run T79; then
-snapshot_log T79
-echo ""
-echo "=== T79: one node's disk fills up (ENOSPC): writes still land, it stays up, and recovers once space is freed ==="
-# A real full filesystem, not an injected error: ENOSPC hits chunk writes AND the node's
-# redb metadata commits. node3's whole directory moves onto a small loop-mounted ext4,
-# which is then filled to ~8 MB free.
-T79_N=3
-T79_DIR="$BASE/node$T79_N"
-T79_IMG="$BASE/t79.img"
-T79_SAVE="$BASE/t79_save"
-t79_start() {
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T79_DIR/config.toml" \
-        >> "$LOG/server${T79_N}.log" 2>&1 &
-}
-t79_stop() {
-    pkill -9 -f "dfs-server start --config $T79_DIR/config.toml" 2>/dev/null || true
-    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null || break; sleep 0.1; done
-}
-t79_stop
-rm -rf "$T79_SAVE"; cp -a "$T79_DIR" "$T79_SAVE"
-T79_USED=$(du -sm "$T79_DIR" | cut -f1)
-truncate -s $(( T79_USED + 160 ))M "$T79_IMG"
-mkfs.ext4 -q -F "$T79_IMG" >/dev/null 2>&1
-T79_MOUNTED=0
-if mount -o loop "$T79_IMG" "$T79_DIR" 2>/dev/null; then
-    T79_MOUNTED=1
-    cp -a "$T79_SAVE"/. "$T79_DIR"/
-    T79_AVAIL=$(df -Pm "$T79_DIR" | awk 'NR==2{print $4}')
-    fallocate -l $(( T79_AVAIL - 8 ))M "$T79_DIR/filler" 2>/dev/null || true
-fi
-echo "  T79: node$T79_N on a loop fs, $(df -Pm "$T79_DIR" | awk 'NR==2{print $4}') MB free"
-t79_start
-sleep 8
-T79_SRC="$BASE/t79_src.bin"
-dd if=/dev/urandom of="$T79_SRC" bs=1M count=64 status=none
-T79_SUM=$(md5sum < "$T79_SRC" | cut -d' ' -f1)
-T79_RC=0
-timeout 180 dd if="$T79_SRC" of="$MOUNT/t79.bin" bs=1M conv=fsync status=none 2>"$LOG/t79_dd.err" || T79_RC=$?
-echo "  T79: 64 MB fsynced write rc=$T79_RC $(head -c 200 "$LOG/t79_dd.err")"
-T79_FULL_ERRS=$(grep -ci "no space left\|ENOSPC\|StorageFull\|os error 28" "$LOG/server${T79_N}.log" || true)
-[ "$T79_MOUNTED" = 1 ] && [ "$T79_RC" = 0 ] \
-    && check "T79a a 64 MB fsynced write completes while one node's disk is full ($T79_FULL_ERRS ENOSPC-type log lines on it)" PASS \
-    || check "T79a write rc=$T79_RC with node$T79_N full (mounted=$T79_MOUNTED): $(head -c 200 "$LOG/t79_dd.err")" FAIL
-pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null \
-    && ! grep -q "panicked" "$LOG/server${T79_N}.log" \
-    && check "T79b the full node stayed up, no panic" PASS \
-    || check "T79b the full node died or panicked (see server${T79_N}.log)" FAIL
-# Free the space and restart it: its metadata db must reopen, and it must rejoin.
-rm -f "$T79_DIR/filler"
-t79_stop
-T79_MARK=$(wc -l < "$LOG/server${T79_N}.log")
-t79_start
-sleep 10
-T79_FRESH_MNT=/tmp/dfs-mount-fresh
-mkdir -p "$T79_FRESH_MNT"
-RUST_LOG=info "$BIN/dfs-client" mount "$T79_FRESH_MNT" --cluster "$CLUSTER" \
-    --log-file "$LOG/client_t79.log" --allow-other --log-level debug &
-T79_CPID=$!
-sleep 2
-T79_READ=$(timeout 60 md5sum < "$T79_FRESH_MNT/t79.bin" 2>/dev/null | cut -d' ' -f1)
-fusermount -u "$T79_FRESH_MNT" 2>/dev/null || true
-kill_client_and_wait "$T79_CPID"
-[ "$T79_READ" = "$T79_SUM" ] \
-    && check "T79c after space is freed, a fresh client reads the file intact" PASS \
-    || check "T79c fresh read ${T79_READ:-failed}, expected $T79_SUM" FAIL
-T79_RESTART_LOG=$(tail -n +"$((T79_MARK + 1))" "$LOG/server${T79_N}.log")
-pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null \
-    && ! echo "$T79_RESTART_LOG" | grep -qi "panicked\|failed to open metadata\|corrupt" \
-    && check "T79d the node restarts cleanly on the disk it filled (metadata db opens)" PASS \
-    || check "T79d node$T79_N did not restart cleanly: $(echo "$T79_RESTART_LOG" | grep -i "panicked\|failed to open\|corrupt\|error" | head -2 | cut -c1-200)" FAIL
-# Put node3 back on the ordinary disk with what it has now.
-t79_stop
-if [ "$T79_MOUNTED" = 1 ]; then
-    rm -rf "$T79_SAVE"; mkdir -p "$T79_SAVE"; cp -a "$T79_DIR"/. "$T79_SAVE"/
-    umount "$T79_DIR" 2>/dev/null || umount -l "$T79_DIR"
-    rm -rf "$T79_DIR"/*; cp -a "$T79_SAVE"/. "$T79_DIR"/
-fi
-rm -rf "$T79_SAVE" "$T79_IMG" "$T79_SRC"
-t79_start
-sleep 5
-rm -f "$MOUNT/t79.bin"
-fi # should_run T79
 
 
 if should_run T70; then

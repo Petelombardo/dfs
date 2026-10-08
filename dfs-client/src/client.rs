@@ -519,6 +519,10 @@ pub struct MetadataQueue {
     /// not be confused with) a NEW leader's own dissemination catch-up lag, which is
     /// a different, already-handled concern.
     delivered_write_seq: DashMap<FileId, u64>,
+    /// File size in the newest push confirmed per file (see mark_delivered). fsync compares
+    /// against it: a file whose size grew since must send its metadata in that fsync, not
+    /// after the 500 ms debounce, or the acked size isn't durable anywhere yet (suite T79).
+    delivered_size: DashMap<FileId, u64>,
 }
 
 struct MetadataEntry {
@@ -543,6 +547,7 @@ impl MetadataQueue {
             max_age: Duration::from_secs(24),
             deleted_ids: DashSet::new(),
             delivered_write_seq: DashMap::new(),
+            delivered_size: DashMap::new(),
         })
     }
 
@@ -550,10 +555,18 @@ impl MetadataQueue {
     /// see delivered_write_seq's doc comment. Called by the queue worker after every
     /// successful PutFileMetadata response (Ok or ResyncMetadataRequested — both mean
     /// the push was persisted).
-    fn mark_delivered(&self, file_id: FileId, write_seq: u64) {
-        self.delivered_write_seq.entry(file_id)
+    fn mark_delivered(&self, file_id: FileId, write_seq: u64, size: u64) {
+        let newest = *self.delivered_write_seq.entry(file_id)
             .and_modify(|v| *v = (*v).max(write_seq))
             .or_insert(write_seq);
+        if write_seq >= newest {
+            self.delivered_size.insert(file_id, size);
+        }
+    }
+
+    /// The file size the leader last confirmed for `file_id`, if any push was confirmed.
+    pub fn delivered_size(&self, file_id: &FileId) -> Option<u64> {
+        self.delivered_size.get(file_id).map(|v| *v)
     }
 
     /// Enqueue an async metadata update (fire-and-forget, no confirmation).
@@ -598,16 +611,29 @@ impl MetadataQueue {
 
     /// Enqueue a metadata update and wait for the worker to confirm delivery.
     /// Retries indefinitely — returns only when the leader acks. Used by release().
-    pub async fn push_and_wait(&self, metadata: FileMetadata) {
+    /// Queue `metadata` and wait for the leader to confirm it committed. True once it has;
+    /// false after METADATA_COMMIT_WAIT without a confirmation. The push stays queued and the
+    /// worker keeps retrying it: only this waiter gives up, so an fsync can report EIO instead
+    /// of hanging forever behind a leader that can't commit (its disk full: suite T80, where
+    /// the old "never give up" left dd stuck in fsync for half an hour).
+    pub async fn push_and_wait(&self, metadata: FileMetadata) -> bool {
+        const METADATA_COMMIT_WAIT: Duration = Duration::from_secs(60);
         let path = metadata.path.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
         self.push_inner(metadata, Some(tx), false).await;
-        // Await confirmation from the worker. Log every 5s so stalls are visible;
-        // never give up — the data is safely replicated, we just need metadata to land.
+        // Log every 5s so stalls are visible.
         let start = std::time::Instant::now();
         loop {
             match tokio::time::timeout(Duration::from_secs(5), &mut rx).await {
-                Ok(_) => break,
+                Ok(_) => return true,
+                Err(_) if start.elapsed() >= METADATA_COMMIT_WAIT => {
+                    error!(
+                        "flush_metadata_sync: metadata for {} not confirmed after {}s — failing \
+                         this flush (still queued; delivered when the leader can commit)",
+                        path, start.elapsed().as_secs()
+                    );
+                    return false;
+                }
                 Err(_) => {
                     warn!(
                         "flush_metadata_sync: waiting {}s for metadata delivery of {} — \
@@ -6791,22 +6817,26 @@ leader_addr: Arc::new(RwLock::new(None)),
             let (r1, r2) = tokio::join!(t1, t2);
             let n1_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r1 {
-                // A replica that ANSWERS with an error (its disk is full, an I/O error) failed
-                // just as much as one that didn't answer: take the next candidate for it. It used
-                // to count as a success, so the write bailed below without trying anyone else
-                // and one full node turned every fresh write through it into EIO (suite T79).
-                Ok(Ok(Response::Error { message, .. })) => { warn!("Parallel replica write refused by {}: {}, will retry serially", n1, message); }
+                // A replica whose own storage failed (IOError: its disk is full, an I/O error)
+                // failed just as much as one that didn't answer: take the next candidate for it.
+                // It used to count as a success, so the write bailed below without trying anyone
+                // else and one full node turned every fresh write through it into EIO (suite T79).
+                // Other refusals still end the write here for the caller's retry path: falling
+                // back on those too stalled writers after a cluster restart (T76c).
+                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n1, message); }
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
             }
             let n2_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r2 {
-                // A replica that ANSWERS with an error (its disk is full, an I/O error) failed
-                // just as much as one that didn't answer: take the next candidate for it. It used
-                // to count as a success, so the write bailed below without trying anyone else
-                // and one full node turned every fresh write through it into EIO (suite T79).
-                Ok(Ok(Response::Error { message, .. })) => { warn!("Parallel replica write refused by {}: {}, will retry serially", n2, message); }
+                // A replica whose own storage failed (IOError: its disk is full, an I/O error)
+                // failed just as much as one that didn't answer: take the next candidate for it.
+                // It used to count as a success, so the write bailed below without trying anyone
+                // else and one full node turned every fresh write through it into EIO (suite T79).
+                // Other refusals still end the write here for the caller's retry path: falling
+                // back on those too stalled writers after a cluster restart (T76c).
+                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n2, message); }
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
@@ -6850,8 +6880,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             ).await;
 
             match result {
-                Ok(Ok(Response::Error { message, .. })) => {
-                    warn!("Chunk replica write refused by {}: {}, trying next node", node, message);
+                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => {
+                    warn!("Chunk replica write failed on {}'s storage: {}, trying next node", node, message);
                 }
                 Ok(Ok(response)) => {
                     debug!("Chunk replica write succeeded to {}", node);
@@ -9444,7 +9474,8 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// confirms delivery to the leader — retries indefinitely, no timeout.
     /// The FUSE thread is parked in block_on but tokio worker threads keep running,
     /// so the metadata queue worker proceeds without starvation.
-    pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) {
+    /// True once the leader confirmed this file's metadata committed (see push_and_wait).
+    pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) -> bool {
         {
             let chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
             debug!("[SIZE TRACE] flush_metadata_sync path={} id={} seq={} chunks={} chunk0_size={:?} pending_chunk_locations_for_this_file={}",
@@ -9535,7 +9566,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         self.drain_ordered_locations(Some(metadata.id), Duration::from_secs(1)).await;
 
         let stamped = self.stamp_write_seq(metadata);
-        self.metadata_queue.push_and_wait(stamped).await;
+        self.metadata_queue.push_and_wait(stamped).await
     }
 
     /// Shutdown-time flush of pending_chunk_locations, plus a LOUD report of anything
@@ -9808,7 +9839,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     entry.metadata.path, entry.metadata.id,
                                     entry.metadata.write_seq, entry.metadata.size
                                 );
-                                client.metadata_queue.mark_delivered(entry.metadata.id, entry.metadata.write_seq);
+                                client.metadata_queue.mark_delivered(entry.metadata.id, entry.metadata.write_seq, entry.metadata.size);
                                 // Signal the release waiter if present.
                                 if let Some(tx) = entry.done_tx {
                                     let _ = tx.send(());
@@ -11039,7 +11070,7 @@ mod tests {
         let entry = queue.pop().await.expect("first entry must be present");
         assert_eq!(entry.covers_from_write_seq, 1);
         // Simulate the queue worker confirming delivery of this push.
-        queue.mark_delivered(file_id, entry.metadata.write_seq);
+        queue.mark_delivered(file_id, entry.metadata.write_seq, entry.metadata.size);
 
         // Second push — write_seq=2, arrives after the first was already dequeued
         // (nothing left in the queue to coalesce with), also with no chunk_locations
@@ -11104,7 +11135,7 @@ mod tests {
     async fn test_metadata_queue_cancel_clears_delivered_write_seq() {
         let queue = MetadataQueue::new();
         let file_id = FileId::new();
-        queue.mark_delivered(file_id, 5);
+        queue.mark_delivered(file_id, 5, 0);
         assert!(queue.delivered_write_seq.contains_key(&file_id));
 
         queue.cancel(file_id).await;

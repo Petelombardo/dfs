@@ -10,6 +10,7 @@
 #   scripts/bench_staging.sh restart 0|1            restart servers+client with DFS_ORDERED_WRITES
 #                                                   (DFS_METADATA_DURABLE=0 in the env: old commit cadence)
 #   scripts/bench_staging.sh run <label>            fio jobs on the client -> /root/dfs-staging-bench-<label>.txt
+#   scripts/bench_staging.sh upgrade-node <node> <dir> [0|1]  replace one node's server binary, keep its data
 #   scripts/bench_staging.sh swap-client <path> [0|1]  replace just the client binary and remount
 #   scripts/bench_staging.sh teardown               unmount, stop, delete everything
 #
@@ -85,6 +86,12 @@ deploy)
     scp -q "$CLIENT_BIN" root@"$CLIENT":$CDIR/dfs-client
     start_servers "$ORDERED"
     start_client "$ORDERED"
+    ;;
+upgrade-node)  # upgrade-node <node> <bin dir> [0|1]: replace ONE node's server binary in place, keep its data
+    n=$2; [ -n "$n" ] && [ -f "$3/dfs-server" ] || { echo "upgrade-node <node> <bin dir> [0|1]"; exit 1; }
+    ssh root@"$n" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && kill \$p; done; sleep 2; true"
+    scp -q "$3/dfs-server" "$3/dfs-admin" root@"$n":$DIR/bin/
+    ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV $BENCH_SERVER_EXTRA_ENV DFS_ORDERED_WRITES=${4:-0} DFS_METADATA_DURABLE=${DFS_METADATA_DURABLE:-1} RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started $n"
     ;;
 swap-client)  # swap-client <dfs-client path> [0|1]: replace only the client binary, remount
     [ -f "$2" ] || { echo "swap-client <dfs-client path> [0|1]"; exit 1; }

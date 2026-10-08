@@ -1158,6 +1158,34 @@ pub enum Request {
         chunk_idx: u64,
         isr_epoch: u64,
     },
+
+    /// A member of a chunk's ISR at `isr_epoch` -> the other member: `member` (the sender)
+    /// can't apply ordered writes because its OWN storage failed (disk full, I/O error), so
+    /// it leaves the ISR. The receiver replaces it as for ReplaceIsrMember (epoch+1 =
+    /// [receiver, replacement], by Paxos), minus the reachability and lease-expiry checks:
+    /// the failed node vouches for its own failure. A full node answers pings and keeps its
+    /// lease, so ReplaceIsrMember always declined, and every write to its chunks failed until
+    /// space was freed (suite T79e). Safe for a resigning primary too: an ordered write needs
+    /// both members, and the receiver refuses the old epoch once the new one commits.
+    /// Answered with SlotIsrRecords. APPENDED at end to preserve wire compatibility.
+    ResignIsrMember {
+        file_id: FileId,
+        chunk_idx: u64,
+        isr_epoch: u64,
+        member: NodeId,
+    },
+
+    /// Node -> every peer, repeated every couple of seconds while it holds: `node` can't lead
+    /// (`unfit`), because its own storage is failing (disk full, I/O errors), or it can again.
+    /// Leadership is the lowest-id online node among those not unfit, so a full leader steps
+    /// down instead of failing every client write until its disk recovers (suite T80c). A
+    /// report expires unless repeated, so a node that dies unfit doesn't stay excluded.
+    /// Answered with Ok. APPENDED at end to preserve wire compatibility; a node too old to
+    /// know it keeps the old leader choice until upgraded.
+    LeaderUnfit {
+        node: NodeId,
+        unfit: bool,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

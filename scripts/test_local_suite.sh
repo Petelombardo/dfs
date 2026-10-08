@@ -195,6 +195,50 @@ t79_stop() {
     pkill -9 -f "dfs-server start --config $T79_DIR/config.toml" 2>/dev/null || true
     for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null || break; sleep 0.1; done
 }
+# T79e's file, written while node3 is still on the ordinary disk. With ordering on, each
+# chunk's ISR is set to include node3 (primary of chunks 0 and 2, secondary of 1 and 3) and
+# patched once so node3 holds the stream: placement can't be relied on to put node3 in any
+# pair (on this box it vetoes every node that reported under 20 GB free).
+T79_PRE_SRC="$BASE/t79_pre.src"
+dd if=/dev/urandom of="$T79_PRE_SRC" bs=4M count=4 status=none
+dd if="$T79_PRE_SRC" of="$MOUNT/t79_pre.bin" bs=1M conv=fsync status=none 2>/dev/null || true
+dfs_sync
+t79_patch() {   # t79_patch <chunk> <offset MB within the chunk> <log tag>: 256 KB, fsynced, mirrored locally
+    dd if=/dev/urandom of="$BASE/t79_piece.bin" bs=256K count=1 status=none
+    dd if="$BASE/t79_piece.bin" of="$T79_PRE_SRC" bs=256K seek=$(( $1 * 16 + $2 * 4 )) conv=notrunc status=none
+    timeout 120 dd if="$BASE/t79_piece.bin" of="$MOUNT/t79_pre.bin" bs=256K seek=$(( $1 * 16 + $2 * 4 )) conv=notrunc,fsync status=none 2>"$LOG/t79_$3.err"
+}
+T79_ISR_NOTE="ordering off: no ISR"
+if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+    T79_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+    T79_N3ID=$("$BIN/dfs-admin" --cluster 127.0.0.1:8902 lease status 2>/dev/null | python3 -c "import json,sys; print(json.loads(sys.stdin.readline())['node'])" || true)
+    t79_isr() {   # t79_isr <chunk>: that chunk's committed members on node1, comma-separated
+        "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file /t79_pre.bin --chunks 4 2>/dev/null | python3 -c "
+import json,sys
+r=json.loads(sys.stdin.readline())['isr'][$1]
+print(','.join(r['members']) if r else '')" 2>/dev/null || true
+    }
+    # The admin tool looks the file up on node1, whose copy of a new file's record can lag.
+    for _ in $(seq 1 30); do
+        "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file /t79_pre.bin --chunks 4 >/dev/null 2>&1 && break
+        sleep 1
+    done
+    for c in 0 1 2 3; do
+        cur=$(t79_isr $c)
+        partner=$(echo "$cur" | tr ',' '\n' | grep -v "^$T79_N3ID\$" | grep . | head -1 || true)
+        [ -n "$partner" ] || partner=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 lease status 2>/dev/null | python3 -c "import json,sys; print(json.loads(sys.stdin.readline())['node'])" || true)
+        if [ $((c % 2)) = 0 ]; then m="$T79_N3ID,$partner"; else m="$partner,$T79_N3ID"; fi
+        echo "  T79: chunk $c ISR [$cur] -> [$m]"
+        [ "$cur" = "$m" ] || "$BIN/dfs-admin" --cluster "$T79_ALL" isr propose --file /t79_pre.bin --chunk $c --members "$m" >>"$LOG/t79_isr.log" 2>&1 || true
+        "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file /t79_pre.bin --chunks 4 >>"$LOG/t79_isr.log" 2>&1 || true
+        t79_patch $c 1 pre || true
+    done
+    T79_IN=0
+    for c in 0 1 2 3; do t79_isr $c | grep -q "$T79_N3ID" && T79_IN=$((T79_IN + 1)) || true; done
+    T79_ISR_NOTE="node$T79_N in $T79_IN of 4 chunk ISRs"
+fi
+echo "  T79: t79_pre.bin written ($T79_ISR_NOTE)"
+dfs_sync
 t79_stop
 rm -rf "$T79_SAVE"; mv "$T79_DIR" "$T79_SAVE"; mkdir "$T79_DIR"   # a rename: no copy on disk
 T79_USED=$(du -sm "$T79_SAVE" | cut -f1)
@@ -241,22 +285,43 @@ done
 rm -f "$BASE/t79_src.bin"
 T79_FULL_ERRS=$(grep -ci "no space left\|os error 28" "$LOG/server${T79_N}.log" || true)
 echo "  T79: $T79_FILES file(s) of 16 MB written (rc=$T79_RC), node$T79_N refused $T79_FULL_ERRS write(s) with ENOSPC $(head -c 200 "$LOG/t79_dd.err")"
-# With ordering on, a chunk's writes go to its ISR pair, and a full member is never replaced
-# (Legata "Ordered writes: an ISR member whose disk is full is never replaced"): the full node
-# is either outside every pair (never asked) or inside one (EIO). Informational until fixed.
-if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
-    echo "  (informational with DFS_ORDERED_WRITES: full ISR member not replaced, open bug) T79a: rc=$T79_RC, node$T79_N refused $T79_FULL_ERRS"
-else
-[ "$T79_MOUNTED" = 1 ] && [ "$T79_RC" = 0 ] && [ "$T79_FULL_ERRS" -gt 0 ] \
-    && check "T79a fsynced writes complete while one node's disk is full (it refused $T79_FULL_ERRS)" PASS \
-    || check "T79a rc=$T79_RC after $T79_FILES file(s), node$T79_N refused $T79_FULL_ERRS (mounted=$T79_MOUNTED; 0 = the full node was never asked): $(head -c 200 "$LOG/t79_dd.err")" FAIL
-fi
 pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null \
     && ! grep -q "panicked" "$LOG/server${T79_N}.log" \
     && check "T79b the full node stayed up, no panic" PASS \
     || check "T79b the full node died or panicked (see server${T79_N}.log)" FAIL
+# T79e: patch t79_pre.bin's 4 chunks while node3 is full (topped up to 0 bytes free first:
+# the 8 MB left above can absorb a few small deltas). With ordering on these are ordered
+# writes, and node3 is in every chunk's ISR. Its own storage fails each one, so it has to
+# leave the ISR (it reports itself to its pair peer, which replaces it) for the writes to
+# land on two copies. It never left, and every write to those chunks failed with EIO until
+# space was freed (2026-10-08).
+[ "$T79_MOUNTED" = 1 ] && dd if=/dev/zero of="$T79_DIR/filler2" bs=1M status=none 2>/dev/null || true
+T79_E_MARK=$(wc -l < "$LOG/server${T79_N}.log")
+T79_E_RC=0
+for c in 0 1 2 3; do
+    t79_patch $c 2 e || { T79_E_RC=$?; echo "  T79e: patch of chunk $c failed rc=$T79_E_RC: $(head -c 200 "$LOG/t79_e.err")"; }
+done
+T79_WARM_SUMS=$(md5sum < "$T79_PRE_SRC" | cut -d' ' -f1)
+rm -f "$BASE/t79_piece.bin"
+T79_E_FULL=$(tail -n +"$((T79_E_MARK + 1))" "$LOG/server${T79_N}.log" | grep -ci "no space left\|os error 28" || true)
+T79_E_RESIGNED=$(tail -n +"$((T79_E_MARK + 1))" "$LOG/server${T79_N}.log" | grep -c "left the ISR of" || true)
+echo "  T79e: patched t79_pre.bin's 4 chunks: rc=$T79_E_RC, node$T79_N hit ENOSPC $T79_E_FULL time(s), left $T79_E_RESIGNED ISR(s)"
+# T79a is graded here: placement prefers nodes with free space, so new files often skip the
+# full node entirely; T79e's patches reach it for certain with ordering on.
+[ "$T79_MOUNTED" = 1 ] && [ "$T79_RC" = 0 ] && [ "$((T79_FULL_ERRS + T79_E_FULL))" -gt 0 ] \
+    && check "T79a fsynced writes complete while one node's disk is full (it refused $T79_FULL_ERRS new-file and $T79_E_FULL patch write(s))" PASS \
+    || check "T79a rc=$T79_RC after $T79_FILES file(s), node$T79_N refused $T79_FULL_ERRS + $T79_E_FULL (mounted=$T79_MOUNTED; 0 = the full node was never asked): $(head -c 200 "$LOG/t79_dd.err")" FAIL
+if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+[ "$T79_MOUNTED" = 1 ] && [ "$T79_E_RC" = 0 ] && [ "$T79_E_RESIGNED" -gt 0 ] \
+    && check "T79e fsynced patches succeed while an ISR member's disk is full (it left $T79_E_RESIGNED ISR(s); was in $T79_IN of 4)" PASS \
+    || check "T79e patches rc=$T79_E_RC with node$T79_N full, in $T79_IN of 4 ISRs, left $T79_E_RESIGNED: $(head -c 200 "$LOG/t79_e.err")" FAIL
+else
+[ "$T79_MOUNTED" = 1 ] && [ "$T79_E_RC" = 0 ] \
+    && check "T79e fsynced patches succeed while one node's disk is full" PASS \
+    || check "T79e patches failed (rc=$T79_E_RC) with node$T79_N full: $(head -c 200 "$LOG/t79_e.err")" FAIL
+fi
 # Free the space and restart it: its metadata db must reopen, and it must rejoin.
-rm -f "$T79_DIR/filler"
+rm -f "$T79_DIR/filler" "$T79_DIR/filler2"
 t79_stop
 T79_MARK=$(wc -l < "$LOG/server${T79_N}.log")
 t79_start
@@ -268,12 +333,16 @@ RUST_LOG=info "$BIN/dfs-client" mount "$T79_FRESH_MNT" --cluster "$CLUSTER" \
 T79_CPID=$!
 sleep 2
 T79_READ=$(for i in $(seq 1 "$T79_FILES"); do timeout 60 md5sum < "$T79_FRESH_MNT/t79_$i.bin" 2>/dev/null | cut -d' ' -f1; done | tr '\n' ' ')
+T79_WARM_READ=$(timeout 60 md5sum < "$T79_FRESH_MNT/t79_pre.bin" 2>/dev/null | cut -d' ' -f1)
 fusermount -u "$T79_FRESH_MNT" 2>/dev/null || true
 kill_client_and_wait "$T79_CPID"
 T79_EXPECT=$(echo $T79_SUMS | tr ' ' '\n' | head -n "$T79_FILES" | tr '\n' ' ')
 [ "$T79_FILES" -gt 0 ] && [ "$T79_READ" = "$T79_EXPECT" ] \
     && check "T79c after space is freed, a fresh client reads every file intact" PASS \
     || check "T79c fresh reads [$T79_READ] expected [$T79_EXPECT]" FAIL
+[ "$T79_E_RC" != 0 ] || { [ "$T79_WARM_READ" = "$T79_WARM_SUMS" ] \
+    && check "T79f a fresh client reads the patched file's new contents" PASS \
+    || check "T79f patched file read ${T79_WARM_READ:-failed}, expected $T79_WARM_SUMS" FAIL; }
 T79_RESTART_LOG=$(tail -n +"$((T79_MARK + 1))" "$LOG/server${T79_N}.log")
 pgrep -f "dfs-server start --config $T79_DIR/config.toml" >/dev/null \
     && ! echo "$T79_RESTART_LOG" | grep -qi "panicked\|failed to open metadata\|corrupt" \
@@ -286,7 +355,7 @@ if [ "$T79_MOUNTED" = 1 ]; then
     umount "$T79_DIR" 2>/dev/null || umount -l "$T79_DIR"
     rmdir "$T79_DIR"; mv "$T79_SAVE" "$T79_DIR"
 fi
-rm -rf "$T79_SAVE" "$T79_IMG"
+rm -rf "$T79_SAVE" "$T79_IMG" "$T79_PRE_SRC"
 t79_start
 sleep 5
 rm -f "$MOUNT"/t79_*.bin
@@ -354,6 +423,13 @@ for i in 1 2 3; do
         T80_ACKED="$T80_ACKED $i"; T80_SUMS="$T80_SUMS $i:$sum"
     fi
 done
+t80_views() {   # every node's own record of the t80 files, for diagnosing a T80a failure
+    for p in 8900 8901 8902 8903 8904; do
+        echo "== $1 node $((p - 8899)) ($(date +%T.%N))"
+        "$BIN/dfs-admin" --cluster 127.0.0.1:$p file list --local 2>&1 | grep t80 || true
+    done >> "$LOG/t80_views.log"
+}
+t80_views after-writes
 T80_COMMIT_FAILS=$(grep -c "group commit.*No space left\|os error 28" "$LOG/server${T80_N}.log" || true)
 echo "  T80: acked while the leader was full:${T80_ACKED:- none}; ENOSPC on the leader: $T80_COMMIT_FAILS"
 # Free the space WITHOUT restarting: the store must recover on its own.
@@ -377,14 +453,23 @@ for pair in $T80_SUMS; do
     [ "$got" = "$want" ] || T80_BAD="$T80_BAD t80_$i.bin(${got:-unreadable})"
 done
 T80_AFTER_READ=$(timeout 60 md5sum < "$T80_FRESH_MNT/t80_after.bin" 2>/dev/null | cut -d' ' -f1)
+t80_views after-reads
 fusermount -u "$T80_FRESH_MNT" 2>/dev/null || true
 kill_client_and_wait "$T80_CPID"
-[ "$T80_MOUNTED" = 1 ] && [ "$T80_COMMIT_FAILS" -gt 0 ] && [ -z "$T80_BAD" ] \
+# The full leader either hit ENOSPC or stepped down first (then it never tries a commit).
+T80_STEPPED=$(grep -c "won't lead until it recovers" "$LOG/server${T80_N}.log" || true)
+[ "$T80_MOUNTED" = 1 ] && [ "$((T80_COMMIT_FAILS + T80_STEPPED))" -gt 0 ] && [ -z "$T80_BAD" ] \
     && check "T80a every write acked while the leader's disk was full reads back intact (acked:${T80_ACKED:- none})" PASS \
-    || check "T80a acked but not intact:${T80_BAD:- none} (mounted=$T80_MOUNTED, leader ENOSPC=$T80_COMMIT_FAILS; 0 = the leader never hit ENOSPC)" FAIL
+    || check "T80a acked but not intact:${T80_BAD:- none} (mounted=$T80_MOUNTED, leader ENOSPC=$T80_COMMIT_FAILS, stepped down=$T80_STEPPED; both 0 = the leader was never full)" FAIL
 [ "$T80_AFTER_RC" = 0 ] && [ "$T80_AFTER_READ" = "$T80_AFTER_SUM" ] \
     && check "T80b once space is freed, without a restart, an fsynced write lands and reads back" PASS \
     || check "T80b after freeing space: write rc=$T80_AFTER_RC, read ${T80_AFTER_READ:-failed} vs $T80_AFTER_SUM" FAIL
+# A leader that can't commit must hand leadership on: it used to stay leader, and every
+# write failed with EIO until its disk was freed (2026-10-08). It now reports itself unfit to
+# lead (Request::LeaderUnfit) and the next-lowest id leads, so all three writes are acked.
+[ "$T80_MOUNTED" = 1 ] && [ "$T80_ACKED" = " 1 2 3" ] \
+    && check "T80c all 3 fsynced writes are acked while the leader's disk is full (it stepped down: $T80_STEPPED)" PASS \
+    || check "T80c acked while the leader was full:${T80_ACKED:- none} of 1 2 3 (stepped down: $T80_STEPPED)" FAIL
 # Back onto the ordinary disk.
 t80_stop
 if [ "$T80_MOUNTED" = 1 ]; then

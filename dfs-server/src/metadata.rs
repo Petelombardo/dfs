@@ -456,6 +456,21 @@ enum PendingReply {
     FilesBatch(tokio::sync::oneshot::Sender<Result<Vec<PutFileResult>>>, Result<Vec<PutFileResult>>),
 }
 
+impl PendingReply {
+    /// The op's error, if it was an I/O error (redb's own wording for its storage failures).
+    fn io_error(&self) -> Option<String> {
+        let e = match self {
+            PendingReply::Unit(_, Err(e)) => e,
+            PendingReply::RetiredToken(_, Err(e)) => e,
+            PendingReply::ChunkSeq(_, Err(e)) => e,
+            PendingReply::FilesBatch(_, Err(e)) => e,
+            _ => return None,
+        };
+        let msg = format!("{:#}", e);
+        msg.contains("I/O error").then_some(msg)
+    }
+}
+
 /// Metadata storage using redb embedded database.
 /// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
@@ -463,6 +478,8 @@ pub struct MetadataStore {
     db_path: PathBuf,
     /// Unix ms of the last reopen_after_io_error; rate-limits reopens while a disk stays full.
     last_io_reopen_ms: AtomicU64,
+    /// When a metadata commit last failed with an I/O error (unix ms, 0 = never).
+    last_io_error_ms: AtomicU64,
     /// Counts Durability::None commits since the last Durability::Immediate one.
     /// See next_write_durability() for why this exists.
     non_durable_commits: AtomicU64,
@@ -636,6 +653,7 @@ impl MetadataStore {
             db: RwLock::new(db),
             db_path,
             last_io_reopen_ms: AtomicU64::new(0),
+            last_io_error_ms: AtomicU64::new(0),
             non_durable_commits: AtomicU64::new(0),
             durable_commits: std::sync::atomic::AtomicBool::new(Self::durable_commits_enabled()),
             dirty_files: Mutex::new(std::collections::HashSet::new()),
@@ -730,7 +748,16 @@ impl MetadataStore {
             let weak = Arc::downgrade(self);
             std::thread::Builder::new()
                 .name("meta-committer".into())
-                .spawn(move || Self::commit_worker_loop(weak, rx))
+                .spawn(move || {
+                    // A dead committer leaves the node serving with no way to persist anything
+                    // (every later write fails "group-commit thread is gone"). Exit instead,
+                    // so the supervisor restarts it, as when a reopen fails.
+                    let run = std::panic::AssertUnwindSafe(|| Self::commit_worker_loop(weak, rx));
+                    if std::panic::catch_unwind(run).is_err() {
+                        error!("metadata group-commit thread panicked; exiting so this node restarts");
+                        std::process::exit(1);
+                    }
+                })
                 .expect("failed to spawn metadata group-commit thread");
             tx
         }).clone()
@@ -1014,12 +1041,25 @@ impl MetadataStore {
             }
         }
 
-        let commit_error: Option<String> = match txn.commit() {
-            Ok(()) => {
-                self.note_txn("group_commit", payload_bytes);
-                None
+        // An op whose write hit an I/O error (e.g. growing the file on a full disk) leaves redb
+        // needing recovery, and committing that transaction then PANICS (an assertion in
+        // redb's commit, not an error): the panic killed this committer thread, and the node
+        // kept serving with no way to persist anything (suite T79, 2026-10-08). Abort instead;
+        // the whole batch fails with that error, and the handle is reopened below. Dropped,
+        // not abort()ed: abort's rollback asserts the same thing and panics too, while drop
+        // skips the rollback when the storage has failed (suite T80, 2026-10-08).
+        let op_io_error = replies.iter().find_map(PendingReply::io_error);
+        let commit_error: Option<String> = if let Some(e) = op_io_error {
+            drop(txn);
+            Some(format!("group commit of {} ops aborted: an op hit an I/O error: {}", op_count, e))
+        } else {
+            match txn.commit() {
+                Ok(()) => {
+                    self.note_txn("group_commit", payload_bytes);
+                    None
+                }
+                Err(e) => Some(format!("group commit of {} ops failed: {}", op_count, e)),
             }
-            Err(e) => Some(format!("group commit of {} ops failed: {}", op_count, e)),
         };
         if let Some(msg) = &commit_error {
             warn!("{}", msg);
@@ -1077,6 +1117,15 @@ impl MetadataStore {
         }
     }
 
+    /// Whether a metadata commit failed with an I/O error within the last `within`: this
+    /// node can't currently persist what it applies.
+    pub fn io_error_within(&self, within: std::time::Duration) -> bool {
+        let last = self.last_io_error_ms.load(Ordering::Relaxed);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        last != 0 && now.saturating_sub(last) < within.as_millis() as u64
+    }
+
     /// redb refuses every write after one failed I/O ("Previous I/O error occurred. Please
     /// close and re-open the database.") until the handle is reopened. A leader whose disk
     /// filled (suite T79) could then persist nothing even after space was freed, short of a
@@ -1087,6 +1136,7 @@ impl MetadataStore {
     fn reopen_after_io_error(&self, why: &str) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64).unwrap_or(0);
+        self.last_io_error_ms.store(now, Ordering::Relaxed);
         let last = self.last_io_reopen_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last) < 5_000
             || self.last_io_reopen_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
@@ -1426,8 +1476,13 @@ impl MetadataStore {
         // chunk (7/8 persisted) under full-suite timing pressure, even after the
         // dissemination/queue/put_file union fixes above — root-caused to this
         // early bail-out never running the merge at all.
+        //
+        // An incoming write_seq of 0 is stale against any sequenced record too: clients send
+        // 0 only for a new object's create, so it is never newer than a sequenced write of
+        // the same file id. Exempting it let a create forwarded seconds late reset a 16 MB
+        // file to 0 bytes on the leader (suite T80a, 2026-10-08).
         let is_stale = existing.is_some_and(|existing| {
-            existing.write_seq > 0 && incoming.write_seq > 0 && existing.write_seq > incoming.write_seq
+            existing.write_seq > 0 && existing.write_seq > incoming.write_seq
         });
 
         let Some(existing) = existing else {
@@ -6330,6 +6385,26 @@ mod tests {
     /// handle_put_file_metadata), so CHUNK_TABLE — not this FILE_TABLE merge — is
     /// what actually guarantees no chunk from either write is lost. This test now
     /// verifies that guarantee where it actually lives.
+    /// A file's create record (write_seq 0, size 0) delivered after its sequenced writes must
+    /// not reset the file. write_seq 0 is only ever a new object's create, so it can't be
+    /// newer than any sequenced write of the same file id. A follower forwarded a full
+    /// leader's create to the next leader seconds late, and the 16 MB file it had already
+    /// committed at write_seq 3 became 0 bytes (suite T80a, 2026-10-08).
+    #[test]
+    fn a_late_create_record_does_not_reset_a_sequenced_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let create = FileMetadata::new("/late_create.bin".to_string(), FileType::RegularFile);
+        let mut written = create.clone();
+        written.write_seq = 3;
+        written.size = 16 * 1024 * 1024;
+        assert!(matches!(store.put_file(&written).unwrap(), PutFileResult::Stored));
+        assert!(matches!(store.put_file(&create).unwrap(), PutFileResult::Stale(_)),
+            "a create arriving after sequenced writes is stale");
+        let stored = store.get_file(&create.id).unwrap().unwrap();
+        assert_eq!((stored.write_seq, stored.size), (3, 16 * 1024 * 1024));
+    }
+
     #[test]
     fn test_put_file_unions_chunks_from_an_out_of_order_stale_push() {
         let temp_dir = TempDir::new().unwrap();

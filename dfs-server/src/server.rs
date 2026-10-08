@@ -1165,7 +1165,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ResyncSlot { .. } => PeerOther,
         Request::GetOrSeedSlotIsr { .. }
         | Request::ReplaceIsrMember { .. } => ClientOther,
-        Request::ResyncFromPrimary { .. } => PeerOther,
+        Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -7172,14 +7172,24 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             let mut was_leader = false;
+            let mut seen_generation = server.cluster.leader_generation();
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
                 let is_leader = server.cluster.is_leader().await;
+                // Leader at both polls doesn't mean leader throughout: a node that stood down
+                // for less than a poll (its disk was full for 2 s) came back without the
+                // catch-up below, missing what the interim leader committed (suite T80a).
+                let generation = server.cluster.leader_generation();
+                let regained = is_leader && was_leader && generation != seen_generation;
+                if regained {
+                    info!("Leadership moved and came back since the last check — treating it as a new election");
+                }
+                seen_generation = generation;
 
                 // On leadership acquisition, announce to all peers immediately so any
                 // concurrent split-brain leader with a higher NodeId concedes.
-                if is_leader && !was_leader {
+                if is_leader && (!was_leader || regained) {
                     // Carry over the post-election grace period (LEADER_CHANGE_GRACE_SECS)
                     // if this node was already the leader before a restart, instead of
                     // resetting it to zero every time the perpetual lowest-NodeId leader
@@ -7986,6 +7996,12 @@ impl Server {
                 self.handle_replace_isr_member(file_id, chunk_idx, isr_epoch, failed).await,
             Request::ResyncFromPrimary { file_id, chunk_idx, isr_epoch } =>
                 self.handle_resync_from_primary(file_id, chunk_idx, isr_epoch).await,
+            Request::ResignIsrMember { file_id, chunk_idx, isr_epoch, member } =>
+                self.replace_isr_member(file_id, chunk_idx, isr_epoch, member, true).await,
+            Request::LeaderUnfit { node, unfit } => {
+                self.cluster.set_leader_unfit(node, unfit);
+                Response::Ok { data: None }
+            }
             Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
                 if !crate::network::fault_injection_allowed() {
                     Response::Error {
@@ -11484,9 +11500,28 @@ impl Server {
         }
     }
 
+    /// IOError when an error comes from this node's own storage (an io::Error, or redb's I/O
+    /// failures, including the "Previous I/O error" it returns until reopened), so the caller
+    /// can tell a failing disk from a refusal; InternalError otherwise.
+    fn storage_failure_code(e: &anyhow::Error) -> ErrorCode {
+        if e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some()) || format!("{:#}", e).contains("I/O error") {
+            ErrorCode::IOError
+        } else {
+            ErrorCode::InternalError
+        }
+    }
+
     /// See `Request::ReplaceIsrMember`.
     async fn handle_replace_isr_member(&self, file_id: FileId, chunk_idx: u64, isr_epoch: u64, failed: NodeId) -> Response {
-        let refuse = |why: String| Response::Error { message: format!("ReplaceIsrMember: {}", why), code: ErrorCode::InvalidRequest };
+        self.replace_isr_member(file_id, chunk_idx, isr_epoch, failed, false).await
+    }
+
+    /// `Request::ReplaceIsrMember`, or with `resigned` `Request::ResignIsrMember` (`failed`
+    /// reported its own storage failure, so neither the reachability nor the lease-expiry
+    /// check applies).
+    async fn replace_isr_member(&self, file_id: FileId, chunk_idx: u64, isr_epoch: u64, failed: NodeId, resigned: bool) -> Response {
+        let what = if resigned { "ResignIsrMember" } else { "ReplaceIsrMember" };
+        let refuse = |why: String| Response::Error { message: format!("{}: {}", what, why), code: ErrorCode::InvalidRequest };
         let me = self.cluster.local_node_id();
         let Some(cur) = self.slot_isr.get(file_id, chunk_idx) else {
             return refuse(format!("no ISR here for file {} chunk {}", file_id, chunk_idx));
@@ -11500,7 +11535,10 @@ impl Server {
         if !self.lease.holds_own_lease() {
             return refuse("this node doesn't hold its own lease".into());
         }
-        if cur.members.first() == Some(&me) {
+        if resigned {
+            // The failed member reported its own storage failure. It answers pings and may
+            // hold its lease, so neither check below would ever let it go.
+        } else if cur.members.first() == Some(&me) {
             // Primary excluding its secondary: only one it can't reach itself.
             let addr = self.cluster.get_node(&failed).await.map(|n| n.addr);
             let reachable = match addr {
@@ -11547,8 +11585,9 @@ impl Server {
             Err(_) => return refuse("the epoch change didn't commit in time".into()),
         };
         if records.first().cloned().flatten().as_ref() == Some(&next) {
-            info!("[ISR] file {} chunk {}: {} replaced {} -- epoch {} -> {}, members {:?}",
-                file_id, chunk_idx, me, failed, cur.epoch, next.epoch, next.members);
+            info!("[ISR] file {} chunk {}: {} replaced {}{} -- epoch {} -> {}, members {:?}",
+                file_id, chunk_idx, me, failed, if resigned { " (its storage failed)" } else { "" },
+                cur.epoch, next.epoch, next.members);
         }
         Response::SlotIsrRecords { records }
     }
@@ -11605,6 +11644,70 @@ impl Server {
         let decided = results.iter().filter(|r| r.is_some()).count();
         info!("SLOT ISR seed pass: {} chunk(s) proposed, {} decided, {} known here in total",
             asked, decided, self.slot_isr.committed_count());
+    }
+
+    /// While this node's own storage is failing it can't commit file records, so it must not
+    /// lead: every 2 s it tells every peer so (`Request::LeaderUnfit`), and itself. A full
+    /// leader used to stay leader, and every client write failed with EIO until its disk was
+    /// freed (suite T80c). Once its storage works again it first pulls what the interim
+    /// leader committed (the metadata catch-up a new leader runs), still marked unfit, and
+    /// only then says it can lead: coming straight back, its chunk map lacked chunks of files
+    /// acked meanwhile, and they read back as zeros (suite T80a).
+    pub fn start_leader_fitness(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let me = self.cluster.local_node_id();
+            let mut was_unfit = false;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let unfit = self.own_storage_failing();
+                if unfit {
+                    if !was_unfit {
+                        warn!("[LEADER] this node's storage is failing, so it won't lead until it recovers");
+                    }
+                    was_unfit = true;
+                    self.cluster.set_leader_unfit(me, true);
+                    self.broadcast_leader_unfit(true).await;
+                    continue;
+                }
+                if !was_unfit {
+                    continue;
+                }
+                info!("[LEADER] this node's storage works again; catching up on metadata before it can lead again");
+                let catchup = tokio::time::timeout(std::time::Duration::from_secs(120), self.run_metadata_catchup());
+                tokio::pin!(catchup);
+                let mut refresh = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    tokio::select! {
+                        r = &mut catchup => {
+                            if r.is_err() {
+                                warn!("[LEADER] metadata catch-up timed out after 120s; leading again anyway");
+                            }
+                            break;
+                        }
+                        _ = refresh.tick() => {
+                            self.cluster.set_leader_unfit(me, true);
+                            self.broadcast_leader_unfit(true).await;
+                        }
+                    }
+                }
+                was_unfit = false;
+                self.cluster.set_leader_unfit(me, false);
+                self.broadcast_leader_unfit(false).await;
+                info!("[LEADER] caught up; this node can lead again");
+            }
+        });
+    }
+
+    async fn broadcast_leader_unfit(&self, unfit: bool) {
+        let me = self.cluster.local_node_id();
+        for peer in self.cluster.get_all_nodes().await.into_iter().filter(|n| n.id != me) {
+            let client = self.client.clone();
+            let req = Request::LeaderUnfit { node: me, unfit };
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    client.send_message(peer.addr, Message::Request(req))).await;
+            });
+        }
     }
 
     pub fn start_leases(&self) {
@@ -15328,7 +15431,7 @@ impl Server {
                     }
                     Err(e) => {
                         drop(patch_guard);
-                        return Err((format!("Failed to look up chunk location for {}: {}", base_for_lookup, e), ErrorCode::InternalError));
+                        return Err((format!("Failed to look up chunk location for {}: {:#}", base_for_lookup, e), Self::storage_failure_code(&e)));
                     }
                 };
                 // Confirm with the leader that base_for_lookup is still genuinely
@@ -15854,13 +15957,14 @@ impl Server {
                     Ok(())
                 }).await
                     .map_err(|e| (format!("spawn_blocking panicked appending patch delta: {}", e), ErrorCode::InternalError))?
-                    .map_err(|e| (e, ErrorCode::InternalError))?;
+                    // Every step above is a file operation on this node's own disk.
+                    .map_err(|e| (e, ErrorCode::IOError))?;
             }
             None => {
                 tokio::task::spawn_blocking(move || storage.write_chunk(&delta_chunk_id, &new_record_bytes))
                     .await
                     .map_err(|e| (format!("spawn_blocking panicked writing patch delta: {}", e), ErrorCode::InternalError))?
-                    .map_err(|e| (format!("Failed to write patch delta: {}", e), ErrorCode::InternalError))?;
+                    .map_err(|e| (format!("Failed to write patch delta: {:#}", e), ErrorCode::IOError))?;
             }
         }
 
@@ -15890,7 +15994,7 @@ impl Server {
 
         let retired_token = self.metadata.put_patch_state_pending_async(
             file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq,
-        ).await.map_err(|e| (format!("Failed to record patch state: {}", e), ErrorCode::InternalError))?;
+        ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)))?;
         if let Some(retired) = retired_token {
             // The slot's previous public_token is now provably unreachable (proof:
             // we just built this new patch on top of whatever it resolved to) —
@@ -16305,6 +16409,77 @@ impl Server {
     /// applies it only in that order. Either way the patch itself goes through
     /// handle_multi_patch unchanged.
     async fn handle_ordered(&self, tag: dfs_common::WriteOrderTag, request: Request) -> Response {
+        let resp = self.handle_ordered_inner(&tag, request).await;
+        match resp {
+            Response::Error { code, message } if code == ErrorCode::IOError
+                || (Self::is_ordered_apply_failure(&message) && self.own_storage_failing()) =>
+                self.leave_isr_after_storage_failure(&tag, message).await,
+            other => other,
+        }
+    }
+
+    /// An ordered write that failed in the apply itself (the patch, the anchor, or the
+    /// secondary's resync), not one of the role/epoch refusals, which all start "Ordered: ".
+    fn is_ordered_apply_failure(message: &str) -> bool {
+        !message.starts_with("Ordered: ") || message.starts_with("Ordered: secondary can't apply")
+    }
+
+    /// This node's own storage is failing now: a metadata commit hit an I/O error within the
+    /// last 30 s, or the data disk has under 64 MiB free. Not every failed apply says so
+    /// itself: a full disk also fails the secondary's resync ("backfill it") and reads of a
+    /// poisoned redb ("Failed to resolve patch state"), and those kept a full node in its
+    /// ISRs (suite T79e).
+    fn own_storage_failing(&self) -> bool {
+        const LOW_FREE: u64 = 64 * 1024 * 1024;
+        self.metadata.io_error_within(std::time::Duration::from_secs(30))
+            || self.storage.get_filesystem_stats().is_ok_and(|(_, free, _)| free < LOW_FREE)
+    }
+
+    /// This node's own storage failed an ordered write (disk full, I/O error): it can't
+    /// apply this slot's stream, so it leaves the ISR rather than fail every write to the
+    /// chunk until the disk recovers. Its pair peer replaces it (`Request::ResignIsrMember`),
+    /// and the answer says so: the client then picks up the new pair and resends there.
+    /// Asked synchronously, so the new epoch is committed before the client hears of the
+    /// failure (suite T79e).
+    async fn leave_isr_after_storage_failure(&self, tag: &dfs_common::WriteOrderTag, failure: String) -> Response {
+        let me = self.cluster.local_node_id();
+        let peer = if me == tag.primary { tag.secondary } else if me == tag.secondary { tag.primary } else {
+            return Response::Error { message: failure, code: ErrorCode::IOError };
+        };
+        let outcome: Result<crate::slot_isr::SlotIsr, String> = async {
+            let addr = self.cluster.get_node(&peer).await.map(|n| n.addr).ok_or_else(|| format!("peer {} unknown", peer))?;
+            let req = Request::ResignIsrMember { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch, member: me };
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), self.client.send_message(addr, Message::Request(req))).await
+                .map_err(|_| format!("peer {} didn't answer in time", peer))?
+                .map_err(|e| format!("peer {}: {}", peer, e))?;
+            match env.message {
+                Message::Response(Response::SlotIsrRecords { records }) => records.into_iter().next().flatten()
+                    .filter(|next| next.epoch > tag.isr_epoch && !next.members.contains(&me))
+                    .ok_or_else(|| format!("peer {} didn't replace this node", peer)),
+                Message::Response(Response::Error { message, .. }) => Err(message),
+                other => Err(format!("peer {}: unexpected {:?}", peer, dfs_common::debug_truncated(&other, 200))),
+            }
+        }.await;
+        match outcome {
+            Ok(next) => {
+                info!("[ISR] file {} chunk {}: this node's storage failed, so it left the ISR of epoch {} (now epoch {} {:?}): {}",
+                    tag.file_id, tag.chunk_idx, tag.isr_epoch, next.epoch, next.members, failure);
+                Response::Error {
+                    message: format!("Ordered: this node's storage failed, so it left the ISR of file {} chunk {} (epoch {} -> {} {:?}): {}",
+                        tag.file_id, tag.chunk_idx, tag.isr_epoch, next.epoch, next.members, failure),
+                    code: ErrorCode::IOError,
+                }
+            }
+            Err(why) => {
+                warn!("[ISR] file {} chunk {}: this node's storage failed and it couldn't leave the ISR of epoch {}: {} ({})",
+                    tag.file_id, tag.chunk_idx, tag.isr_epoch, why, failure);
+                Response::Error { message: failure, code: ErrorCode::IOError }
+            }
+        }
+    }
+
+    async fn handle_ordered_inner(&self, tag: &dfs_common::WriteOrderTag, request: Request) -> Response {
+        let tag = *tag;
         if let Request::ForceFold { file_id, chunk_idx } = request {
             if file_id != tag.file_id || chunk_idx != tag.chunk_idx {
                 return Response::Error { message: "Ordered: tag does not match the fold".into(), code: ErrorCode::InvalidRequest };
@@ -19375,6 +19550,17 @@ impl Server {
             refused.push((idx, c.chunk_id, f.chunk_id));
             merged.push(c.clone());
         }
+        // A slot the re-derive has nothing for keeps its current entry. `fresh` is this
+        // node's own CHUNK_TABLE, which can lack rows it never received; dropping the slot
+        // served a hole, read back as zeros (suite T80a). Kept, it reads the replicas, or
+        // fails with EIO if the chunk really is gone.
+        for c in current {
+            let Some(i) = idx_of(c) else { continue };
+            if !merged.iter().any(|m| idx_of(m) == Some(i)) {
+                merged.push(c.clone());
+            }
+        }
+        merged.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
         (merged, refused)
     }
 
@@ -26505,6 +26691,34 @@ mod tests {
             "a token with a live Pending patch_state resolves through base+delta, so it \
              is current content however old it is — reverting it to the base would hand \
              back pre-write data for a write we acknowledged");
+    }
+
+    /// A slot the re-derive has nothing for is kept, never dropped. `fresh` comes from this
+    /// node's own CHUNK_TABLE, which can simply lack rows it never received (a leader whose
+    /// disk was full while the interim leader committed them): dropping the slot made the
+    /// map a hole there, and three acked files read back with zeros (suite T80a, 2026-10-08).
+    /// Kept, the slot reads the intact replicas; if it really was purged, the read fails
+    /// with EIO instead of returning zeros.
+    #[test]
+    fn self_heal_keeps_a_slot_the_re_derive_has_nothing_for() {
+        const NOW_MS: u64 = 1_789_000_000_000;
+        let file = FileId::new();
+        let mk = |hash: u8, idx: u64| ChunkLocation {
+            chunk_id: ChunkId::from_hash([hash; 32]),
+            nodes: vec![NodeId::new()],
+            size: 4 * 1024 * 1024, checksum: [0u8; 32],
+            file_offset: Some(idx * 4 * 1024 * 1024), written_at: Some(NOW_MS - 1000),
+            client_write_seq: Some(idx + 1), file_id: Some(file),
+        };
+        let current = vec![mk(0x10, 0), mk(0x11, 1), mk(0x12, 2), mk(0x13, 3)];
+        // This node's CHUNK_TABLE has rows for slots 0 and 1 only.
+        let fresh = vec![mk(0x10, 0), mk(0x11, 1)];
+        let no_row: std::collections::HashSet<ChunkId> = [current[2].chunk_id, current[3].chunk_id].into_iter().collect();
+        let (merged, refused) = Server::merge_self_heal(&current, &fresh, NOW_MS, |id| no_row.contains(id));
+        let ids: Vec<ChunkId> = merged.iter().map(|l| l.chunk_id).collect();
+        assert_eq!(ids, current.iter().map(|l| l.chunk_id).collect::<Vec<_>>(),
+            "every slot of the current map must survive, in order");
+        assert!(refused.is_empty());
     }
 
     /// The self-heal's regression guard must be decided PER SLOT, not per file.

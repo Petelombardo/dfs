@@ -425,6 +425,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_conn_pressure_watchdog();
     server.clone().start_slot_audit();
     server.start_leases();
+    server.clone().start_leader_fitness();
     server.clone().start_slot_isr_seeder();
     server.clone().start_slot_isr_catchup();
     let mut server_handle = tokio::spawn(async move {

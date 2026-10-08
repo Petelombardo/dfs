@@ -8212,7 +8212,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                     && matches!(r, Err(e) if e.to_string().contains("is expired by a majority; ask the secondary to take over"))
             });
             let primary_ok = replica_results.iter().any(|(a, r)| addr_to_node_id_snap.get(a) == Some(&tag.primary) && r.is_ok());
-            let ask = if (transport_failed(tag.secondary) || secondary_errored) && primary_ok {
+            // A member whose own storage failed (disk full) left the ISR itself before
+            // answering: its peer already committed the next epoch, and asking the peer
+            // returns it, so the write is resent to the new pair (suite T79e).
+            let resigned = |node: dfs_common::NodeId| replica_results.iter().any(|(a, r)| {
+                addr_to_node_id_snap.get(a) == Some(&node) && matches!(r, Err(e) if e.to_string().contains("storage failed, so it left the ISR"))
+            });
+            let ask = if resigned(tag.primary) {
+                addr_of(tag.secondary).map(|a| (a, tag.primary))
+            } else if (transport_failed(tag.secondary) || secondary_errored) && primary_ok {
                 addr_of(tag.primary).map(|a| (a, tag.secondary))
             } else if (transport_failed(tag.primary) || refused_as_primary) && !primary_ok {
                 addr_of(tag.secondary).map(|a| (a, tag.primary))

@@ -68,6 +68,15 @@ pub struct ClusterManager {
     /// allowing destructive operations (orphan purge, DATA LOSS declarations).
     became_leader_at: Arc<RwLock<Option<std::time::Instant>>>,
 
+    /// Nodes that reported they can't lead because their own storage is failing
+    /// (`Request::LeaderUnfit`), each until its report expires. Leadership skips them.
+    leader_unfit: Arc<std::sync::Mutex<HashMap<NodeId, std::time::Instant>>>,
+
+    /// Bumped whenever the leader this node computes changes, and whenever this node marks
+    /// itself unfit to lead or fit again (`leader_generation`), with the last leader seen.
+    leader_generation: Arc<std::sync::atomic::AtomicU64>,
+    last_leader_seen: Arc<std::sync::Mutex<Option<NodeId>>>,
+
     /// This node's most recently computed heal bandwidth target (MB/s), set by
     /// HealingManager::run_bandwidth_controller only when this node is leader.
     /// Piggybacked on outgoing heartbeats so followers — whose own pending_healing
@@ -153,6 +162,9 @@ impl ClusterManager {
             failure_timeout,
             node_recovered_notify: Arc::new(Notify::new()),
             became_leader_at: Arc::new(RwLock::new(None)),
+            leader_unfit: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            leader_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_leader_seen: Arc::new(std::sync::Mutex::new(None)),
             client: Arc::new(NetworkClient::new_for_peers()),
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compaction_intents: Arc::new(RwLock::new(HashMap::new())),
@@ -400,16 +412,59 @@ impl ClusterManager {
         if online_ids.len() < self.quorum_of(nodes.len()) {
             return None;
         }
-        online_ids.into_iter().min()
+        let leader = self.leader_among(online_ids);
+        let mut last = self.last_leader_seen.lock().unwrap();
+        if *last != leader {
+            *last = leader;
+            self.leader_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        leader
+    }
+
+    /// Changes whenever leadership may have moved in this node's view (see the field). A
+    /// node that loses leadership and regains it between two polls of a watcher still sees
+    /// a new generation: it must catch up on what the interim leader committed. A full
+    /// leader stood down for 2 s and came back without that catch-up, and its chunk map
+    /// lacked chunks of three files acked meanwhile: they read back as zeros (suite T80a).
+    pub fn leader_generation(&self) -> u64 {
+        self.leader_generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How long a `LeaderUnfit` report holds without being repeated: a node that recovers
+    /// or dies stops repeating it, and leadership returns to the usual choice.
+    pub const LEADER_UNFIT_TTL: Duration = Duration::from_secs(10);
+
+    /// Record whether `node` reported it can't lead (see `leader_unfit`).
+    pub fn set_leader_unfit(&self, node: NodeId, unfit: bool) {
+        let mut m = self.leader_unfit.lock().unwrap();
+        let changed = if unfit {
+            m.insert(node, std::time::Instant::now() + Self::LEADER_UNFIT_TTL).is_none()
+        } else {
+            m.remove(&node).is_some()
+        };
+        if changed && node == self.local_node_id {
+            self.leader_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The leader among `online`: the min id, skipping nodes that reported they can't lead.
+    /// A leader whose disk is full can't commit file records, so every client write failed
+    /// for as long as it stayed full (suite T80c). If every online node is unfit, the min id
+    /// leads anyway: someone has to answer.
+    fn leader_among(&self, online: Vec<NodeId>) -> Option<NodeId> {
+        let now = std::time::Instant::now();
+        let fit_min = {
+            let m = self.leader_unfit.lock().unwrap();
+            online.iter().copied().filter(|id| m.get(id).is_none_or(|until| *until <= now)).min()
+        };
+        fit_min.or_else(|| online.into_iter().min())
     }
 
     /// Returns the SocketAddr of the current leader, if known.
     pub async fn get_leader_addr(&self) -> Option<std::net::SocketAddr> {
         let nodes = self.nodes.read().await;
-        nodes.values()
-            .filter(|n| n.status == NodeStatus::Online)
-            .min_by_key(|n| n.id)
-            .map(|n| n.addr)
+        let online: Vec<NodeId> = nodes.values().filter(|n| n.status == NodeStatus::Online).map(|n| n.id).collect();
+        self.leader_among(online).and_then(|id| nodes.get(&id)).map(|n| n.addr)
     }
 
     /// Returns true if the given node_id is the current leader per this node's gossip view.
@@ -417,12 +472,8 @@ impl ClusterManager {
     /// but our view disagrees, we reject the instruction to prevent split-brain execution.
     pub async fn is_leader_id(&self, node_id: NodeId) -> bool {
         let nodes = self.nodes.read().await;
-        let leader_id = nodes
-            .values()
-            .filter(|n| n.status == NodeStatus::Online)
-            .map(|n| n.id)
-            .min();
-        leader_id == Some(node_id)
+        let online: Vec<NodeId> = nodes.values().filter(|n| n.status == NodeStatus::Online).map(|n| n.id).collect();
+        self.leader_among(online) == Some(node_id)
     }
 
     /// Returns true if a strict majority of known nodes are online.

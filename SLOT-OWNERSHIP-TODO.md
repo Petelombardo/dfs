@@ -4,7 +4,7 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-10-03, staging fio bench done and torn down_
+_Last updated: 2026-10-08, T78-T80 (bit rot, one node full, leader full) and their fixes pushed (365a738)_
 
 **Resume here:** 3c step 2 — next: order folds through the primary, then arbitration by version
 at the leader. Ordering kept (2026-10-03). Replica-side version identity done (T64 5/5).
@@ -303,7 +303,22 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   - [x] **Client SIGKILL, T77 (2026-10-06):** passes with ordering on; with ordering off a killed
         client's fsync'd writes are lost (Legata bug, open). Watch: the killed client sometimes
         finishes no fsync in its first 5s (2 of 10 runs).
-  - [ ] Bit flip, ENOSPC one node / all nodes, power loss, mixed versions, and the rest.
+  - [x] **Bit flip, T78 (2026-10-07):** failed first: a fresh client read flipped bytes with no
+        error; the scrub couldn't see rot; the healer deleted the routing record of a chunk whose
+        source lacked it. Fixed a0179af (verify on first disk read + quarantine, real scrub,
+        heal drops only the missing holder). Cold 4K random reads -8..-14% (first touch).
+  - [x] **ENOSPC one node, T79 (2026-10-08):** failed first: one full node turned fresh writes
+        into EIO. Fixed 5f3d067 (fall back to another node on the replica's own storage error).
+        T79a informational with ordering on: a full ISR member is never replaced (open bug,
+        protocol proposal: the failing node reports itself to its pair peer).
+  - [x] **ENOSPC on the leader, T80 (2026-10-08):** failed first: 3 fsyncs acked, 3 files lost.
+        Fixed a809751 + 99b672e (ack PutFileMetadata after commit, redb reopen after I/O error,
+        fsync syncs a grown size, bounded 60s wait -> EIO). Bench: no measurable cost.
+        Follow-up: a leader that can't persist metadata should step down.
+  - [x] **Mixed versions (2026-10-07):** rolling upgrade from production's build on the bench
+        cluster (bb11734 upgrade-node): 0 writer errors, every file intact; old nodes log
+        "Failed to deserialize" for new request types until upgraded.
+  - [ ] ENOSPC on all nodes, power loss (LazyFS / dm-flakey), and the rest of the Legata list.
 
 - **Six fix branches MERGED 2026-10-05** (fix/dir-rename-subtree, fix/is-leader-startup,
   fix/delete-resurrection, fix/rename-lost-pending-write, fix/unit-test-fixtures,

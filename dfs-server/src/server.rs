@@ -8605,6 +8605,41 @@ impl Server {
         }
     }
 
+    /// Before serving `chunk_id` from this node's disk the first time: do its bytes still
+    /// hash to its id? Nothing on the read path used to check, so a copy that rotted on disk
+    /// was served as-is (suite T78: a fresh client read flipped bytes, with no error
+    /// anywhere). A copy that fails is quarantined, which leaves this node without it: the
+    /// read then takes the ordinary missing-chunk path (another replica serves it) and healing
+    /// restores the copy. False = it was corrupt and is gone now.
+    ///
+    /// Checked only where the id provably IS a content hash and its inputs are known: not a
+    /// patch token (looks_like_patch_token needs no lookup, so it can't miss; the 2026-07-23
+    /// and 2026-08-03 false-corruption storms were tokens), not a slot's in-flight patch, and
+    /// with a ChunkLocation giving the file_id and file_offset it was hashed with. The same
+    /// rule PushChunkTo has verified heal sources with since 2026-08. Patch deltas have no
+    /// ChunkLocation of their own and aren't checked here.
+    async fn local_chunk_is_intact(&self, chunk_id: ChunkId) -> bool {
+        if chunk_id.looks_like_patch_token() || self.pending_patch_ids.contains_key(&chunk_id) {
+            return true;
+        }
+        let Ok(Some(loc)) = self.metadata.get_chunk_location_async(chunk_id).await else { return true };
+        let (Some(file_offset), Some(file_id)) = (loc.file_offset, loc.file_id) else { return true };
+        let storage = self.storage.clone();
+        match tokio::task::spawn_blocking(move || storage.verify_on_disk_once(&chunk_id, file_offset, file_id)).await {
+            Ok(Ok(false)) => {}
+            // Good, or unreadable (missing, I/O error): the read itself reports that as before.
+            _ => return true,
+        }
+        let storage = self.storage.clone();
+        match tokio::task::spawn_blocking(move || storage.quarantine_chunk(&chunk_id)).await {
+            Ok(Ok(dest)) => error!("[CORRUPT] chunk {} (file {} offset {}): bytes on disk don't match its id; \
+                quarantined to {:?}, serving it from another replica", chunk_id, file_id, file_offset, dest),
+            other => error!("[CORRUPT] chunk {} (file {} offset {}): bytes on disk don't match its id, \
+                and quarantining it failed: {:?}", chunk_id, file_id, file_offset, other),
+        }
+        false
+    }
+
     async fn handle_read_chunk(&self, chunk_id: ChunkId, client_write_seq: Option<u64>, slot: Option<(FileId, u64)>) -> Response {
         debug!("Handling read chunk: {}", chunk_id);
 
@@ -8636,6 +8671,9 @@ impl Server {
         // Wait out any in-place patch currently mutating this exact chunk_id
         // (no-op unless one is in flight — see chunk_io_locks).
         let _io_guard = self.chunk_io_read_guard(&chunk_id).await;
+
+        // A corrupt copy is quarantined here, and the read below then misses like any absent chunk.
+        self.local_chunk_is_intact(chunk_id).await;
 
         // Serve from local storage only — never proxy to other nodes.
         // If the client sends a ReadChunk to a node that doesn't hold the chunk,
@@ -8720,6 +8758,11 @@ impl Server {
         // pending/outstanding patch pays for full resolution via
         // resolve_chunk_content, then slices the requested range out of the result.
         let needs_resolve = self.pending_patch_ids.contains_key(&chunk_id);
+        // A corrupt copy is quarantined here, and the partial read below then misses (see
+        // handle_read_chunk). Costs one full read + hash of the chunk on its first cold read.
+        if !needs_resolve {
+            self.local_chunk_is_intact(chunk_id).await;
+        }
         let range_result: Result<Vec<u8>> = if needs_resolve {
             self.resolve_chunk_content(chunk_id).await.map(|arc| {
                 let start = (offset as usize).min(arc.len());
@@ -9181,6 +9224,12 @@ impl Server {
             if actual_hash != chunk_id.hash {
                 warn!("PushChunkTo: chunk {} at offset {} failed content hash verification — disk corruption detected, refusing to propagate",
                     chunk_id, offset);
+                // Refusing alone left the bad copy in place, and the leader picked this same
+                // source for the chunk every heal cycle, so it never got its replicas back
+                // (suite T78). Quarantine it, after checking the file itself (these bytes may
+                // have come from a cache): then this node no longer holds the chunk, the
+                // healer picks a good source, and copies it back here too.
+                self.local_chunk_is_intact(chunk_id).await;
                 return Response::Error {
                     message: format!("Chunk {} content hash mismatch (disk corruption)", chunk_id),
                     code: ErrorCode::ChecksumMismatch,
@@ -18161,8 +18210,18 @@ impl Server {
     }
 
     /// Handle trigger scrub request
+    /// Start a scrub pass on this node now, in the background (dfs-admin storage scrub asks
+    /// every node). It used to be a no-op.
     async fn handle_trigger_scrub(&self) -> Response {
-        // Scrubber runs on its own interval loop; no immediate trigger implemented yet.
+        let Some(healing) = self.healing.read().await.clone() else {
+            return Response::Error { message: "healer not running on this node".into(), code: ErrorCode::InvalidRequest };
+        };
+        tokio::spawn(async move {
+            info!("Scrub pass triggered via admin command");
+            if let Err(e) = healing.scrub_all_chunks().await {
+                warn!("Scrubbing error: {}", e);
+            }
+        });
         Response::Ok { data: None }
     }
 

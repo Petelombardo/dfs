@@ -5060,6 +5060,23 @@ impl HealingManager {
                             }
                         }
                         Ok(envelope) if matches!(envelope.message, Message::Response(Response::Error { code: dfs_common::ErrorCode::NotFound, .. })) => {
+                            // The source no longer has it (quarantined as corrupt, deleted,
+                            // folded away). If other confirmed holders remain, drop only this
+                            // one and keep the chunk queued: the next cycle copies from a
+                            // holder that has it. Deleting the whole routing record here, as
+                            // this always did, left a chunk with a surviving good copy
+                            // untracked and never brought back to RF (suite T78, 2026-10-07).
+                            let remaining: Vec<NodeId> = base_nodes.iter().copied().filter(|n| *n != source_id).collect();
+                            if !remaining.is_empty() {
+                                warn!("Chunk {} not found on source {} — dropping that holder, retrying from {:?}", chunk_id, source_id, remaining);
+                                return Ok(Some(HealOutcome {
+                                    chunk_id: *chunk_id,
+                                    location_put: Some(ChunkLocation { nodes: remaining, ..location.clone() }),
+                                    location_delete: None,
+                                    clear_pending: false,
+                                    broadcast: true,
+                                }));
+                            }
                             warn!("Chunk {} not found on source {} — removing from heal queue", chunk_id, source_id);
                             return Ok(Some(HealOutcome {
                                 chunk_id: *chunk_id,
@@ -5397,12 +5414,14 @@ impl HealingManager {
     }
 
     /// Scrub all chunks (verify checksums)
-    async fn scrub_all_chunks(&self) -> Result<()> {
-        // Chunks whose on-disk mtime is more than MTIME_TOLERANCE_SECS newer than
-        // ChunkLocation.written_at were likely overwritten after the original write
-        // (e.g. a crash during PatchChunk). Only verify hash on those suspicious chunks,
-        // avoiding a full re-hash of every chunk on every scrub cycle.
-        const MTIME_TOLERANCE_SECS: u64 = 300;
+    /// Re-hash every chunk on this node's disk whose id is a content hash with known inputs
+    /// (its ChunkLocation's file_id and file_offset; patch tokens and deltas are skipped), and
+    /// quarantine + re-heal any that no longer match. It used to verify only chunks whose
+    /// mtime looked newer than their write, and read_and_verify_chunk never verified anything,
+    /// so bit rot (which changes neither size nor mtime) could never be found (suite T78,
+    /// 2026-10-07). Paced by DFS_SCRUB_PACE_MS (default 50 ms) between chunks, and hashed on
+    /// one thread, so a pass stays in the background.
+    pub async fn scrub_all_chunks(&self) -> Result<()> {
 
         // spawn_blocking: same rule as list_chunks()'s other call sites — real disk
         // I/O (a full recursive directory walk on a cache miss), never called inline
@@ -5413,51 +5432,41 @@ impl HealingManager {
         let chunks = tokio::task::spawn_blocking(move || storage.list_chunks())
             .await
             .map_err(|e| anyhow::anyhow!("list_chunks panicked: {}", e))??;
-        info!("Scrubbing {} chunks (mtime heuristic)", chunks.len());
+        let pace = Duration::from_millis(std::env::var("DFS_SCRUB_PACE_MS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(50));
+        info!("Scrubbing {} chunks (pace {:?})", chunks.len(), pace);
 
-        let mut skipped = 0usize;
-        let mut verified = 0usize;
-        let mut errors = 0usize;
-
+        let (mut skipped, mut verified, mut corrupt, mut gone) = (0usize, 0usize, 0usize, 0usize);
         for chunk_id in chunks {
-            let mtime = self.storage.get_chunk_mtime(&chunk_id);
-            let written_at = self.metadata
-                .get_chunk_location(&chunk_id)
-                .ok()
-                .flatten()
-                .and_then(|loc| loc.written_at);
-
-            let suspicious = match (mtime, written_at) {
-                (Some(mt), Some(wa)) => mt > wa.saturating_add(MTIME_TOLERANCE_SECS),
-                // No written_at recorded (old chunk) — always verify
-                (Some(_), None) => true,
-                // Can't stat the file — verify so we detect missing chunks
-                (None, _) => true,
-            };
-
-            if !suspicious {
+            if chunk_id.looks_like_patch_token() {
                 skipped += 1;
                 continue;
             }
-
-            match self.storage.read_and_verify_chunk(&chunk_id) {
-                Ok(_) => {
-                    verified += 1;
-                }
-                Err(e) => {
-                    warn!("Scrub hash mismatch for chunk {} (mtime={:?} written_at={:?}): {}",
-                        chunk_id, mtime, written_at, e);
-                    errors += 1;
+            let loc = self.metadata.get_chunk_location_async(chunk_id).await.ok().flatten();
+            let (Some(file_offset), Some(file_id)) = (loc.as_ref().and_then(|l| l.file_offset), loc.as_ref().and_then(|l| l.file_id)) else {
+                skipped += 1;
+                continue;
+            };
+            let storage = self.storage.clone();
+            match tokio::task::spawn_blocking(move || storage.verify_on_disk_for_scrub(&chunk_id, file_offset, file_id)).await {
+                Ok(Ok(true)) => verified += 1,
+                Ok(Ok(false)) => {
+                    corrupt += 1;
+                    let storage = self.storage.clone();
+                    let quarantined = tokio::task::spawn_blocking(move || storage.quarantine_chunk(&chunk_id)).await;
+                    error!("[CORRUPT] scrub: chunk {} (file {} offset {}): bytes on disk don't match its id; quarantined: {:?}",
+                        chunk_id, file_id, file_offset, quarantined);
                     self.mark_pending(chunk_id).await;
                 }
+                // Deleted, folded away or retired since the listing: not corruption.
+                _ => gone += 1,
+            }
+            if !pace.is_zero() {
+                tokio::time::sleep(pace).await;
             }
         }
 
-        info!(
-            "Scrubbing complete: skipped={}, verified={}, errors={}",
-            skipped, verified, errors
-        );
-
+        info!("Scrubbing complete: verified={}, corrupt={}, skipped={}, gone={}", verified, corrupt, skipped, gone);
         Ok(())
     }
 

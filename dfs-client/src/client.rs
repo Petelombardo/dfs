@@ -6791,12 +6791,22 @@ leader_addr: Arc::new(RwLock::new(None)),
             let (r1, r2) = tokio::join!(t1, t2);
             let n1_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r1 {
+                // A replica that ANSWERS with an error (its disk is full, an I/O error) failed
+                // just as much as one that didn't answer: take the next candidate for it. It used
+                // to count as a success, so the write bailed below without trying anyone else
+                // and one full node turned every fresh write through it into EIO (suite T79).
+                Ok(Ok(Response::Error { message, .. })) => { warn!("Parallel replica write refused by {}: {}, will retry serially", n1, message); }
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
             }
             let n2_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r2 {
+                // A replica that ANSWERS with an error (its disk is full, an I/O error) failed
+                // just as much as one that didn't answer: take the next candidate for it. It used
+                // to count as a success, so the write bailed below without trying anyone else
+                // and one full node turned every fresh write through it into EIO (suite T79).
+                Ok(Ok(Response::Error { message, .. })) => { warn!("Parallel replica write refused by {}: {}, will retry serially", n2, message); }
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
@@ -6840,6 +6850,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             ).await;
 
             match result {
+                Ok(Ok(Response::Error { message, .. })) => {
+                    warn!("Chunk replica write refused by {}: {}, trying next node", node, message);
+                }
                 Ok(Ok(response)) => {
                     debug!("Chunk replica write succeeded to {}", node);
                     successful.push((node, response));

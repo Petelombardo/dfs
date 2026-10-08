@@ -5578,7 +5578,13 @@ impl Server {
                     let mut channel_closed = false;
 
                     if metadata_batch_drain_enabled {
-                        let deadline = std::time::Instant::now() + BATCH_MAX_LINGER;
+                        // Linger only for fire-and-forget writes. When someone waits on this
+                        // commit (the leader's client-facing put, which acks only once it's
+                        // committed), the 8 ms linger was pure added latency on every fsync
+                        // that grew a file: take what is already queued and commit now. Writes
+                        // still batch, since they queue up while the previous commit runs.
+                        let linger = if buf[0].1.is_some() { std::time::Duration::ZERO } else { BATCH_MAX_LINGER };
+                        let deadline = std::time::Instant::now() + linger;
                         while buf.len() < BATCH_MAX_ITEMS {
                             match rx.try_recv() {
                                 Ok(m) => buf.push(m),

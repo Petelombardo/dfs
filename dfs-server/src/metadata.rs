@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 // guard small, short-held, single-owner-at-a-time state where starvation isn't a
 // concern the way a reader-vs-writer race on the whole database handle is.
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Table definitions — each replaces one sled prefix or named tree.
@@ -457,6 +457,8 @@ enum PendingReply {
 pub struct MetadataStore {
     db: RwLock<Database>,
     db_path: PathBuf,
+    /// Unix ms of the last reopen_after_io_error; rate-limits reopens while a disk stays full.
+    last_io_reopen_ms: AtomicU64,
     /// Counts Durability::None commits since the last Durability::Immediate one.
     /// See next_write_durability() for why this exists.
     non_durable_commits: AtomicU64,
@@ -629,6 +631,7 @@ impl MetadataStore {
         Ok(Self {
             db: RwLock::new(db),
             db_path,
+            last_io_reopen_ms: AtomicU64::new(0),
             non_durable_commits: AtomicU64::new(0),
             durable_commits: std::sync::atomic::AtomicBool::new(Self::durable_commits_enabled()),
             dirty_files: Mutex::new(std::collections::HashSet::new()),
@@ -817,6 +820,10 @@ impl MetadataStore {
                 warn!("{}", msg);
                 for op in ops {
                     Self::fail_op(op, &msg);
+                }
+                drop(_db);
+                if msg.contains("I/O error") {
+                    self.reopen_after_io_error(&msg);
                 }
                 return;
             }
@@ -1058,6 +1065,48 @@ impl MetadataStore {
                     };
                     let _ = reply.send(final_result);
                 }
+            }
+        }
+        drop(_db);
+        if let Some(msg) = commit_error.as_ref().filter(|m| m.contains("I/O error")) {
+            self.reopen_after_io_error(msg);
+        }
+    }
+
+    /// redb refuses every write after one failed I/O ("Previous I/O error occurred. Please
+    /// close and re-open the database.") until the handle is reopened. A leader whose disk
+    /// filled (suite T79) could then persist nothing even after space was freed, short of a
+    /// restart, while still taking requests. Reopen the handle, at most once per 5 s, so
+    /// writes resume as soon as the disk can take them again. If the file can't be reopened,
+    /// exit: a node with no usable metadata store must not keep serving (its supervisor
+    /// restarts it, and leadership moves meanwhile).
+    fn reopen_after_io_error(&self, why: &str) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        let last = self.last_io_reopen_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 5_000
+            || self.last_io_reopen_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let mut live = self.db.write();
+        // The poisoned handle holds the file lock, so it has to close before the file can
+        // reopen: park a throwaway in-memory database in its place meanwhile.
+        let placeholder = match Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()) {
+            Ok(db) => db,
+            Err(e) => {
+                error!("redb: can't reopen after an I/O error ({}): no placeholder: {}", why, e);
+                return;
+            }
+        };
+        drop(std::mem::replace(&mut *live, placeholder));
+        match Database::builder().set_cache_size(256 * 1024 * 1024).create(&self.db_path) {
+            Ok(db) => {
+                *live = db;
+                warn!("redb reopened after an I/O error ({})", why);
+            }
+            Err(e) => {
+                error!("redb: reopening {:?} after an I/O error ({}) failed: {}; exiting so this node restarts", self.db_path, why, e);
+                std::process::exit(1);
             }
         }
     }

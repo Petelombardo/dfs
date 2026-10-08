@@ -9367,8 +9367,17 @@ impl Filesystem for DfsFilesystem {
                             // defensive/periodic fsync right after open), so metadata_cache may
                             // still hold a scalar-only entry with no real chunk_locations.
                             let trustworthy = !meta.chunk_locations.is_empty() || meta.size == 0;
-                            if needs_sync && trustworthy {
-                                handle.client.flush_metadata_sync(&meta).await;
+                            // The debounce only skips a sync that wouldn't change what the leader
+                            // has. A file that grew since the last confirmed push must sync now:
+                            // this fsync acks the new size (suite T79: an fsynced 16 MB write read
+                            // back empty after the leader restarted).
+                            let size_unsynced = handle.client.metadata_queue.delivered_size(&meta.id) != Some(meta.size);
+                            if (needs_sync || size_unsynced) && trustworthy {
+                                if !handle.client.flush_metadata_sync(&meta).await {
+                                    error!("fsync: metadata for inode {} not committed by the leader; returning EIO", ino);
+                                    reply.error(libc::EIO);
+                                    return;
+                                }
                                 handle.last_metadata_update.insert(ino, std::time::Instant::now());
                             }
                         }

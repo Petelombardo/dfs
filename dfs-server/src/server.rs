@@ -222,7 +222,7 @@ pub struct Server {
     /// (planned offline compaction) MUST call restart_sled_writes(), or every
     /// subsequent PutFileMetadata is acked and silently never persisted (see
     /// restart_sled_writes' doc comment for the 2026-07-16 incident).
-    sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>>,
+    sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SledWrite>>>>,
 
     /// Whether the sled-write worker folds its batch into one transaction (see
     /// spawn_sled_write_worker). Stored so restart_sled_writes() can respawn the
@@ -5164,6 +5164,12 @@ impl Drop for FoldHealingCancelGuard {
     }
 }
 
+/// One queued metadata write for the sled-write worker, plus where to report its commit
+/// (Ok, or why it failed) when the writer has to know. The leader's client-facing put
+/// waits on it before acking: it used to ack on enqueue, so a commit that failed (a full
+/// disk, suite T79) or a crash before the commit lost an fsync-acked size change.
+pub(crate) type SledWrite = (FileMetadata, Option<tokio::sync::oneshot::Sender<Result<(), String>>>);
+
 /// How many metadata writes per file are queued in sled_write_tx and not yet committed
 /// (see Server::pending_metadata_writes). A count, not a set: two writes queued back to
 /// back for one file can land in different worker batches, and a set cleared by the
@@ -5266,8 +5272,8 @@ impl Server {
         pending_for_worker: Arc<PendingWrites>,
         progress_for_worker: Arc<tokio::sync::Notify>,
         metadata_batch_drain_enabled: bool,
-    ) -> tokio::sync::mpsc::UnboundedSender<FileMetadata> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
+    ) -> tokio::sync::mpsc::UnboundedSender<SledWrite> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SledWrite>();
         std::thread::spawn(move || {
                 // Batch/fold pending writes into one redb transaction per drain cycle
                 // instead of one begin_write() per item — the measured bottleneck
@@ -5314,7 +5320,7 @@ impl Server {
                     // about to be filtered out as tombstoned below. Those still need
                     // clearing from pending_for_worker (they're intentionally dropped, not
                     // delayed) or a rename waiting on one would block forever.
-                    let ids_in_batch: Vec<FileId> = buf.iter().map(|m| m.id).collect();
+                    let ids_in_batch: Vec<FileId> = buf.iter().map(|(m, _)| m.id).collect();
 
                     let batch_len = buf.len();
                     let backlog = backlog_for_worker.fetch_sub(batch_len, std::sync::atomic::Ordering::Relaxed) - batch_len;
@@ -5334,26 +5340,36 @@ impl Server {
                     // wins and we discard the stale metadata update. Filtered before
                     // folding, not after — folding a soon-to-be-discarded item into a
                     // survivor would incorrectly union its chunk_locations in.
-                    buf.retain(|m| {
-                        if tombstones_for_worker.contains_key(&m.id) {
-                            debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
-                            false
-                        } else {
-                            true
+                    // A write dropped because its file was deleted is resolved, not failed.
+                    let (buf, dropped): (Vec<SledWrite>, Vec<SledWrite>) = buf.into_iter()
+                        .partition(|(m, _)| !tombstones_for_worker.contains_key(&m.id));
+                    for (m, reply) in dropped {
+                        debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
                         }
-                    });
+                    }
 
                     if !buf.is_empty() {
+                        let (metas, replies): (Vec<FileMetadata>, Vec<_>) = buf.into_iter().unzip();
                         if metadata_batch_drain_enabled {
-                            let folded = fold_metadata_batch(buf);
+                            let folded = fold_metadata_batch(metas);
                             let folded_len = folded.len();
-                            if let Err(e) = meta_bg.put_files_batch_via_committer(folded) {
+                            let result = meta_bg.put_files_batch_via_committer(folded).map(|_| ()).map_err(|e| e.to_string());
+                            if let Err(e) = &result {
                                 warn!("sled_write_worker: put_files_batch failed for {} files: {}", folded_len, e);
                             }
+                            for reply in replies.into_iter().flatten() {
+                                let _ = reply.send(result.clone());
+                            }
                         } else {
-                            for m in &buf {
-                                if let Err(e) = meta_bg.put_file(m) {
+                            for (m, reply) in metas.iter().zip(replies) {
+                                let result = meta_bg.put_file(m).map(|_| ()).map_err(|e| e.to_string());
+                                if let Err(e) = &result {
                                     warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
+                                }
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(result);
                                 }
                             }
                         }
@@ -5403,7 +5419,7 @@ impl Server {
         let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let pending_renames: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
         let rename_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-        let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>> =
+        let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SledWrite>>>> =
             Arc::new(std::sync::Mutex::new(Some(Self::spawn_sled_write_worker(
                 metadata.clone(),
                 tombstones_for_worker,
@@ -8990,7 +9006,7 @@ impl Server {
         self.chunk_map_update(&metadata).await;
         if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
             self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = tx.send(metadata.clone());
+            let _ = tx.send((metadata.clone(), None));
         }
 
         // TTL>0: forward to all other nodes with ttl-1 so every node gets
@@ -10489,7 +10505,7 @@ impl Server {
             self.chunk_map_update(&metadata).await;
             if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
                 self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _ = tx.send(metadata.clone());
+                let _ = tx.send((metadata.clone(), None));
             }
         }
         Response::Ok { data: None }
@@ -13220,11 +13236,29 @@ impl Server {
         // the delete returns NotFound without setting a tombstone, and the worker
         // later resurrects the file.  Seq>0 writes are safe: sled already has the
         // file record from the seq=0 commit, so the delete can always find it.
-        if metadata.write_seq == 0 && metadata.chunk_locations.is_empty() {
+        //
+        // Either way, ack only once the record is committed: the client's fsync takes this
+        // reply as "the size and chunk list are durable". This used to ack on enqueue, so a
+        // commit that failed (the leader's disk full, suite T79) or a crash before it lost
+        // an fsync-acked size change. A failed commit is the writer's error now.
+        let committed: Result<(), String> = if metadata.write_seq == 0 && metadata.chunk_locations.is_empty() {
             let meta_clone = metadata.clone();
             let meta_store = self.metadata.clone();
-            let _ = tokio::task::spawn_blocking(move || meta_store.put_file(&meta_clone)).await;
+            match tokio::task::spawn_blocking(move || meta_store.put_file(&meta_clone)).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("put_file panicked: {}", e)),
+            }
         } else {
+            // An offline compaction pauses the worker (sled_write_tx is None until
+            // restart_sled_writes): wait for it to come back rather than fail the write.
+            for _ in 0..300 {
+                if self.sled_write_tx.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let mut waiter = None;
             if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
                 self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Must be set before send(): once the worker picks this item up it
@@ -13232,11 +13266,27 @@ impl Server {
                 // send() could race a very fast worker and leak "pending" forever.
                 self.pending_metadata_writes.queued(metadata.id);
                 let id = metadata.id;
-                if tx.send(metadata).is_err() {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                if tx.send((metadata, Some(reply))).is_err() {
                     // Worker gone: nothing will ever resolve this entry.
                     self.pending_metadata_writes.resolved(id);
+                } else {
+                    waiter = Some(rx);
                 }
             }
+            match waiter {
+                Some(rx) => rx.await.unwrap_or_else(|_| Err("metadata write worker dropped the write".to_string())),
+                // Still paused after 30s: the write is in chunk_map and pending_broadcasts as
+                // before, but not durable here, so it can't be acked as if it were.
+                None => Err("metadata write worker is not running (compaction still in progress after 30s)".to_string()),
+            }
+        };
+        if let Err(e) = committed {
+            warn!("[META SERVER] put not committed, failing it: {}", e);
+            return Response::Error {
+                message: format!("metadata commit failed: {}", e),
+                code: ErrorCode::IOError,
+            };
         }
         match resync_requested_for {
             Some(file_id) => Response::ResyncMetadataRequested { file_id },
@@ -13929,9 +13979,15 @@ impl Server {
             }
             Err(e) => {
                 warn!("Failed to write file locally: {:#}", e);
+                // IOError only when this node's own storage failed (disk full, I/O error):
+                // the client then writes the copy to another node instead (suite T79). Any
+                // other refusal keeps InternalError and the client's ordinary retry path;
+                // falling back to other nodes on those too stalled writers up to 60s right
+                // after a whole-cluster restart (suite T76c, 2026-10-08).
+                let storage_failed = e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some());
                 Response::Error {
                     message: format!("Failed to write file: {:#}", e),
-                    code: ErrorCode::InternalError,
+                    code: if storage_failed { ErrorCode::IOError } else { ErrorCode::InternalError },
                 }
             }
         }

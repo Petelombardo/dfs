@@ -13903,9 +13903,9 @@ impl Server {
                 Response::ChunkIds { chunk_ids, chunk_sizes, replica_nodes_per_chunk }
             }
             Err(e) => {
-                warn!("Failed to write file: {}", e);
+                warn!("Failed to write file: {:#}", e);
                 Response::Error {
-                    message: format!("Failed to write file: {}", e),
+                    message: format!("Failed to write file: {:#}", e),
                     code: ErrorCode::InternalError,
                 }
             }
@@ -13928,9 +13928,9 @@ impl Server {
                 Response::ChunkIds { chunk_ids, chunk_sizes, replica_nodes_per_chunk }
             }
             Err(e) => {
-                warn!("Failed to write file locally: {}", e);
+                warn!("Failed to write file locally: {:#}", e);
                 Response::Error {
-                    message: format!("Failed to write file: {}", e),
+                    message: format!("Failed to write file: {:#}", e),
                     code: ErrorCode::InternalError,
                 }
             }

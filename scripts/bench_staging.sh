@@ -10,8 +10,11 @@
 #   scripts/bench_staging.sh restart 0|1            restart servers+client with DFS_ORDERED_WRITES
 #                                                   (DFS_METADATA_DURABLE=0 in the env: old commit cadence)
 #   scripts/bench_staging.sh run <label>            fio jobs on the client -> /root/dfs-staging-bench-<label>.txt
+#   scripts/bench_staging.sh swap-client <path> [0|1]  replace just the client binary and remount
 #   scripts/bench_staging.sh teardown               unmount, stop, delete everything
 #
+# BENCH_JOBS="seq1m_fsync ..." runs only those fio jobs (default: all).
+# BENCH_SERVER_EXTRA_ENV="K=V ..." adds environment for the servers (e.g. DFS_APTIMING_INFO_MS=0).
 # BENCH_SERVER_BIN_DIR / BENCH_CLIENT_BIN deploy other binaries (e.g. production's own, copied
 # read-only, for a prod-vs-new comparison). A redeploy over a running bench needs teardown first.
 set -e
@@ -45,7 +48,7 @@ stop_bench_client() {
 # keeps ssh's stdout open, so ssh never returns.
 start_servers() {  # $1 = DFS_ORDERED_WRITES; DFS_METADATA_DURABLE from the caller's env (default 1)
     for n in $NODES; do
-        ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV DFS_ORDERED_WRITES=$1 DFS_METADATA_DURABLE=${DFS_METADATA_DURABLE:-1} RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
+        ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV $BENCH_SERVER_EXTRA_ENV DFS_ORDERED_WRITES=$1 DFS_METADATA_DURABLE=${DFS_METADATA_DURABLE:-1} RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
     done
     sleep 8
 }
@@ -83,6 +86,12 @@ deploy)
     start_servers "$ORDERED"
     start_client "$ORDERED"
     ;;
+swap-client)  # swap-client <dfs-client path> [0|1]: replace only the client binary, remount
+    [ -f "$2" ] || { echo "swap-client <dfs-client path> [0|1]"; exit 1; }
+    stop_bench_client; sleep 1
+    scp -q "$2" root@"$CLIENT":$CDIR/dfs-client
+    start_client "${3:-0}"
+    ;;
 restart)
     [ "$2" = 0 ] || [ "$2" = 1 ] || { echo "restart 0|1"; exit 1; }
     stop_bench_client; stop_bench_servers; sleep 3
@@ -98,6 +107,7 @@ run)
         sleep 10 && \
         for job in 'rand4k_fsync --rw=randwrite --bs=4k --numjobs=1' 'rand4k_16w_fsync --rw=randwrite --bs=4k --numjobs=16' 'seq1m_fsync --rw=write --bs=1m --numjobs=1' 'rand4k_read --rw=randread --bs=4k --numjobs=1' 'rand4k_16r_read --rw=randread --bs=4k --numjobs=16' 'seq1m_read --rw=read --bs=1m --numjobs=1'; do
             set -- \$job; name=\$1; shift
+            case \" $BENCH_JOBS \" in \"  \"|*\" \$name \"*) ;; *) continue ;; esac
             fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --direct=1 --fsync=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null 2>&1 \
               || fio --name=\$name --filename=bench.bin --size=64m --ioengine=psync --fsync=1 --time_based --runtime=30 --group_reporting \"\$@\" --output-format=json --output=$CDIR/\$name.json >/dev/null
             cat $CDIR/\$name.json

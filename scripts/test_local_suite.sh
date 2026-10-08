@@ -179,12 +179,23 @@ else
     T79_MOUNTED=1
     cp -a "$T79_SAVE"/. "$T79_DIR"/
     rm -rf "$T79_SAVE"
+fi
+t79_start
+sleep 8
+# Fill only once clients use the node again: a client keeps a node it just saw go down out
+# of fresh-write placement for a while, so the full node could go unasked (the ordering-off
+# suite, 2026-10-08). Small writes until node3 stores a chunk, then fill.
+T79_WROTE0=$(grep -c "chunks locally" "$LOG/server${T79_N}.log" || true)
+for i in $(seq 1 20); do
+    dd if=/dev/urandom of="$MOUNT/t79_warm_$i.bin" bs=1M count=4 conv=fsync status=none 2>/dev/null || true
+    [ "$(grep -c "chunks locally" "$LOG/server${T79_N}.log" || true)" -gt "$T79_WROTE0" ] && break
+done
+rm -f "$MOUNT"/t79_warm_*.bin
+if [ "$T79_MOUNTED" = 1 ]; then
     T79_AVAIL=$(df -Pm "$T79_DIR" | awk 'NR==2{print $4}')
     fallocate -l $(( T79_AVAIL - 8 ))M "$T79_DIR/filler" 2>/dev/null || true
 fi
-echo "  T79: node$T79_N on a loop fs, $(df -Pm "$T79_DIR" | awk 'NR==2{print $4}') MB free"
-t79_start
-sleep 8
+echo "  T79: node$T79_N on a loop fs, in use again after $i warm-up write(s), now $(df -Pm "$T79_DIR" | awk 'NR==2{print $4}') MB free"
 # Which nodes take a file's chunks depends on placement, so keep writing new 16 MB files
 # (fsync each) until the full node has refused at least one write: only then has the
 # write path met a full replica. Each file must be written without error.

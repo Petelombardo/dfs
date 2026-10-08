@@ -14476,7 +14476,8 @@ impl Server {
                             let mut h = blake3::Hasher::new();
                             h.update(&fid_bytes);
                             h.update(&offset_bytes);
-                            h.update(&prior_bytes_for_hash);
+                            // Multi-MB; see the new-record hash below for why rayon.
+                            h.update_rayon(&prior_bytes_for_hash);
                             h
                         }).await.map_err(|e| (format!("spawn_blocking panicked hashing prior delta: {}", e), ErrorCode::InternalError))?;
                         (h, legacy)
@@ -14513,9 +14514,18 @@ impl Server {
         // dirty_patch_slots insert below — the ring key has to be the NEW
         // delta_chunk_id, which isn't known until after the hash/write section
         // that follows this block.
+        // Sub-spans of `hash` for APTIMING: the running hasher's resolve, the no-op check
+        // (with its materialized-buffer ring hit or cold rebuild), and encode + rehash.
+        let t_hash_hasher = t_hash_start.elapsed();
+        let t_noop_start = std::time::Instant::now();
+        let mut noop_ring: &'static str = "none";
         let mut pending_materialized_buf: Option<Vec<u8>> = None;
         if let Some(prior_delta_id) = prior_delta {
-            let ring_hit = self.materialized_ring.shard(&prior_delta_id).lock().unwrap().get(&prior_delta_id).cloned();
+            // Taken out of the ring, not cloned from it: once this patch lands, prior_delta_id
+            // names a delta that no longer exists (it's renamed to the new id), and a sole
+            // owner can patch the 4 MB buffer in place instead of copying it (~1.5 ms per
+            // patch on the A55 storage nodes). A no-op puts it back below.
+            let ring_hit = self.materialized_ring.shard(&prior_delta_id).lock().unwrap().pop(&prior_delta_id);
             // known_max_seq must be a value PROVABLY grounded in reality, never
             // an absence treated as "trust anything" — a warm ring hit is only
             // trustworthy paired with dirty_patch_slots' own tracked seq (the
@@ -14533,11 +14543,13 @@ impl Server {
             // first patch had no tracked seq at all, so a since-reordered lower-
             // seq repeat of that same patch was wrongly treated as a no-op.
             let (materialized_buf, known_max_seq): (Option<Arc<Vec<u8>>>, Option<u64>) = if let Some(cached) = ring_hit {
+                noop_ring = "hit";
                 self.materialized_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let cached_seq = self.dirty_patch_slots.get(&(file_id, cidx))
                     .and_then(|e| e.value().materialized_max_seq);
                 (Some(cached), cached_seq)
             } else {
+                noop_ring = "miss";
                 self.materialized_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Cold rebuild: roughly fold-equivalent cost, paid once per cold
                 // slot — read base (chunk_ring first, disk fallback, same
@@ -14600,7 +14612,6 @@ impl Server {
                                 // just cold-rebuilt may have no dirty_patch_slots entry
                                 // at all yet (e.g. a fresh Server instance that never
                                 // processed this accumulator's earlier patches).
-                                self.materialized_ring.shard(&prior_delta_id).lock().unwrap().put(prior_delta_id, buf_arc.clone());
                                 self.dirty_patch_slots.entry((file_id, cidx))
                                     .and_modify(|slot| slot.materialized_max_seq = Some(true_max_seq))
                                     .or_insert_with(|| DirtyPatchSlot {
@@ -14636,26 +14647,29 @@ impl Server {
                     // real-change path. Returns the mutated buffer only when it's
                     // actually needed (real change); a no-op has nothing to mutate.
                     let patches_for_check = patches.clone();
-                    let buf_arc_for_check = buf_arc.clone();
-                    let (is_noop, mutated_buf) = tokio::task::spawn_blocking(move || {
-                        let needs_growth = patches_for_check.iter().any(|(off, d)| off + d.len() > buf_arc_for_check.len());
+                    let (is_noop, mutated_buf, unchanged_buf) = tokio::task::spawn_blocking(move || {
+                        let needs_growth = patches_for_check.iter().any(|(off, d)| off + d.len() > buf_arc.len());
                         let is_noop = !needs_growth
-                            && patches_for_check.iter().all(|(off, d)| &buf_arc_for_check[*off..*off + d.len()] == d.as_slice());
+                            && patches_for_check.iter().all(|(off, d)| &buf_arc[*off..*off + d.len()] == d.as_slice());
                         if is_noop {
-                            (true, None)
+                            (true, None, Some(buf_arc))
                         } else {
-                            let mut buf = (*buf_arc_for_check).clone();
+                            let mut buf = Arc::try_unwrap(buf_arc).unwrap_or_else(|shared| (*shared).clone());
                             let needed_len = patches_for_check.iter().map(|(off, d)| off + d.len()).max().unwrap_or(0).max(buf.len());
                             buf.resize(needed_len, 0);
                             for (off, data) in &patches_for_check {
                                 let end = off + data.len();
                                 buf[*off..end].copy_from_slice(data);
                             }
-                            (false, Some(buf))
+                            (false, Some(buf), None)
                         }
                     }).await.map_err(|e| (format!("spawn_blocking panicked in no-op check: {}", e), ErrorCode::InternalError))?;
 
                     if is_noop {
+                        // The delta is unchanged, so its materialized buffer is still current.
+                        if let Some(buf) = unchanged_buf {
+                            self.materialized_ring.shard(&prior_delta_id).lock().unwrap().put(prior_delta_id, buf);
+                        }
                         // Nothing changed: skip the raw-log append entirely, update
                         // only the lightweight bookkeeping, and return the client's
                         // own unchanged identity — the exact same shape
@@ -14700,6 +14714,7 @@ impl Server {
             }
         }
 
+        let t_hash_noop = t_noop_start.elapsed();
         let mut new_record_bytes = Vec::new();
         if prior_delta.is_none() {
             new_record_bytes.extend_from_slice(&DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes());
@@ -14717,11 +14732,16 @@ impl Server {
         // and in case a single call's own patches are themselves large. hasher must
         // come back out (not be consumed) — it's stored in DirtyPatchSlot below to
         // keep serving as this accumulator's incremental hasher for the next merge.
-        let new_record_bytes_for_hash = new_record_bytes.clone();
-        let (hasher, delta_chunk_id) = tokio::task::spawn_blocking(move || {
-            hasher.update(&new_record_bytes_for_hash);
+        //
+        // update_rayon (same result: blake3 is a tree hash) spreads a large record across
+        // cores. On the storage nodes' Cortex-A55s single-threaded blake3 runs ~230 MB/s,
+        // so a 1 MiB patch spent ~4.6 ms here on every MultiPatch; with rayon ~1.3 ms
+        // (measured on gluster2, 2026-10-07). The record moves in and back out rather
+        // than being cloned (another ~0.4 ms per MiB there).
+        let (hasher, delta_chunk_id, new_record_bytes) = tokio::task::spawn_blocking(move || {
+            hasher.update_rayon(&new_record_bytes);
             let id = ChunkId::from_hash(*hasher.finalize().as_bytes());
-            (hasher, id)
+            (hasher, id, new_record_bytes)
         }).await.map_err(|e| (format!("spawn_blocking panicked computing delta identity: {}", e), ErrorCode::InternalError))?;
 
         // Write: a fresh accumulator writes a brand-new file (needs_patch's first
@@ -15024,8 +15044,9 @@ impl Server {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100);
             if total.as_millis() >= aptiming_info_ms {
-                info!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} permit_wait={:?} state={:?} loc={:?}",
-                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_permit_wait, t_state, t_loc);
+                info!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} (hasher={:?} noop={:?} ring={} rehash={:?}) write={:?} permit_wait={:?} state={:?} loc={:?}",
+                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_hash_hasher, t_hash_noop, noop_ring,
+                    t_hash.saturating_sub(t_hash_hasher + t_hash_noop), t_write, t_permit_wait, t_state, t_loc);
             } else {
                 debug!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} permit_wait={:?} state={:?} loc={:?}",
                     file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_permit_wait, t_state, t_loc);

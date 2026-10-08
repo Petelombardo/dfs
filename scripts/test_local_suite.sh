@@ -483,6 +483,179 @@ sleep 5
 rm -f "$MOUNT"/t80_*.bin
 fi # should_run T80
 
+if should_run T81; then
+snapshot_log T81
+echo ""
+echo "=== T81: EVERY node's disk fills up: writes fail cleanly (no hang, no crash), reads keep working, nothing acked is lost, and writes resume once space is freed ==="
+# T79 fills one node and T80 the leader; here there is nowhere left to put anything.
+# Required: no node dies; each write returns (an error is fine, a hang is not); data written
+# before keeps reading back; anything acked while full is intact afterwards; once space is
+# freed, without restarting anything, an fsynced write lands and reads back.
+t81_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" \
+        >> "$LOG/server$1.log" 2>&1 &
+}
+t81_stop() {
+    pkill -9 -f "dfs-server start --config $BASE/node$1/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$1/config.toml" >/dev/null || break; sleep 0.1; done
+}
+t81_up() {   # how many of the 5 servers are running
+    local up=0
+    for n in 1 2 3 4 5; do pgrep -f "dfs-server start --config $BASE/node$n/config.toml" >/dev/null && up=$((up + 1)); done
+    echo $up
+}
+# The data written before the disks fill; read back while full and after.
+T81_PRE_SRC="$BASE/t81_pre.src"
+dd if=/dev/urandom of="$T81_PRE_SRC" bs=4M count=4 status=none
+dd if="$T81_PRE_SRC" of="$MOUNT/t81_pre.bin" bs=1M conv=fsync status=none 2>/dev/null || true
+dfs_sync
+# Move every node onto its own small loop filesystem (no root reserve, see T80).
+T81_MOUNTED=""
+for n in 1 2 3 4 5; do t81_stop $n; done
+for n in 1 2 3 4 5; do
+    d="$BASE/node$n"; img="$BASE/t81_$n.img"; save="$BASE/t81_save$n"
+    rm -rf "$save"; mv "$d" "$save"; mkdir "$d"
+    truncate -s $(( $(du -sm "$save" | cut -f1) + 160 ))M "$img"
+    mkfs.ext4 -q -F -m 0 "$img" >/dev/null 2>&1
+    if mount -o loop "$img" "$d" 2>/dev/null; then
+        cp -a "$save"/. "$d"/; rm -rf "$save"; T81_MOUNTED="$T81_MOUNTED $n"
+    else
+        rmdir "$d"; mv "$save" "$d"
+    fi
+done
+for n in 1 2 3 4 5; do t81_start $n; done
+sleep 8
+# Wait until the cluster takes writes again before filling.
+for i in $(seq 1 20); do
+    dd if=/dev/urandom of="$MOUNT/t81_warm.bin" bs=1M count=1 conv=fsync status=none 2>/dev/null && break
+    sleep 2
+done
+rm -f "$MOUNT/t81_warm.bin"
+for n in $T81_MOUNTED; do
+    d="$BASE/node$n"
+    fallocate -l $(( $(df -Pm "$d" | awk 'NR==2{print $4}') - 2 ))M "$d/filler" 2>/dev/null || true
+    dd if=/dev/zero of="$d/filler2" bs=64K status=none 2>/dev/null || true
+done
+echo "  T81: nodes on full loop filesystems:${T81_MOUNTED:- none}; free MB: $(for n in 1 2 3 4 5; do df -Pm "$BASE/node$n" | awk 'NR==2{printf "%s ", $4}'; done)"
+T81_MARKS=""
+for n in 1 2 3 4 5; do T81_MARKS="$T81_MARKS $(wc -l < "$LOG/server$n.log")"; done
+# Writes while everything is full: 3 new 16 MB files and 4 patches of t81_pre.bin, each
+# fsynced. 124 from timeout = a hang.
+T81_ACKED=""; T81_SUMS=""; T81_HUNG=""; T81_ERRS=0
+for i in 1 2 3; do
+    dd if=/dev/urandom of="$BASE/t81_src.bin" bs=1M count=16 status=none
+    sum=$(md5sum < "$BASE/t81_src.bin" | cut -d' ' -f1)
+    rc=0; timeout 150 dd if="$BASE/t81_src.bin" of="$MOUNT/t81_$i.bin" bs=1M conv=fsync status=none 2>>"$LOG/t81_dd.err" || rc=$?
+    case $rc in 0) T81_ACKED="$T81_ACKED $i"; T81_SUMS="$T81_SUMS $i:$sum";; 124) T81_HUNG="$T81_HUNG file$i";; *) T81_ERRS=$((T81_ERRS + 1));; esac
+done
+# A patch that is acked must be there afterwards; one whose fsync failed may or may not have
+# landed, so its range may hold either the old or the new bytes (t81_check).
+T81_PATCHED=""; T81_UNACKED=""
+for c in 0 1 2 3; do
+    dd if=/dev/urandom of="$BASE/t81_piece$c.bin" bs=256K count=1 status=none
+    rc=0; timeout 150 dd if="$BASE/t81_piece$c.bin" of="$MOUNT/t81_pre.bin" bs=256K seek=$(( c * 16 + 2 )) conv=notrunc,fsync status=none 2>>"$LOG/t81_dd.err" || rc=$?
+    case $rc in
+        0) T81_PATCHED="$T81_PATCHED $c"
+           dd if="$BASE/t81_piece$c.bin" of="$T81_PRE_SRC" bs=256K seek=$(( c * 16 + 2 )) conv=notrunc status=none;;
+        124) T81_HUNG="$T81_HUNG patch$c"; T81_UNACKED="$T81_UNACKED $c";;
+        *) T81_ERRS=$((T81_ERRS + 1)); T81_UNACKED="$T81_UNACKED $c";;
+    esac
+done
+rm -f "$BASE/t81_src.bin"
+t81_check() {   # $1 = a read of t81_pre.bin: "ok", or what differs
+    python3 - "$1" "$T81_PRE_SRC" "$BASE" $T81_UNACKED <<'PY'
+import sys
+got, want, base, unacked = open(sys.argv[1], 'rb').read(), open(sys.argv[2], 'rb').read(), sys.argv[3], sys.argv[4:]
+if len(got) != len(want):
+    print(f"size {len(got)} != {len(want)}"); sys.exit()
+P = 256 * 1024
+bad = []
+for c in range(4):
+    off = (c * 16 + 2) * P
+    new = open(f"{base}/t81_piece{c}.bin", 'rb').read()
+    ok = [want[off:off + P]] + ([new] if str(c) in unacked else [])
+    if got[off:off + P] not in ok:
+        bad.append(f"patch{c}")
+    got = got[:off] + want[off:off + P] + got[off + P:]
+if got != want:
+    bad.append("bytes outside the patched ranges")
+print("ok" if not bad else " ".join(bad))
+PY
+}
+T81_ENOSPC=0; i=0
+for n in 1 2 3 4 5; do
+    i=$((i + 1)); mark=$(echo $T81_MARKS | cut -d' ' -f$i)
+    T81_ENOSPC=$((T81_ENOSPC + $(tail -n +"$((mark + 1))" "$LOG/server$n.log" | grep -ci "no space left\|os error 28\|storage is failing" || true)))
+done
+echo "  T81: while full: acked files:${T81_ACKED:- none}, acked patches:${T81_PATCHED:- none}, failed $T81_ERRS, hung:${T81_HUNG:- none}; ENOSPC/unfit log lines: $T81_ENOSPC; $(head -c 200 "$LOG/t81_dd.err")"
+# Reads while full, through a fresh client (nothing from the writer's cache).
+T81_FRESH_MNT=/tmp/dfs-mount-fresh
+mkdir -p "$T81_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T81_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t81.log" --allow-other --log-level debug &
+T81_CPID=$!
+sleep 2
+T81_FULL_READ=failed
+timeout 60 cat "$T81_FRESH_MNT/t81_pre.bin" > "$BASE/t81_read.bin" 2>/dev/null && T81_FULL_READ=$(t81_check "$BASE/t81_read.bin")
+fusermount -u "$T81_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T81_CPID"
+T81_UP_FULL=$(t81_up)
+T81_PANICS=$(cat "$LOG"/server*.log | grep -c "panicked" || true)
+# Free every disk WITHOUT restarting: each node must recover on its own.
+for n in $T81_MOUNTED; do rm -f "$BASE/node$n/filler" "$BASE/node$n/filler2"; done
+sleep 15
+dd if=/dev/urandom of="$BASE/t81_src.bin" bs=1M count=4 status=none
+T81_AFTER_SUM=$(md5sum < "$BASE/t81_src.bin" | cut -d' ' -f1)
+T81_AFTER_RC=0
+timeout 90 dd if="$BASE/t81_src.bin" of="$MOUNT/t81_after.bin" bs=1M conv=fsync status=none 2>/dev/null || T81_AFTER_RC=$?
+rm -f "$BASE/t81_src.bin"
+sleep 3
+RUST_LOG=info "$BIN/dfs-client" mount "$T81_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t81.log" --allow-other --log-level debug &
+T81_CPID=$!
+sleep 2
+T81_BAD=""
+for pair in $T81_SUMS; do
+    i=${pair%%:*}; want=${pair#*:}
+    got=$(timeout 60 md5sum < "$T81_FRESH_MNT/t81_$i.bin" 2>/dev/null | cut -d' ' -f1)
+    [ "$got" = "$want" ] || T81_BAD="$T81_BAD t81_$i.bin(${got:-unreadable})"
+done
+T81_PRE_READ=unreadable
+timeout 60 cat "$T81_FRESH_MNT/t81_pre.bin" > "$BASE/t81_read.bin" 2>/dev/null && T81_PRE_READ=$(t81_check "$BASE/t81_read.bin")
+[ "$T81_PRE_READ" = ok ] || T81_BAD="$T81_BAD t81_pre.bin($T81_PRE_READ)"
+T81_AFTER_READ=$(timeout 60 md5sum < "$T81_FRESH_MNT/t81_after.bin" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T81_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T81_CPID"
+T81_ALL_MOUNTED=0; [ "$T81_MOUNTED" = " 1 2 3 4 5" ] && T81_ALL_MOUNTED=1
+[ "$T81_ALL_MOUNTED" = 1 ] && [ "$T81_UP_FULL" = 5 ] && [ "$T81_PANICS" = 0 ] \
+    && check "T81a every node stays up with all disks full, no panic" PASS \
+    || check "T81a with all disks full: $T81_UP_FULL of 5 servers up, $T81_PANICS panic line(s) (on loop fs:$T81_MOUNTED)" FAIL
+[ "$T81_ALL_MOUNTED" = 1 ] && [ -z "$T81_HUNG" ] \
+    && check "T81b every write returns while all disks are full (acked:${T81_ACKED:- none}${T81_PATCHED:+, patches$T81_PATCHED}; $T81_ERRS failed)" PASS \
+    || check "T81b writes hung (150s) with all disks full:$T81_HUNG" FAIL
+[ "$T81_ALL_MOUNTED" = 1 ] && [ "$T81_FULL_READ" = ok ] \
+    && check "T81c data written before the disks filled reads back intact while they are full" PASS \
+    || check "T81c read of t81_pre.bin while full: $T81_FULL_READ" FAIL
+[ "$T81_ALL_MOUNTED" = 1 ] && [ -z "$T81_BAD" ] \
+    && check "T81d after space is freed, everything acked (before and while full) reads back intact" PASS \
+    || check "T81d after freeing space, acked but not intact:$T81_BAD" FAIL
+[ "$T81_AFTER_RC" = 0 ] && [ "$T81_AFTER_READ" = "$T81_AFTER_SUM" ] \
+    && check "T81e once space is freed, without a restart, an fsynced write lands and reads back" PASS \
+    || check "T81e after freeing space: write rc=$T81_AFTER_RC, read ${T81_AFTER_READ:-failed} vs $T81_AFTER_SUM" FAIL
+# Back onto the ordinary disk.
+for n in 1 2 3 4 5; do t81_stop $n; done
+for n in $T81_MOUNTED; do
+    d="$BASE/node$n"; save="$BASE/t81_save$n"
+    rm -rf "$save"; mkdir -p "$save"; cp -a "$d"/. "$save"/
+    umount "$d" 2>/dev/null || umount -l "$d"
+    rmdir "$d"; mv "$save" "$d"
+done
+rm -f "$BASE"/t81_*.img "$BASE"/t81_piece*.bin "$BASE/t81_read.bin" "$T81_PRE_SRC"
+for n in 1 2 3 4 5; do t81_start $n; done
+sleep 8
+rm -f "$MOUNT"/t81_*.bin
+fi # should_run T81
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

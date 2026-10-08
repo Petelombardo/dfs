@@ -1004,6 +1004,13 @@ pub struct DfsClient {
     /// both, divided into bytes sent, gives real achieved throughput per target.
     /// Added 2026-07-14 for the offline-compaction regression investigation.
     write_target_last_op_at: Arc<DashMap<SocketAddr, std::time::Instant>>,
+    /// Set when the latest write was refused by every node for its own storage (disk full
+    /// or failing), cleared by the next write that lands. While it is set, a writer waiting
+    /// for room in a full write buffer gets ENOSPC instead of waiting: the buffered bytes
+    /// can't drain anywhere, so the wait could only end at the flusher's 10-minute give-up
+    /// (suite T81, 2026-10-08: every disk full, a new file's write() hung on another
+    /// file's undrainable buffer).
+    cluster_storage_full: Arc<std::sync::atomic::AtomicBool>,
 
     /// Zero-filled gap table: tracks ranges that contain zeros in sparse files.
     /// Key: (inode, chunk_offset), Value: Vec of gap ranges within that chunk.
@@ -1362,6 +1369,15 @@ pub struct DfsClient {
 /// corruption). A slow-but-alive node is exactly the case we most want to wait out, so
 /// its timeout errors must count as transient too. Matched case-insensitively against
 /// the error strings produced by send_request / send_split_frame_write_request.
+/// A replica's refusal because its own storage failed (disk full, or its metadata db
+/// poisoned by an I/O error until it reopens), as the text reaches the client in a patch
+/// error.
+fn is_storage_full_refusal(err_msg: &str) -> bool {
+    err_msg.contains("No space left on device") || err_msg.contains("os error 28")
+        || err_msg.contains("Previous I/O error occurred")
+        || err_msg.contains("storage failed, so it left the ISR")
+}
+
 fn is_transient_write_failure(err_msg: &str) -> bool {
     let s = err_msg.to_lowercase();
     // All distinctive client-side network-wrapper phrases (see send_request /
@@ -1393,6 +1409,23 @@ fn is_ordered_handover_failure(err_msg: &str) -> bool {
 }
 
 impl DfsClient {
+    /// True when the latest write was refused by every node for its own storage; see
+    /// cluster_storage_full.
+    pub fn cluster_storage_full(&self) -> bool {
+        self.cluster_storage_full.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_cluster_storage_full(&self, full: bool) {
+        if self.cluster_storage_full.swap(full, std::sync::atomic::Ordering::Relaxed) != full {
+            if full {
+                warn!("Every node refused the last write for its own storage (out of space): writers \
+                       waiting on a full write buffer now get ENOSPC until a write lands again");
+            } else {
+                info!("A write landed again: the cluster has room");
+            }
+        }
+    }
+
     /// Create a new DFS client
     pub fn new(cluster_nodes: Vec<SocketAddr>) -> Result<Self> {
         if cluster_nodes.is_empty() {
@@ -1515,6 +1548,7 @@ impl DfsClient {
             reserved_cache_bytes,
             zero_gap_table: Arc::new(ShardedZeroGapTable::new()),
             write_target_last_op_at: Arc::new(DashMap::new()),
+            cluster_storage_full: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(tokio::sync::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
@@ -6782,6 +6816,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Try the preferred pair in parallel first — halves write latency on the hot path.
         // If either fails, fall back to serial retries from the remaining candidates.
         let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
+        // Replicas asked, and how many refused for their own storage: all of them refusing
+        // that way is the cluster being out of space (see cluster_storage_full).
+        let mut attempted = 0usize;
+        let mut storage_refusals = 0usize;
 
         if candidates.len() >= 2 {
             let n1 = candidates[0];
@@ -6806,6 +6844,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // rather than infer them from throughput alone — see this session's offline-
             // compaction regression investigation.
             let replica_write_start = std::time::Instant::now();
+            attempted += 2;
             let t1 = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
                 self.send_split_frame_write_request(n1, &encoded, data),
@@ -6823,7 +6862,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // else and one full node turned every fresh write through it into EIO (suite T79).
                 // Other refusals still end the write here for the caller's retry path: falling
                 // back on those too stalled writers after a cluster restart (T76c).
-                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n1, message); }
+                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { storage_refusals += 1; warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n1, message); }
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
@@ -6836,7 +6875,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // else and one full node turned every fresh write through it into EIO (suite T79).
                 // Other refusals still end the write here for the caller's retry path: falling
                 // back on those too stalled writers after a cluster restart (T76c).
-                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n2, message); }
+                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { storage_refusals += 1; warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n2, message); }
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
@@ -6858,11 +6897,17 @@ leader_addr: Arc::new(RwLock::new(None)),
         while successful.len() < 2 {
             let node = match candidate_iter.next() {
                 Some(n) => *n,
-                None => anyhow::bail!(
-                    "Chunk write failed: could not get 2 replicas after trying all {} nodes",
-                    candidates.len()
-                ),
+                None => {
+                    let storage_full = attempted > 0 && storage_refusals == attempted;
+                    if storage_full { self.set_cluster_storage_full(true); }
+                    anyhow::bail!(
+                        "Chunk write failed: could not get 2 replicas after trying all {} nodes{}",
+                        candidates.len(),
+                        if storage_full { " (every node's own storage refused it: out of space)" } else { "" }
+                    )
+                }
             };
+            attempted += 1;
 
             // Use split-frame encoding for serial fallback too
             let request = Request::WriteFileLocalOnly {
@@ -6881,6 +6926,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             match result {
                 Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => {
+                    storage_refusals += 1;
                     warn!("Chunk replica write failed on {}'s storage: {}, trying next node", node, message);
                 }
                 Ok(Ok(response)) => {
@@ -6897,6 +6943,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
+        self.set_cluster_storage_full(false);
         let (addr1, response1) = successful.remove(0);
         let (addr2, response2) = successful.remove(0);
 
@@ -8388,9 +8435,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
                     continue 'retry;
                 }
+                let storage_full = !replica_results.is_empty()
+                    && replica_results.iter().all(|(_, r)| r.as_ref().err().is_some_and(|e| is_storage_full_refusal(&e.to_string())));
+                // Only a write that lands clears the mark; a failure of another kind says
+                // nothing about whether the cluster has room.
+                if storage_full { self.set_cluster_storage_full(true); }
                 anyhow::bail!("MultiPatch: all replicas failed for chunk {}", old_chunk_id)
             }
         };
+        self.set_cluster_storage_full(false);
 
         // Record only replicas that successfully applied the patch with the authoritative
         // chunk_id. Stale replicas (healer-copied old versions) are simply excluded from
@@ -10864,6 +10917,18 @@ mod tests {
         assert!(!is_ordered_handover_failure("chunk stale"));
         assert!(!is_ordered_handover_failure("chunk 224 fresh-write safety check found real existing data"));
         assert!(!is_ordered_handover_failure("Timeout reading chunk from 10.0.0.1:8900"));
+    }
+
+    #[test]
+    fn storage_refusals_are_told_apart_from_other_patch_failures() {
+        // Each replica's own storage refusing is what marks the cluster out of space (T81).
+        assert!(is_storage_full_refusal("Failed to write patch delta: Failed to create chunk directory: \"/d/chunks/3e/4f\": No space left on device (os error 28)"));
+        assert!(is_storage_full_refusal("Failed to look up chunk location for x: Previous I/O error occurred. Please close and re-open the database."));
+        assert!(is_storage_full_refusal("Ordered: this node's storage failed, so it left the ISR of file f chunk 0"));
+        // Unreachable or slow nodes, and data errors, say nothing about free space.
+        assert!(!is_storage_full_refusal("Failed to connect to 127.0.0.1:8901: Connection refused"));
+        assert!(!is_storage_full_refusal("Timeout writing to 10.0.0.1:8900"));
+        assert!(!is_storage_full_refusal("ChunkStale: chunk has moved on"));
     }
 
     #[test]

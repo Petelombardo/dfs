@@ -3557,8 +3557,12 @@ impl FlushHandle {
                         false
                     }
                     Err(e) => {
-                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={}", ino, chunk_idx, path, e);
-                        false
+                        // Not knowing is not "no data": with every node's metadata db failing
+                        // (all disks full, suite T81) this lookup errors, and treating that as
+                        // "no chunk here" sent zero gaps over the chunk's real bytes. Refuse
+                        // this attempt like a confirmed chunk; it retries once lookups work.
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={} — treating as real data", ino, chunk_idx, path, e);
+                        true
                     }
                 }
             } else {
@@ -7026,7 +7030,11 @@ impl Filesystem for DfsFilesystem {
                                             // longer won't help — that's not a slow pipeline, it's
                                             // no pipeline. Report ENOSPC rather than blocking on a
                                             // drain that can't happen.
-                                            let stuck = write_chunk_indices.iter().any(|idx| {
+                                            // The same holds when every node just refused a
+                                            // write for its own storage: the buffer is full of
+                                            // bytes that can't drain anywhere, whichever file
+                                            // they belong to (suite T81).
+                                            let stuck = client.cluster_storage_full() || write_chunk_indices.iter().any(|idx| {
                                                 match state_arc.chunk_get(*idx) {
                                                     Some(shard) => shard.try_lock().map(|cs| cs.slot.in_backoff()).unwrap_or(false),
                                                     None => false,
@@ -7357,7 +7365,7 @@ impl Filesystem for DfsFilesystem {
                             // See matching comment on the fast-path write above: a full buffer
                             // plus a target chunk already in_backoff (every replica just
                             // rejected it) means there's nothing to wait for — report ENOSPC.
-                            let stuck = chunk_indices_for_write(write_offset, data_vec.len()).iter().any(|idx| {
+                            let stuck = client.cluster_storage_full() || chunk_indices_for_write(write_offset, data_vec.len()).iter().any(|idx| {
                                 match state_arc.chunk_get(*idx) {
                                     Some(shard) => shard.try_lock().map(|cs| cs.slot.in_backoff()).unwrap_or(false),
                                     None => false,

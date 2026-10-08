@@ -309,16 +309,33 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         heal drops only the missing holder). Cold 4K random reads -8..-14% (first touch).
   - [x] **ENOSPC one node, T79 (2026-10-08):** failed first: one full node turned fresh writes
         into EIO. Fixed 5f3d067 (fall back to another node on the replica's own storage error).
-        T79a informational with ordering on: a full ISR member is never replaced (open bug,
-        protocol proposal: the failing node reports itself to its pair peer).
+        Ordering on: a full ISR member was never replaced. Fixed 36c31f6 (ResignIsrMember: the
+        failing member resigns to its pair peer, epoch+1); T79a/T79e required in both modes.
   - [x] **ENOSPC on the leader, T80 (2026-10-08):** failed first: 3 fsyncs acked, 3 files lost.
         Fixed a809751 + 99b672e (ack PutFileMetadata after commit, redb reopen after I/O error,
         fsync syncs a grown size, bounded 60s wait -> EIO). Bench: no measurable cost.
-        Follow-up: a leader that can't persist metadata should step down.
+        Leader step-down done 36c31f6 (LeaderUnfit; catch-up before leading again; T80c).
+        Found on the way, fixed 36c31f6 (all pre-existing): redb panics on commit/abort after
+        ENOSPC killed the meta-committer; merge_self_heal dropped slots (zeros); a late
+        write_seq-0 create reset a file to 0 B. T78b flake fixed ea6fe11 (healer drained from a
+        stale alive_nodes_cache entry naming the quarantined holder).
   - [x] **Mixed versions (2026-10-07):** rolling upgrade from production's build on the bench
         cluster (bb11734 upgrade-node): 0 writer errors, every file intact; old nodes log
         "Failed to deserialize" for new request types until upgraded.
-  - [ ] ENOSPC on all nodes, power loss (LazyFS / dm-flakey), and the rest of the Legata list.
+  - [ ] **ENOSPC on every node, T81 (2026-10-08, IN PROGRESS):** all 5 nodes on full loop
+        filesystems. Found and fixed (local commit, suites NOT yet run):
+        (1) a new file's write() hung on backpressure for 600s behind other files' undrainable
+        buffer: client cluster_storage_full mark (every node refused for its own storage) ->
+        write() gets ENOSPC; (2) redb 2.6.3 race: begin_write checks for I/O errors before
+        waiting for the writer slot, so a commit queued behind a failed file grow PANICKED
+        (assert !needs_recovery): all commits go through metadata::commit_txn, which turns it
+        into an I/O error (fail-first unit test); (3) the client's fresh-write safety check
+        treated a failed metadata lookup as "no data" and could zero-fill real bytes.
+        OPEN: T81c ~1 in 3: with every node unfit, a LAGGING follower (node4, still at the
+        file's create record) briefly became leader and served size 0 to a fresh client.
+        Next: a node that hasn't caught up must not serve as leader (or the client must not
+        trust a leader that isn't caught up). Logs: /root/t81fail (dev box).
+  - [ ] Power loss (LazyFS / dm-flakey), and the rest of the Legata list.
 
 - **Six fix branches MERGED 2026-10-05** (fix/dir-rename-subtree, fix/is-leader-startup,
   fix/delete-resurrection, fix/rename-lost-pending-write, fix/unit-test-fixtures,

@@ -276,6 +276,50 @@ pub struct StaleFoldedPatchCandidate {
     pub safe_without_leader_check: bool,
 }
 
+thread_local! {
+    /// Set while this thread is inside commit_txn's commit: the panic hook reports a panic
+    /// there as the refused commit it is, and commit_txn turns it into an error.
+    static IN_REDB_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commit a redb write transaction; every commit in this store goes through here.
+///
+/// redb 2.6.3 checks for an earlier I/O error in begin_write() BEFORE it waits for the
+/// single writer slot. When the transaction holding the slot fails (growing the file on a
+/// full disk), the database is left needing recovery, and the waiting transaction then
+/// starts on it anyway: its commit() hits redb's `assert!(!needs_recovery)` and PANICS
+/// instead of returning an error. Seen on a tokio worker in put_leader_state (suite T81,
+/// 2026-10-08: every disk full); any write here can be the waiter. redb is built for that
+/// unwind (a transaction dropped while panicking skips its rollback), so catch it and
+/// return the I/O error it stands for: the caller fails cleanly, and the next group commit
+/// fails the same way and reopens the handle (reopen_after_io_error).
+pub(crate) fn commit_txn(txn: redb::WriteTransaction) -> std::result::Result<(), redb::CommitError> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if IN_REDB_COMMIT.with(|c| c.get()) {
+                let what = info.payload().downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+                warn!("redb refused a commit: the database needs recovery after an earlier I/O error ({} at {})", what, at);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+    IN_REDB_COMMIT.with(|c| c.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| txn.commit()));
+    IN_REDB_COMMIT.with(|c| c.set(false));
+    match result {
+        Ok(committed) => committed,
+        Err(_) => Err(redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+            "redb refused the commit: an earlier transaction's I/O error left the database needing recovery",
+        )))),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test hook: runs once, right after a compaction catch-up pass opens its read snapshot,
@@ -629,7 +673,7 @@ impl MetadataStore {
             txn.open_table(COUNTERS_TABLE)?;
             txn.open_table(DELETE_QUEUE_TABLE)?;
             txn.open_table(PENDING_HEALING_TABLE)?;
-            txn.commit()?;
+            commit_txn(txn)?;
         }
 
         let tombstoned_files = dashmap::DashSet::new();
@@ -670,7 +714,7 @@ impl MetadataStore {
     /// `payload_bytes` is the serialized value size actually written where that's
     /// cheaply available (already computed for the insert), 0 otherwise (pure
     /// deletes, counter bumps, or multi-row txns where tracking an exact sum isn't
-    /// worth the bookkeeping). Call immediately after a successful `txn.commit()?` —
+    /// worth the bookkeeping). Call immediately after a successful `commit_txn(txn)?` —
     /// never before, so a failed commit is never counted as growth. Cheap: one
     /// Mutex lock + HashMap entry bump, no behavior change to the write path.
     fn note_txn(&self, site: &'static str, payload_bytes: usize) {
@@ -1053,7 +1097,7 @@ impl MetadataStore {
             drop(txn);
             Some(format!("group commit of {} ops aborted: an op hit an I/O error: {}", op_count, e))
         } else {
-            match txn.commit() {
+            match commit_txn(txn) {
                 Ok(()) => {
                     self.note_txn("group_commit", payload_bytes);
                     None
@@ -1286,7 +1330,7 @@ impl MetadataStore {
                     let mut table = txn.open_table(COUNTERS_TABLE)?;
                     table.insert("durability_heartbeat_ms", now_ms)?;
                 }
-                txn.commit()?;
+                commit_txn(txn)?;
                 store.note_txn("flush_durability", 0);
                 Ok(())
             }).await.context("spawn_blocking panicked in flush_durability_async")?;
@@ -1370,7 +1414,7 @@ impl MetadataStore {
                     path_table.insert(path.as_str(), file_id_str.as_bytes())?;
                 }
             }
-            txn.commit()?;
+            commit_txn(txn)?;
             let payload_bytes: usize = to_repair.iter().map(|(_, id)| id.len()).sum();
             self.note_txn("repair_path_index", payload_bytes);
         }
@@ -1406,7 +1450,7 @@ impl MetadataStore {
                     path_table.remove(path.as_str())?;
                 }
             }
-            txn.commit()?;
+            commit_txn(txn)?;
             self.note_txn("repair_path_index", 0);
         }
 
@@ -1798,7 +1842,7 @@ impl MetadataStore {
         // A Stale result no longer means "nothing was mutated" — put_file_in_txn still
         // unions incoming's chunk_locations into existing's before returning Stale, so
         // this transaction must always commit or that merge is silently rolled back.
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_file", payload_bytes);
         let t_committed = t_put_start.elapsed();
         if t_committed.as_millis() > 5 {
@@ -1869,7 +1913,7 @@ impl MetadataStore {
                 results.push(result);
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_files_batch", payload_bytes);
 
         // See put_file's matching comment: must happen while `_db` is still held.
@@ -1951,7 +1995,7 @@ impl MetadataStore {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             file_table.insert(key.as_str(), bytes)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_raw_file_bytes", bytes.len());
         Ok(())
     }
@@ -1970,7 +2014,7 @@ impl MetadataStore {
             let mut path_table = txn.open_table(PATH_TABLE)?;
             path_table.insert(path, bytes)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         Ok(())
     }
 
@@ -2113,7 +2157,7 @@ impl MetadataStore {
                 announce_table.remove(k.as_str())?;
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("delete_file", 0);
         if for_good {
             self.tombstoned_files.insert(file_id_str.clone());
@@ -2143,7 +2187,7 @@ impl MetadataStore {
             let mut table = txn.open_table(PATH_TABLE)?;
             table.remove(path)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("delete_path_index", 0);
 
         // See put_file's matching comment: must happen while `_db` is still held.
@@ -2233,7 +2277,7 @@ impl MetadataStore {
             }
             old
         };
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("prune_file_tombstones", 0);
         for k in &pruned {
             self.tombstoned_files.remove(k);
@@ -2332,7 +2376,7 @@ impl MetadataStore {
                     removed += 1;
                 }
             }
-            txn.commit()?;
+            commit_txn(txn)?;
             self.note_txn("remove_unlisted_files", 0);
 
             // See put_file's matching comment: must happen while `_db` is still held.
@@ -2376,7 +2420,7 @@ impl MetadataStore {
                     removed += 1;
                 }
             }
-            txn.commit()?;
+            commit_txn(txn)?;
             self.note_txn("remove_unlisted_files", 0);
 
             // See put_file's matching comment: must happen while `_db` is still held.
@@ -2476,7 +2520,7 @@ impl MetadataStore {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_chunk_location", value.len());
         debug!("Stored location for chunk: {}", location.chunk_id);
         Ok(())
@@ -2508,7 +2552,7 @@ impl MetadataStore {
                 table.insert(key.as_str(), value.as_slice())?;
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_chunk_locations_batch", payload_bytes);
         debug!("Stored {} chunk locations in one batch transaction", locations.len());
         Ok(())
@@ -2589,7 +2633,7 @@ impl MetadataStore {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.remove(key.as_str())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("delete_chunk_location", 0);
         Ok(())
     }
@@ -2676,7 +2720,7 @@ impl MetadataStore {
             new_count = current + 1;
             table.insert(key.as_str(), new_count)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("incr_chunk_refcount", 0);
         Ok(new_count)
     }
@@ -2710,7 +2754,7 @@ impl MetadataStore {
                 }
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("decr_chunk_refcount", 0);
         Ok(result)
     }
@@ -2767,7 +2811,7 @@ impl MetadataStore {
                 table.insert(key.as_str(), seq)?;
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_chunk_seq", 0);
         Ok(effective)
     }
@@ -2843,7 +2887,7 @@ impl MetadataStore {
             &txn, file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
             size, written_at, client_write_seq,
         )?;
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_patch_state_pending", payload_bytes);
         Ok(retired)
     }
@@ -2933,7 +2977,7 @@ impl MetadataStore {
             let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
             ts_table.insert(token_key.as_str(), dfs_common::types::current_timestamp())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("update_patch_state_folded", value.len());
         Ok(())
     }
@@ -2951,7 +2995,7 @@ impl MetadataStore {
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         Self::delete_patch_state_abandoned_in_txn(&txn, public_token, file_id, chunk_idx)?;
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("delete_patch_state_abandoned", 0);
         Ok(())
     }
@@ -3058,7 +3102,7 @@ impl MetadataStore {
                 }
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         Ok(out)
     }
 
@@ -3596,7 +3640,7 @@ impl MetadataStore {
                 ts_table.remove(key.as_str())?;
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("remove_patch_state_rows", 0);
         Ok(keys.iter().filter_map(|key| decode_hex_32(key).map(ChunkId::from_hash)).collect())
     }
@@ -3625,7 +3669,7 @@ impl MetadataStore {
             let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_pending_fold_announce", 0);
         Ok(())
     }
@@ -3651,7 +3695,7 @@ impl MetadataStore {
             let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
             table.remove(key.as_str())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("delete_pending_fold_announce", 0);
         Ok(())
     }
@@ -3766,7 +3810,7 @@ impl MetadataStore {
             let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
             table.insert(key.as_str(), detected_at_secs)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_pending_healing", 0);
         Ok(())
     }
@@ -3782,7 +3826,7 @@ impl MetadataStore {
             let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
             table.remove(key.as_str())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("delete_pending_healing", 0);
         Ok(())
     }
@@ -3819,7 +3863,7 @@ impl MetadataStore {
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         Self::put_pending_healing_batch_in_txn(&txn, entries)?;
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_pending_healing_batch", 0);
         Ok(())
     }
@@ -3909,7 +3953,7 @@ impl MetadataStore {
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         let payload_bytes = Self::apply_chunk_location_updates_in_txn(&txn, puts, deletes, pending_healing_deletes)?;
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("batch_update_chunk_locations", payload_bytes);
         Ok(())
     }
@@ -4158,7 +4202,7 @@ impl MetadataStore {
                     table.insert(key.as_str(), bytes.as_slice())?;
                 }
             }
-            txn.commit()?;
+            commit_txn(txn)?;
             let payload_bytes: usize = to_write.iter().map(|(_, b)| b.len()).sum();
             self.note_txn("rebuild_chunk_locations_from_files", payload_bytes);
         }
@@ -4196,7 +4240,7 @@ impl MetadataStore {
             table.insert("meta_seq", next)?;
             next
         };
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("next_meta_sequence", 0);
         Ok(next)
     }
@@ -4240,7 +4284,7 @@ impl MetadataStore {
             table.insert("leader_state_lo", lo)?;
             table.insert("leader_state_since_secs", since_secs)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("put_leader_state", 0);
         Ok(())
     }
@@ -4307,7 +4351,7 @@ impl MetadataStore {
             queue_table.insert(queue_key.as_str(), value.as_slice())?;
             idx_table.insert(idx_key.as_str(), sequence.to_be_bytes().as_slice())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("enqueue_meta_for_node", payload_bytes);
         Ok(())
     }
@@ -4409,7 +4453,7 @@ impl MetadataStore {
                 queue_table.remove(queue_key.as_str())?;
             }
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("ack_meta_queue_for_node", 0);
         Ok(())
     }
@@ -4462,7 +4506,7 @@ impl MetadataStore {
                     table.remove(key.as_str())?;
                 }
             }
-            txn.commit()?;
+            commit_txn(txn)?;
             self.note_txn("compact_meta_queue_for_node", 0);
         }
         Ok(())
@@ -4477,7 +4521,7 @@ impl MetadataStore {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
             table.insert("follower_seq", seq)?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("set_follower_sequence", 0);
         Ok(())
     }
@@ -4645,7 +4689,7 @@ impl MetadataStore {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("enqueue_delete", value.len());
         Ok(())
     }
@@ -4668,7 +4712,7 @@ impl MetadataStore {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
             table.remove(key.as_str())?;
         }
-        txn.commit()?;
+        commit_txn(txn)?;
         self.note_txn("dequeue_delete", 0);
         Ok(())
     }
@@ -5107,7 +5151,7 @@ impl MetadataStore {
                     phase1_budget
                 );
             }
-            dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase1 commit: {}", e))?;
+            commit_txn(dst_txn).map_err(|e| anyhow::anyhow!("compact phase1 commit: {}", e))?;
             // Payload = size_before: this phase's commit rewrites the whole live DB into
             // the shadow file, not a proportional per-record write — attributing
             // size_before bytes here (rather than 0) keeps it from being mistaken for a
@@ -5135,7 +5179,7 @@ impl MetadataStore {
             after_catchup_snapshot();
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase2 begin_write: {}", e))?;
             let changed = self.diff_all_tables_tracked(&src_txn, &dst_txn, dirty)?;
-            dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase2 commit: {}", e))?;
+            commit_txn(dst_txn).map_err(|e| anyhow::anyhow!("compact phase2 commit: {}", e))?;
             self.note_txn("compact_db_prepare_phase2", 0);
             if changed <= convergence_threshold {
                 converged = true;
@@ -5173,7 +5217,7 @@ impl MetadataStore {
                 let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase3 begin_read: {}", e))?;
                 let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase3 begin_write: {}", e))?;
                 self.diff_all_tables_tracked(&src_txn, &dst_txn, dirty)?;
-                dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase3 commit: {}", e))?;
+                commit_txn(dst_txn).map_err(|e| anyhow::anyhow!("compact phase3 commit: {}", e))?;
                 self.note_txn("compact_db_finish_phase3", 0);
             }
             drop(shadow_db);
@@ -5219,7 +5263,7 @@ impl MetadataStore {
         {
             let txn = db.begin_write()
                 .map_err(|e| anyhow::anyhow!("compact pre-flush begin: {}", e))?;
-            txn.commit()
+            commit_txn(txn)
                 .map_err(|e| anyhow::anyhow!("compact pre-flush commit: {}", e))?;
             self.note_txn("compact_db_blocking", 0);
         }
@@ -5257,7 +5301,7 @@ impl MetadataStore {
         let db = self.db.read();
         let txn = db.begin_write()
             .map_err(|e| anyhow::anyhow!("flush_durable begin: {}", e))?;
-        txn.commit()
+        commit_txn(txn)
             .map_err(|e| anyhow::anyhow!("flush_durable commit: {}", e))?;
         self.note_txn("flush_durable", 0);
         Ok(())
@@ -5318,6 +5362,65 @@ mod tests {
     use super::*;
     use dfs_common::{ChunkId, FileType, NodeId};
     use tempfile::TempDir;
+
+    /// In-memory redb storage whose file can be made unable to grow, like a full disk.
+    #[derive(Debug)]
+    struct FillableBackend {
+        inner: redb::backends::InMemoryBackend,
+        full: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl redb::StorageBackend for FillableBackend {
+        fn len(&self) -> std::result::Result<u64, std::io::Error> { self.inner.len() }
+        fn read(&self, offset: u64, len: usize) -> std::result::Result<Vec<u8>, std::io::Error> { self.inner.read(offset, len) }
+        fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
+            if self.full.load(Ordering::SeqCst) && len > self.inner.len()? {
+                return Err(std::io::Error::from_raw_os_error(28));
+            }
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self, eventual: bool) -> std::result::Result<(), std::io::Error> { self.inner.sync_data(eventual) }
+        fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> { self.inner.write(offset, data) }
+    }
+
+    /// Suite T81, 2026-10-08: a write transaction that began while another held the writer
+    /// slot, and got the slot after that one failed to grow the file on a full disk, PANICKED
+    /// in commit (redb asserts !needs_recovery; its begin_write checked for errors before
+    /// waiting). commit_txn must report it as an I/O error instead.
+    #[test]
+    fn a_commit_queued_behind_a_failed_grow_is_an_error_not_a_panic() {
+        let full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = FillableBackend { inner: redb::backends::InMemoryBackend::new(), full: full.clone() };
+        let db = Arc::new(Database::builder().create_with_backend(backend).unwrap());
+        const T: TableDefinition<u64, &[u8]> = TableDefinition::new("t");
+
+        let holder = db.begin_write().unwrap();
+        let waiter = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let txn = db.begin_write().unwrap();   // passes redb's check, then waits for the slot
+                {
+                    let mut t = txn.open_table(T).unwrap();
+                    let _ = t.insert(1, &b"small"[..]);
+                }
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit_txn(txn)))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));   // the waiter is parked on the slot
+        full.store(true, Ordering::SeqCst);
+        {
+            let mut t = holder.open_table(T).unwrap();
+            let big = vec![7u8; 8 * 1024 * 1024];
+            assert!(t.insert(0, &big[..]).is_err(), "test setup: growing the file must fail");
+        }
+        drop(holder);
+
+        match waiter.join().unwrap() {
+            Ok(Err(e)) => assert!(e.to_string().contains("I/O error"), "{}", e),
+            Ok(Ok(())) => panic!("test setup: the queued commit succeeded, so the race wasn't reproduced"),
+            Err(_) => panic!("commit of a transaction queued behind a failed grow panicked instead of returning an error"),
+        }
+    }
 
     /// A put_file that has returned (what a write's ack waits on) must survive the
     /// process dying right after, with no clean shutdown. Durability::None did not:

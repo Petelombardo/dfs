@@ -72,10 +72,50 @@ pub struct ClusterManager {
     /// (`Request::LeaderUnfit`), each until its report expires. Leadership skips them.
     leader_unfit: Arc<std::sync::Mutex<HashMap<NodeId, std::time::Instant>>>,
 
+    /// Asked live whenever this node weighs itself as leader: true while its own storage is
+    /// failing (`set_self_unfit_probe`). Its own `leader_unfit` entry comes from a 2 s tick,
+    /// and a node whose disk had just filled elected itself 3 ms before that tick noticed,
+    /// then answered a fresh client's lookups from a record it never caught up on: a 16 MB
+    /// file read back as 0 bytes (suite T81c).
+    self_unfit_probe: Arc<std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>>,
+
+    /// The term of this node's latest leadership while fit and caught up: once its election
+    /// catch-up has pulled every record (`leading_caught_up`), and again whenever a peer
+    /// reports a term as high, it moves above every term it knows of. Peers' terms come with
+    /// their `Request::LeaderUnfit` reports (`leader_terms`). When every node is unfit the
+    /// highest term leads. The leader each node had last seen kept leading instead, but
+    /// those differed: node4, full, had seen node5 lead, and node5 node4, so each sent
+    /// clients to the other, ~7000 times a second until the disk filled with logs.
+    own_term: Arc<std::sync::atomic::AtomicU64>,
+    leader_terms: Arc<std::sync::Mutex<HashMap<NodeId, u64>>>,
+
+    /// The `leader_generation` in which this node, leading, finished its election catch-up
+    /// (`leading_caught_up`); u64::MAX for none. Its term moves only while that generation
+    /// holds. Moved on taking the lead, a node whose full disk refused the catch-up (0 file
+    /// records) outranked the last leader that held them once every disk was full, and
+    /// answered a fresh client's lookup of a 16 MB file with not-found (suite T81c).
+    caught_up_generation: Arc<std::sync::atomic::AtomicU64>,
+
     /// Bumped whenever the leader this node computes changes, and whenever this node marks
     /// itself unfit to lead or fit again (`leader_generation`), with the last leader seen.
     leader_generation: Arc<std::sync::atomic::AtomicU64>,
     last_leader_seen: Arc<std::sync::Mutex<Option<NodeId>>>,
+
+    /// Woken whenever the leader this node computes changes, so a holder pushes its chunk
+    /// locations to a new leader at once (chunk_location_sync) instead of on its next 30 s
+    /// poll; see `Request::SyncHeldLocations` for what that gap cost.
+    pub leader_changed_notify: Arc<Notify>,
+    /// The `leader_generation` in which this node last became leader in its own view
+    /// (u64::MAX: never). Woken through `became_leader_notify`.
+    leading_since: Arc<std::sync::atomic::AtomicU64>,
+    pub became_leader_notify: Arc<Notify>,
+    /// The leader this node last pushed its held locations to on request
+    /// (`Request::SyncHeldLocations`), and when: chunk_location_sync skips the same push.
+    pub held_locations_synced: Arc<std::sync::Mutex<Option<(SocketAddr, std::time::Instant)>>>,
+    /// The `leading_since` whose holders have all pushed their chunk locations to this
+    /// node (`holder_locations_in`). Until it matches, this leader's chunk map may lack
+    /// chunks it never held, and chunk-map reads wait (`wait_holder_locations`).
+    holder_locations_ready: Arc<tokio::sync::watch::Sender<u64>>,
 
     /// This node's most recently computed heal bandwidth target (MB/s), set by
     /// HealingManager::run_bandwidth_controller only when this node is leader.
@@ -102,6 +142,11 @@ pub struct ClusterManager {
     /// to heartbeat while "offline". Same AtomicBool-checked-each-tick pattern as
     /// Server::compaction_quiescing.
     heartbeat_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Held (shared) by every heartbeat send in flight; `announce_leaving` takes it
+    /// exclusively after pausing, so no heartbeat built before the pause lands after the
+    /// GracefulLeave. One did, 50 ms after it: heartbeats always say Online, so every peer
+    /// re-admitted the departing leader and led it for 30 s (suite T82, 2026-10-12).
+    heartbeat_sends: Arc<tokio::sync::RwLock<()>>,
 
     /// The largest cluster this node knows it belongs to — the denominator of every
     /// majority (is_leader, has_quorum). `nodes.len()` alone is NOT that: a node that
@@ -163,12 +208,22 @@ impl ClusterManager {
             node_recovered_notify: Arc::new(Notify::new()),
             became_leader_at: Arc::new(RwLock::new(None)),
             leader_unfit: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            self_unfit_probe: Arc::new(std::sync::OnceLock::new()),
+            own_term: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            leader_terms: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            caught_up_generation: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             leader_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_leader_seen: Arc::new(std::sync::Mutex::new(None)),
+            leader_changed_notify: Arc::new(Notify::new()),
+            leading_since: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            became_leader_notify: Arc::new(Notify::new()),
+            held_locations_synced: Arc::new(std::sync::Mutex::new(None)),
+            holder_locations_ready: Arc::new(tokio::sync::watch::channel(u64::MAX).0),
             client: Arc::new(NetworkClient::new_for_peers()),
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compaction_intents: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            heartbeat_sends: Arc::new(tokio::sync::RwLock::new(())),
             peer_rtt: Arc::new(std::sync::Mutex::new(HashMap::new())),
             known_cluster_size: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             known_cluster_size_file: Arc::new(std::sync::OnceLock::new()),
@@ -415,8 +470,20 @@ impl ClusterManager {
         let leader = self.leader_among(online_ids);
         let mut last = self.last_leader_seen.lock().unwrap();
         if *last != leader {
+            let unfit: Vec<NodeId> = {
+                let now = std::time::Instant::now();
+                self.leader_unfit.lock().unwrap().iter().filter(|(_, until)| **until > now).map(|(id, _)| *id).collect()
+            };
+            info!("[LEADER] leader in this node's view: {:?} -> {:?} (unfit: {:?}, own term {}, peer terms {:?})",
+                *last, leader, unfit, self.led_term(), self.leader_terms.lock().unwrap());
+            let was_self = *last == Some(self.local_node_id);
             *last = leader;
-            self.leader_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let generation = self.leader_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if leader == Some(self.local_node_id) && !was_self {
+                self.leading_since.store(generation, std::sync::atomic::Ordering::Relaxed);
+                self.became_leader_notify.notify_one();
+            }
+            self.leader_changed_notify.notify_one();
         }
         leader
     }
@@ -428,6 +495,36 @@ impl ClusterManager {
     /// lacked chunks of three files acked meanwhile: they read back as zeros (suite T80a).
     pub fn leader_generation(&self) -> u64 {
         self.leader_generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The generation in which this node last became leader (see `leading_since`).
+    pub fn leading_since(&self) -> u64 {
+        self.leading_since.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every online node has pushed its chunk locations to this node, leading since
+    /// `since`. Ignored if it has stopped leading and led again since.
+    pub fn holder_locations_in(&self, since: u64) {
+        if self.leading_since() == since {
+            self.holder_locations_ready.send_replace(since);
+        }
+    }
+
+    /// A cluster of this node alone: no other node holds anything, so a leader has every
+    /// chunk location already. Judged by the cluster size this node knows of, not by who is
+    /// online now: just restarted, a node saw itself alone and led for a moment, 1 ms before
+    /// it loaded the size (5), and a lone-online shortcut let it serve chunk maps it never
+    /// pulled (suite T79f, 2026-10-12).
+    pub async fn single_node_cluster(&self) -> bool {
+        self.known_cluster_size() <= 1 && self.nodes.read().await.len() <= 1
+    }
+
+    /// Wait up to `max` for the holders' chunk locations to reach this leader (see
+    /// `holder_locations_ready`). False if they haven't.
+    pub async fn wait_holder_locations(&self, max: Duration) -> bool {
+        let mut rx = self.holder_locations_ready.subscribe();
+        let ready = tokio::time::timeout(max, rx.wait_for(|in_for| *in_for == self.leading_since())).await;
+        matches!(ready, Ok(Ok(_)))
     }
 
     /// How long a `LeaderUnfit` report holds without being repeated: a node that recovers
@@ -447,17 +544,72 @@ impl ClusterManager {
         }
     }
 
+    /// Record a peer's `Request::LeaderUnfit` report: whether it can lead, and its term.
+    pub fn record_leader_report(&self, node: NodeId, unfit: bool, led_term: u64) {
+        if node != self.local_node_id {
+            self.leader_terms.lock().unwrap().insert(node, led_term);
+        }
+        self.set_leader_unfit(node, unfit);
+    }
+
+    fn peer_term_max(terms: &HashMap<NodeId, u64>, online: &[NodeId]) -> u64 {
+        terms.iter().filter(|(id, _)| online.contains(id)).map(|(_, t)| *t).max().unwrap_or(0)
+    }
+
+    /// This node, leading since `generation` (`leader_generation`), finished its election
+    /// catch-up: it holds every record, so its term may move (see `caught_up_generation`).
+    /// Ignored if leadership has moved since, in this node's view.
+    pub async fn leading_caught_up(&self, generation: u64) {
+        self.caught_up_generation.store(generation, std::sync::atomic::Ordering::Relaxed);
+        // Moves the term now if this node still leads fit in `generation`.
+        self.leader_with_quorum().await;
+    }
+
+    /// This node's term, for its `Request::LeaderUnfit` reports (see `own_term`).
+    pub fn led_term(&self) -> u64 {
+        self.own_term.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Install the live check behind `self_unfit_probe`. Once, at startup.
+    pub fn set_self_unfit_probe(&self, probe: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.self_unfit_probe.set(Box::new(probe));
+    }
+
     /// The leader among `online`: the min id, skipping nodes that reported they can't lead.
     /// A leader whose disk is full can't commit file records, so every client write failed
-    /// for as long as it stayed full (suite T80c). If every online node is unfit, the min id
-    /// leads anyway: someone has to answer.
+    /// for as long as it stayed full (suite T80c). This node judges itself live as well as
+    /// by its own reports (`self_unfit_probe`).
+    ///
+    /// If every online node is unfit, the one with the highest term leads (`own_term`): no
+    /// one can commit anything, so the node that led last while it could, caught up, holds
+    /// every record.
+    /// The min id instead moved leadership onto a node that had filled first and never
+    /// caught up, and a 16 MB file read back as 0 bytes (suite T81c). The terms stop moving
+    /// once no node leads while fit, so every node reaches the same answer.
     fn leader_among(&self, online: Vec<NodeId>) -> Option<NodeId> {
         let now = std::time::Instant::now();
+        let self_unfit = online.contains(&self.local_node_id)
+            && self.self_unfit_probe.get().is_some_and(|probe| probe());
         let fit_min = {
             let m = self.leader_unfit.lock().unwrap();
-            online.iter().copied().filter(|id| m.get(id).is_none_or(|until| *until <= now)).min()
+            online.iter().copied()
+                .filter(|id| !(*id == self.local_node_id && self_unfit))
+                .filter(|id| m.get(id).is_none_or(|until| *until <= now))
+                .min()
         };
-        fit_min.or_else(|| online.into_iter().min())
+        let terms = self.leader_terms.lock().unwrap();
+        if fit_min.is_some() {
+            if fit_min == Some(self.local_node_id) && self.caught_up_generation.load(std::sync::atomic::Ordering::Relaxed)
+                == self.leader_generation.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.own_term.fetch_max(Self::peer_term_max(&terms, &online) + 1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return fit_min;
+        }
+        let own = self.led_term();
+        let term_of = |id: &NodeId| if *id == self.local_node_id { own } else { terms.get(id).copied().unwrap_or(0) };
+        // Highest term first, then the min id.
+        online.iter().copied().max_by(|a, b| term_of(a).cmp(&term_of(b)).then(b.cmp(a)))
     }
 
     /// Returns the SocketAddr of the current leader, if known.
@@ -547,6 +699,13 @@ impl ClusterManager {
         use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
+
+        // Leaving for real (not ConnectionPressure, which keeps heartbeating to rejoin):
+        // heartbeats stop first, and the ones already in flight land before the leave.
+        if reason != dfs_common::LeaveReason::ConnectionPressure {
+            self.pause_heartbeats();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.heartbeat_sends.write()).await;
+        }
 
         // Mark ourselves Leaving locally first.
         {
@@ -1057,6 +1216,13 @@ impl ClusterManager {
         use dfs_common::protocol::{ClusterMessage, Message};
         use dfs_common::{NodeHealthGossip, NodeInfo};
 
+        // Shared by this round's sends (see `heartbeat_sends`); checked again under it, since
+        // a leave may have paused heartbeats after the loop's own check.
+        let in_flight = Arc::new(self.heartbeat_sends.clone().read_owned().await);
+        if self.heartbeat_paused.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
         let nodes = self.nodes.read().await.clone();
         let local_node_id = self.local_node_id;
         let local_addr = self.local_addr;
@@ -1123,7 +1289,9 @@ impl ClusterManager {
             let is_probe = node_info.status == NodeStatus::Failed;
             let client = self.client.clone();
             let peer_rtt = self.peer_rtt.clone();
+            let in_flight = in_flight.clone();
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 let started = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
@@ -1419,6 +1587,163 @@ pub struct ClusterStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Five online nodes as ids sorted ascending, viewed from `ids[local]`.
+    async fn five_node_view(ids: &[NodeId], local: usize) -> ClusterManager {
+        let addr = |i: usize| -> SocketAddr { format!("127.0.0.1:{}", 8900 + i).parse().unwrap() };
+        let manager = ClusterManager::new(ids[local], addr(local), 10, 30);
+        for (i, id) in ids.iter().enumerate() {
+            if i != local {
+                manager.add_node(NodeInfo::new(*id, addr(i), None)).await.unwrap();
+            }
+        }
+        manager
+    }
+
+    fn five_ids() -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = (0..5).map(|_| NodeId::new()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Five online nodes, viewed from `ids[3]`.
+    async fn five_node_cluster() -> (ClusterManager, Vec<NodeId>) {
+        let ids = five_ids();
+        (five_node_view(&ids, 3).await, ids)
+    }
+
+    /// Suite T82: a node elected after a restart held none of three files' chunks and served
+    /// them as 0 chunks before the holders pushed their locations. A leader with peers waits
+    /// for them (`holder_locations_in`); a single-node cluster has nothing to wait for; a report for a
+    /// leadership it has since lost and regained doesn't count.
+    #[tokio::test]
+    async fn a_new_leader_serves_chunk_maps_only_once_the_holders_locations_are_in() {
+        let short = Duration::from_millis(20);
+        let lone = ClusterManager::new(NodeId::new(), "127.0.0.1:8900".parse().unwrap(), 10, 30);
+        assert!(lone.is_leader().await);
+        assert!(lone.single_node_cluster().await, "no other node: nothing to wait for");
+
+        let ids = five_ids();
+        let manager = five_node_view(&ids, 0).await;
+        assert!(!manager.single_node_cluster().await);
+        assert!(manager.is_leader().await, "lowest id leads");
+        let first = manager.leading_since();
+        assert!(!manager.wait_holder_locations(short).await, "holders haven't pushed yet");
+        manager.holder_locations_in(first);
+        assert!(manager.wait_holder_locations(short).await);
+
+        // Stands down (unfit) and leads again: a new leadership, whose holders it waits for.
+        let probe_failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe = probe_failing.clone();
+        manager.set_self_unfit_probe(move || probe.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!manager.is_leader().await);
+        probe_failing.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(manager.is_leader().await);
+        let second = manager.leading_since();
+        assert_ne!(second, first);
+        assert!(!manager.wait_holder_locations(short).await, "a new leadership waits again");
+        manager.holder_locations_in(first);
+        assert!(!manager.wait_holder_locations(short).await, "the old leadership's report doesn't count");
+        manager.holder_locations_in(second);
+        assert!(manager.wait_holder_locations(short).await);
+    }
+
+    /// Suite T81c: as disks filled one by one, the min-id rule with every node unfit handed
+    /// leadership to the node that had filled first and never caught up. The node that led
+    /// last while fit (highest term) leads instead.
+    #[tokio::test]
+    async fn every_node_unfit_the_last_fit_leader_leads() {
+        let (manager, ids) = five_node_cluster().await;
+        for (i, id) in ids.iter().enumerate().filter(|(i, _)| *i != 3) {
+            // ids[4] led last (term 7); ids[0] first (term 2).
+            let term = [2, 0, 5, 0, 7][i];
+            manager.record_leader_report(*id, true, term);
+        }
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[3]), "itself: the only fit node");
+        assert_eq!(manager.led_term(), 0, "not caught up yet");
+        manager.leading_caught_up(manager.leader_generation()).await;
+        assert_eq!(manager.led_term(), 8, "caught up: above every known term");
+        manager.set_leader_unfit(ids[3], true);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[3]), "all unfit: its own term 8 is the highest");
+        manager.record_leader_report(ids[4], true, 9);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[4]), "all unfit: highest term");
+        assert_eq!(manager.led_term(), 8, "unchanged while it doesn't lead fit");
+        manager.record_leader_report(ids[0], false, 2);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[0]), "a fit node leads again");
+    }
+
+    /// Suite T81c (10-12): node5 took the lead while node1 was full, but its own disk had
+    /// filled too and refused the catch-up: it held 0 file records. Its term had moved on
+    /// taking the lead, so once every disk was full it outranked node1, the last leader that
+    /// held the records, and told a fresh client a 16 MB file didn't exist. Its term moves
+    /// only once its catch-up is done.
+    #[tokio::test]
+    async fn a_leader_that_never_caught_up_does_not_outrank_the_last_one_that_did() {
+        let (manager, ids) = five_node_cluster().await;
+        manager.record_leader_report(ids[0], true, 5);
+        for id in [ids[1], ids[2], ids[4]] {
+            manager.record_leader_report(id, true, 0);
+        }
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[3]), "itself: the only fit node");
+        let generation = manager.leader_generation();
+        manager.set_leader_unfit(ids[3], true);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[0]),
+            "all unfit: the last leader that caught up, not the one whose catch-up failed");
+        manager.leading_caught_up(generation).await;
+        assert_eq!(manager.led_term(), 0, "a catch-up from an election since superseded doesn't count");
+        manager.set_leader_unfit(ids[3], false);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[3]));
+        manager.leading_caught_up(manager.leader_generation()).await;
+        assert_eq!(manager.led_term(), 6);
+        manager.set_leader_unfit(ids[3], true);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[3]), "all unfit: now it holds the highest term");
+    }
+
+    /// The 10-08 log flood: node4's disk filled while node5 still took it for fit, and the
+    /// other way round, so each saw the other lead last. With every node unfit, each kept
+    /// the leader it had seen last and sent clients to the other, forever. Once both hold
+    /// the same reports they agree, whatever each saw on the way.
+    #[tokio::test]
+    async fn every_node_unfit_two_nodes_that_saw_each_other_lead_agree() {
+        let ids = five_ids();
+        let (n4, n5) = (five_node_view(&ids, 3).await, five_node_view(&ids, 4).await);
+        // ids[2] led last while fit; nodes 1-3 are full, and both views know it.
+        for m in [&n4, &n5] {
+            for (i, id) in ids[..3].iter().enumerate() {
+                m.record_leader_report(*id, true, [1, 2, 3][i]);
+            }
+        }
+        let (full4, full5) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let (p4, p5) = (full4.clone(), full5.clone());
+        n4.set_self_unfit_probe(move || p4.load(std::sync::atomic::Ordering::Relaxed));
+        n5.set_self_unfit_probe(move || p5.load(std::sync::atomic::Ordering::Relaxed));
+        // Each knows itself full before hearing the other is.
+        assert_eq!(n4.leader_with_quorum().await, Some(ids[4]));
+        assert_eq!(n5.leader_with_quorum().await, Some(ids[3]));
+        // The reports cross.
+        n4.record_leader_report(ids[4], true, n5.led_term());
+        n5.record_leader_report(ids[3], true, n4.led_term());
+        let (l4, l5) = (n4.leader_with_quorum().await, n5.leader_with_quorum().await);
+        assert_eq!(l4, l5, "both views name the same leader");
+        assert_eq!(l4, Some(ids[2]), "the last fit leader");
+    }
+
+    /// Suite T81c: a node whose disk had just filled elected itself 3 ms before its own 2 s
+    /// fitness tick reported it. It weighs itself live.
+    #[tokio::test]
+    async fn a_node_never_elects_itself_while_its_own_storage_fails() {
+        let (manager, ids) = five_node_cluster().await;
+        for id in &ids[..3] {
+            manager.set_leader_unfit(*id, true);
+        }
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe = failing.clone();
+        manager.set_self_unfit_probe(move || probe.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[4]), "skips itself (ids[3])");
+        assert!(!manager.is_leader().await);
+        failing.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(manager.is_leader().await, "fit again: min fit id is itself");
+    }
 
     #[tokio::test]
     async fn test_add_remove_node() {

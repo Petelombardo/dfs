@@ -1165,7 +1165,10 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ResyncSlot { .. } => PeerOther,
         Request::GetOrSeedSlotIsr { .. }
         | Request::ReplaceIsrMember { .. } => ClientOther,
-        Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. } => PeerOther,
+        Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. }
+        | Request::SyncHeldLocations { .. } => PeerOther,
+        // A client's leader-directed read, relayed by the node the client asked.
+        Request::ForwardedToLeader { .. } => ClientOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -7173,6 +7176,12 @@ impl Server {
         tokio::spawn(async move {
             let mut was_leader = false;
             let mut seen_generation = server.cluster.leader_generation();
+            // The election whose catch-up is still owed, and the run in flight with the
+            // election it started for: a run from before a re-election can't settle it.
+            let mut election = 0u64;
+            let mut election_generation = 0u64;
+            let mut catchup_owed = false;
+            let mut catchup_task: Option<(u64, tokio::task::JoinHandle<Result<bool, tokio::time::error::Elapsed>>)> = None;
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
@@ -7221,21 +7230,41 @@ impl Server {
                         });
                     }
                     info!("Became leader — spawning metadata catch-up for all followers");
-                    let server_catchup = server.clone();
-                    tokio::spawn(async move {
-                        let result = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(120),
-                            server_catchup.run_metadata_catchup(),
-                        ).await;
-                        if result.is_err() {
-                            warn!("Metadata catch-up timed out after 120s — dissemination loop will cover remaining gaps");
-                        }
-                    });
+                    election += 1;
+                    election_generation = generation;
+                    catchup_owed = true;
                 }
                 was_leader = is_leader;
 
                 if !is_leader {
+                    catchup_owed = false;
                     continue;
+                }
+
+                // The election catch-up, retried every poll until this node's store takes
+                // what it was missing. Run once, a refused pull (disk full) waited for the
+                // 5-minute pass below while this node led from records it lacked (suite T81c).
+                if catchup_task.as_ref().is_some_and(|(_, t)| t.is_finished()) {
+                    let (started_for, task) = catchup_task.take().unwrap();
+                    match task.await {
+                        Ok(Ok(true)) => if started_for == election {
+                            catchup_owed = false;
+                            // Only now may its term move (see `ClusterManager::leading_caught_up`).
+                            server.cluster.leading_caught_up(election_generation).await;
+                        },
+                        Ok(Ok(false)) => warn!("Metadata catch-up incomplete — retrying"),
+                        Ok(Err(_)) => warn!("Metadata catch-up timed out after 120s — retrying"),
+                        Err(e) => warn!("Metadata catch-up task failed: {} — retrying", e),
+                    }
+                }
+                if catchup_owed && catchup_task.is_none() {
+                    let server_catchup = server.clone();
+                    catchup_task = Some((election, tokio::spawn(async move {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_secs(120),
+                            server_catchup.run_metadata_catchup(),
+                        ).await
+                    })));
                 }
 
                 // Periodically re-run the full pull-merge catchup so the leader stays
@@ -7533,6 +7562,7 @@ impl Server {
         tokio::spawn(async move {
             let mut prev_leader: Option<std::net::SocketAddr> = None;
             let notify = server.cluster.node_recovered_notify.clone();
+            let leader_changed = server.cluster.leader_changed_notify.clone();
 
             // First iteration triggers immediately (startup).
             let mut node_event = true;
@@ -7543,6 +7573,8 @@ impl Server {
                     // Wake on node recovery/join OR poll every 30s as a backstop.
                     tokio::select! {
                         _ = notify.notified() => { node_event = true; }
+                        // A leader change pushes at once; it waited for this 30 s poll.
+                        _ = leader_changed.notified() => {}
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                     }
                 }
@@ -7568,9 +7600,16 @@ impl Server {
                 }
 
                 last_push_time = Some(std::time::Instant::now());
-                info!("chunk_location_sync: pushing local locations to leader {}", leader_addr);
-                if let Err(e) = Self::push_locations_to(&server, leader_addr).await {
-                    warn!("chunk_location_sync: push failed: {}", e);
+                // A leader that already pulled them (SyncHeldLocations) has them.
+                let pulled = matches!(*server.cluster.held_locations_synced.lock().unwrap(),
+                    Some((to, at)) if to == leader_addr && at.elapsed() < std::time::Duration::from_secs(60));
+                if pulled {
+                    debug!("chunk_location_sync: leader {} already pulled this node's locations", leader_addr);
+                } else {
+                    info!("chunk_location_sync: pushing local locations to leader {}", leader_addr);
+                    if let Err(e) = Self::push_locations_to(&server, leader_addr).await {
+                        warn!("chunk_location_sync: push failed: {}", e);
+                    }
                 }
                 // Also push file metadata for files this node physically holds.
                 // This fills leader gaps that arise from rolling restarts where the
@@ -7639,7 +7678,7 @@ impl Server {
     /// create ghost replicas on the leader via the expansion rule — if our
     /// sled record predates a ghost-prune and has a larger node set, the leader
     /// would re-introduce the ghost on every chunk_location_sync cycle.
-    async fn push_locations_to(server: &Arc<Self>, target: std::net::SocketAddr) -> anyhow::Result<()> {
+    async fn push_locations_to(server: &Self, target: std::net::SocketAddr) -> anyhow::Result<()> {
         let my_node_id = server.cluster.local_node_id();
         let storage = server.storage.clone();
         let metadata = server.metadata.clone();
@@ -7668,6 +7707,88 @@ impl Server {
         Ok(())
     }
 
+    /// `Request::SyncHeldLocations`: push every chunk location this node holds to the new
+    /// leader `to`, answering once it has taken them all.
+    async fn handle_sync_held_locations(&self, to: std::net::SocketAddr) -> Response {
+        match Self::push_locations_to(self, to).await {
+            Ok(()) => {
+                *self.cluster.held_locations_synced.lock().unwrap() = Some((to, std::time::Instant::now()));
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("sync_held_locations: push to {} failed: {}", to, e);
+                Response::Error { message: format!("push to {} failed: {}", to, e), code: ErrorCode::InternalError }
+            }
+        }
+    }
+
+    /// On becoming leader, ask every online node for the chunk locations it holds
+    /// (`Request::SyncHeldLocations`), then let chunk-map reads through
+    /// (`ClusterManager::holder_locations_in`). A node that doesn't answer in time doesn't
+    /// hold the reads up: its chunks have other replicas, and its own push follows.
+    pub fn start_holder_location_pull_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let became_leader = self.cluster.became_leader_notify.clone();
+            loop {
+                became_leader.notified().await;
+                let since = self.cluster.leading_since();
+                let local_id = self.cluster.local_node_id();
+                let local_addr = self.cluster.local_addr();
+                // No peer online yet is not "nothing to pull" unless the cluster is this node
+                // alone: a node just restarted leads itself for a moment before it has rejoined.
+                let peers = loop {
+                    if self.cluster.leading_since() != since {
+                        break None;
+                    }
+                    let peers: Vec<_> = self.cluster.get_all_nodes().await.into_iter()
+                        .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+                        .collect();
+                    if !peers.is_empty() || self.cluster.single_node_cluster().await {
+                        break Some(peers);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                };
+                let Some(peers) = peers else { continue };
+                let started = std::time::Instant::now();
+                let asks = peers.iter().map(|n| {
+                    let client = self.client.clone();
+                    let addr = n.addr;
+                    async move {
+                        let req = Request::SyncHeldLocations { to: local_addr };
+                        let answer = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            client.send_message(addr, Message::Request(req)),
+                        ).await;
+                        (addr, matches!(answer, Ok(Ok(ref env)) if matches!(env.message, Message::Response(Response::Ok { .. }))))
+                    }
+                });
+                let answers = futures::future::join_all(asks).await;
+                let missing: Vec<_> = answers.iter().filter(|(_, ok)| !ok).map(|(a, _)| *a).collect();
+                if missing.is_empty() {
+                    info!("[LEADER] chunk locations pulled from {} node(s) in {:?}", answers.len(), started.elapsed());
+                } else {
+                    warn!("[LEADER] chunk locations pulled in {:?}; no answer from {:?}", started.elapsed(), missing);
+                }
+                self.cluster.holder_locations_in(since);
+            }
+        });
+    }
+
+    /// A new leader whose holders' chunk locations haven't all arrived yet: wait up to 2 s
+    /// (the client waits 3 s for an answer), then answer NotLeader with no leader, which
+    /// the client retries; answering from the incomplete map read files back as zeros
+    /// (suite T82).
+    async fn leader_locations_not_ready(&self) -> Option<Response> {
+        if !self.cluster.is_leader().await
+            || self.cluster.single_node_cluster().await
+            || self.cluster.wait_holder_locations(std::time::Duration::from_secs(2)).await
+        {
+            return None;
+        }
+        warn!("[LEADER] chunk-map read refused: still collecting the holders' chunk locations");
+        Some(Response::NotLeader { leader_addr: None })
+    }
+
     /// Catch-up pass run when this node becomes leader.
     ///
     /// Two-phase process:
@@ -7685,7 +7806,14 @@ impl Server {
     /// main.rs's run_planned_offline_compaction — see that call site's comment for
     /// why start_metadata_dissemination_loop's own background-spawned call isn't
     /// enough to close the gap this addresses.
-    pub(crate) async fn run_metadata_catchup(&self) {
+    ///
+    /// Returns whether this node now holds everything its online peers have, as far as it
+    /// could store it: false if its own store refused (disk full, I/O error). A peer that
+    /// doesn't answer doesn't count; it isn't this node's failure to fix. Callers that make
+    /// this node serve as leader afterwards must not on false: a full node logged
+    /// "complete" with its pulls refused, took leadership back, and answered from records
+    /// it never caught up on (suite T81c).
+    pub(crate) async fn run_metadata_catchup(&self) -> bool {
         let nodes = self.cluster.get_all_nodes().await;
         let local_id = self.cluster.local_node_id();
 
@@ -7694,8 +7822,8 @@ impl Server {
         let my_inventory_result = tokio::task::spawn_blocking(move || metadata.get_file_inventory()).await;
         let my_inventory: std::collections::HashMap<FileId, u64> = match my_inventory_result {
             Ok(Ok(v)) => v.into_iter().collect(),
-            Ok(Err(e)) => { warn!("catchup: failed to build local inventory: {}", e); return; }
-            Err(e) => { warn!("catchup: spawn_blocking panic building inventory: {}", e); return; }
+            Ok(Err(e)) => { warn!("catchup: failed to build local inventory: {}", e); return false; }
+            Err(e) => { warn!("catchup: spawn_blocking panic building inventory: {}", e); return false; }
         };
 
         // Build the set of files that are queued for deletion on this node.
@@ -7720,6 +7848,7 @@ impl Server {
         // --- Phase 1: pull anything we're missing from each follower ---
         // Collect all file IDs we pull so we can update our inventory for Phase 2.
         let mut pulled_total = 0usize;
+        let mut stored_all = true;
 
         for node in &nodes {
             if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
@@ -7816,8 +7945,14 @@ impl Server {
                             self.chunk_map_update(item).await;
                         }
                     }
-                    Ok(Err(e)) => warn!("catchup: store error pulling from {}: {}", node.id, e),
-                    Err(e) => warn!("catchup: spawn_blocking panic storing pull from {}: {}", node.id, e),
+                    Ok(Err(e)) => {
+                        warn!("catchup: store error pulling from {}: {}", node.id, e);
+                        stored_all = false;
+                    }
+                    Err(e) => {
+                        warn!("catchup: spawn_blocking panic storing pull from {}: {}", node.id, e);
+                        stored_all = false;
+                    }
                 }
             }
         }
@@ -7832,8 +7967,8 @@ impl Server {
         let updated_inventory_result = tokio::task::spawn_blocking(move || metadata.get_file_inventory()).await;
         let updated_inventory: std::collections::HashMap<FileId, u64> = match updated_inventory_result {
             Ok(Ok(v)) => v.into_iter().collect(),
-            Ok(Err(e)) => { warn!("catchup: failed to rebuild inventory for push phase: {}", e); return; }
-            Err(e) => { warn!("catchup: spawn_blocking panic rebuilding inventory: {}", e); return; }
+            Ok(Err(e)) => { warn!("catchup: failed to rebuild inventory for push phase: {}", e); return false; }
+            Err(e) => { warn!("catchup: spawn_blocking panic rebuilding inventory: {}", e); return false; }
         };
 
         for node in &nodes {
@@ -7888,7 +8023,12 @@ impl Server {
             }
         }
 
+        if !stored_all {
+            warn!("catchup: incomplete — this node's store refused records it was missing");
+            return false;
+        }
         info!("catchup: complete");
+        true
     }
 
     /// Handle an incoming request message
@@ -7998,8 +8138,8 @@ impl Server {
                 self.handle_resync_from_primary(file_id, chunk_idx, isr_epoch).await,
             Request::ResignIsrMember { file_id, chunk_idx, isr_epoch, member } =>
                 self.replace_isr_member(file_id, chunk_idx, isr_epoch, member, true).await,
-            Request::LeaderUnfit { node, unfit } => {
-                self.cluster.set_leader_unfit(node, unfit);
+            Request::LeaderUnfit { node, unfit, led_term } => {
+                self.cluster.record_leader_report(node, unfit, led_term);
                 Response::Ok { data: None }
             }
             Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
@@ -8062,7 +8202,11 @@ impl Server {
             }
             Request::GetFileMetadataByPath { path, if_modified_since } => {
                 self.ops_tracker.inc_meta();
-                self.handle_get_file_metadata_by_path(path, if_modified_since).await
+                let req = Request::GetFileMetadataByPath { path: path.clone(), if_modified_since };
+                match self.forward_read_to_leader(0, req).await {
+                    Some(answer) => answer,
+                    None => self.handle_get_file_metadata_by_path(path, if_modified_since).await,
+                }
             }
             Request::PutFileMetadata { metadata, covers_from_write_seq } => {
                 self.ops_tracker.inc_meta();
@@ -8166,8 +8310,14 @@ impl Server {
                 self.handle_purge_file_metadata_by_id(file_id, propagate).await
             }
             Request::GetFileChunkMap { file_id, from_chunk, count } => {
-                self.handle_get_file_chunk_map(file_id, from_chunk, count).await
+                let req = Request::GetFileChunkMap { file_id, from_chunk, count };
+                match self.forward_read_to_leader(0, req).await {
+                    Some(answer) => answer,
+                    None => self.handle_get_file_chunk_map(file_id, from_chunk, count).await,
+                }
             }
+            Request::ForwardedToLeader { hops, request } => self.handle_forwarded_to_leader(hops, *request).await,
+            Request::SyncHeldLocations { to } => self.handle_sync_held_locations(to).await,
             Request::RevalidateChunkSlot { file_id, chunk_idx, distrust_chunk_id } => {
                 self.handle_revalidate_chunk_slot(file_id, chunk_idx, distrust_chunk_id).await
             }
@@ -11654,6 +11804,21 @@ impl Server {
     /// only then says it can lead: coming straight back, its chunk map lacked chunks of files
     /// acked meanwhile, and they read back as zeros (suite T80a).
     pub fn start_leader_fitness(self: Arc<Self>) {
+        // Leader election asks this live (is_leader runs on hot paths, hence the 250 ms
+        // memo); the loop below is what tells the peers.
+        let (metadata, storage) = (self.metadata.clone(), self.storage.clone());
+        let memo: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+        self.cluster.set_self_unfit_probe(move || {
+            let mut m = memo.lock().unwrap();
+            match *m {
+                Some((at, failing)) if at.elapsed() < std::time::Duration::from_millis(250) => failing,
+                _ => {
+                    let failing = Self::storage_failing(&metadata, &storage);
+                    *m = Some((std::time::Instant::now(), failing));
+                    failing
+                }
+            }
+        });
         tokio::spawn(async move {
             let me = self.cluster.local_node_id();
             let mut was_unfit = false;
@@ -11670,25 +11835,35 @@ impl Server {
                     continue;
                 }
                 if !was_unfit {
+                    // Fit: still tell the peers this node's term (see `Request::LeaderUnfit`).
+                    self.broadcast_leader_unfit(false).await;
                     continue;
                 }
                 info!("[LEADER] this node's storage works again; catching up on metadata before it can lead again");
                 let catchup = tokio::time::timeout(std::time::Duration::from_secs(120), self.run_metadata_catchup());
                 tokio::pin!(catchup);
                 let mut refresh = tokio::time::interval(std::time::Duration::from_secs(2));
-                loop {
+                let caught_up = loop {
                     tokio::select! {
                         r = &mut catchup => {
                             if r.is_err() {
                                 warn!("[LEADER] metadata catch-up timed out after 120s; leading again anyway");
                             }
-                            break;
+                            break r.unwrap_or(true);
                         }
                         _ = refresh.tick() => {
                             self.cluster.set_leader_unfit(me, true);
                             self.broadcast_leader_unfit(true).await;
                         }
                     }
+                };
+                // Its store refused what it pulled: still unfit, try again next tick. Taken as
+                // caught up, a node whose disk was still full led again (suite T81c).
+                if !caught_up {
+                    warn!("[LEADER] metadata catch-up incomplete; staying unfit to lead");
+                    self.cluster.set_leader_unfit(me, true);
+                    self.broadcast_leader_unfit(true).await;
+                    continue;
                 }
                 was_unfit = false;
                 self.cluster.set_leader_unfit(me, false);
@@ -11702,7 +11877,7 @@ impl Server {
         let me = self.cluster.local_node_id();
         for peer in self.cluster.get_all_nodes().await.into_iter().filter(|n| n.id != me) {
             let client = self.client.clone();
-            let req = Request::LeaderUnfit { node: me, unfit };
+            let req = Request::LeaderUnfit { node: me, unfit, led_term: self.cluster.led_term() };
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
                     client.send_message(peer.addr, Message::Request(req))).await;
@@ -12266,6 +12441,70 @@ impl Server {
     }
 
     /// Handle get file metadata by path request
+    /// A leader-directed read (`GetFileMetadataByPath`, `GetFileChunkMap`) that reached a
+    /// node which isn't leader: the leader's answer, or None to answer from this node's own
+    /// copy (no leader known, the leader is this node in every view but its own quorum
+    /// check, it didn't answer, or it's too old to take the relay). Clients only ever ask
+    /// the leader; one reaches a follower when its cached leader moved. That node answered
+    /// from its own copy whenever it had any record of the file, and a node that never
+    /// caught up served a 16 MB file as 0 bytes (suite T81c). See `Request::ForwardedToLeader`.
+    async fn forward_read_to_leader(&self, hops: u8, request: Request) -> Option<Response> {
+        const MAX_HOPS: u8 = 2;
+        if hops >= MAX_HOPS || self.cluster.is_leader().await {
+            return None;
+        }
+        let leader = self.cluster.get_leader_addr().await?;
+        if leader == self.cluster.local_addr() {
+            return None;
+        }
+        let req = Request::ForwardedToLeader { hops: hops + 1, request: Box::new(request) };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.client.send_message(leader, Message::Request(req)),
+        ).await {
+            Ok(Ok(env)) => match env.message {
+                Message::Response(Response::Error { code: ErrorCode::InvalidRequest, message }) => {
+                    debug!("forward to leader {}: refused ({}); answering locally", leader, message);
+                    None
+                }
+                Message::Response(answer) => Some(answer),
+                _ => None,
+            },
+            Ok(Err(e)) => {
+                debug!("forward to leader {} failed: {}; answering locally", leader, e);
+                None
+            }
+            Err(_) => {
+                debug!("forward to leader {} timed out; answering locally", leader);
+                None
+            }
+        }
+    }
+
+    async fn handle_forwarded_to_leader(&self, hops: u8, request: Request) -> Response {
+        match request {
+            Request::GetFileMetadataByPath { path, if_modified_since } => {
+                self.ops_tracker.inc_meta();
+                let req = Request::GetFileMetadataByPath { path: path.clone(), if_modified_since };
+                match self.forward_read_to_leader(hops, req).await {
+                    Some(answer) => answer,
+                    None => self.handle_get_file_metadata_by_path(path, if_modified_since).await,
+                }
+            }
+            Request::GetFileChunkMap { file_id, from_chunk, count } => {
+                let req = Request::GetFileChunkMap { file_id, from_chunk, count };
+                match self.forward_read_to_leader(hops, req).await {
+                    Some(answer) => answer,
+                    None => self.handle_get_file_chunk_map(file_id, from_chunk, count).await,
+                }
+            }
+            other => Response::Error {
+                message: format!("ForwardedToLeader can't carry {:?}", dfs_common::debug_truncated(&other, 100)),
+                code: ErrorCode::InvalidRequest,
+            },
+        }
+    }
+
     async fn handle_get_file_metadata_by_path(&self, path: String, if_modified_since: Option<u64>) -> Response {
         debug!("Handling get file metadata by path: {} (if_modified_since: {:?})", path, if_modified_since);
 
@@ -12342,43 +12581,8 @@ impl Server {
                 Response::FileMetadata { metadata }
             }
             Ok(None) => {
-                // Not found locally. If we are a follower, metadata might not have
-                // replicated yet — forward to leader for authoritative answer.
-                // If we are the leader, file definitively doesn't exist.
-                if !self.cluster.is_leader().await {
-                    if let Some(leader_addr) = self.cluster.get_leader_addr().await {
-                        debug!("File {} not found on follower — forwarding query to leader {}", path, leader_addr);
-                        let forward_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            self.client.send_message(leader_addr, Message::Request(Request::GetFileMetadataByPath {
-                                path: path.clone(),
-                                if_modified_since,
-                            }))
-                        ).await;
-
-                        match forward_result {
-                            Ok(Ok(envelope)) => {
-                                if let Message::Response(response) = envelope.message {
-                                    debug!("Follower forwarded {} to leader, got: {:?}", path,
-                                           if matches!(response, Response::FileMetadata { .. }) { "FileMetadata" }
-                                           else { "NotFound/Error" });
-                                    return response;
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                warn!("Failed to forward {} query to leader {}: {}", path, leader_addr, e);
-                                // Fall through to NotFound
-                            }
-                            Err(_) => {
-                                warn!("Timeout forwarding {} query to leader {}", path, leader_addr);
-                                // Fall through to NotFound
-                            }
-                        }
-                    } else {
-                        debug!("File {} not found on follower but no leader available", path);
-                        // Fall through to NotFound
-                    }
-                }
+                // A follower asked by a client already forwarded to the leader before
+                // getting here (forward_read_to_leader); here the answer is this node's.
                 Response::Error {
                     message: "File not found".to_string(),
                     code: ErrorCode::NotFound,
@@ -16430,9 +16634,21 @@ impl Server {
     /// poisoned redb ("Failed to resolve patch state"), and those kept a full node in its
     /// ISRs (suite T79e).
     fn own_storage_failing(&self) -> bool {
+        Self::storage_failing(&self.metadata, &self.storage)
+    }
+
+    fn storage_failing(metadata: &MetadataStore, storage: &ChunkStorage) -> bool {
         const LOW_FREE: u64 = 64 * 1024 * 1024;
-        self.metadata.io_error_within(std::time::Duration::from_secs(30))
-            || self.storage.get_filesystem_stats().is_ok_and(|(_, free, _)| free < LOW_FREE)
+        static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        let io_error = metadata.io_error_within(std::time::Duration::from_secs(30));
+        let stats = storage.get_filesystem_stats();
+        let failing = io_error || stats.as_ref().is_ok_and(|(_, free, _)| *free < LOW_FREE);
+        if LAST.swap(failing as u8, std::sync::atomic::Ordering::Relaxed) != failing as u8 {
+            info!("[LEADER] own storage {}: metadata I/O error in the last 30s: {}, data disk free: {}",
+                if failing { "failing" } else { "fit" }, io_error,
+                match &stats { Ok((_, free, _)) => format!("{} KiB", free / 1024), Err(e) => format!("unknown ({})", e) });
+        }
+        failing
     }
 
     /// This node's own storage failed an ordered write (disk full, I/O error): it can't
@@ -19819,6 +20035,9 @@ impl Server {
     /// waiting out its full backoff schedule. If it differs, the client
     /// applies the correction and retries the read with the new identity.
     async fn handle_revalidate_chunk_slot(&self, file_id: FileId, chunk_idx: u64, distrust_chunk_id: ChunkId) -> Response {
+        if let Some(not_ready) = self.leader_locations_not_ready().await {
+            return not_ready;
+        }
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let (fresh_locations, write_seq) = self.re_derive_and_repair_chunk_map(file_id).await;
         let total_chunks = fresh_locations.iter()
@@ -19969,6 +20188,9 @@ impl Server {
     /// Returns the sparse list as-is with total_chunks = max chunk index + 1 so the client
     /// can place each entry at its correct position using file_offset.
     async fn handle_get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Response {
+        if let Some(not_ready) = self.leader_locations_not_ready().await {
+            return not_ready;
+        }
         // Set by slice_response below when a cached entry's chunk_id has NO
         // CHUNK_TABLE record at all (as opposed to the routine "still valid,
         // node list changed" case) — see the self-heal block after the

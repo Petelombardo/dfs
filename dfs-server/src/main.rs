@@ -268,6 +268,14 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ));
     info!("✓ Server instance created");
 
+    // The persisted cluster size, before anything asks is_leader() (the background loops
+    // below do at once). Loaded only once the join targets are known, a restarted node
+    // saw itself alone, led for a moment, and took itself for a single-node cluster
+    // (suite T79f, 2026-10-12). The join-target hint raises it further below.
+    if let Some(dir) = config_path.parent() {
+        server.cluster().init_known_cluster_size(dir, 1).await;
+    }
+
     // Rebuild the fold-origin set BEFORE the chunk map rebuild below: the chunk
     // map rebuild's per-slot merge consults this set for the fold-vs-client
     // tiebreak, so it must already be populated when that merge runs.
@@ -389,6 +397,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_metadata_dissemination_loop();
     server.clone().start_leader_forward_loop();
     server.clone().start_chunk_location_sync_loop();
+    server.clone().start_holder_location_pull_loop();
     server.clone().start_metadata_gossip_loop();
     server.clone().start_metadata_healer_loop();
     server.clone().start_file_tombstone_prune_loop();

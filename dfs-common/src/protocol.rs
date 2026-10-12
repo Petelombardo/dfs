@@ -1180,11 +1180,44 @@ pub enum Request {
     /// Leadership is the lowest-id online node among those not unfit, so a full leader steps
     /// down instead of failing every client write until its disk recovers (suite T80c). A
     /// report expires unless repeated, so a node that dies unfit doesn't stay excluded.
+    /// Sent while fit too, for `led_term`: the term of `node`'s latest leadership (0 if it
+    /// never led since it started). When every node is unfit, the one with the highest term
+    /// leads: the last to lead while it could commit, so the one holding every record, and
+    /// a choice every node makes alike once the reports are in (see `leader_among`).
     /// Answered with Ok. APPENDED at end to preserve wire compatibility; a node too old to
     /// know it keeps the old leader choice until upgraded.
     LeaderUnfit {
         node: NodeId,
         unfit: bool,
+        led_term: u64,
+    },
+
+    /// Node -> the node it takes to be leader: a leader-directed read (`GetFileMetadataByPath`,
+    /// `GetFileChunkMap`) that a client sent to the forwarder while the forwarder wasn't
+    /// leader. A client caches the leader it was told at mount, and a node that had led for
+    /// a moment and stood down went on answering those reads from its own copy, which had
+    /// never caught up: a 16 MB file read back as 0 bytes (suite T81c). The receiver answers
+    /// as leader, or forwards once more if it isn't one either (`hops` counts, and a node
+    /// views can briefly disagree on stops at the limit and answers from its own copy).
+    /// Answered as `request` is. APPENDED at end to preserve wire compatibility; a node too
+    /// old to know it fails the forward, and the forwarder answers from its own copy as
+    /// before.
+    ForwardedToLeader {
+        hops: u8,
+        request: Box<Request>,
+    },
+
+    /// New leader -> each online node: push every chunk location you hold to `to` now
+    /// (as `ReplicateChunkLocations`), and answer Ok once they have all been taken. The
+    /// client sends chunk locations to the leader only, so a node that holds none of a
+    /// file's chunks knows them only in memory, and not after a restart. Elected after one,
+    /// it learned them from the holders' pushes, which came only on a node rejoin or every
+    /// 30 s: meanwhile it served a 16 MB file as 0 chunks, read back as zeros (suite T82,
+    /// T79c). The new leader holds chunk-map reads until every online node has answered.
+    /// APPENDED at end to preserve wire compatibility; a node too old to know it fails
+    /// the request, and the leader stops waiting for it.
+    SyncHeldLocations {
+        to: std::net::SocketAddr,
     },
 }
 

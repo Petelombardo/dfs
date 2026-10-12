@@ -1641,6 +1641,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             + tokio::time::Duration::from_secs(TIMEOUT_SECS);
         let mut backoff = tokio::time::Duration::from_millis(150);
         let mut attempts = 0u32;
+        // Redirects followed since the last wait. Two nodes whose views of the leader differ
+        // send the request back and forth: followed every time, that loop ran ~7000 times a
+        // second for 45 minutes, logging each one, until the disk was full.
+        let mut redirects = 0u32;
+        const REDIRECTS_BEFORE_WAIT: u32 = 2;
 
         loop {
             let nodes = self.cluster_nodes.read().await.clone();
@@ -1655,9 +1660,14 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             match self.send_request(target, request.clone()).await {
                 Ok(Response::NotLeader { leader_addr: Some(new_leader) }) => {
-                    // Redirect — update cache and retry immediately (no backoff).
+                    // Redirect — update cache and retry immediately, unless redirected
+                    // already: then the nodes disagree on the leader, and the wait below
+                    // gives their views time to settle.
                     *self.leader_addr.write().await = Some(new_leader);
-                    continue;
+                    redirects += 1;
+                    if redirects < REDIRECTS_BEFORE_WAIT {
+                        continue;
+                    }
                 }
                 Ok(Response::NotLeader { leader_addr: None }) => {
                     // Leader unknown — fall through to backoff + retry.
@@ -1688,7 +1698,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             }
 
-            // NotLeader without redirect: refresh and retry.
+            // NotLeader without redirect, or redirected in a loop: refresh and retry.
             attempts += 1;
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -1696,7 +1706,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
             let remaining = deadline - now;
             let wait = backoff.min(remaining);
-            warn!("leader election in progress (attempt {}), retrying in {:?}", attempts, wait);
+            warn!("leader election in progress (attempt {}, {} redirect(s)), retrying in {:?}", attempts, redirects, wait);
+            redirects = 0;
             let _ = self.refresh_cluster_nodes().await;
             tokio::time::sleep(wait).await;
             backoff = (backoff * 2).min(tokio::time::Duration::from_secs(2));
@@ -5365,44 +5376,14 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Query the leader for the full chunk location map of a file.
     /// Returns (locations, from_chunk, total_chunks, write_seq). Falls back to any node if leader is unknown.
     pub async fn get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Result<(Vec<dfs_common::ChunkLocation>, u32, u32, u64)> {
-        let target = {
-            let leader = self.leader_addr.read().await;
-            match *leader {
-                Some(addr) => addr,
-                None => {
-                    let nodes = self.cluster_nodes.read().await;
-                    *nodes.first().context("No cluster nodes available")?
-                }
-            }
-        };
-
-        let request = Request::GetFileChunkMap { file_id, from_chunk, count };
-        let response = self.send_request(target, request).await;
-
         // Followers only have the chunks written to them — they cannot answer
-        // GetFileChunkMap authoritatively. Never fall back to a non-leader node:
-        // a partial follower response would give the client stale chunk_ids for
-        // chunks it doesn't hold, causing "chunk not found" on all replicas.
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                // Leader unreachable: refresh our leader address and retry once on
-                // the newly discovered leader before giving up entirely.
-                warn!("GetFileChunkMap to leader {} failed ({}), refreshing leader and retrying", target, e);
-                let _ = self.refresh_cluster_nodes().await;
-                let new_target = {
-                    let leader = self.leader_addr.read().await;
-                    *leader
-                };
-                match new_target {
-                    Some(addr) if addr != target => {
-                        self.send_request(addr, Request::GetFileChunkMap { file_id, from_chunk, count }).await
-                            .map_err(|e2| anyhow::anyhow!("GetFileChunkMap: leader {} also failed: {}", addr, e2))?
-                    }
-                    _ => return Err(anyhow::anyhow!("GetFileChunkMap: leader unreachable: {}", e)),
-                }
-            }
-        };
+        // GetFileChunkMap authoritatively, so this goes to the leader (a follower relays it
+        // there). A just-elected leader still collecting the holders' chunk locations
+        // answers NotLeader with no leader, and this retries with backoff: before, it was
+        // answered from an incomplete map, and files read back as zeros (suite T82).
+        let response = self.send_to_leader_with_retry(Request::GetFileChunkMap { file_id, from_chunk, count })
+            .await
+            .context("GetFileChunkMap")?;
 
         match response {
             Response::FileChunkMap { locations, from_chunk, total_chunks, write_seq, .. } => {
@@ -5426,18 +5407,10 @@ leader_addr: Arc::new(RwLock::new(None)),
     pub async fn revalidate_chunk_slot(
         &self, file_id: FileId, chunk_idx: u64, distrust_chunk_id: dfs_common::ChunkId,
     ) -> Result<Option<dfs_common::ChunkLocation>> {
-        let target = {
-            let leader = self.leader_addr.read().await;
-            match *leader {
-                Some(addr) => addr,
-                None => {
-                    let nodes = self.cluster_nodes.read().await;
-                    *nodes.first().context("No cluster nodes available")?
-                }
-            }
-        };
+        // Same retry as get_file_chunk_map: a just-elected leader may still be collecting
+        // chunk locations.
         let request = Request::RevalidateChunkSlot { file_id, chunk_idx, distrust_chunk_id };
-        let response = self.send_request(target, request).await
+        let response = self.send_to_leader_with_retry(request).await
             .context("RevalidateChunkSlot request failed")?;
         match response {
             Response::FileChunkMap { locations, .. } => Ok(locations.into_iter().next()),

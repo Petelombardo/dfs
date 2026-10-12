@@ -518,12 +518,17 @@ impl PendingReply {
 /// Metadata storage using redb embedded database.
 /// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
-    db: RwLock<Database>,
+    /// In an Arc so the reopener thread (`spawn_reopener`) can reach it.
+    db: Arc<RwLock<Database>>,
     db_path: PathBuf,
-    /// Unix ms of the last reopen_after_io_error; rate-limits reopens while a disk stays full.
-    last_io_reopen_ms: AtomicU64,
-    /// When a metadata commit last failed with an I/O error (unix ms, 0 = never).
+    /// When a metadata write last failed with an I/O error (unix ms, 0 = never).
     last_io_error_ms: AtomicU64,
+    /// That failure's text: writes refused by `begin_write` until the next try carry it.
+    last_io_error: Mutex<String>,
+    /// Set on every I/O failure; the reopener clears it when it reopens the handle.
+    needs_reopen: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the reopener thread. Dropped with the store, which ends the thread.
+    reopen_signal: std::sync::mpsc::SyncSender<()>,
     /// Counts Durability::None commits since the last Durability::Immediate one.
     /// See next_write_durability() for why this exists.
     non_durable_commits: AtomicU64,
@@ -693,11 +698,16 @@ impl MetadataStore {
 
         info!("Initialized redb metadata store at {:?}", db_path);
 
+        let db = Arc::new(RwLock::new(db));
+        let needs_reopen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reopen_signal = Self::spawn_reopener(Arc::downgrade(&db), needs_reopen.clone(), db_path.clone());
         Ok(Self {
-            db: RwLock::new(db),
+            db,
             db_path,
-            last_io_reopen_ms: AtomicU64::new(0),
             last_io_error_ms: AtomicU64::new(0),
+            last_io_error: Mutex::new(String::new()),
+            needs_reopen,
+            reopen_signal,
             non_durable_commits: AtomicU64::new(0),
             durable_commits: std::sync::atomic::AtomicBool::new(Self::durable_commits_enabled()),
             dirty_files: Mutex::new(std::collections::HashSet::new()),
@@ -888,7 +898,7 @@ impl MetadataStore {
 
         // Any failure to even open the transaction fails the whole batch.
         let _db = self.db.read();
-        let mut txn = match _db.begin_write() {
+        let mut txn = match self.begin_write(&_db) {
             Ok(txn) => txn,
             Err(e) => {
                 let msg = format!("group commit begin_write failed: {}", e);
@@ -897,9 +907,6 @@ impl MetadataStore {
                     Self::fail_op(op, &msg);
                 }
                 drop(_db);
-                if msg.contains("I/O error") {
-                    self.reopen_after_io_error(&msg);
-                }
                 return;
             }
         };
@@ -1095,9 +1102,11 @@ impl MetadataStore {
         let op_io_error = replies.iter().find_map(PendingReply::io_error);
         let commit_error: Option<String> = if let Some(e) = op_io_error {
             drop(txn);
-            Some(format!("group commit of {} ops aborted: an op hit an I/O error: {}", op_count, e))
+            let msg = format!("group commit of {} ops aborted: an op hit an I/O error: {}", op_count, e);
+            self.note_io_failure(&msg);
+            Some(msg)
         } else {
-            match commit_txn(txn) {
+            match self.commit(txn) {
                 Ok(()) => {
                     self.note_txn("group_commit", payload_bytes);
                     None
@@ -1156,9 +1165,6 @@ impl MetadataStore {
             }
         }
         drop(_db);
-        if let Some(msg) = commit_error.as_ref().filter(|m| m.contains("I/O error")) {
-            self.reopen_after_io_error(msg);
-        }
     }
 
     /// Whether a metadata commit failed with an I/O error within the last `within`: this
@@ -1170,43 +1176,88 @@ impl MetadataStore {
         last != 0 && now.saturating_sub(last) < within.as_millis() as u64
     }
 
-    /// redb refuses every write after one failed I/O ("Previous I/O error occurred. Please
-    /// close and re-open the database.") until the handle is reopened. A leader whose disk
-    /// filled (suite T79) could then persist nothing even after space was freed, short of a
-    /// restart, while still taking requests. Reopen the handle, at most once per 5 s, so
-    /// writes resume as soon as the disk can take them again. If the file can't be reopened,
-    /// exit: a node with no usable metadata store must not keep serving (its supervisor
-    /// restarts it, and leadership moves meanwhile).
-    fn reopen_after_io_error(&self, why: &str) {
+    /// How long writes are refused after one failed with an I/O error, before the next is
+    /// let through to see whether the disk takes writes again.
+    const WRITE_RETRY_AFTER_IO_ERROR: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// A write failed with an I/O error (disk full, failing disk). redb then refuses every
+    /// later operation, reads included ("Previous I/O error occurred. Please close and
+    /// re-open the database.") until the handle is reopened. So: reopen it at once
+    /// (`spawn_reopener`), and refuse writes for `WRITE_RETRY_AFTER_IO_ERROR` before trying
+    /// one again (`begin_write`). On a full disk the client's retries, the durability timer
+    /// and the healer each tried a commit several times a second, each one poisoned the
+    /// handle again, and reopens were held to one per 5 s: the node's reads failed nearly
+    /// all the time, and a fresh client couldn't look up any file (suite T81c).
+    pub(crate) fn note_io_failure(&self, why: &str) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64).unwrap_or(0);
+        *self.last_io_error.lock().unwrap() = why.to_string();
         self.last_io_error_ms.store(now, Ordering::Relaxed);
-        let last = self.last_io_reopen_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < 5_000
-            || self.last_io_reopen_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-            return;
+        self.needs_reopen.store(true, Ordering::Release);
+        let _ = self.reopen_signal.try_send(());
+    }
+
+    /// The reopener: reopens the handle after each I/O failure (`note_io_failure`), as soon
+    /// as the readers of the poisoned one let go. A thread of its own, because the code
+    /// that sees a failure holds the handle's read lock. If the file can't be reopened,
+    /// exit: a node with no usable metadata store must not keep serving (its supervisor
+    /// restarts it, and leadership moves meanwhile).
+    fn spawn_reopener(db: Weak<RwLock<Database>>, needs_reopen: Arc<std::sync::atomic::AtomicBool>, path: PathBuf) -> std::sync::mpsc::SyncSender<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        std::thread::Builder::new()
+            .name("meta-reopener".into())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    let Some(db) = db.upgrade() else { return };
+                    if !needs_reopen.swap(false, Ordering::AcqRel) {
+                        continue;
+                    }
+                    let mut live = db.write();
+                    // The poisoned handle holds the file lock, so it has to close before the
+                    // file can reopen: park a throwaway in-memory database in its place.
+                    let placeholder = match Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()) {
+                        Ok(placeholder) => placeholder,
+                        Err(e) => {
+                            error!("redb: can't reopen after an I/O error: no placeholder: {}", e);
+                            continue;
+                        }
+                    };
+                    drop(std::mem::replace(&mut *live, placeholder));
+                    match Database::builder().set_cache_size(256 * 1024 * 1024).create(&path) {
+                        Ok(reopened) => {
+                            *live = reopened;
+                            warn!("redb reopened after an I/O error");
+                        }
+                        Err(e) => {
+                            error!("redb: reopening {:?} after an I/O error failed: {}; exiting so this node restarts", path, e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn metadata reopener thread");
+        tx
+    }
+
+    /// `db.begin_write()`, unless a write failed with an I/O error under
+    /// `WRITE_RETRY_AFTER_IO_ERROR` ago: then refused with that error, and redb isn't
+    /// touched (see `note_io_failure`).
+    fn begin_write(&self, db: &Database) -> std::result::Result<redb::WriteTransaction, redb::TransactionError> {
+        if self.io_error_within(Self::WRITE_RETRY_AFTER_IO_ERROR) {
+            let last = self.last_io_error.lock().unwrap().clone();
+            return Err(redb::TransactionError::Storage(redb::StorageError::Io(std::io::Error::other(
+                format!("not retried yet after a recent write failure: {}", last)))));
         }
-        let mut live = self.db.write();
-        // The poisoned handle holds the file lock, so it has to close before the file can
-        // reopen: park a throwaway in-memory database in its place meanwhile.
-        let placeholder = match Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()) {
-            Ok(db) => db,
-            Err(e) => {
-                error!("redb: can't reopen after an I/O error ({}): no placeholder: {}", why, e);
-                return;
-            }
-        };
-        drop(std::mem::replace(&mut *live, placeholder));
-        match Database::builder().set_cache_size(256 * 1024 * 1024).create(&self.db_path) {
-            Ok(db) => {
-                *live = db;
-                warn!("redb reopened after an I/O error ({})", why);
-            }
-            Err(e) => {
-                error!("redb: reopening {:?} after an I/O error ({}) failed: {}; exiting so this node restarts", self.db_path, why, e);
-                std::process::exit(1);
-            }
-        }
+        db.begin_write().inspect_err(|e| if matches!(e, redb::TransactionError::Storage(_)) {
+            self.note_io_failure(&e.to_string());
+        })
+    }
+
+    /// `commit_txn`, noting an I/O failure (see `note_io_failure`).
+    fn commit(&self, txn: redb::WriteTransaction) -> std::result::Result<(), redb::CommitError> {
+        commit_txn(txn).inspect_err(|e| if matches!(e, redb::CommitError::Storage(_)) {
+            self.note_io_failure(&e.to_string());
+        })
     }
 
     /// Resolve an op's reply with an error without applying it (used when the
@@ -1324,13 +1375,13 @@ impl MetadataStore {
             let store = Arc::clone(self);
             return tokio::task::spawn_blocking(move || {
                 let _db = store.db.read();
-                let mut txn = _db.begin_write()?;
+                let mut txn = store.begin_write(&_db)?;
                 txn.set_durability(Durability::Immediate);
                 {
                     let mut table = txn.open_table(COUNTERS_TABLE)?;
                     table.insert("durability_heartbeat_ms", now_ms)?;
                 }
-                commit_txn(txn)?;
+                store.commit(txn)?;
                 store.note_txn("flush_durability", 0);
                 Ok(())
             }).await.context("spawn_blocking panicked in flush_durability_async")?;
@@ -1405,7 +1456,7 @@ impl MetadataStore {
         let repaired = to_repair.len();
         if !to_repair.is_empty() {
             let _db = self.db.read();
-            let mut txn = _db.begin_write()?;
+            let mut txn = self.begin_write(&_db)?;
             txn.set_durability(self.next_write_durability());
             {
                 let mut path_table = txn.open_table(PATH_TABLE)?;
@@ -1414,7 +1465,7 @@ impl MetadataStore {
                     path_table.insert(path.as_str(), file_id_str.as_bytes())?;
                 }
             }
-            commit_txn(txn)?;
+            self.commit(txn)?;
             let payload_bytes: usize = to_repair.iter().map(|(_, id)| id.len()).sum();
             self.note_txn("repair_path_index", payload_bytes);
         }
@@ -1441,7 +1492,7 @@ impl MetadataStore {
         let stale_count = stale_paths.len();
         if !stale_paths.is_empty() {
             let _db = self.db.read();
-            let mut txn = _db.begin_write()?;
+            let mut txn = self.begin_write(&_db)?;
             txn.set_durability(self.next_write_durability());
             {
                 let mut path_table = txn.open_table(PATH_TABLE)?;
@@ -1450,7 +1501,7 @@ impl MetadataStore {
                     path_table.remove(path.as_str())?;
                 }
             }
-            commit_txn(txn)?;
+            self.commit(txn)?;
             self.note_txn("repair_path_index", 0);
         }
 
@@ -1827,7 +1878,7 @@ impl MetadataStore {
         let t_put_start = std::time::Instant::now();
         let _db = self.db.read();
         let t_lock_acquired = t_put_start.elapsed();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let t_txn_begun = t_put_start.elapsed();
 
@@ -1842,7 +1893,7 @@ impl MetadataStore {
         // A Stale result no longer means "nothing was mutated" — put_file_in_txn still
         // unions incoming's chunk_locations into existing's before returning Stale, so
         // this transaction must always commit or that merge is silently rolled back.
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_file", payload_bytes);
         let t_committed = t_put_start.elapsed();
         if t_committed.as_millis() > 5 {
@@ -1889,7 +1940,7 @@ impl MetadataStore {
         }
 
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
 
         let mut results = Vec::with_capacity(items.len());
@@ -1913,7 +1964,7 @@ impl MetadataStore {
                 results.push(result);
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_files_batch", payload_bytes);
 
         // See put_file's matching comment: must happen while `_db` is still held.
@@ -1990,12 +2041,12 @@ impl MetadataStore {
     pub(crate) fn put_raw_file_bytes(&self, file_id: &FileId, bytes: &[u8]) -> Result<()> {
         let key = format!("{}", file_id);
         let _db = self.db.read();
-        let txn = _db.begin_write()?;
+        let txn = self.begin_write(&_db)?;
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             file_table.insert(key.as_str(), bytes)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_raw_file_bytes", bytes.len());
         Ok(())
     }
@@ -2009,12 +2060,12 @@ impl MetadataStore {
     #[cfg(test)]
     pub(crate) fn put_raw_path_entry(&self, path: &str, bytes: &[u8]) -> Result<()> {
         let _db = self.db.read();
-        let txn = _db.begin_write()?;
+        let txn = self.begin_write(&_db)?;
         {
             let mut path_table = txn.open_table(PATH_TABLE)?;
             path_table.insert(path, bytes)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         Ok(())
     }
 
@@ -2083,7 +2134,7 @@ impl MetadataStore {
         let file_id_str = format!("{}", file_id);
         let mut removed_path: Option<String> = None;
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -2157,7 +2208,7 @@ impl MetadataStore {
                 announce_table.remove(k.as_str())?;
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("delete_file", 0);
         if for_good {
             self.tombstoned_files.insert(file_id_str.clone());
@@ -2181,13 +2232,13 @@ impl MetadataStore {
     /// Delete only the path index entry for a specific path (used during rename).
     pub fn delete_path_index(&self, path: &str) -> Result<()> {
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PATH_TABLE)?;
             table.remove(path)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("delete_path_index", 0);
 
         // See put_file's matching comment: must happen while `_db` is still held.
@@ -2263,7 +2314,7 @@ impl MetadataStore {
         let cutoff = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs()).unwrap_or(0).saturating_sub(max_age.as_secs());
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let pruned = {
             let mut table = txn.open_table(FILE_TOMBSTONE_TABLE)?;
@@ -2277,7 +2328,7 @@ impl MetadataStore {
             }
             old
         };
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("prune_file_tombstones", 0);
         for k in &pruned {
             self.tombstoned_files.remove(k);
@@ -2364,7 +2415,7 @@ impl MetadataStore {
         let mut removed = 0usize;
         if !stale_file_ids.is_empty() {
             let _db = self.db.read();
-            let mut txn = _db.begin_write()?;
+            let mut txn = self.begin_write(&_db)?;
             txn.set_durability(self.next_write_durability());
             {
                 let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -2376,7 +2427,7 @@ impl MetadataStore {
                     removed += 1;
                 }
             }
-            commit_txn(txn)?;
+            self.commit(txn)?;
             self.note_txn("remove_unlisted_files", 0);
 
             // See put_file's matching comment: must happen while `_db` is still held.
@@ -2410,7 +2461,7 @@ impl MetadataStore {
 
         if !stale_path_keys.is_empty() {
             let _db = self.db.read();
-            let mut txn = _db.begin_write()?;
+            let mut txn = self.begin_write(&_db)?;
             txn.set_durability(self.next_write_durability());
             {
                 let mut table = txn.open_table(PATH_TABLE)?;
@@ -2420,7 +2471,7 @@ impl MetadataStore {
                     removed += 1;
                 }
             }
-            commit_txn(txn)?;
+            self.commit(txn)?;
             self.note_txn("remove_unlisted_files", 0);
 
             // See put_file's matching comment: must happen while `_db` is still held.
@@ -2514,13 +2565,13 @@ impl MetadataStore {
         let value = bincode::serialize(location)
             .context("Failed to serialize chunk location")?;
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_chunk_location", value.len());
         debug!("Stored location for chunk: {}", location.chunk_id);
         Ok(())
@@ -2539,7 +2590,7 @@ impl MetadataStore {
             return Ok(());
         }
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let mut payload_bytes: usize = 0;
         {
@@ -2552,7 +2603,7 @@ impl MetadataStore {
                 table.insert(key.as_str(), value.as_slice())?;
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_chunk_locations_batch", payload_bytes);
         debug!("Stored {} chunk locations in one batch transaction", locations.len());
         Ok(())
@@ -2627,13 +2678,13 @@ impl MetadataStore {
     pub fn delete_chunk_location(&self, chunk_id: &ChunkId) -> Result<()> {
         let key = format!("{}", chunk_id);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.remove(key.as_str())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("delete_chunk_location", 0);
         Ok(())
     }
@@ -2711,7 +2762,7 @@ impl MetadataStore {
     pub fn incr_chunk_refcount(&self, chunk_id: &ChunkId) -> Result<u64> {
         let key = format!("{}", chunk_id);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let new_count;
         {
@@ -2720,7 +2771,7 @@ impl MetadataStore {
             new_count = current + 1;
             table.insert(key.as_str(), new_count)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("incr_chunk_refcount", 0);
         Ok(new_count)
     }
@@ -2735,7 +2786,7 @@ impl MetadataStore {
     pub fn decr_chunk_refcount(&self, chunk_id: &ChunkId) -> Result<Option<u64>> {
         let key = format!("{}", chunk_id);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let result;
         {
@@ -2754,7 +2805,7 @@ impl MetadataStore {
                 }
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("decr_chunk_refcount", 0);
         Ok(result)
     }
@@ -2798,7 +2849,7 @@ impl MetadataStore {
     pub fn put_chunk_seq(&self, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<u64> {
         let key = format!("{}:{}", file_id, chunk_idx);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let effective;
         {
@@ -2811,7 +2862,7 @@ impl MetadataStore {
                 table.insert(key.as_str(), seq)?;
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_chunk_seq", 0);
         Ok(effective)
     }
@@ -2881,13 +2932,13 @@ impl MetadataStore {
         written_at: u64, client_write_seq: Option<u64>,
     ) -> Result<Option<ChunkId>> {
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
             &txn, file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
             size, written_at, client_write_seq,
         )?;
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_patch_state_pending", payload_bytes);
         Ok(retired)
     }
@@ -2964,7 +3015,7 @@ impl MetadataStore {
         let value = bincode::serialize(&PatchState::Folded(new_chunk_id))
             .context("Failed to serialize patch state")?;
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         if let Some(file_id) = file_id {
             Self::refuse_fold_of_deleted_file_in_txn(&txn, file_id)?;
@@ -2977,7 +3028,7 @@ impl MetadataStore {
             let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
             ts_table.insert(token_key.as_str(), dfs_common::types::current_timestamp())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("update_patch_state_folded", value.len());
         Ok(())
     }
@@ -2992,10 +3043,10 @@ impl MetadataStore {
     /// a Pending row stops being Pending; this is the abandon-on-failure path.
     pub fn delete_patch_state_abandoned(&self, public_token: &ChunkId, file_id: FileId, chunk_idx: u64) -> Result<()> {
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         Self::delete_patch_state_abandoned_in_txn(&txn, public_token, file_id, chunk_idx)?;
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("delete_patch_state_abandoned", 0);
         Ok(())
     }
@@ -3084,7 +3135,7 @@ impl MetadataStore {
         mut f: impl FnMut(usize, &mut crate::slot_isr::AcceptorState) -> R,
     ) -> Result<Vec<R>> {
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(Durability::Immediate);
         let mut out = Vec::with_capacity(slots.len());
         {
@@ -3102,7 +3153,7 @@ impl MetadataStore {
                 }
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         Ok(out)
     }
 
@@ -3626,7 +3677,7 @@ impl MetadataStore {
             return Ok(Vec::new());
         }
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PATCH_STATE_TABLE)?;
@@ -3640,7 +3691,7 @@ impl MetadataStore {
                 ts_table.remove(key.as_str())?;
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("remove_patch_state_rows", 0);
         Ok(keys.iter().filter_map(|key| decode_hex_32(key).map(ChunkId::from_hash)).collect())
     }
@@ -3662,14 +3713,14 @@ impl MetadataStore {
         let key = format!("{}", announce.public_token);
         let value = bincode::serialize(announce).context("Failed to serialize PendingFoldAnnounce")?;
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         // A deleted file's fold has nothing to announce (see file_tombstoned_in_txn).
         if !Self::file_tombstoned_in_txn(&txn, announce.file_id)? {
             let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_pending_fold_announce", 0);
         Ok(())
     }
@@ -3689,13 +3740,13 @@ impl MetadataStore {
     pub fn delete_pending_fold_announce(&self, public_token: ChunkId) -> Result<()> {
         let key = format!("{}", public_token);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
             table.remove(key.as_str())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("delete_pending_fold_announce", 0);
         Ok(())
     }
@@ -3804,13 +3855,13 @@ impl MetadataStore {
     pub fn put_pending_healing(&self, chunk_id: &ChunkId, detected_at_secs: u64) -> Result<()> {
         let key = format!("{}", chunk_id);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
             table.insert(key.as_str(), detected_at_secs)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_pending_healing", 0);
         Ok(())
     }
@@ -3820,13 +3871,13 @@ impl MetadataStore {
     pub fn delete_pending_healing(&self, chunk_id: &ChunkId) -> Result<()> {
         let key = format!("{}", chunk_id);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
             table.remove(key.as_str())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("delete_pending_healing", 0);
         Ok(())
     }
@@ -3860,10 +3911,10 @@ impl MetadataStore {
             return Ok(());
         }
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         Self::put_pending_healing_batch_in_txn(&txn, entries)?;
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_pending_healing_batch", 0);
         Ok(())
     }
@@ -3950,10 +4001,10 @@ impl MetadataStore {
             return Ok(());
         }
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         let payload_bytes = Self::apply_chunk_location_updates_in_txn(&txn, puts, deletes, pending_healing_deletes)?;
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("batch_update_chunk_locations", payload_bytes);
         Ok(())
     }
@@ -4193,7 +4244,7 @@ impl MetadataStore {
         let written = to_write.len();
         if !to_write.is_empty() {
             let _db = self.db.read();
-            let mut txn = _db.begin_write()?;
+            let mut txn = self.begin_write(&_db)?;
             txn.set_durability(self.next_write_durability());
             {
                 let mut table = txn.open_table(CHUNK_TABLE)?;
@@ -4202,7 +4253,7 @@ impl MetadataStore {
                     table.insert(key.as_str(), bytes.as_slice())?;
                 }
             }
-            commit_txn(txn)?;
+            self.commit(txn)?;
             let payload_bytes: usize = to_write.iter().map(|(_, b)| b.len()).sum();
             self.note_txn("rebuild_chunk_locations_from_files", payload_bytes);
         }
@@ -4232,7 +4283,7 @@ impl MetadataStore {
     /// Increment and return the next metadata sequence number (leader-only).
     pub fn next_meta_sequence(&self) -> Result<u64> {
         let _db = self.db.read();
-        let txn = _db.begin_write()?;
+        let txn = self.begin_write(&_db)?;
         let next = {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
             let current = table.get("meta_seq")?.map(|v| v.value()).unwrap_or(0);
@@ -4240,7 +4291,7 @@ impl MetadataStore {
             table.insert("meta_seq", next)?;
             next
         };
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("next_meta_sequence", 0);
         Ok(next)
     }
@@ -4277,14 +4328,14 @@ impl MetadataStore {
         let hi = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let lo = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
             table.insert("leader_state_hi", hi)?;
             table.insert("leader_state_lo", lo)?;
             table.insert("leader_state_since_secs", since_secs)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("put_leader_state", 0);
         Ok(())
     }
@@ -4327,7 +4378,7 @@ impl MetadataStore {
         let idx_key = format!("{}:{}", node_hex, file_id_hex);
 
         let _db = self.db.read();
-        let txn = _db.begin_write()?;
+        let txn = self.begin_write(&_db)?;
         let payload_bytes;
         {
             let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
@@ -4351,7 +4402,7 @@ impl MetadataStore {
             queue_table.insert(queue_key.as_str(), value.as_slice())?;
             idx_table.insert(idx_key.as_str(), sequence.to_be_bytes().as_slice())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("enqueue_meta_for_node", payload_bytes);
         Ok(())
     }
@@ -4427,7 +4478,7 @@ impl MetadataStore {
         }
 
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
@@ -4453,7 +4504,7 @@ impl MetadataStore {
                 queue_table.remove(queue_key.as_str())?;
             }
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("ack_meta_queue_for_node", 0);
         Ok(())
     }
@@ -4498,7 +4549,7 @@ impl MetadataStore {
 
         if !to_remove.is_empty() {
             let _db = self.db.read();
-            let mut txn = _db.begin_write()?;
+            let mut txn = self.begin_write(&_db)?;
             txn.set_durability(self.next_write_durability());
             {
                 let mut table = txn.open_table(META_QUEUE_TABLE)?;
@@ -4506,7 +4557,7 @@ impl MetadataStore {
                     table.remove(key.as_str())?;
                 }
             }
-            commit_txn(txn)?;
+            self.commit(txn)?;
             self.note_txn("compact_meta_queue_for_node", 0);
         }
         Ok(())
@@ -4515,13 +4566,13 @@ impl MetadataStore {
     /// Record the last sequence number received from the leader (follower-only).
     pub fn set_follower_sequence(&self, seq: u64) -> Result<()> {
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
             table.insert("follower_seq", seq)?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("set_follower_sequence", 0);
         Ok(())
     }
@@ -4684,12 +4735,12 @@ impl MetadataStore {
         let value = bincode::serialize(entry)
             .context("Failed to serialize DeleteQueueEntry")?;
         let _db = self.db.read();
-        let txn = _db.begin_write()?;
+        let txn = self.begin_write(&_db)?;
         {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("enqueue_delete", value.len());
         Ok(())
     }
@@ -4706,13 +4757,13 @@ impl MetadataStore {
     pub fn dequeue_delete(&self, file_id: &FileId) -> Result<()> {
         let key = format!("del:{}", file_id);
         let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
+        let mut txn = self.begin_write(&_db)?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
             table.remove(key.as_str())?;
         }
-        commit_txn(txn)?;
+        self.commit(txn)?;
         self.note_txn("dequeue_delete", 0);
         Ok(())
     }
@@ -5261,9 +5312,9 @@ impl MetadataStore {
         // commit. A single empty durable commit drains the entire accumulated list so
         // compact() can proceed.
         {
-            let txn = db.begin_write()
+            let txn = self.begin_write(&db)
                 .map_err(|e| anyhow::anyhow!("compact pre-flush begin: {}", e))?;
-            commit_txn(txn)
+            self.commit(txn)
                 .map_err(|e| anyhow::anyhow!("compact pre-flush commit: {}", e))?;
             self.note_txn("compact_db_blocking", 0);
         }
@@ -5299,9 +5350,9 @@ impl MetadataStore {
     /// never set writer-intent, so that wedge vector is gone.
     pub fn flush_durable(&self) -> Result<()> {
         let db = self.db.read();
-        let txn = db.begin_write()
+        let txn = self.begin_write(&db)
             .map_err(|e| anyhow::anyhow!("flush_durable begin: {}", e))?;
-        commit_txn(txn)
+        self.commit(txn)
             .map_err(|e| anyhow::anyhow!("flush_durable commit: {}", e))?;
         self.note_txn("flush_durable", 0);
         Ok(())
@@ -5341,7 +5392,7 @@ impl MetadataStore {
     /// existing 60s compaction-check poll, not on any write's hot path.
     pub fn redb_fragmentation_stats(&self) -> Result<(u64, u64)> {
         let _db = self.db.read();
-        let txn = _db.begin_write()?;
+        let txn = self.begin_write(&_db)?;
         let stats = txn.stats()?;
         let live_bytes = stats.stored_bytes() + stats.metadata_bytes();
         let fragmented_bytes = stats.fragmented_bytes();

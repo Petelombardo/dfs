@@ -151,7 +151,7 @@ cd "$REPO" && cargo build --release 2>&1 | tail -2
 echo "=== Starting 5-node cluster ==="
 bash "$REPO/scripts/setup-cluster.sh" 5 2>/dev/null
 for i in 1 2 3 4 5; do
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         > "$LOG/server${i}.log" 2>&1 &
 done
 sleep 3
@@ -188,7 +188,7 @@ T79_DIR="$BASE/node$T79_N"
 T79_IMG="$BASE/t79.img"
 T79_SAVE="$BASE/t79_save"
 t79_start() {
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T79_DIR/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T79_DIR/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${T79_N}.log" 2>&1 &
 }
 t79_stop() {
@@ -382,7 +382,7 @@ T80_DIR="$BASE/node$T80_N"
 T80_IMG="$BASE/t80.img"
 T80_SAVE="$BASE/t80_save"
 t80_start() {
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T80_DIR/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$T80_DIR/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${T80_N}.log" 2>&1 &
 }
 t80_stop() {
@@ -492,7 +492,7 @@ echo "=== T81: EVERY node's disk fills up: writes fail cleanly (no hang, no cras
 # before keeps reading back; anything acked while full is intact afterwards; once space is
 # freed, without restarting anything, an fsynced write lands and reads back.
 t81_start() {
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server$1.log" 2>&1 &
 }
 t81_stop() {
@@ -533,6 +533,9 @@ done
 rm -f "$MOUNT/t81_warm.bin"
 for n in $T81_MOUNTED; do
     d="$BASE/node$n"
+    # Only ever fill the small loop filesystem: if anything unmounted it (another suite run's
+    # startup cleanup), $d is on the real disk, and filling it filled / (10-12).
+    mountpoint -q "$d" || { echo "  T81: node$n is no longer on its loop filesystem; not filling it"; continue; }
     fallocate -l $(( $(df -Pm "$d" | awk 'NR==2{print $4}') - 2 ))M "$d/filler" 2>/dev/null || true
     dd if=/dev/zero of="$d/filler2" bs=64K status=none 2>/dev/null || true
 done
@@ -655,6 +658,98 @@ for n in 1 2 3 4 5; do t81_start $n; done
 sleep 8
 rm -f "$MOUNT"/t81_*.bin
 fi # should_run T81
+
+if should_run T82; then
+snapshot_log T82
+echo ""
+echo "=== T82: rolling restart: the next leader holds none of a file's chunks, and a fresh client reads it intact as soon as it leads ==="
+# The client sends chunk locations to the leader only; a follower that holds none of a
+# file's chunks knows them only in memory, and loses them on restart. A new leader learns
+# them from the holders (chunk_location_sync), but the holders noticed a leader change only
+# on a node rejoin or every 30 s. A restarted node that became leader later than it
+# rejoined answered a fresh client's chunk-map lookup from what it held itself: a 16 MB
+# file read as 0 chunks, silently (T79c/f, 2026-10-12).
+# Here: the second-lowest id (B) is down while the files are written, so it holds none of
+# them; it comes back, restarts once more, then the lowest id (A) stops gracefully and B leads.
+T82_ORDER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(' '.join(n['address'] for n in online[:2]))
+" 2>/dev/null)
+T82_A_ADDR=${T82_ORDER%% *}; T82_B_ADDR=${T82_ORDER##* }
+T82_A=$(( ${T82_A_ADDR##*:} - 8899 )); T82_B=$(( ${T82_B_ADDR##*:} - 8899 ))
+t82_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$1.log" 2>&1 &
+}
+# A graceful stop, as in a rolling restart: it broadcasts GracefulLeave, so the next-lowest
+# id leads at once. (After a crash, leadership waits out the failure detector.)
+t82_stop() {
+    pkill -TERM -f "dfs-server start --config $BASE/node$1/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 100); do pgrep -f "dfs-server start --config $BASE/node$1/config.toml" >/dev/null || break; sleep 0.1; done
+    pkill -9 -f "dfs-server start --config $BASE/node$1/config.toml" 2>/dev/null || true
+}
+# Healing off: its outcome broadcast (ReplicateChunkLocationsV2) is the one path that does
+# persist locations on every node, and B's absence would trigger it. Routine writes don't.
+t82_noheal() { "$BIN/dfs-admin" --cluster "$CLUSTER" healing disable >/dev/null 2>&1 || true; }
+t82_noheal
+echo "  T82: lowest id node$T82_A ($T82_A_ADDR), next node$T82_B ($T82_B_ADDR); stopping node$T82_B"
+t82_stop "$T82_B"
+sleep 2
+T82_SUMS=""
+T82_WRITE_RC=0
+for i in 1 2 3; do
+    dd if=/dev/urandom of="$BASE/t82_src.bin" bs=1M count=16 status=none
+    T82_SUMS="$T82_SUMS $i:$(md5sum < "$BASE/t82_src.bin" | cut -d' ' -f1)"
+    timeout 60 dd if="$BASE/t82_src.bin" of="$MOUNT/t82_$i.bin" bs=1M conv=fsync status=none 2>/dev/null || T82_WRITE_RC=$?
+done
+rm -f "$BASE/t82_src.bin"
+dfs_sync
+t82_start "$T82_B"
+sleep 3; t82_noheal   # not persistent: a restarted node comes back with healing on
+sleep 5   # B rejoins as a follower and learns the files' records (their locations in memory only)
+# Restarted again, B keeps the records (FILE_TABLE) but not the locations, and nothing
+# replays them: its follower sequence is already past them.
+t82_stop "$T82_B"
+t82_start "$T82_B"
+sleep 3; t82_noheal
+sleep 5
+T82_MARK=$(wc -l < "$LOG/server${T82_B}.log")
+echo "  T82: stopping node$T82_A; node$T82_B should lead"
+t82_stop "$T82_A"
+T82_LED=0
+for _ in $(seq 1 40); do
+    tail -n +"$((T82_MARK + 1))" "$LOG/server${T82_B}.log" | grep -q "Became leader" && { T82_LED=1; break; }
+    sleep 0.25
+done
+# Read at once, with a client that has no cached chunk maps.
+T82_FRESH_MNT=/tmp/dfs-mount-fresh
+mkdir -p "$T82_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T82_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t82.log" --allow-other --log-level debug &
+T82_CPID=$!
+sleep 2
+T82_BAD=""
+for pair in $T82_SUMS; do
+    i=${pair%%:*}; want=${pair#*:}
+    got=$(timeout 60 md5sum < "$T82_FRESH_MNT/t82_$i.bin" 2>/dev/null | cut -d' ' -f1)
+    [ "$got" = "$want" ] || T82_BAD="$T82_BAD t82_$i.bin(${got:-unreadable})"
+done
+fusermount -u "$T82_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T82_CPID"
+echo "  T82: writes rc=$T82_WRITE_RC; node$T82_B led after node$T82_A stopped: $T82_LED"
+[ "$T82_WRITE_RC" = 0 ] && [ "$T82_LED" = 1 ] \
+    && check "T82a writes complete across the rolling restart, and the restarted node leads once the lowest id stops" PASS \
+    || check "T82a writes rc=$T82_WRITE_RC; node$T82_B led within 10 s of node$T82_A stopping: $T82_LED (T82b proves nothing without both)" FAIL
+[ -z "$T82_BAD" ] \
+    && check "T82b a fresh client reads every file intact as soon as the new leader leads" PASS \
+    || check "T82b fresh reads once the new leader led:$T82_BAD" FAIL
+t82_start "$T82_A"
+sleep 5
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing enable >/dev/null 2>&1 || true
+rm -f "$MOUNT"/t82_*.bin
+fi # should_run T82
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
@@ -3392,7 +3487,7 @@ echo "  Rolling restart of all 5 server nodes (one at a time)..."
 for i in 1 2 3 4 5; do
     pkill -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true
     sleep 0.5
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${i}.log" 2>&1 &
     sleep 2
 done
@@ -3944,7 +4039,7 @@ check "T45b healing set persisted to config.toml on all 5 nodes" "$T45_CONFIG_OK
 echo "  T45: restarting node1 to confirm tuned values survive (not reverted to defaults)..."
 pkill -f "dfs-server start --config $BASE/node1/config.toml" 2>/dev/null || true
 sleep 0.5
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node1/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
     >> "$LOG/server1.log" 2>&1 &
 
 # Poll for a full 5-node rejoin, not just node1's RPC listener being up — Part B below
@@ -4037,7 +4132,7 @@ grep -q "replication_factor = 3" "$BASE/node5/config.toml" || T45_NODE5_STALE_OK
 check "T45f node5 config still stale (=3) while down — confirms no silent cross-node update" "$T45_NODE5_STALE_OK"
 
 echo "  T45: restarting node5 — expect it to self-reconcile replication_factor to 4 on rejoin..."
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
     >> "$LOG/server5.log" 2>&1 &
 
 T45_DEADLINE=$(( $(date +%s) + 30 ))
@@ -4513,7 +4608,7 @@ pkill -9 -f "dfs-server start --config $BASE/node${T51_LEADER_NODE}/config.toml"
 # repeatedly, the same way the real incident's ~16s leader outage did.
 sleep 3
 
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
     >> "$LOG/server${T51_LEADER_NODE}.log" 2>&1 &
 
 # Storm keeps running through the outage and recovery — that's the whole
@@ -4786,7 +4881,7 @@ sleep 2
 echo "  Killing node$T52_VICTIM_NUM ($T52_VICTIM_NODE) mid-storm (SIGKILL, matching a real abrupt outage)..."
 pkill -9 -f "dfs-server start --config $BASE/node${T52_VICTIM_NUM}/config.toml" 2>/dev/null || true
 sleep 3
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T52_VICTIM_NUM}/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T52_VICTIM_NUM}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
     >> "$LOG/server${T52_VICTIM_NUM}.log" 2>&1 &
 
 sleep $(( T52_DURATION - 2 ))
@@ -6352,7 +6447,7 @@ else
     sleep 3
     pkill -9 -f "dfs-server start --config $BASE/node${T67_N}/config.toml" 2>/dev/null || true
     sleep 2
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T67_N}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T67_N}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${T67_N}.log" 2>&1 &
     wait "$T67_W1" "$T67_W2" 2>/dev/null || true
     dfs_sync; sync "$T67_MOUNT2" 2>/dev/null || true
@@ -6827,7 +6922,7 @@ else
     sleep 4
     pkill -9 -f "dfs-server start --config $BASE/node${T73_N}/config.toml" 2>/dev/null || true
     sleep "$T73_DOWN"
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T73_N}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${T73_N}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${T73_N}.log" 2>&1 &
     wait "$T73_W1" "$T73_W2" 2>/dev/null || true
     dfs_sync; sync "$T73_MOUNT2" 2>/dev/null || true
@@ -7338,7 +7433,7 @@ done
 echo "  T76: killed all 5 servers 6s into the storm; restarting them in 3s"
 sleep 3
 for i in 1 2 3 4 5; do
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${i}.log" 2>&1 &
 done
 T76_UP=$(date +%s.%N)
@@ -7622,7 +7717,7 @@ for n in $T78_NODES; do
 done
 sleep 1
 for n in $T78_NODES; do
-    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 DFS_SCRUB_PACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${n}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 DFS_SCRUB_PACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${n}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server${n}.log" 2>&1 &
 done
 sleep 8
@@ -7791,7 +7886,7 @@ for _ in $(seq 1 50); do pgrep -f "dfs-server start" >/dev/null || break; sleep 
 [ -s "$BASE/node5/peers.json" ] \
     && check "T71a node5 persisted its peers before the restart" PASS \
     || check "T71a node5 has no peers.json — cannot know its cluster size" FAIL
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
     > "$LOG/server5_t71.log" 2>&1 &
 T71_PID=$!
 # The healer's discovery loop re-evaluates leadership on a 60s tick; wait past

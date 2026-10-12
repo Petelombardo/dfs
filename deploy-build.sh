@@ -23,15 +23,27 @@ get_dfs_mountpoint() {
 
 # get_dfs_containers <host> <mountpoint>
 # Prints names of running containers that have a bind-mount under <mountpoint>.
+#
+# Matches each mount source as a PATH, not as a substring. The previous version
+# joined every source into one string and ran `grep -q "$mountpoint"` over it,
+# which over-matched in two ways and stopped containers that have nothing to do
+# with DFS: any source merely *containing* the path matched (mountpoint
+# /mnt/test caught /mnt/test-backup/data and /opt/mnt/testing/cache), and the
+# path was interpolated as a regex, so a '.' in it was a wildcard. Over-matching
+# here means an unnecessary outage of an unrelated service on every deploy, so
+# compare component-wise: exactly the mountpoint, or something beneath it.
 get_dfs_containers() {
 	local host="$1"
 	local mountpoint="$2"
 	ssh root@"$host" "
 		podman ps --format '{{.Names}}' 2>/dev/null | while read name; do
-			mounts=\$(podman inspect \"\$name\" --format '{{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null)
-			if echo \"\$mounts\" | grep -q '$mountpoint'; then
-				echo \"\$name\"
-			fi
+			podman inspect \"\$name\" --format '{{range .Mounts}}{{println .Source}}{{end}}' 2>/dev/null |
+			while read src; do
+				[ -n \"\$src\" ] || continue
+				case \"\$src\" in
+					'$mountpoint'|'$mountpoint'/*) echo \"\$name\"; break ;;
+				esac
+			done
 		done
 	"
 }
@@ -203,6 +215,14 @@ if [ "$1" == "all" ] || [ "$1" == "server" ]; then
 		echo "Deploying to $i"
 		ssh root@$i systemctl stop dfs-server
 		sleep 1
+		# DB_BACKUP_DIR=<dir on the node's data disk>: copy the metadata DB and config while
+		# the server is stopped (a copy of a live redb file isn't consistent), so a rollback
+		# can restore the exact pre-deploy state, not just the binaries.
+		if [ -n "${DB_BACKUP_DIR:-}" ]; then
+			echo "  [$i] Backing up metadata + config -> $DB_BACKUP_DIR"
+			ssh root@$i "mkdir -p '$DB_BACKUP_DIR' && cp -a /mnt/gluster/dfs/metadata /mnt/gluster/dfs/config '$DB_BACKUP_DIR'/ && du -sh '$DB_BACKUP_DIR'" \
+				|| { echo "  [$i] DB backup FAILED — restarting the old binary and stopping the deploy"; ssh root@$i systemctl start dfs-server; exit 1; }
+		fi
 		backup_remote_binaries "$i" dfs-server dfs-admin dfs-client
 		scp target/release/dfs-server target/release/dfs-admin target/release/dfs-client root@$i:/usr/bin/
 		ssh root@$i systemctl start dfs-server

@@ -907,6 +907,110 @@ fusermount -u "$T84_MNT" 2>/dev/null || true
 kill_client_and_wait "$T84_CPID"
 fi # should_run T84
 
+# ── T85: old versions of a file rewritten in place get deleted (staging, 10-13) ──────
+# Every in-place rewrite of a chunk gives its slot a new chunk id; the old version's
+# CHUNK_TABLE row stayed, and the orphan sweep kept any chunk whose row names a live file.
+# Staging: 1.5 TB of 4.1 TB was old versions of VM disks, growing since July. The sweep
+# now deletes a copy only once every node names the same newer version for its slot.
+# The deleting paths are gated 20 min after any restart, so this test restarts the
+# cluster with those graces lowered, and restores the normal settings after.
+snapshot_log T85
+if should_run T85; then
+echo "=== T85: superseded versions of a rewritten file are deleted; every byte still reads back ==="
+t85_kill_all() {
+    for i in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true; done
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node" >/dev/null || break; sleep 0.1; done
+}
+t85_start_all() {
+    for i in 1 2 3 4 5; do
+        env $1 RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+            >> "$LOG/server${i}.log" 2>&1 &
+    done
+}
+t85_wait_ready() {
+    for _ in $(seq 1 60); do
+        [ "$("$BIN/dfs-admin" --cluster "$CLUSTER" cluster status 2>/dev/null | grep -oP 'Healthy Nodes:\s+\K[0-9]+')" = 5 ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+t85_ids() {
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t85.bin 2>/dev/null \
+        | python3 -c "import json,sys; print(' '.join(c['chunk_id'] for c in json.load(sys.stdin)['chunk_locations']))" 2>/dev/null
+}
+# copies of each id on the nodes' disks: "<id> <n>" per id
+t85_copies() {
+    for c in $1; do
+        n=0
+        for i in 1 2 3 4 5; do [ -f "$BASE/node$i/data/chunks/${c:0:2}/${c:2:2}/$c" ] && n=$((n+1)); done
+        echo "$c $n"
+    done
+}
+T85_ENV="DFS_LIVE_FILE_ORPHAN_GRACE_SECS=0 DFS_DESTRUCTIVE_GRACE_SECS=0 DFS_ORPHAN_STABILITY_SECS=0 DFS_SUPERSEDED_GRACE_SECS=0 DFS_SUPERSEDED_SETTLE_SECS=5 DFS_ORPHAN_SWEEP_PAGE_GRACE_MS=2000 DFS_ORPHAN_SWEEP_MAX_PAGE_GRACE_MS=4000 DFS_ORPHAN_SWEEP_PAGE_SIZE=100000"
+t85_kill_all
+t85_start_all "$T85_ENV"
+t85_wait_ready || echo "  T85: cluster not fully healthy 30s after the restart"
+sleep 5
+dd if=/dev/urandom of="$T/t85_v1.bin" bs=1M count=16 status=none
+cp "$T/t85_v1.bin" "$MOUNT/t85.bin"
+dfs_sync
+sleep 2
+T85_SEEN="$(t85_ids)"
+for v in 2 3 4; do
+    dd if=/dev/urandom of="$MOUNT/t85.bin" bs=4M count=1 seek=0 conv=notrunc,fsync status=none
+    dd if=/dev/urandom of="$MOUNT/t85.bin" bs=4M count=1 seek=2 conv=notrunc,fsync status=none
+    dd if=/dev/urandom of="$MOUNT/t85.bin" bs=64K count=4 seek=70 conv=notrunc,fsync status=none
+    dfs_sync
+    sleep 3
+    T85_SEEN="$T85_SEEN $(t85_ids)"
+done
+cp "$MOUNT/t85.bin" "$T/t85_final.bin"
+T85_FINAL="$(t85_ids)"
+# Old versions: every id the file ever named that it no longer names (tokens excluded:
+# their lifecycle is the patch-state GC's).
+T85_OLD=$(python3 -c "import sys; seen=set(sys.argv[1].split()); final=set(sys.argv[2].split()); print(' '.join(sorted(i for i in seen - final if not i.startswith('df7c'))))" "$T85_SEEN" "$T85_FINAL")
+T85_OLD_N=$(echo $T85_OLD | wc -w)
+T85_LEFT=$(t85_copies "$T85_OLD" | awk '$2>0' | wc -l)
+echo "  T85: ${T85_OLD_N} old version(s) of the file's chunks; ${T85_LEFT} still on disk before the cleanup"
+for _ in $(seq 1 90); do
+    T85_LEFT=$(t85_copies "$T85_OLD" | awk '$2>0' | wc -l)
+    [ "$T85_LEFT" = 0 ] && break
+    sleep 2
+done
+T85_DELETED=$(cat "$LOG"/server*.log | grep -c "Superseded cleanup: .* old version(s) deleted" || true)
+[ "$T85_OLD_N" -gt 0 ] && [ "$T85_LEFT" = 0 ] \
+    && check "T85a all ${T85_OLD_N} old version(s) of the rewritten file's chunks deleted from every node" PASS \
+    || check "T85a ${T85_LEFT} of ${T85_OLD_N} old version(s) still on disk after 180s (cleanup passes logged: $T85_DELETED)" FAIL
+if [ "$T85_LEFT" != 0 ]; then
+    for c in $(t85_copies "$T85_OLD" | awk '$2>0 {print $1}'); do
+        echo "  T85: left: $c on node(s):$(for i in 1 2 3 4 5; do [ -f "$BASE/node$i/data/chunks/${c:0:2}/${c:2:2}/$c" ] && echo -n " $i"; done)"
+        "$BIN/dfs-admin" --cluster "$CLUSTER" file raw-location "$c" 2>&1 | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g; s/^/    /' | cut -c1-260
+    done
+    echo "  T85: current: $T85_FINAL"
+fi
+T85_THIN=$(t85_copies "$(echo $T85_FINAL | tr ' ' '\n' | grep -v '^df7c')" | awk '$2<2' | wc -l)
+[ "$T85_THIN" = 0 ] \
+    && check "T85b every current chunk still has at least 2 copies" PASS \
+    || check "T85b $T85_THIN current chunk(s) under 2 copies after the cleanup" FAIL
+T85_FRESH_MNT=/tmp/dfs-mount-t85
+mkdir -p "$T85_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T85_FRESH_MNT" --cluster "$CLUSTER" --log-file "$LOG/client_t85.log" --allow-other --log-level debug &
+T85_CPID=$!
+sleep 2
+T85_M1=$(md5sum < "$T/t85_final.bin" | cut -d' ' -f1)
+T85_M2=$(timeout 60 md5sum < "$T85_FRESH_MNT/t85.bin" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T85_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T85_CPID"
+[ "$T85_M1" = "$T85_M2" ] \
+    && check "T85c a fresh client reads the rewritten file back exactly" PASS \
+    || check "T85c the rewritten file reads back wrong after the cleanup (exp $T85_M1 got ${T85_M2:-unreadable})" FAIL
+rm -f "$MOUNT/t85.bin" "$T"/t85_*.bin
+t85_kill_all
+t85_start_all ""
+t85_wait_ready || echo "  T85: cluster not fully healthy 30s after restoring normal settings"
+sleep 5
+fi # should_run T85
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

@@ -733,6 +733,58 @@ impl ChunkStorage {
         Ok(dest)
     }
 
+    /// Superseded-version cleanup, step one: move an old version of slot (file_id,
+    /// chunk_idx) out of the chunk tree into `<data_dir>/superseded-trash/`, the slot and
+    /// time in the name. To the rest of the node it is gone, as after delete_chunk. Step
+    /// two (`superseded_trash_entries`, later) deletes it for good or moves it back: a
+    /// write of the same id landing just before the move must find its bytes again.
+    pub fn move_superseded_aside(&self, chunk_id: &ChunkId, file_id: FileId, chunk_idx: u64) -> Result<PathBuf> {
+        let path = self.get_chunk_path(chunk_id);
+        let dir = self.data_dir.join("superseded-trash");
+        fs::create_dir_all(&dir).with_context(|| format!("Failed to create {:?}", dir))?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let dest = dir.join(format!("{}.{}.{}.{}", chunk_id.to_hex(), file_id.0, chunk_idx, now));
+        fs::rename(&path, &dest).with_context(|| format!("Failed to move {:?} aside", path))?;
+        self.verified.lock().unwrap().pop(chunk_id);
+        self.invalidate_cache(chunk_id);
+        self.forget_chunk_in_index(chunk_id);
+        Ok(dest)
+    }
+
+    /// Every chunk in `superseded-trash/`: (path, chunk, file, chunk_idx, moved-at secs).
+    pub fn superseded_trash_entries(&self) -> Vec<(PathBuf, ChunkId, FileId, u64, u64)> {
+        let Ok(rd) = fs::read_dir(self.data_dir.join("superseded-trash")) else { return Vec::new() };
+        let mut out = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let parts: Vec<&str> = name.split('.').collect();
+            let [hex, fid, idx, ts] = parts[..] else { continue };
+            let (Ok(bytes), Ok(fid), Ok(idx), Ok(ts)) = (hex_to_bytes(hex), fid.parse::<uuid::Uuid>(), idx.parse::<u64>(), ts.parse::<u64>()) else { continue };
+            let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) else { continue };
+            out.push((entry.path(), ChunkId::from_hash(hash), FileId::from_uuid(fid), idx, ts));
+        }
+        out
+    }
+
+    /// Move a chunk back from `superseded-trash/` (it turned out to be needed). If the id
+    /// was written again meanwhile, those bytes are identical (ids are content hashes), so
+    /// the trash copy is just dropped.
+    pub fn restore_superseded(&self, chunk_id: &ChunkId, trash_path: &Path) -> Result<()> {
+        let path = self.get_chunk_path(chunk_id);
+        if path.exists() {
+            fs::remove_file(trash_path).with_context(|| format!("Failed to drop {:?}", trash_path))?;
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("Failed to create {:?}", parent))?;
+        }
+        fs::rename(trash_path, &path).with_context(|| format!("Failed to restore {:?}", path))?;
+        if let Some(index) = self.list_chunks_cache.write().as_mut() {
+            index.insert(*chunk_id);
+        }
+        Ok(())
+    }
+
     /// Check if a chunk exists in local storage
     pub fn has_chunk(&self, chunk_id: &ChunkId) -> bool {
         let path = self.get_chunk_path(chunk_id);

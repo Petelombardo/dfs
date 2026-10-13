@@ -49,6 +49,20 @@ pub const LEADER_CHANGE_GRACE_SECS: u64 = 1200;
 /// created copies of at least one of them, for real.
 pub const SELF_RESTART_GRACE_SECS: u64 = LEADER_CHANGE_GRACE_SECS;
 
+/// The disk orphan sweep's restart/leader-change grace: LEADER_CHANGE_GRACE_SECS, unless
+/// DFS_DESTRUCTIVE_GRACE_SECS says otherwise. Only the test suite lowers it: every run
+/// boots a fresh cluster, so a 20-minute grace made every deleting path of the sweep
+/// untestable there.
+fn destructive_grace_secs() -> u64 {
+    std::env::var("DFS_DESTRUCTIVE_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(LEADER_CHANGE_GRACE_SECS)
+}
+
+/// How long every node must have been up before an orphan deletion is authorized (its chunk
+/// map caught up): 300 s, unless DFS_ORPHAN_STABILITY_SECS says otherwise (the test suite).
+fn orphan_stability_secs() -> u64 {
+    std::env::var("DFS_ORPHAN_STABILITY_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
+}
+
 /// Settle grace specifically for the NON-destructive orphan-dequeue in discovery
 /// (dropping an unreferenced under-RF chunk from the heal queue). Much shorter than
 /// SELF_RESTART_GRACE_SECS on purpose: that 20-minute grace exists to keep the
@@ -446,6 +460,10 @@ pub struct HealingManager {
     /// stale (e.g. during initial metadata replication lag after a write). One extra
     /// 60s cycle of accumulation is acceptable vs. data loss from false-positive orphans.
     orphan_candidates: Arc<RwLock<HashSet<ChunkId>>>,
+    /// Superseded-version candidates seen once (confirm_and_move_superseded's second-
+    /// sighting gate). Separate from orphan_candidates: a rowless copy passes through the
+    /// plain orphan path first, and a shared set would reset each path's first sighting.
+    superseded_seen: Arc<RwLock<HashSet<ChunkId>>>,
 
     /// Tokens this node has confirmed the current leader knows about, via
     /// run_pending_patch_reconciliation — see that method's doc comment. Cleared
@@ -693,6 +711,7 @@ impl HealingManager {
             heal_push_failure: Arc::new(DashMap::new()),
             requeue_priority: Arc::new(DashMap::new()),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
+            superseded_seen: Arc::new(RwLock::new(HashSet::new())),
             pending_patch_confirmed: Arc::new(RwLock::new(HashSet::new())),
             folded_patch_confirmed: Arc::new(RwLock::new(HashSet::new())),
             last_reconcile_leader: Arc::new(RwLock::new(None)),
@@ -2030,8 +2049,9 @@ impl HealingManager {
             .count();
         let nodes_down = total.saturating_sub(online);
 
+        let grace_secs = destructive_grace_secs();
         let grace_elapsed = self.cluster.time_since_became_leader().await
-            .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+            .map_or(true, |d| d.as_secs() >= grace_secs);
 
         if nodes_down > 1 {
             if should_log {
@@ -2044,7 +2064,7 @@ impl HealingManager {
                 let elapsed = self.cluster.time_since_became_leader().await
                     .map_or(0.0, |d| d.as_secs_f64());
                 warn!("Skipping disk orphan sweep — within grace period after leader election ({:.0}s elapsed of {}s)",
-                    elapsed, LEADER_CHANGE_GRACE_SECS);
+                    elapsed, grace_secs);
             }
             return false;
         }
@@ -2054,10 +2074,10 @@ impl HealingManager {
         // restarted. This is the independent check for that case: THIS node's
         // own local_started_at, regardless of leadership.
         let self_uptime = self.local_started_at.elapsed().as_secs();
-        if self_uptime < SELF_RESTART_GRACE_SECS {
+        if self_uptime < grace_secs {
             if should_log {
                 warn!("Skipping disk orphan sweep — this node restarted {}s ago (< {}s grace period, chunk_map may not have caught up to current cluster state yet)",
-                    self_uptime, SELF_RESTART_GRACE_SECS);
+                    self_uptime, grace_secs);
             }
             return false;
         }
@@ -2158,6 +2178,10 @@ impl HealingManager {
             // it. Collected for the async leader-confirm/stability gate below; never
             // deleted inside this blocking closure.
             let mut live_file_candidates: Vec<(ChunkId, u64)> = Vec::new();
+            // Kept only because a CHUNK_TABLE row names a live file, not because any
+            // file's current chunk map does: possibly an old version of its slot
+            // (see process_superseded_candidates).
+            let mut row_only: Vec<ChunkId> = Vec::new();
 
             for chunk_id in &chunks {
                 // 2026-08-04: a chunk_id matching the reserved patch-token marker
@@ -2223,8 +2247,13 @@ impl HealingManager {
                 // gating (pre-739435c behavior) until generation state has a real
                 // cluster-reconciled source of truth. The heal-queue-exclusion half of
                 // 739435c (slot_losers skip below, non-destructive) is unaffected and stays.
-                if live_from_metadata.contains(chunk_id) || live_from_chunk_map.contains(chunk_id) {
+                if live_from_chunk_map.contains(chunk_id) {
                     kept += 1;
+                    continue;
+                }
+                if live_from_metadata.contains(chunk_id) {
+                    kept += 1;
+                    row_only.push(*chunk_id);
                     continue;
                 }
 
@@ -2260,10 +2289,10 @@ impl HealingManager {
                 }
             }
 
-            Ok::<_, anyhow::Error>((kept, chunks.len(), live_file_candidates))
+            Ok::<_, anyhow::Error>((kept, chunks.len(), live_file_candidates, row_only))
         }).await;
 
-        let (kept, total, live_file_candidates) = match result {
+        let (kept, total, live_file_candidates, row_only) = match result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return Vec::new(); }
             Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return Vec::new(); }
@@ -2279,7 +2308,233 @@ impl HealingManager {
         }
 
         self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
+        self.drain_superseded_trash().await;
+        self.process_superseded_candidates(row_only).await;
         candidate_ids
+    }
+
+    /// Superseded-version cleanup (DFS_SUPERSEDED_CLEANUP, on by default). A file rewritten
+    /// in place (a VM disk) gets a new chunk id per version of each slot, and the old
+    /// version's CHUNK_TABLE row was never removed. The sweep kept every chunk whose row
+    /// names a live file, so old versions were never deleted: 1.5 TB of staging's 4.1 TB
+    /// on 10-13, growing since July (the 08-08 "superseded-generation backlog").
+    ///
+    /// Deciding "old" is where earlier attempts lost data. Generations were the 07-26 basis
+    /// and are unknown for some versions (fold results), and any single node's chunk map,
+    /// the leader's included, can lag the newest write. So nothing here orders versions:
+    /// every replica's chunk map moves to a new version as the write lands, so if a newer
+    /// version than the one a node names exists, the nodes holding it name it. A copy is
+    /// deleted only if EVERY node, all online and settled, names the same other version N
+    /// as the slot's current one, at least RF of them hold N, and none still needs this
+    /// chunk (a pending patch's base or delta, a token, an ordered head). Plus: older than
+    /// DFS_SUPERSEDED_GRACE_SECS (6 h), seen on two consecutive passes, and deleted in two
+    /// steps (moved aside, then gone a pass later unless the slot names it again).
+    async fn process_superseded_candidates(&self, row_only: Vec<ChunkId>) {
+        if row_only.is_empty() || std::env::var("DFS_SUPERSEDED_CLEANUP").is_ok_and(|v| v == "0") {
+            return;
+        }
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let grace = std::env::var("DFS_SUPERSEDED_GRACE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(6 * 3600);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let rows = match self.metadata.get_chunk_locations_batch_async(row_only).await {
+            Ok(r) => r,
+            Err(e) => { debug!("Superseded cleanup: chunk rows unreadable this pass: {}", e); return; }
+        };
+        let mut items: Vec<(ChunkId, FileId, u64)> = Vec::new();
+        for (chunk, loc) in rows {
+            let (Some(file_id), Some(off)) = (loc.file_id, loc.file_offset) else { continue };
+            let idx = off / CHUNK_SIZE;
+            if !matches!(self.slot_current(file_id, idx), Some(cur) if cur != chunk) {
+                continue;
+            }
+            if self.storage.get_chunk_mtime(&chunk).is_none_or(|m| now.saturating_sub(m) < grace) {
+                continue;
+            }
+            items.push((chunk, file_id, idx));
+        }
+        self.confirm_and_move_superseded(items).await;
+    }
+
+    /// Local copies with no CHUNK_TABLE row here that the leader still calls live: the
+    /// leader's own row for them names a live file. A third replica the healer pushed just
+    /// before its version was superseded has no row here, and the plain orphan path's
+    /// leader-confirm kept it forever on the leader's stale row. Take the slot from the
+    /// leader's row and decide as for any superseded copy (every node must agree).
+    async fn process_rowless_superseded(&self, chunks: Vec<ChunkId>) {
+        if chunks.is_empty() || std::env::var("DFS_SUPERSEDED_CLEANUP").is_ok_and(|v| v == "0") {
+            return;
+        }
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let Some(leader) = self.cluster.get_leader_addr().await else { return };
+        let grace = std::env::var("DFS_SUPERSEDED_GRACE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(6 * 3600);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut items = Vec::new();
+        for chunk in chunks {
+            if chunk.looks_like_patch_token() || self.storage.get_chunk_mtime(&chunk).is_none_or(|m| now.saturating_sub(m) < grace) {
+                continue;
+            }
+            let req = Request::DebugGetRawChunkLocation { chunk_id: chunk };
+            let loc = match tokio::time::timeout(Duration::from_secs(5), self.client.send_message(leader, Message::Request(req))).await {
+                Ok(Ok(env)) => match env.message {
+                    Message::Response(Response::DebugRawChunkLocation { location: Some(loc) }) => loc,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let (Some(file_id), Some(off)) = (loc.file_id, loc.file_offset) else { continue };
+            let idx = off / CHUNK_SIZE;
+            if matches!(self.slot_current(file_id, idx), Some(cur) if cur != chunk) {
+                items.push((chunk, file_id, idx));
+            }
+        }
+        self.confirm_and_move_superseded(items).await;
+    }
+
+    /// The shared tail of superseded-version cleanup: skip anything a local patch uses,
+    /// require a second sighting, then every node's agreement, then move the copy aside.
+    async fn confirm_and_move_superseded(&self, mut items: Vec<(ChunkId, FileId, u64)>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Ok(tracked) = self.metadata.get_patch_states_present_batch_async(items.iter().map(|i| i.0).collect()).await {
+            items.retain(|i| !tracked.contains(&i.0));
+        }
+        let mut ready = Vec::new();
+        {
+            let mut seen = self.superseded_seen.write().await;
+            for item in items {
+                if seen.remove(&item.0) { ready.push(item) } else { seen.insert(item.0); }
+            }
+        }
+        if ready.is_empty() {
+            return;
+        }
+        let Some(authorized) = self.authorize_superseded_deletes(&ready).await else {
+            let mut seen = self.superseded_seen.write().await;
+            seen.extend(ready.iter().map(|i| i.0));
+            return;
+        };
+        let mut moved = 0usize;
+        for (chunk, file_id, idx) in &authorized {
+            if chunk.looks_like_patch_token() || self.slot_current(*file_id, *idx) == Some(*chunk) {
+                continue;
+            }
+            match self.storage.move_superseded_aside(chunk, *file_id, *idx) {
+                Ok(_) => moved += 1,
+                Err(e) => debug!("Superseded cleanup: couldn't move {} aside: {}", chunk, e),
+            }
+        }
+        info!("Superseded cleanup: {} of {} candidate(s) confirmed old by every node; {} moved aside for deletion",
+            authorized.len(), ready.len(), moved);
+    }
+
+    /// This node's current chunk for slot (file_id, chunk_idx), from its chunk map.
+    fn slot_current(&self, file_id: FileId, chunk_idx: u64) -> Option<ChunkId> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        self.chunk_map.get(&file_id).and_then(|e| {
+            e.value().0.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx)).map(|l| l.chunk_id)
+        })
+    }
+
+    /// Ask every node (this one included) about `items` (see Request::CheckSupersededChunks)
+    /// and return those every node agrees are old. None: couldn't get a full answer.
+    async fn authorize_superseded_deletes(&self, items: &[(ChunkId, FileId, u64)]) -> Option<Vec<(ChunkId, FileId, u64)>> {
+        let stability_secs = orphan_stability_secs();
+        let nodes = self.cluster.get_all_nodes().await;
+        if nodes.iter().any(|n| n.status != dfs_common::NodeStatus::Online) {
+            debug!("Superseded cleanup: deferring — a node isn't online");
+            return None;
+        }
+        let rf = self.replication_factor.load(Ordering::Relaxed).clamp(1, nodes.len().max(1));
+        let req = Request::CheckSupersededChunks { items: items.to_vec() };
+        let answers = futures::future::join_all(nodes.iter().map(|node| {
+            let req = req.clone();
+            async move {
+                match tokio::time::timeout(Duration::from_secs(15), self.client.send_message(node.addr, Message::Request(req))).await {
+                    Ok(Ok(env)) => match env.message {
+                        Message::Response(Response::SupersededCheck { current, holds, protected, uptime_secs })
+                            if current.len() == items.len() && holds.len() == items.len() && protected.len() == items.len()
+                                && uptime_secs >= stability_secs => Some((current, holds, protected)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+        })).await;
+        let Some(answers) = answers.into_iter().collect::<Option<Vec<_>>>() else {
+            debug!("Superseded cleanup: deferring — not every node answered (or one is too fresh)");
+            return None;
+        };
+        Some(Self::superseded_verdict(items, &answers, rf))
+    }
+
+    /// Which `items` every node's answer (current, holds, protected per item) shows to be
+    /// an old version: all name the same current chunk N, N isn't the item, at least `rf`
+    /// hold N, and none still needs the item. Any node without an entry vetoes.
+    #[allow(clippy::type_complexity)]
+    fn superseded_verdict(
+        items: &[(ChunkId, FileId, u64)],
+        answers: &[(Vec<Option<ChunkId>>, Vec<bool>, Vec<bool>)],
+        rf: usize,
+    ) -> Vec<(ChunkId, FileId, u64)> {
+        let mut ok = Vec::new();
+        if answers.is_empty() {
+            return ok;
+        }
+        for (i, item) in items.iter().enumerate() {
+            let Some(n) = answers[0].0[i] else { continue };
+            let unanimous = answers.iter().all(|(cur, _, _)| cur[i] == Some(n));
+            let holders = answers.iter().filter(|(_, held, _)| held[i]).count();
+            let needed = answers.iter().any(|(_, _, prot)| prot[i]);
+            if unanimous && n != item.0 && holders >= rf && !needed {
+                ok.push(*item);
+            }
+        }
+        ok
+    }
+
+    /// Step two of superseded-version cleanup: a copy moved aside at least two minutes
+    /// ago is deleted for good (and its CHUNK_TABLE row with it), unless the slot names it
+    /// again or a patch uses it: then it goes back.
+    async fn drain_superseded_trash(&self) {
+        // DFS_SUPERSEDED_SETTLE_SECS: lowered only by the test suite.
+        let settle_secs: u64 = std::env::var("DFS_SUPERSEDED_SETTLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        // Switched off (an emergency stop): put back everything not yet deleted.
+        let disabled = std::env::var("DFS_SUPERSEDED_CLEANUP").is_ok_and(|v| v == "0");
+        let entries: Vec<_> = self.storage.superseded_trash_entries().into_iter()
+            .filter(|e| disabled || now.saturating_sub(e.4) >= settle_secs).collect();
+        if entries.is_empty() {
+            return;
+        }
+        let mut tracked = self.metadata.get_patch_states_present_batch_async(entries.iter().map(|e| e.1).collect()).await
+            .unwrap_or_default();
+        // A pending patch here built on it (its base or delta): needed, put it back. Can't
+        // tell: put everything back this pass.
+        match self.metadata.all_pending_patch_chunk_ids_async().await {
+            Ok(ids) => tracked.extend(entries.iter().map(|e| e.1).filter(|c| ids.contains(c))),
+            Err(_) => tracked.extend(entries.iter().map(|e| e.1)),
+        }
+        let (mut gone, mut back) = (Vec::new(), 0usize);
+        for (path, chunk, file_id, idx, _) in entries {
+            if disabled || self.slot_current(file_id, idx) == Some(chunk) || tracked.contains(&chunk) || self.storage.has_chunk(&chunk) {
+                match self.storage.restore_superseded(&chunk, &path) {
+                    Ok(()) => back += 1,
+                    Err(e) => warn!("Superseded cleanup: couldn't restore {}: {}", chunk, e),
+                }
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => gone.push(chunk),
+                Err(e) => warn!("Superseded cleanup: couldn't delete {:?}: {}", path, e),
+            }
+        }
+        if !gone.is_empty() {
+            if let Err(e) = self.metadata.batch_update_chunk_locations_async(Vec::new(), gone.clone(), Vec::new()).await {
+                warn!("Superseded cleanup: removing {} row(s) failed: {}", gone.len(), e);
+            }
+        }
+        info!("Superseded cleanup: {} old version(s) deleted, {} moved back (needed again)", gone.len(), back);
     }
 
     /// Floor for disk_sweep_next_delay — see that function's doc comment for why a
@@ -2645,6 +2900,10 @@ impl HealingManager {
                 return;
             }
         };
+        // The leader called these live. If only its stale row for an old version says so,
+        // the superseded-version check (every node must agree) can still clear them.
+        let leader_kept: Vec<ChunkId> = ready_to_delete.iter().copied().filter(|id| !authorized.contains(id)).collect();
+        self.process_rowless_superseded(leader_kept).await;
         if authorized.is_empty() {
             debug!("Live-file orphan sweep: {} candidate(s) confirmed-absent locally but confirmed still-needed (live Pending base/token) elsewhere — not deleting",
                    ready_to_delete.len());
@@ -2743,7 +3002,7 @@ impl HealingManager {
     /// 275+ chunks indefinitely on a cluster that's rarely two consecutive sweep
     /// passes away from every node reporting Online at once).
     async fn authorize_live_file_orphan_deletes(&self, candidates: &[ChunkId]) -> Option<Vec<ChunkId>> {
-        const STABILITY_SECS: u64 = 300;
+        let stability_secs = orphan_stability_secs();
         const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
         if self.cluster.is_leader().await {
@@ -2804,9 +3063,9 @@ impl HealingManager {
                 match tokio::time::timeout(RPC_TIMEOUT, self.client.send_message(node.addr, Message::Request(req))).await {
                     Ok(Ok(envelope)) => match envelope.message {
                         Message::Response(Response::OrphanAuthInfo { uptime_secs, pending_patch_chunk_ids }) => {
-                            if uptime_secs < STABILITY_SECS {
+                            if uptime_secs < stability_secs {
                                 debug!("Live-file orphan sweep: deferring — node {} uptime {}s < {}s stability requirement",
-                                       node.id, uptime_secs, STABILITY_SECS);
+                                       node.id, uptime_secs, stability_secs);
                                 None
                             } else {
                                 Some(pending_patch_chunk_ids)
@@ -8321,6 +8580,76 @@ mod tests {
             "chunk_map now points at a different chunk at this offset — superseded, not data loss"
         );
     }
+
+    /// Superseded-version cleanup, step two: a copy moved aside is deleted for good once it
+    /// has settled, unless its slot names it again (a write of the same id raced the move):
+    /// then it is put back, readable. With the cleanup switched off, everything goes back.
+    #[tokio::test]
+    async fn superseded_trash_deletes_only_what_its_slot_no_longer_names() {
+        let (storage, _metadata, healing, _t1, _t2) = make_healing(NodeId::new(), "127.0.0.1:8911".parse().unwrap());
+        let file_id = FileId::new();
+        let (old, again, newer) = (ChunkId::from_hash([0x11; 32]), ChunkId::from_hash([0x22; 32]), ChunkId::from_hash([0x33; 32]));
+        let at = |idx: u64, id: ChunkId| ChunkLocation {
+            chunk_id: id, nodes: vec![], size: 4, checksum: id.hash, file_offset: Some(idx * 4 * 1024 * 1024),
+            written_at: None, client_write_seq: None, file_id: Some(file_id),
+        };
+        // Slot 0 moved on to `newer`; slot 1 names `again` (rewritten after it was moved aside).
+        healing.chunk_map.insert(file_id, (vec![at(0, newer), at(1, again)], 1));
+        storage.write_chunk(&old, b"old!").unwrap();
+        storage.write_chunk(&again, b"agn!").unwrap();
+        storage.move_superseded_aside(&old, file_id, 0).unwrap();
+        storage.move_superseded_aside(&again, file_id, 1).unwrap();
+        assert!(!storage.has_chunk(&old) && !storage.has_chunk(&again), "moved aside: gone to the rest of the node");
+
+        healing.drain_superseded_trash().await;
+        assert_eq!(storage.superseded_trash_entries().len(), 2, "nothing is deleted before it has settled");
+
+        // Age both entries past the settle time.
+        for (path, ..) in storage.superseded_trash_entries() {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let (stem, ts) = name.rsplit_once('.').unwrap();
+            let aged = path.with_file_name(format!("{}.{}", stem, ts.parse::<u64>().unwrap() - 600));
+            std::fs::rename(&path, aged).unwrap();
+        }
+        healing.drain_superseded_trash().await;
+        assert!(storage.superseded_trash_entries().is_empty(), "every settled entry is resolved");
+        assert!(!storage.has_chunk(&old), "an old version its slot no longer names is deleted");
+        assert_eq!(storage.read_chunk(&again).unwrap(), b"agn!", "BUG: a chunk its slot names again was deleted");
+
+        // Emergency stop: switched off, what's in the trash goes back at once.
+        storage.move_superseded_aside(&again, file_id, 0).unwrap(); // slot 0 names `newer`: would be deleted
+        std::env::set_var("DFS_SUPERSEDED_CLEANUP", "0");
+        healing.drain_superseded_trash().await;
+        std::env::remove_var("DFS_SUPERSEDED_CLEANUP");
+        assert_eq!(storage.read_chunk(&again).unwrap(), b"agn!", "switched off, the trash must be restored, not deleted");
+    }
+
+    /// Superseded-version cleanup (10-13): a copy is deletable only when every node names
+    /// the same newer version for its slot, held by RF, and none still needs it.
+    #[test]
+    fn superseded_verdict_needs_every_node_to_name_the_same_newer_version() {
+        let (f, idx) = (FileId::new(), 7u64);
+        let id = |b: u8| ChunkId::from_hash([b; 32]);
+        let (old, cur, other) = (id(1), id(2), id(3));
+        let item = vec![(old, f, idx)];
+        let ans = |c: Option<ChunkId>, held: bool, prot: bool| (vec![c], vec![held], vec![prot]);
+        let ok = |answers: Vec<_>| !HealingManager::superseded_verdict(&item, &answers, 3).is_empty();
+
+        assert!(ok(vec![ans(Some(cur), true, false), ans(Some(cur), true, false), ans(Some(cur), true, false), ans(Some(cur), false, false)]),
+            "every node names the same newer version, held by RF: deletable");
+        assert!(!ok(vec![ans(Some(cur), true, false), ans(Some(other), true, false), ans(Some(cur), true, false)]),
+            "a node naming another version (its map may hold the newest write) must veto");
+        assert!(!ok(vec![ans(Some(cur), true, false), ans(None, false, false), ans(Some(cur), true, false), ans(Some(cur), true, false)]),
+            "a node with no entry for the slot must veto");
+        assert!(!ok(vec![ans(Some(old), true, false), ans(Some(old), true, false), ans(Some(old), true, false)]),
+            "the item is the slot's current version: never deletable");
+        assert!(!ok(vec![ans(Some(cur), true, false), ans(Some(cur), true, false), ans(Some(cur), false, false)]),
+            "the current version held by fewer than RF nodes: keep the old one");
+        assert!(!ok(vec![ans(Some(cur), true, false), ans(Some(cur), true, true), ans(Some(cur), true, false)]),
+            "a node still needs it (pending patch base, token, ordered head): keep");
+        assert!(HealingManager::superseded_verdict(&item, &[], 3).is_empty(), "no answers: nothing deletable");
+    }
+
 
     /// A.1 (2026-08-09, observe-only stage of the superseded-generation backlog
     /// cleanup): proves the hard-confirmed classification itself is correct

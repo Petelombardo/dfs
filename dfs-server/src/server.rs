@@ -1188,7 +1188,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         Request::GetOrSeedSlotIsr { .. }
         | Request::ReplaceIsrMember { .. } => ClientOther,
         Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. }
-        | Request::SyncHeldLocations { .. } => PeerOther,
+        | Request::SyncHeldLocations { .. } | Request::CheckSupersededChunks { .. } => PeerOther,
         // A client's leader-directed read, relayed by the node the client asked.
         Request::ForwardedToLeader { .. } => ClientOther,
 
@@ -8394,6 +8394,7 @@ impl Server {
             }
             Request::ForwardedToLeader { hops, request } => self.handle_forwarded_to_leader(hops, *request).await,
             Request::SyncHeldLocations { to } => self.handle_sync_held_locations(to).await,
+            Request::CheckSupersededChunks { items } => self.handle_check_superseded_chunks(items).await,
             Request::RevalidateChunkSlot { file_id, chunk_idx, distrust_chunk_id } => {
                 self.handle_revalidate_chunk_slot(file_id, chunk_idx, distrust_chunk_id).await
             }
@@ -10449,6 +10450,34 @@ impl Server {
         }
         let uptime_secs = self.ops_tracker.get_stats().uptime_secs;
         Response::OrphanAuthInfo { uptime_secs, pending_patch_chunk_ids: ids.into_iter().collect() }
+    }
+
+    /// See `Request::CheckSupersededChunks`: this node's view of each item's slot.
+    async fn handle_check_superseded_chunks(&self, items: Vec<(ChunkId, FileId, u64)>) -> Response {
+        let mut needed = match self.metadata.all_pending_patch_chunk_ids_async().await {
+            Ok(ids) => ids,
+            Err(e) => return Response::Error { message: format!("CheckSupersededChunks: patch_state unreadable: {}", e), code: ErrorCode::InternalError },
+        };
+        match self.metadata.all_patch_token_ids_async().await {
+            Ok(ids) => needed.extend(ids),
+            Err(e) => return Response::Error { message: format!("CheckSupersededChunks: patch tokens unreadable: {}", e), code: ErrorCode::InternalError },
+        }
+        let (mut current, mut holds, mut protected) = (Vec::new(), Vec::new(), Vec::new());
+        for (chunk, file_id, chunk_idx) in items {
+            let cur = self.chunk_map.get(&file_id).and_then(|e| {
+                let (locs, _) = e.value();
+                Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+            });
+            let held = match cur {
+                Some(c) => self.storage.has_chunk(&c) || matches!(self.metadata.get_patch_state_async(c).await, Ok(Some(_))),
+                None => false,
+            };
+            current.push(cur);
+            holds.push(held);
+            protected.push(needed.contains(&chunk) || self.write_ordering.is_head(file_id, chunk_idx, chunk));
+        }
+        let uptime_secs = self.ops_tracker.get_stats().uptime_secs;
+        Response::SupersededCheck { current, holds, protected, uptime_secs }
     }
 
     /// Run this node's local orphan reconciliation sweep right now instead of

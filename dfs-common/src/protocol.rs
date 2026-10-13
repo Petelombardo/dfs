@@ -1255,6 +1255,19 @@ pub enum Request {
     SyncHeldLocations {
         to: std::net::SocketAddr,
     },
+
+    /// Superseded-version cleanup, node -> every other node: for each item (chunk, file,
+    /// chunk_idx), a chunk this sender holds whose CHUNK_TABLE row names that slot but which
+    /// isn't the slot's current version here. The receiver answers from its own state (see
+    /// `Response::SupersededCheck`); the sender deletes its copy only if every node names
+    /// the same newer version. A file rewritten in place left every old version's row
+    /// behind, and the orphan sweep kept any chunk whose row names a live file: 1.5 TB of
+    /// staging's 4.1 TB was old versions of VM disks (10-13). APPENDED at end to preserve
+    /// wire compatibility; a node too old to know it fails the request and nothing is
+    /// deleted.
+    CheckSupersededChunks {
+        items: Vec<(ChunkId, FileId, u64)>,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member
@@ -1866,6 +1879,19 @@ pub enum Response {
     SlotResync {
         chunk_id: ChunkId,
         version: u64,
+    },
+
+    /// Answer to `Request::CheckSupersededChunks`, one entry per item in order: `current`,
+    /// this node's current chunk for the item's slot (None: it has no entry); `holds`,
+    /// whether this node holds that current version's data; `protected`, whether this node
+    /// still needs the item's chunk (a pending patch's base or delta, a patch token, or an
+    /// ordered stream's head). `uptime_secs` lets the sender skip nodes too fresh to have
+    /// caught up. APPENDED at end to preserve wire compatibility.
+    SupersededCheck {
+        current: Vec<Option<ChunkId>>,
+        holds: Vec<bool>,
+        protected: Vec<bool>,
+        uptime_secs: u64,
     },
 }
 

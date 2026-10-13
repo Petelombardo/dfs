@@ -10264,6 +10264,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                         }
 
                         let mut nodes_lock = self.cluster_nodes.write().await;
+                        // A node that can't name a leader can't see a majority of its cluster:
+                        // typically one just restarted and not rejoined yet, which sees only
+                        // itself. Its membership is a minority's view. Adopting it shrank the
+                        // client to that one node, the next chunk went through the single-node
+                        // path to it alone, and the acked chunk was lost (suite T38a). Ask
+                        // the next node; such a view may only add nodes (a client bootstrapping
+                        // during an election), never drop them.
+                        if leader_node_id.is_none() && new_addrs.len() <= nodes_lock.len() {
+                            info!("Cluster view from {} names no leader ({} node(s)); keeping the {} known, asking another",
+                                node_addr, new_addrs.len(), nodes_lock.len());
+                            continue;
+                        }
                         *nodes_lock = new_addrs;
                         info!("Refreshed cluster nodes: {} nodes, RF={} (via {})", nodes_lock.len(), replication_factor, node_addr);
                         return Ok(());
@@ -11161,6 +11173,71 @@ mod tests {
         assert_eq!(locs[0].nodes.len(), 2);
         assert_eq!(old_stored.load(std::sync::atomic::Ordering::SeqCst), 1, "the node that can't chain got its copy directly");
         assert_eq!(other_stored.load(std::sync::atomic::Ordering::SeqCst), 1, "the second replica got its copy directly");
+    }
+
+    /// A fake node answering GetClusterStatus with `nodes` online and `leader` as the leader
+    /// it can name (None: it can't see a majority of its cluster).
+    async fn cluster_status_server(view: Arc<std::sync::Mutex<(Vec<dfs_common::NodeInfo>, Option<dfs_common::NodeId>)>>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                let view = view.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() { return; }
+                        let mut env = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut env).await.is_err() { return; }
+                        let Ok(env) = MessageEnvelope::from_bytes(&env) else { return };
+                        let (nodes, leader) = view.lock().unwrap().clone();
+                        let reply = Response::ClusterStatus {
+                            total_nodes: nodes.len(), healthy_nodes: nodes.len(), nodes,
+                            chunk_size_mb: 4, leader_node_id: leader, replication_factor: 3, local_node_id: None,
+                        };
+                        let reply = MessageEnvelope::new(env.request_id, Message::Response(reply)).to_bytes().unwrap();
+                        let mut out = (reply.len() as u32).to_be_bytes().to_vec();
+                        out.extend_from_slice(&reply);
+                        if s.write_all(&out).await.is_err() { return; }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Suite T38a (10-13, twice): the leader restarted mid-write and, before it had rejoined,
+    /// answered the client's refresh with a cluster of just itself and no leader. The client
+    /// took that as the membership, wrote the next chunk through the single-node path to
+    /// that node alone, and the acked chunk was lost. A view that can't name a leader is a
+    /// minority's view: the client must ask another node, and keep what it knows if none can.
+    #[tokio::test]
+    async fn a_refresh_never_adopts_a_view_that_cant_name_a_leader() {
+        let lone_view = Arc::new(std::sync::Mutex::new((vec![], None)));
+        let lone = cluster_status_server(lone_view.clone()).await;
+        let full_view = Arc::new(std::sync::Mutex::new((vec![], None)));
+        let other = cluster_status_server(full_view.clone()).await;
+        let (lone_id, other_id) = (dfs_common::NodeId::new(), dfs_common::NodeId::new());
+        let both = vec![dfs_common::NodeInfo::new(lone_id, lone, None), dfs_common::NodeInfo::new(other_id, other, None)];
+        *lone_view.lock().unwrap() = (vec![dfs_common::NodeInfo::new(lone_id, lone, None)], None);
+        *full_view.lock().unwrap() = (both.clone(), Some(other_id));
+
+        let client = DfsClient::new(vec![lone, other]).unwrap();
+        *client.cluster_nodes.write().await = vec![lone, other];
+        *client.leader_addr.write().await = Some(lone); // asked first, as the known leader was
+        client.refresh_cluster_nodes().await.ok();
+        let mut got = client.cluster_nodes.read().await.clone();
+        got.sort();
+        let mut want = vec![lone, other];
+        want.sort();
+        assert_eq!(got, want, "BUG: adopted the lone restarted node's one-node, leaderless view");
+
+        // Nobody can name a leader: keep the known membership rather than shrink it.
+        *full_view.lock().unwrap() = (vec![dfs_common::NodeInfo::new(other_id, other, None)], None);
+        client.refresh_cluster_nodes().await.ok();
+        assert_eq!(client.cluster_nodes.read().await.len(), 2, "a leaderless view replaced the known membership");
     }
 
     /// rock5b dd (10-13): a 500 MB burst on a 1 GbE client put ~100 4 MB uploads on the

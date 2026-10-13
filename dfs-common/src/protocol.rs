@@ -72,6 +72,42 @@ where
     stream.flush().await
 }
 
+/// `write_all` that fails only when the peer stops taking bytes: each 256 KB slice must
+/// go out within `stall`, however long the whole buffer takes. A total-duration deadline
+/// can't tell a slow link from a dead peer: a client on 1 GbE pushing two replicas of a
+/// burst shares its uplink among many writes, each crawls, and every one missed a fixed
+/// 3 s deadline though all were moving (rock5b dd, 10-13). Fails with `TimedOut`.
+pub async fn write_all_with_stall<W>(stream: &mut W, buf: &[u8], stall: std::time::Duration) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    const SLICE: usize = 256 * 1024;
+    let stalled = || std::io::Error::new(std::io::ErrorKind::TimedOut, format!("write made no progress for {:?}", stall));
+    for piece in buf.chunks(SLICE) {
+        tokio::time::timeout(stall, stream.write_all(piece)).await.map_err(|_| stalled())??;
+    }
+    tokio::time::timeout(stall, stream.flush()).await.map_err(|_| stalled())?
+}
+
+/// `write_split_frame_request` with a progress deadline instead of a total one (see
+/// `write_all_with_stall`).
+pub async fn write_split_frame_request_with_stall<W>(
+    stream: &mut W,
+    encoded_envelope: &[u8],
+    raw_data: &[u8],
+    stall: std::time::Duration,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let mut header = Vec::with_capacity(4 + encoded_envelope.len() + 4);
+    header.extend_from_slice(&(encoded_envelope.len() as u32).to_be_bytes());
+    header.extend_from_slice(encoded_envelope);
+    header.extend_from_slice(&(raw_data.len() as u32).to_be_bytes());
+    write_all_with_stall(stream, &header, stall).await?;
+    write_all_with_stall(stream, raw_data, stall).await
+}
+
 /// Messages exchanged between nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {

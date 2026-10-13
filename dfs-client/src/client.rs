@@ -36,11 +36,14 @@ struct NodeHealth {
     /// Last time a liveness probe (Ping) was launched for this node — single-flights
     /// the probe so concurrent failing requests don't each fire one.
     last_probe_at: Option<std::time::Instant>,
+    /// The current penalty rests on proof the node is unreachable (connection refused or
+    /// reset, or a liveness probe on a fresh connection failed), not just on timeouts.
+    confirmed_down: bool,
 }
 
 impl NodeHealth {
     fn new() -> Self {
-        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0, last_probe_at: None }
+        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0, last_probe_at: None, confirmed_down: false }
     }
 
     fn is_penalized(&self) -> bool {
@@ -56,6 +59,7 @@ impl NodeHealth {
                 self.penalized_until = None;
                 self.consecutive_failures = 0;
                 self.backoff_level = 0;
+                self.confirmed_down = false;
             }
         }
     }
@@ -122,6 +126,7 @@ impl NodeHealthTracker {
             h.consecutive_failures = 0;
             h.penalized_until = None;
             h.backoff_level = 0;
+            h.confirmed_down = false;
         }
     }
 
@@ -183,6 +188,7 @@ impl NodeHealthTracker {
         let already_penalized = h.penalized_until.is_some();
         h.consecutive_failures = h.consecutive_failures.max(Self::PENALTY_THRESHOLD);
         h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(Self::DEAD_SHED_SECS));
+        h.confirmed_down = true;
         drop(h);
         if !already_penalized {
             warn!("Node {} shed immediately on proof of death (connection refused/reset/EOF) — skipping it for {}s instead of paying a full RPC timeout per retry",
@@ -237,11 +243,27 @@ impl NodeHealthTracker {
         h.consecutive_failures = h.consecutive_failures.max(Self::PENALTY_THRESHOLD);
         let secs = (Self::BASE_PROBE_SECS << h.backoff_level).min(Self::MAX_PROBE_SECS);
         h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(secs));
+        h.confirmed_down = true;
         if h.backoff_level < 8 {
             h.backoff_level += 1;
         }
         drop(h);
         warn!("Node {} hard-penalized for {}s (liveness probe failed — confirmed unreachable)", addr, secs);
+    }
+
+    /// Whether requests to `addr` should be skipped without trying: it is penalized AND that
+    /// rests on proof it's unreachable. Timeouts alone only ever order it last
+    /// (`sort_by_health`): they can't tell a dead node from this client's own saturated
+    /// uplink. Skipping on them blocked every node, the leader included, for 120 s after a
+    /// 500 MB burst on a 1 GbE client: the file's metadata (a few KB) wasn't even attempted
+    /// and fsync returned EIO, though the leader answered fine (rock5b dd, 10-13).
+    pub async fn is_shed(&self, addr: SocketAddr) -> bool {
+        if let Some(mut h) = self.inner.get_mut(&addr) {
+            h.maybe_clear_expired_penalty();
+            h.is_penalized() && h.confirmed_down
+        } else {
+            false
+        }
     }
 
     /// Returns true if `addr` is currently in a penalty period.
@@ -413,6 +435,49 @@ pub struct ChunkReadHint {
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// How long an upload to a node may make no progress at all before it's taken as stuck.
+/// A deadline on the whole transfer can't tell a dead node from this client's own uplink
+/// shared among many writes; this can (see `dfs_common::protocol::write_all_with_stall`).
+const WRITE_STALL: Duration = Duration::from_secs(10);
+
+/// Unit of the client-wide upload budget (`wire_permit`).
+const WIRE_UNIT: usize = 64 * 1024;
+
+/// Client-wide budget of request bytes being written to the network at once, in WIRE_UNITs
+/// (DFS_CLIENT_WIRE_BUDGET_MB, default 32). Without it a burst (dd of 500 MB, two replicas
+/// per chunk) put ~100 4 MB uploads on a 1 GbE link at once: each got ~1 MB/s, all missed
+/// their deadline together, and each was resent from scratch, so throughput collapsed to a
+/// third of the link (rock5b, 10-13). 32 MB is far above the bandwidth-delay product of any
+/// LAN link, so a single fast link stays full.
+fn wire_budget() -> &'static (tokio::sync::Semaphore, usize) {
+    static BUDGET: std::sync::OnceLock<(tokio::sync::Semaphore, usize)> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let mb = std::env::var("DFS_CLIENT_WIRE_BUDGET_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32).max(1);
+        let units = mb * 1024 * 1024 / WIRE_UNIT;
+        (tokio::sync::Semaphore::new(units), units)
+    })
+}
+
+/// A share of the upload budget for writing `len` bytes, held only while they're being
+/// written (not while waiting for the reply). Small requests (metadata, control) never
+/// wait: they must not queue behind bulk data.
+async fn wire_permit(len: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    if len < WIRE_UNIT {
+        return None;
+    }
+    let (budget, total) = wire_budget();
+    budget.acquire_many(len.div_ceil(WIRE_UNIT).min(*total) as u32).await.ok()
+}
+
+/// `TimedOut` (an upload stalled, or the reply didn't come in time) as `Err(())`, the shape
+/// the send paths' retry ladders match on.
+fn stall_shape<T>(r: std::io::Result<T>) -> std::result::Result<std::io::Result<T>, ()> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(()),
+        other => Ok(other),
+    }
+}
 
 /// Maximum number of recent SQLite file writes to track for read-after-write consistency
 const SQLITE_WRITE_TRACKER_SIZE: usize = 256;
@@ -1884,6 +1949,31 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// send_request's resend on a fresh connection: the request written with a stall
+    /// deadline (within the upload budget), its reply within 3 s. Err(()) is a timeout
+    /// of either, the shape the retry ladder matches on.
+    async fn round_trip_on_fresh(fresh: &mut TcpStream, encoded: &[u8]) -> std::result::Result<Result<Vec<u8>>, ()> {
+        let wire = wire_permit(encoded.len() + 4).await;
+        let mut framed = Vec::with_capacity(4 + encoded.len());
+        framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        framed.extend_from_slice(encoded);
+        match stall_shape(dfs_common::protocol::write_all_with_stall(fresh, &framed, WRITE_STALL).await) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Ok(Err(anyhow::Error::new(e).context("write request"))),
+            Err(()) => return Err(()),
+        }
+        drop(wire);
+        let read = async {
+            let mut len_buf = [0u8; 4];
+            fresh.read_exact(&mut len_buf).await.context("read len")?;
+            let rlen = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; rlen];
+            fresh.read_exact(&mut buf).await.context("read body")?;
+            Ok::<Vec<u8>, anyhow::Error>(buf)
+        };
+        tokio::time::timeout(Duration::from_secs(3), read).await.map_err(|_| ())
+    }
+
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         if !crate::read_trace::active() {
             return self.send_request_untraced(addr, request).await;
@@ -1909,8 +1999,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // failing over to the two healthy replicas quickly. is_penalized() only trips
         // after PENALTY_THRESHOLD (5) consecutive failures with real backoff (30-120s),
         // so this can't fire on a single blip — by the time it's true, the node has
-        // already proven itself bad multiple times in a row.
-        if self.node_health.is_penalized(addr).await {
+        // already proven itself bad multiple times in a row. Since 10-13 it skips only a
+        // node proven unreachable (`is_shed`): timeouts alone also come from this client's
+        // own saturated uplink, and skipping on them cost a healthy leader 120 s.
+        if self.node_health.is_shed(addr).await {
             return Err(anyhow::anyhow!(
                 "Node {} is penalized (recent repeated failures) — skipping without attempting a connection",
                 addr
@@ -2006,6 +2098,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         // client read. write/read here are just the syscall-level client-side legs;
         // the gap between write completing and read completing that ISN'T server-side
         // dispatch (per NETTIMING) is genuine network transit / TCP-level delay.
+        //
+        // The request is written within the client-wide upload budget and fails only on a
+        // stall (WRITE_STALL); the 3 s deadline covers the reply alone. It used to cover the
+        // upload too, and a multi-MB MultiPatch on a shared, saturated uplink missed it
+        // while still moving.
+        let wire = wire_permit(encoded.len() + 4).await;
         let io_future = async {
             // Coalesce the length prefix and body into one buffer so the write hits the
             // wire as a single packet instead of two — halves the packet count (and
@@ -2015,17 +2113,21 @@ leader_addr: Arc::new(RwLock::new(None)),
             framed.extend_from_slice(&len.to_be_bytes());
             framed.extend_from_slice(&encoded);
             let write_start = std::time::Instant::now();
-            stream.write_all(&framed).await?;
-            stream.flush().await?;
+            dfs_common::protocol::write_all_with_stall(&mut stream, &framed, WRITE_STALL).await?;
             let write_elapsed = write_start.elapsed();
+            drop(wire);
 
             let read_start = std::time::Instant::now();
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await?;
+            let read = async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<Vec<u8>, std::io::Error>(buf)
+            };
+            let buf = tokio::time::timeout(tokio::time::Duration::from_secs(3), read).await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply within 3s"))??;
             let read_elapsed = read_start.elapsed();
             if write_elapsed.as_millis() >= 5 || read_elapsed.as_millis() >= 5 {
                 info!("CLIENTNET addr={} write={:?} read={:?}", addr, write_elapsed, read_elapsed);
@@ -2033,7 +2135,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             Ok::<Vec<u8>, std::io::Error>(buf)
         };
 
-        let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
+        let buf = match stall_shape(io_future.await) {
             Ok(Ok(buf)) => buf,
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
                         || e.kind() == std::io::ErrorKind::ConnectionReset
@@ -2062,19 +2164,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
                     }
                 };
-                let len = encoded.len() as u32;
-                let retry_result = async {
-                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
-                    fresh.write_all(&encoded).await.context("write body")?;
-                    fresh.flush().await.context("flush")?;
-                    let mut len_buf = [0u8; 4];
-                    fresh.read_exact(&mut len_buf).await.context("read len")?;
-                    let rlen = u32::from_be_bytes(len_buf) as usize;
-                    let mut buf = vec![0u8; rlen];
-                    fresh.read_exact(&mut buf).await.context("read body")?;
-                    Ok::<Vec<u8>, anyhow::Error>(buf)
-                };
-                match tokio::time::timeout(tokio::time::Duration::from_secs(3), retry_result).await {
+                match Self::round_trip_on_fresh(&mut fresh, &encoded).await {
                     Ok(Ok(buf)) => {
                         stream = fresh;
                         buf
@@ -2115,19 +2205,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 };
 
                 // Reuse the same serialized envelope (idempotent for reads; acceptable for writes)
-                let len = encoded.len() as u32;
-                let retry_result = async {
-                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
-                    fresh.write_all(&encoded).await.context("write body")?;
-                    fresh.flush().await.context("flush")?;
-                    let mut len_buf = [0u8; 4];
-                    fresh.read_exact(&mut len_buf).await.context("read len")?;
-                    let rlen = u32::from_be_bytes(len_buf) as usize;
-                    let mut buf = vec![0u8; rlen];
-                    fresh.read_exact(&mut buf).await.context("read body")?;
-                    Ok::<Vec<u8>, anyhow::Error>(buf)
-                };
-                match tokio::time::timeout(tokio::time::Duration::from_secs(3), retry_result).await {
+                match Self::round_trip_on_fresh(&mut fresh, &encoded).await {
                     Ok(Ok(buf)) => {
                         stream = fresh;
                         buf
@@ -2441,7 +2519,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // See send_request's matching check for why: fail instantly against a node
         // already known bad instead of paying a full connect+retry+timeout cycle on
         // every call to it while the multi-replica dispatch (join_all) waits on it.
-        if self.node_health.is_penalized(addr).await {
+        if self.node_health.is_shed(addr).await {
             return Err(anyhow::anyhow!(
                 "Node {} is penalized (recent repeated failures) — skipping without attempting a connection",
                 addr
@@ -2533,10 +2611,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         // stale) connect — everything from here to recv_start below is the actual write.
         let connect_done_at = std::time::Instant::now();
 
-        // Send using split-frame encoding (envelope with empty data + raw bytes)
-        let io_future = dfs_common::protocol::write_split_frame_request(&mut stream, encoded_envelope, raw_data);
+        // Send using split-frame encoding (envelope with empty data + raw bytes), within the
+        // client-wide upload budget and failing only on a stall (see WRITE_STALL): a fixed
+        // 3 s deadline here failed every write of a burst on a shared 1 GbE uplink.
+        let wire = wire_permit(encoded_envelope.len() + raw_data.len() + 8).await;
+        let io_future = dfs_common::protocol::write_split_frame_request_with_stall(&mut stream, encoded_envelope, raw_data, WRITE_STALL);
 
-        match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
+        match stall_shape(io_future.await) {
             Ok(Ok(())) => {},
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
                         || e.kind() == std::io::ErrorKind::ConnectionReset
@@ -2557,10 +2638,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
                     }
                 };
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(3),
-                    dfs_common::protocol::write_split_frame_request(&mut fresh, encoded_envelope, raw_data)
-                ).await {
+                match stall_shape(dfs_common::protocol::write_split_frame_request_with_stall(&mut fresh, encoded_envelope, raw_data, WRITE_STALL).await) {
                     Ok(Ok(())) => { stream = fresh; }
                     Ok(Err(e)) => {
                         self.node_health.record_failure(addr).await;
@@ -2568,6 +2646,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     Err(_) => {
                         self.node_health.record_failure(addr).await;
+                        // Stalled twice, on two connections: confirm with a Ping before
+                        // anyone skips the node (a timeout alone doesn't shed it).
+                        self.confirm_liveness_or_penalize(addr).await;
                         return Err(anyhow::anyhow!("Timeout writing to {}", addr));
                     }
                 }
@@ -2592,10 +2673,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 };
 
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(3),
-                    dfs_common::protocol::write_split_frame_request(&mut fresh, encoded_envelope, raw_data)
-                ).await {
+                match stall_shape(dfs_common::protocol::write_split_frame_request_with_stall(&mut fresh, encoded_envelope, raw_data, WRITE_STALL).await) {
                     Ok(Ok(())) => { stream = fresh; }
                     Ok(Err(e)) => {
                         self.node_health.record_failure(addr).await;
@@ -2603,11 +2681,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     Err(_) => {
                         self.node_health.record_failure(addr).await;
+                        // Stalled twice, on two connections: confirm with a Ping before
+                        // anyone skips the node (a timeout alone doesn't shed it).
+                        self.confirm_liveness_or_penalize(addr).await;
                         return Err(anyhow::anyhow!("Timeout writing to {}", addr));
                     }
                 }
             }
         }
+
+        drop(wire);
 
         // Read response — BOUNDED. This used to be two bare read_exact().await calls
         // with no timeout: a server that received the request but was slow or never
@@ -10919,6 +11002,95 @@ mod tests {
         assert!(!is_transient_write_failure("chunk data missing on this node"));
         assert!(!is_transient_write_failure("unexpected response"));
         assert!(!is_transient_write_failure("chunk 224 fresh-write safety check found real existing data"));
+    }
+
+    /// A fake node for the congestion tests: answers every request with Pong, reading
+    /// split-frame payloads at about `bytes_per_sec` (a 1 GbE uplink shared by many
+    /// uploads, as the client sees it). Small receive buffer, so the client's writes block.
+    async fn slow_reading_pong_server(bytes_per_sec: usize) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(64 * 1024).unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = sock.listen(16).unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() { return; }
+                        let mut env = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut env).await.is_err() { return; }
+                        let Ok(env) = MessageEnvelope::from_bytes(&env) else { return };
+                        if matches!(env.message, Message::Request(Request::WriteChunk { .. })) {
+                            // Split frame: the raw payload follows, read slowly.
+                            if s.read_exact(&mut len).await.is_err() { return; }
+                            let mut left = u32::from_be_bytes(len) as usize;
+                            let mut buf = vec![0u8; 64 * 1024];
+                            while left > 0 {
+                                let n = left.min(buf.len());
+                                if s.read_exact(&mut buf[..n]).await.is_err() { return; }
+                                left -= n;
+                                tokio::time::sleep(Duration::from_secs_f64(n as f64 / bytes_per_sec as f64)).await;
+                            }
+                        }
+                        let reply = MessageEnvelope::new(env.request_id, Message::Response(Response::Pong)).to_bytes().unwrap();
+                        let mut out = (reply.len() as u32).to_be_bytes().to_vec();
+                        out.extend_from_slice(&reply);
+                        if s.write_all(&out).await.is_err() { return; }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// rock5b dd (10-13): a 500 MB burst on a 1 GbE client put ~100 4 MB uploads on the
+    /// link at once; each crawled at ~1 MB/s and missed a fixed 3 s deadline while still
+    /// moving, was resent from scratch, and the node was blamed. An upload that keeps
+    /// moving must complete, however long it takes.
+    #[tokio::test]
+    async fn a_slow_but_moving_upload_is_not_a_timeout() {
+        let addr = slow_reading_pong_server(2 * 1024 * 1024).await;
+        let client = DfsClient::new(vec![addr]).unwrap();
+        let env = MessageEnvelope::new(RequestId::new(1), Message::Request(Request::WriteChunk {
+            chunk_id: ChunkId::from_hash([7; 32]), data: Vec::new(), checksum: [7; 32],
+        }));
+        let encoded = env.to_bytes().unwrap();
+        let raw = vec![0x5au8; 16 * 1024 * 1024]; // ~8 s at 2 MB/s
+        let started = std::time::Instant::now();
+        let r = client.send_split_frame_write_request(addr, &encoded, &raw).await;
+        assert!(r.is_ok(), "BUG: an upload still moving after {:?} was failed as a timeout: {:?}", started.elapsed(), r.err());
+        assert!(!client.node_health.is_penalized(addr).await, "a node that took every byte was penalized");
+    }
+
+    /// Timeouts can't tell a dead node from this client's own saturated uplink, so they
+    /// must never make the client skip a node without trying it: after the burst above,
+    /// every node was skipped for up to 120 s, the leader too, so the file's metadata was
+    /// never even sent and fsync returned EIO though the leader was fine. Proof of death
+    /// (connection refused) still sheds a node at once.
+    #[tokio::test]
+    async fn timeouts_alone_never_make_the_client_skip_a_node() {
+        let addr = slow_reading_pong_server(usize::MAX / 2).await;
+        let client = DfsClient::new(vec![addr]).unwrap();
+        for _ in 0..8 {
+            client.node_health.record_failure(addr).await;
+        }
+        assert!(client.node_health.is_penalized(addr).await, "setup: the node is penalized (ordered last)");
+        let r = client.send_request(addr, Request::Ping).await;
+        assert!(matches!(r, Ok(Response::Pong)),
+            "BUG: a node penalized only for timeouts was skipped without being tried: {:?}", r.err().map(|e| e.to_string()));
+
+        let dead: SocketAddr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        }; // closed: connections are refused
+        client.node_health.record_dead(dead).await;
+        let r = client.send_request(dead, Request::Ping).await;
+        assert!(r.as_ref().err().is_some_and(|e| e.to_string().contains("skipping without attempting a connection")),
+            "a node proven dead must be skipped, got {:?}", r.map(|_| ()));
     }
 
     /// Direct regression for the 2026-07-21 corruption root cause: the split-frame

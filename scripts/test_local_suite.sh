@@ -854,6 +854,59 @@ rm -f "$MOUNT/t83.bin" "$BASE"/t83_*.bin
 done
 fi # should_run T83
 
+# ── T84: a burst bigger than the client's link (rock5b dd, 10-13) ────────────
+# A 500 MB dd with conv=fsync from a 1 GbE client: the client put ~100 4 MB uploads on
+# its link at once, each missed a fixed 3 s deadline while still moving, every node
+# (the leader too) was skipped for up to 120 s, the file's metadata was never sent and
+# fsync returned EIO. Here loopback is capped at 100 Mbit (each upload gets about the
+# share ~100 parallel uploads got on rock5b) and the client has a production-sized write
+# buffer. fsync may be slow; it must succeed, the bytes must read back, and no node may
+# be skipped untried.
+snapshot_log T84
+if should_run T84; then
+echo "=== T84: a write burst bigger than the client's link: slow, never EIO ==="
+T84_SRC="$BASE/t84_src.bin"
+dd if=/dev/urandom of="$T84_SRC" bs=1M count=500 status=none
+# Its own client with a production-sized write buffer (the suite's caps it at 32 MB):
+# rock5b's held 90 4 MB slots at fsync, and flushed them all at once.
+T84_MNT=/tmp/dfs-mount-t84
+mkdir -p "$T84_MNT"
+: > "$LOG/client_t84.log"
+DFS_WRITE_BUFFER_CAP_MB=400 RUST_LOG=info "$BIN/dfs-client" mount "$T84_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t84.log" --allow-other --log-level info &
+T84_CPID=$!
+sleep 2
+T84_MARK=1
+if tc qdisc replace dev lo root tbf rate 100mbit burst 128kb latency 400ms 2>"$LOG/t84_tc.err"; then
+    T84_START=$(date +%s)
+    T84_RC=0
+    timeout 600 dd if="$T84_SRC" of="$T84_MNT/t84.img" bs=1M conv=fsync status=none 2>"$LOG/t84_dd.err" || T84_RC=$?
+    T84_SECS=$(( $(date +%s) - T84_START ))
+    tc qdisc del dev lo root 2>/dev/null || true
+    T84_SKIPS=$(grep -c "skipping without attempting a connection" "$LOG/client_t84.log" || true)
+    T84_TIMEOUTS=$(grep -c "Timeout writing to" "$LOG/client_t84.log" || true)
+    echo "  T84: dd rc=$T84_RC in ${T84_SECS}s; upload timeouts: $T84_TIMEOUTS; requests skipped untried: $T84_SKIPS"
+    [ "$T84_RC" = 0 ] \
+        && check "T84a the fsync'd burst succeeded on a saturated 100 Mbit link (${T84_SECS}s)" PASS \
+        || check "T84a dd failed (rc=$T84_RC): $(head -c 200 "$LOG/t84_dd.err")" FAIL
+    [ "$T84_SKIPS" = 0 ] \
+        && check "T84b no node skipped without being tried" PASS \
+        || check "T84b $T84_SKIPS request(s) skipped a node untried during the burst ($T84_TIMEOUTS upload timeouts)" FAIL
+    dfs_sync
+    T84_M1=$(md5sum < "$T84_SRC" | cut -d' ' -f1)
+    T84_M2=$(timeout 120 md5sum < "$T84_MNT/t84.img" 2>/dev/null | cut -d' ' -f1)
+    [ "$T84_M1" = "$T84_M2" ] \
+        && check "T84c the burst reads back intact" PASS \
+        || check "T84c the burst reads back wrong (exp $T84_M1 got ${T84_M2:-unreadable})" FAIL
+else
+    check "T84 couldn't cap loopback with tc: $(head -c 200 "$LOG/t84_tc.err")" FAIL
+fi
+tc qdisc del dev lo root 2>/dev/null || true
+rm -f "$T84_MNT/t84.img" "$T84_SRC"
+fusermount -u "$T84_MNT" 2>/dev/null || true
+kill_client_and_wait "$T84_CPID"
+fi # should_run T84
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

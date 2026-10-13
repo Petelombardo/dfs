@@ -17217,25 +17217,22 @@ impl Server {
         if !id.looks_like_patch_token() && self.storage.has_chunk(&id) {
             return self.register_anchor_location(file_id, chunk_idx, id).await.then_some(id);
         }
-        // By exact id first. If this node can't resolve it (at stream start `id` can be the
-        // client's chunk id, which an earlier unordered phase left this replica without), the
-        // anchor is this primary's own current content for the slot: the slot backstop
-        // (resolve_by_slot, local). Without it a stream starting after unordered writes had
-        // no anchor, every ordered write failed, and both writers got EIO (suite T63+T64).
-        let mut resp = self.handle_read_chunk(id, None, None).await;
-        if !matches!(resp, Response::ChunkData { .. }) {
-            info!("[ORDER] materialize_anchor: {} unreadable here for file {} chunk {}; anchoring on this node's current content for the slot",
-                id, file_id, chunk_idx);
-            resp = self.handle_read_chunk(id, None, Some((file_id, chunk_idx))).await;
-        }
-        let data: Vec<u8> = match resp {
-            Response::ChunkData { arc_data: Some(arc), arc_range: Some((a, b)), .. } => arc[a..b].to_vec(),
-            Response::ChunkData { arc_data: Some(arc), .. } => arc.as_ref().clone(),
-            Response::ChunkData { data, .. } => data,
-            other => {
-                warn!("[ORDER] materialize_anchor: can't read {} or the slot's content for file {} chunk {}: {:?}", id, file_id, chunk_idx, other);
-                return None;
-            }
+        // Exactly `id`, never a substitute: here, else from a peer holding it (at stream start
+        // `id` can be the client's chunk id, which an earlier unordered phase or a missed
+        // version left this replica without, suite T63+T64). This node's own content for the
+        // slot was the fallback once, but a new primary that missed versions then anchored
+        // on old bytes and every later write was applied onto them: an acked write was lost
+        // (suite T74, 10-13). With no copy anywhere the write fails and the client retries.
+        let data = match Self::chunk_data_bytes(self.handle_read_chunk(id, None, None).await) {
+            Some(data) => data,
+            None => match self.read_exact_version_from_peers(file_id, chunk_idx, id).await {
+                Some(data) => data,
+                None => {
+                    warn!("[ORDER] materialize_anchor: {} is unreadable here and on every peer asked, for file {} chunk {}; not anchoring",
+                        id, file_id, chunk_idx);
+                    return None;
+                }
+            },
         };
         let anchor = ChunkId { hash: dfs_common::compute_chunk_hash_at(&data, chunk_idx * (4 * 1024 * 1024), file_id) };
         if !self.storage.has_chunk(&anchor) {
@@ -17245,6 +17242,55 @@ impl Server {
             }
         }
         self.register_anchor_location(file_id, chunk_idx, anchor).await.then_some(anchor)
+    }
+
+    fn chunk_data_bytes(resp: Response) -> Option<Vec<u8>> {
+        match resp {
+            Response::ChunkData { arc_data: Some(arc), arc_range: Some((a, b)), .. } => Some(arc[a..b].to_vec()),
+            Response::ChunkData { arc_data: Some(arc), .. } => Some(arc.as_ref().clone()),
+            Response::ChunkData { data, .. } => Some(data),
+            _ => None,
+        }
+    }
+
+    /// The bytes of version `id` of a slot from a peer: the slot's ISR members first, then its
+    /// holders, then any other online node. Read by exact id with no slot hint, so a peer
+    /// answers with that version or nothing. A patch token isn't a content hash, so its bytes
+    /// can't be verified here; a real chunk's are.
+    async fn read_exact_version_from_peers(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> Option<Vec<u8>> {
+        let me = self.cluster.local_node_id();
+        let mut order: Vec<NodeId> = self.slot_isr.get(file_id, chunk_idx).map(|isr| isr.members).unwrap_or_default();
+        if let Some(e) = self.chunk_map.get(&file_id) {
+            let (locs, _) = e.value();
+            if let Some(i) = Self::chunk_map_find_by_idx(locs, chunk_idx) {
+                order.extend(locs[i].nodes.iter().copied());
+            }
+        }
+        let nodes = self.cluster.get_all_nodes().await;
+        order.extend(nodes.iter().map(|n| n.id));
+        let mut asked: Vec<NodeId> = Vec::new();
+        for node_id in order {
+            if node_id == me || asked.contains(&node_id) {
+                continue;
+            }
+            asked.push(node_id);
+            let Some(node) = nodes.iter().find(|n| n.id == node_id && n.status == dfs_common::NodeStatus::Online) else { continue };
+            let req = Request::ReadChunk { chunk_id: id, sequential_hint: None, client_write_seq: None, file_id: None, chunk_idx: None };
+            let resp = match tokio::time::timeout(std::time::Duration::from_secs(3),
+                self.client.send_message(node.addr, Message::Request(req))).await {
+                Ok(Ok(env)) => match env.message { Message::Response(r) => r, _ => continue },
+                _ => continue,
+            };
+            let Some(data) = Self::chunk_data_bytes(resp) else { continue };
+            if !id.looks_like_patch_token()
+                && dfs_common::compute_chunk_hash_at(&data, chunk_idx * (4 * 1024 * 1024), file_id) != id.hash {
+                warn!("[ORDER] {} from {} fails its content hash; ignoring", id, node.addr);
+                continue;
+            }
+            info!("[ORDER] materialize_anchor: {} for file {} chunk {} read from {} (not held here)", id, file_id, chunk_idx, node.addr);
+            return Some(data);
+        }
+        None
     }
 
     /// Hold the real chunk `id` locally, pulling it from `from` (verified by its content hash)
@@ -23694,6 +23740,81 @@ mod tests {
     /// holds five slots of one file with the peer; each carries one condition: agreeing,
     /// peer view diverged, peer phantom (listed, no bytes: the 2026-09-27 gluster1 shape),
     /// owner phantom, and a divergence that heals before its confirmation (transient).
+    /// An ordered stream's anchor is exactly the version it's asked for (suite T74, 10-13): a
+    /// new primary that missed versions can't read the named one, and anchoring on its own
+    /// stale content for the slot instead applied every later write onto old bytes, losing
+    /// an acked write. It must take the named version from a peer that holds it, and with
+    /// none, refuse rather than substitute.
+    #[tokio::test]
+    async fn ordered_anchor_is_the_named_version_never_this_nodes_stale_slot_content() {
+        use crate::network::NetworkServer;
+        use dfs_common::NodeInfo;
+
+        let peer_temp_storage = TempDir::new().unwrap();
+        let peer_temp_metadata = TempDir::new().unwrap();
+        let peer_temp_metadata_dir = TempDir::new().unwrap();
+        let peer_storage = Arc::new(ChunkStorage::new(peer_temp_storage.path().to_path_buf()).unwrap());
+        let peer_metadata = Arc::new(MetadataStore::new(peer_temp_metadata.path().to_path_buf()).unwrap());
+        let h = make_overlay_test_harness();
+        let peer_node_id = NodeId::new();
+        let peer_addr: SocketAddr = "127.0.0.1:19343".parse().unwrap();
+        let peer_cluster = Arc::new(ClusterManager::new(peer_node_id, peer_addr, 10, 30));
+        let peer_server = Arc::new(Server::new(
+            peer_storage.clone(), peer_metadata.clone(), 4 * 1024 * 1024, peer_cluster.clone(), 3,
+            peer_temp_metadata_dir.path().to_path_buf(), peer_temp_metadata_dir.path().join("config.toml"), true,
+        ));
+        let mut peer_net_server = NetworkServer::new(crate::network::peer_port_addr(peer_addr), peer_server.clone(), 10);
+        tokio::spawn(async move { peer_net_server.start().await.ok(); });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        h.server.cluster().add_node(NodeInfo::new(peer_node_id, peer_addr, None)).await.unwrap();
+
+        let file_meta = dfs_common::FileMetadata::new("/anchor-test".to_string(), dfs_common::types::FileType::RegularFile);
+        let file_id = file_meta.id;
+        h.metadata.put_file(&file_meta).unwrap();
+        peer_metadata.put_file(&file_meta).unwrap();
+        const CS: u64 = 4 * 1024 * 1024;
+        let (chunk_idx, off) = (1u64, CS);
+        let loc = |id: ChunkId, node: NodeId, len: usize| ChunkLocation {
+            chunk_id: id, nodes: vec![node], size: len, checksum: id.hash,
+            file_offset: Some(off), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+
+        // The peer holds the slot's current version: a patch token over a real base.
+        let base = vec![0x11u8; 4096];
+        let base_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base, off, file_id));
+        peer_storage.write_chunk(&base_id, &base).unwrap();
+        peer_server.chunk_map.insert(file_id, (vec![loc(base_id, peer_node_id, base.len())], 1));
+        peer_metadata.put_chunk_location(&loc(base_id, peer_node_id, base.len())).unwrap();
+        let current = match peer_server.handle_multi_patch(
+            base_id, file_id, Some(chunk_idx), off, vec![(100usize, vec![0x22u8; 8])], None, Some(2), None, Some(2), false,
+        ).await {
+            Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
+            other => panic!("setup: the peer's patch failed: {:?}", other),
+        };
+        assert!(current.looks_like_patch_token(), "setup: the current version is an unfolded token, as in T74");
+        let mut want = base.clone();
+        want[100..108].copy_from_slice(&[0x22u8; 8]);
+
+        // This node missed that version: its chunk_map and disk still have an older one.
+        let stale = vec![0x77u8; 4096];
+        let stale_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&stale, off, file_id));
+        let me = h.server.cluster.local_node_id();
+        h.storage.write_chunk(&stale_id, &stale).unwrap();
+        h.server.chunk_map.insert(file_id, (vec![loc(stale_id, me, stale.len())], 1));
+        h.metadata.put_chunk_location(&loc(stale_id, me, stale.len())).unwrap();
+
+        let anchor = h.server.materialize_anchor(file_id, chunk_idx, current).await
+            .expect("the named version is on a peer: the anchor must be built from it");
+        let got = h.storage.read_chunk(&anchor).unwrap();
+        assert_ne!(anchor, stale_id, "BUG: anchored on this node's stale slot content instead of {}", current);
+        assert_eq!(got, want, "the anchor's bytes are the named version's");
+
+        // A version no node can serve: refuse, never fall back to the stale slot content.
+        let unknown = ChunkId::from_hash({ let mut x = current.hash; x[31] ^= 0xff; x });
+        assert_eq!(h.server.materialize_anchor(file_id, chunk_idx, unknown).await, None,
+            "an unreadable version must not be replaced by this node's own content for the slot");
+    }
+
     /// Confirmed slots must not be re-reported before the re-audit interval, and a slot
     /// inside its quiet window must not be audited at all.
     #[tokio::test]

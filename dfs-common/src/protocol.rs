@@ -1268,6 +1268,20 @@ pub enum Request {
     CheckSupersededChunks {
         items: Vec<(ChunkId, FileId, u64)>,
     },
+
+    /// Chain replication (DFS_CHAIN_WRITES): `WriteFileLocalOnly`, sent once to the first
+    /// replica, which forwards each piece of the payload to `next` (the second replica's
+    /// client address; it is dialled on its peer port) as it arrives, so the client's link
+    /// carries the data once instead of twice. Always split-frame (`data` empty, raw payload
+    /// after the envelope). Answered with `Response::ChainedWrite`. APPENDED at end to
+    /// preserve wire compatibility; a node too old to know it drops the connection and the
+    /// client falls back to writing the copies itself.
+    WriteFileChained {
+        data: Vec<u8>,
+        file_offset: u64,
+        file_id: FileId,
+        next: std::net::SocketAddr,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member
@@ -1892,6 +1906,15 @@ pub enum Response {
         holds: Vec<bool>,
         protected: Vec<bool>,
         uptime_secs: u64,
+    },
+
+    /// Answer to `Request::WriteFileChained`: what each replica answered to its
+    /// `WriteFileLocalOnly`. `secondary` is an `Error` when the forward failed or the
+    /// second replica stored different chunk ids than the first; the client then writes
+    /// the second copy elsewhere itself. APPENDED at end to preserve wire compatibility.
+    ChainedWrite {
+        primary: Box<Response>,
+        secondary: Box<Response>,
     },
 }
 

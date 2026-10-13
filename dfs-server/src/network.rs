@@ -366,6 +366,7 @@ async fn handle_connection<H: MessageHandler>(
     client_facing: bool,
 ) -> Result<()> {
     let mut read_buf = BytesMut::with_capacity(8192); // 8KB buffer (SBC-friendly)
+    let mut chain = ChainState::default();
 
     // Close idle connections after 5 minutes of inactivity. Must be longer than
     // READ_TIMEOUT (30s) so the outer idle wrapper always fires first (producing a
@@ -383,7 +384,7 @@ async fn handle_connection<H: MessageHandler>(
         let read_start = std::time::Instant::now();
         let read_result = tokio::time::timeout(
             IDLE_TIMEOUT,
-            read_message(&mut stream, &mut read_buf, |cid| handler.start_prefetch_for_patch(cid)),
+            read_message(&mut stream, &mut read_buf, |cid| handler.start_prefetch_for_patch(cid), Some(&mut chain)),
         ).await;
         // NETTIMING read_wait: dominated by idle time since the last request/response
         // on this persistent connection (client-side think-time between reuses), NOT
@@ -447,11 +448,18 @@ async fn handle_connection<H: MessageHandler>(
                     }
                 }
                 let dispatch_start = std::time::Instant::now();
-                let response = match tokio::time::timeout(
-                    HANDLER_TIMEOUT,
-                    process_message(envelope, handler.clone()),
-                ).await {
-                    Ok(r) => r,
+                let forward = chain.forward.take();
+                let dispatch = async {
+                    match forward {
+                        Some(fwd) => chained_dispatch(envelope, fwd, handler.clone()).await,
+                        None => (process_message(envelope, handler.clone()).await, None),
+                    }
+                };
+                let response = match tokio::time::timeout(HANDLER_TIMEOUT, dispatch).await {
+                    Ok((r, idle)) => {
+                        if idle.is_some() { chain.idle = idle; }
+                        r
+                    }
                     Err(_) => {
                         warn!("Handler timed out (>120s) for request from {}, closing connection", peer_addr);
                         break;
@@ -501,12 +509,141 @@ async fn handle_connection<H: MessageHandler>(
     Ok(())
 }
 
+/// A forward's write to the second replica may stall this long before it's given up (the
+/// first replica then stores its copy alone and the client places the second one).
+const CHAIN_STALL: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the first replica waits for the second's answer once both have the payload.
+const CHAIN_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+static CHAIN_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Chain replication on one client connection (`Request::WriteFileChained`). read_message
+/// forwards the payload to the second replica while reading it and leaves the open forward
+/// in `forward`; the dispatch then stores this node's copy while the second replica answers.
+#[derive(Default)]
+struct ChainState {
+    /// The connection to the last second replica, reused by the next chained write to it.
+    idle: Option<(SocketAddr, TcpStream)>,
+    forward: Option<ChainForward>,
+}
+
+struct ChainForward {
+    next: SocketAddr,
+    /// The connection with the request header and payload sent, or why the forward failed.
+    outcome: std::result::Result<(TcpStream, RequestId), String>,
+}
+
+/// Opens (or reuses) the connection to `next`'s peer port and sends a split-frame
+/// WriteFileLocalOnly header for a `plen`-byte payload, which the caller then streams.
+async fn open_chain_forward(
+    idle: Option<(SocketAddr, TcpStream)>,
+    next: SocketAddr,
+    file_offset: u64,
+    file_id: dfs_common::FileId,
+    plen: usize,
+) -> std::result::Result<(TcpStream, RequestId), String> {
+    if outbound_fault(next).is_some() {
+        return Err(format!("link to {} down (fault injection)", next));
+    }
+    // A kept connection the second replica has since closed reads as EOF (or an error);
+    // WouldBlock means it's still open with nothing pending, as it should be.
+    let reusable = idle.filter(|(addr, s)| {
+        let mut probe = [0u8; 1];
+        *addr == next && matches!(s.try_read(&mut probe), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    });
+    let mut out = match reusable {
+        Some((_, s)) => s,
+        None => {
+            let dial = peer_port_addr(next);
+            let s = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(dial)).await
+                .map_err(|_| format!("connect timeout to {}", dial))?
+                .map_err(|e| format!("connect to {} failed: {}", dial, e))?;
+            let _ = s.set_nodelay(true);
+            s
+        }
+    };
+    let request_id = RequestId::new(CHAIN_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let envelope = MessageEnvelope::new(request_id, Message::Request(Request::WriteFileLocalOnly {
+        data: Vec::new(),
+        file_offset,
+        file_id,
+    }));
+    let body = envelope.to_bytes().map_err(|e| format!("encoding the forward: {}", e))?;
+    let mut head = Vec::with_capacity(8 + body.len());
+    head.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    head.extend_from_slice(&body);
+    head.extend_from_slice(&(plen as u32).to_be_bytes());
+    dfs_common::protocol::write_all_with_stall(&mut out, &head, CHAIN_STALL).await
+        .map_err(|e| format!("sending the forward header to {}: {}", next, e))?;
+    Ok((out, request_id))
+}
+
+/// The second replica's answer to a forward, and its connection if it can be reused.
+async fn finish_chain_forward(fwd: ChainForward) -> (Response, Option<(SocketAddr, TcpStream)>) {
+    let failed = |message: String| Response::Error { message, code: ErrorCode::NetworkError };
+    let (mut out, request_id) = match fwd.outcome {
+        Ok(o) => o,
+        Err(e) => return (failed(e), None),
+    };
+    let mut rbuf = BytesMut::with_capacity(1024);
+    match tokio::time::timeout(CHAIN_REPLY_TIMEOUT, read_message(&mut out, &mut rbuf, |_| {}, None)).await {
+        Ok(Ok(Some(env))) if env.request_id == request_id => match env.message {
+            // Leftover bytes would belong to nothing we sent: don't reuse such a connection.
+            Message::Response(r) => { let keep = rbuf.is_empty(); (r, keep.then_some((fwd.next, out))) }
+            _ => (failed(format!("second replica {} answered the forward with a non-response", fwd.next)), None),
+        },
+        Ok(Ok(Some(_))) => (failed(format!("second replica {} answered a different request", fwd.next)), None),
+        Ok(Ok(None)) => (failed(format!("second replica {} closed the connection", fwd.next)), None),
+        Ok(Err(e)) => (failed(format!("reading second replica {}'s answer: {}", fwd.next, e)), None),
+        Err(_) => (failed(format!("second replica {} didn't answer within {:?}", fwd.next, CHAIN_REPLY_TIMEOUT)), None),
+    }
+}
+
+/// A chained write: store this node's copy while the second replica answers, then answer
+/// with both. The two must agree on the chunk ids before the client is told both hold it.
+async fn chained_dispatch<H: MessageHandler>(
+    envelope: MessageEnvelope,
+    fwd: ChainForward,
+    handler: Arc<H>,
+) -> (MessageEnvelope, Option<(SocketAddr, TcpStream)>) {
+    let request_id = envelope.request_id;
+    let next = fwd.next;
+    let local = match envelope.message {
+        Message::Request(Request::WriteFileChained { data, file_offset, file_id, .. }) =>
+            Request::WriteFileLocalOnly { data, file_offset, file_id },
+        other => return (process_message(MessageEnvelope::new(request_id, other), handler).await, None),
+    };
+    let (local_env, (secondary, idle)) = tokio::join!(
+        process_message(MessageEnvelope::new(request_id, Message::Request(local)), handler),
+        finish_chain_forward(fwd),
+    );
+    let primary = match local_env.message {
+        Message::Response(r) => r,
+        _ => Response::Error { message: "no response from the local write".to_string(), code: ErrorCode::InternalError },
+    };
+    let secondary = match (&primary, secondary) {
+        (Response::ChunkIds { chunk_ids: mine, .. }, Response::ChunkIds { chunk_ids: theirs, .. }) if *mine != theirs =>
+            Response::Error {
+                message: format!("second replica {} stored {:?}, this node {:?}", next, theirs, mine),
+                code: ErrorCode::ChecksumMismatch,
+            },
+        (_, s) => s,
+    };
+    if let Response::Error { message, .. } = &secondary {
+        warn!("chained write: second replica {} failed: {}", next, message);
+    }
+    (MessageEnvelope::new(request_id, Message::Response(Response::ChainedWrite {
+        primary: Box::new(primary),
+        secondary: Box::new(secondary),
+    })), idle)
+}
+
 /// Read a framed message from the stream
 /// Format: [4 bytes length][message bytes]
 async fn read_message<F>(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
     on_multi_patch_envelope: F,
+    mut chain: Option<&mut ChainState>,
 ) -> Result<Option<MessageEnvelope>>
 where
     F: Fn(dfs_common::types::ChunkId) + Send,
@@ -576,6 +713,51 @@ where
                         }
                         *data = buf.split_to(plen).to_vec();
                         debug!("Received split-frame write request: {} bytes", plen);
+                    }
+                }
+
+                // Split-frame WriteFileChained: forward each piece of the payload to the
+                // second replica as it arrives (see ChainState), then hand this node its copy.
+                if let dfs_common::Message::Request(dfs_common::Request::WriteFileChained { ref mut data, file_offset, file_id, next }) = envelope.message {
+                    if data.is_empty() {
+                        while buf.len() < 4 {
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading chained write payload length"))?
+                                .context("IO error reading chained write payload length")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading chained write payload length"); }
+                        }
+                        let mut plen_bytes = [0u8; 4];
+                        plen_bytes.copy_from_slice(&buf[..4]);
+                        buf.advance(4);
+                        let plen = u32::from_be_bytes(plen_bytes) as usize;
+
+                        let mut forward = match chain.as_deref_mut() {
+                            Some(c) => Some(open_chain_forward(c.idle.take(), next, file_offset, file_id, plen).await),
+                            None => None,
+                        };
+                        let mut forwarded = 0usize;
+                        loop {
+                            let have = buf.len().min(plen);
+                            if have > forwarded {
+                                if let Some(Ok((out, _))) = forward.as_mut() {
+                                    if let Err(e) = dfs_common::protocol::write_all_with_stall(out, &buf[forwarded..have], CHAIN_STALL).await {
+                                        forward = Some(Err(format!("forwarding to {} failed after {} of {} bytes: {}", next, forwarded, plen, e)));
+                                    }
+                                }
+                                forwarded = have;
+                            }
+                            if buf.len() >= plen { break; }
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading chained write payload"))?
+                                .context("IO error reading chained write payload")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading chained write payload"); }
+                        }
+                        *data = buf.split_to(plen).to_vec();
+                        debug!("Received chained write: {} bytes, forwarded to {}: {}", plen, next,
+                            match &forward { Some(Ok(_)) => "ok".to_string(), Some(Err(e)) => e.clone(), None => "no".to_string() });
+                        if let (Some(c), Some(outcome)) = (chain, forward) {
+                            c.forward = Some(ChainForward { next, outcome });
+                        }
                     }
                 }
 
@@ -910,7 +1092,7 @@ impl NetworkClient {
         let mut read_buf = BytesMut::with_capacity(8192);
         let response = tokio::time::timeout(
             response_timeout,
-            read_message(&mut stream, &mut read_buf, |_| {}),
+            read_message(&mut stream, &mut read_buf, |_| {}, None),
         )
         .await
         .map_err(|_| anyhow::anyhow!("Read timeout from {}", target))?  // Elapsed → Err
@@ -1151,6 +1333,195 @@ mod tests {
         });
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         sem
+    }
+
+    /// Stores each WriteFileLocalOnly payload and answers with a chunk id derived from it.
+    struct WriteRecorder {
+        got: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    fn recorded_id(data: &[u8]) -> ChunkId {
+        ChunkId::from_hash(*blake3::hash(data).as_bytes())
+    }
+
+    impl MessageHandler for WriteRecorder {
+        fn handle_request(
+            &self,
+            request: Request,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let got = self.got.clone();
+            Box::pin(async move {
+                match request {
+                    Request::WriteFileLocalOnly { data, .. } => {
+                        let id = recorded_id(&data);
+                        let len = data.len() as u64;
+                        got.lock().unwrap().push(data);
+                        Response::ChunkIds { chunk_ids: vec![id], chunk_sizes: vec![len], replica_nodes_per_chunk: vec![vec![]] }
+                    }
+                    _ => Response::Bool { value: false },
+                }
+            })
+        }
+
+        fn handle_cluster_message(
+            &self,
+            _message: ClusterMessage,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move { Response::Ok { data: None } })
+        }
+    }
+
+    /// A replica serving every connection on `listener` with a WriteRecorder.
+    fn serve_recorder(listener: TcpListener, client_facing: bool) -> Arc<std::sync::Mutex<Vec<Vec<u8>>>> {
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler = Arc::new(WriteRecorder { got: got.clone() });
+        tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                tokio::spawn(handle_connection(stream, peer, handler.clone(), client_facing));
+            }
+        });
+        got
+    }
+
+    /// The client address whose peer port is `peer` (the second replica is dialled there).
+    fn client_addr_for_peer_port(peer: SocketAddr) -> SocketAddr {
+        SocketAddr::new(peer.ip(), peer.port() - PEER_PORT_OFFSET)
+    }
+
+    fn chain_payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+    }
+
+    /// Sends a split-frame WriteFileChained header for `payload_len` bytes; the caller
+    /// sends the payload.
+    async fn send_chained_header(stream: &mut TcpStream, next: SocketAddr, payload_len: usize) {
+        let req = Request::WriteFileChained { data: vec![], file_offset: 0, file_id: dfs_common::FileId::new(), next };
+        let bytes = MessageEnvelope::new(RequestId::new(7), Message::Request(req)).to_bytes().unwrap();
+        stream.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.write_all(&(payload_len as u32).to_be_bytes()).await.unwrap();
+    }
+
+    fn chained_parts(resp: MessageEnvelope) -> (Response, Response) {
+        match resp.message {
+            Message::Response(Response::ChainedWrite { primary, secondary }) => (*primary, *secondary),
+            other => panic!("expected ChainedWrite, got {:?}", other),
+        }
+    }
+
+    fn ids_of(resp: &Response) -> Vec<ChunkId> {
+        match resp {
+            Response::ChunkIds { chunk_ids, .. } => chunk_ids.clone(),
+            other => panic!("expected ChunkIds, got {:?}", other),
+        }
+    }
+
+    /// Chain replication: the client sends the payload once, to the first replica, and the
+    /// second replica gets the same bytes from it; the answer carries both replicas' results.
+    #[tokio::test]
+    async fn a_chained_write_reaches_the_second_replica_through_the_first() {
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let next = client_addr_for_peer_port(second.local_addr().unwrap());
+        let second_got = serve_recorder(second, false);
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let first_got = serve_recorder(first, true);
+
+        let payload = chain_payload(3 * 1024 * 1024 + 123);
+        let mut stream = TcpStream::connect(first_addr).await.unwrap();
+        send_chained_header(&mut stream, next, payload.len()).await;
+        stream.write_all(&payload).await.unwrap();
+        let (primary, secondary) = chained_parts(read_response(&mut stream).await);
+
+        assert_eq!(ids_of(&primary), vec![recorded_id(&payload)]);
+        assert_eq!(ids_of(&secondary), vec![recorded_id(&payload)], "the second replica's own answer, relayed");
+        assert_eq!(*first_got.lock().unwrap(), vec![payload.clone()]);
+        assert_eq!(*second_got.lock().unwrap(), vec![payload], "the second replica stored exactly the client's bytes");
+    }
+
+    /// The first replica forwards each piece as it arrives, not after the whole payload:
+    /// the second replica sees bytes while the client is still holding back the rest.
+    #[tokio::test]
+    async fn a_chained_write_is_forwarded_while_it_is_still_arriving() {
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let next = client_addr_for_peer_port(second.local_addr().unwrap());
+        let seen = Arc::new(AtomicU64::new(0));
+        let seen_by_second = seen.clone();
+        tokio::spawn(async move {
+            // A raw second replica: counts bytes as they arrive, answers once it has them all.
+            let (mut s, _) = second.accept().await.unwrap();
+            let mut all = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 { return; }
+                all.extend_from_slice(&buf[..n]);
+                seen_by_second.store(all.len() as u64, Ordering::SeqCst);
+                if all.len() >= 4 {
+                    let env_len = u32::from_be_bytes(all[..4].try_into().unwrap()) as usize;
+                    if all.len() >= 8 + env_len {
+                        let plen = u32::from_be_bytes(all[4 + env_len..8 + env_len].try_into().unwrap()) as usize;
+                        if all.len() >= 8 + env_len + plen {
+                            let env = MessageEnvelope::from_bytes(&all[4..4 + env_len]).unwrap();
+                            let data = &all[8 + env_len..8 + env_len + plen];
+                            let resp = MessageEnvelope::new(env.request_id, Message::Response(Response::ChunkIds {
+                                chunk_ids: vec![recorded_id(data)], chunk_sizes: vec![plen as u64], replica_nodes_per_chunk: vec![vec![]],
+                            }));
+                            write_message(&mut s, &resp).await.unwrap();
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let _first_got = serve_recorder(first, true);
+
+        let payload = chain_payload(4 * 1024 * 1024);
+        let half = payload.len() / 2;
+        let mut stream = TcpStream::connect(first_addr).await.unwrap();
+        send_chained_header(&mut stream, next, payload.len()).await;
+        stream.write_all(&payload[..half]).await.unwrap();
+        stream.flush().await.unwrap();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while seen.load(Ordering::SeqCst) < (half / 2) as u64 {
+            assert!(tokio::time::Instant::now() < deadline,
+                "the second replica got {} bytes while the first held {} of the payload: not forwarded as it arrived",
+                seen.load(Ordering::SeqCst), half);
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        stream.write_all(&payload[half..]).await.unwrap();
+        let (primary, secondary) = chained_parts(read_response(&mut stream).await);
+        assert_eq!(ids_of(&primary), ids_of(&secondary));
+    }
+
+    /// A second replica that can't be reached fails only its half: the first replica still
+    /// stores its copy and says the forward failed, so the client places the second copy.
+    #[tokio::test]
+    async fn a_chained_write_with_an_unreachable_second_replica_still_stores_the_first_copy() {
+        let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let next = client_addr_for_peer_port(gone.local_addr().unwrap());
+        drop(gone);
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let first_got = serve_recorder(first, true);
+
+        let payload = chain_payload(1024 * 1024);
+        let mut stream = TcpStream::connect(first_addr).await.unwrap();
+        send_chained_header(&mut stream, next, payload.len()).await;
+        stream.write_all(&payload).await.unwrap();
+        let (primary, secondary) = chained_parts(read_response(&mut stream).await);
+        assert_eq!(ids_of(&primary), vec![recorded_id(&payload)]);
+        assert!(matches!(secondary, Response::Error { .. }), "secondary: {:?}", secondary);
+        assert_eq!(*first_got.lock().unwrap(), vec![payload]);
+
+        // The connection still works for the next request.
+        let payload2 = chain_payload(1000);
+        send_chained_header(&mut stream, next, payload2.len()).await;
+        stream.write_all(&payload2).await.unwrap();
+        let (primary2, _) = chained_parts(read_response(&mut stream).await);
+        assert_eq!(ids_of(&primary2), vec![recorded_id(&payload2)]);
     }
 
     #[test]

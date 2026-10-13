@@ -1011,6 +1011,71 @@ t85_wait_ready || echo "  T85: cluster not fully healthy 30s after restoring nor
 sleep 5
 fi # should_run T85
 
+# ── T86: chain replication (DFS_CHAIN_WRITES, 10-13) ─────────────────────────────
+# A fresh chunk crosses the client's link once: the first replica forwards it to the
+# second as it arrives (Request::WriteFileChained), and answers once both have stored the
+# same chunk. With every node up each chunk must go out chained, land on two nodes and
+# read back exactly; with a replica down the write must still succeed, its second copy
+# placed elsewhere by the client.
+snapshot_log T86
+if should_run T86; then
+echo ""
+echo "=== T86: chain replication: one upload per chunk, two copies, exact read-back; a dead replica still gets a second copy ==="
+T86_MNT=/tmp/dfs-mount-t86
+mkdir -p "$T86_MNT"
+: > "$LOG/client_t86.log"
+DFS_CHAIN_WRITES=1 RUST_LOG=info "$BIN/dfs-client" mount "$T86_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t86.log" --allow-other --log-level debug &
+T86_CPID=$!
+sleep 2
+t86_copies_thin() {   # chunks of $1 with under 2 copies on disk
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info "$1" 2>/dev/null \
+        | python3 -c "import json,sys; print(' '.join(c['chunk_id'] for c in json.load(sys.stdin)['chunk_locations']))" 2>/dev/null \
+        | tr ' ' '\n' | grep -v '^$' | while read -r c; do
+            n=0
+            for i in 1 2 3 4 5; do [ -f "$BASE/node$i/data/chunks/${c:0:2}/${c:2:2}/$c" ] && n=$((n+1)); done
+            [ "$n" -lt 2 ] && echo "$c:$n"
+        done
+}
+dd if=/dev/urandom of="$BASE/t86_a.bin" bs=1M count=64 status=none
+T86_RC=0
+dd if="$BASE/t86_a.bin" of="$T86_MNT/t86_a.bin" bs=1M conv=fsync status=none 2>>"$LOG/t86_dd.err" || T86_RC=$?
+T86_CHAINED=$(grep -c "Chained write:" "$LOG/client_t86.log" || true)
+T86_FALLBACK=$(grep -c "Chained replica write to .* failed" "$LOG/client_t86.log" || true)
+T86_M1=$(md5sum < "$BASE/t86_a.bin" | cut -d' ' -f1)
+T86_M2=$(timeout 60 md5sum < "$MOUNT/t86_a.bin" 2>/dev/null | cut -d' ' -f1)
+T86_THIN=$(t86_copies_thin /t86_a.bin | wc -w)
+echo "  T86: 64 MB: dd rc=$T86_RC, chained writes: $T86_CHAINED, second copies placed by the client: $T86_FALLBACK, chunks under 2 copies: $T86_THIN"
+[ "$T86_RC" = 0 ] && [ "$T86_CHAINED" -ge 16 ] && [ "$T86_FALLBACK" = 0 ] \
+    && check "T86a every chunk of a 64 MB write went out chained ($T86_CHAINED), none needed a client-placed copy" PASS \
+    || check "T86a chained 64 MB write: rc=$T86_RC, $T86_CHAINED chained (want >= 16), $T86_FALLBACK fell back" FAIL
+[ "$T86_M1" = "$T86_M2" ] && [ "$T86_THIN" = 0 ] \
+    && check "T86b the chained file reads back exactly through another client, every chunk on 2+ nodes" PASS \
+    || check "T86b chained file: read-back ${T86_M2:-unreadable} vs $T86_M1, $T86_THIN chunk(s) under 2 copies" FAIL
+# A replica down: chains through or to it fail, and the client must place those copies itself.
+pkill -9 -f "dfs-server start --config $BASE/node5/config.toml" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node5/config.toml" >/dev/null || break; sleep 0.1; done
+sleep 2
+dd if=/dev/urandom of="$BASE/t86_b.bin" bs=1M count=32 status=none
+T86_RC=0
+timeout 300 dd if="$BASE/t86_b.bin" of="$T86_MNT/t86_b.bin" bs=1M conv=fsync status=none 2>>"$LOG/t86_dd.err" || T86_RC=$?
+T86_M1=$(md5sum < "$BASE/t86_b.bin" | cut -d' ' -f1)
+T86_M2=$(timeout 60 md5sum < "$MOUNT/t86_b.bin" 2>/dev/null | cut -d' ' -f1)
+T86_THIN=$(t86_copies_thin /t86_b.bin | wc -w)
+[ "$T86_RC" = 0 ] && [ "$T86_M1" = "$T86_M2" ] && [ "$T86_THIN" = 0 ] \
+    && check "T86c with a replica down the chained write still succeeds, reads back exactly, every chunk on 2+ nodes" PASS \
+    || check "T86c with a replica down: dd rc=$T86_RC, read-back ${T86_M2:-unreadable} vs $T86_M1, $T86_THIN chunk(s) under 2 copies ($(t86_copies_thin /t86_b.bin | tr '\n' ' '))" FAIL
+fusermount -u "$T86_MNT" 2>/dev/null || true
+kill_client_and_wait "$T86_CPID"
+rm -f "$MOUNT/t86_a.bin" "$MOUNT/t86_b.bin" "$BASE"/t86_*.bin
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+    >> "$LOG/server5.log" 2>&1 &
+for _ in $(seq 1 60); do
+    [ "$("$BIN/dfs-admin" --cluster "$CLUSTER" cluster status 2>/dev/null | grep -oP 'Healthy Nodes:\s+\K[0-9]+')" = 5 ] && break
+    sleep 0.5
+done
+fi # should_run T86
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

@@ -1128,6 +1128,9 @@ pub struct DfsClient {
     /// Committed per-chunk ISRs this client has looked up, for `DFS_ORDERED_WRITES`
     /// (SLOT-OWNERSHIP-PLAN 3c). Dropped when a primary answers that it no longer is one.
     slot_isr_cache: Arc<DashMap<(dfs_common::FileId, u64), dfs_common::SlotIsr>>,
+    /// First replicas a chained write got no answer from at all (down, or too old to know
+    /// WriteFileChained), and until when fresh writes through them go out unchained.
+    no_chain_until: Arc<DashMap<SocketAddr, std::time::Instant>>,
 
     /// Tracks which chunks have been prefetch-hinted to which server nodes
     /// When reading chunks, prefer these nodes to hit warm server caches
@@ -1624,6 +1627,7 @@ impl DfsClient {
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
             slot_isr_cache: Arc::new(DashMap::new()),
+            no_chain_until: Arc::new(DashMap::new()),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
             node_capacities: Arc::new(DashMap::new()),
@@ -6901,15 +6905,50 @@ leader_addr: Arc::new(RwLock::new(None)),
             // compaction regression investigation.
             let replica_write_start = std::time::Instant::now();
             attempted += 2;
-            let t1 = tokio::time::timeout(
+            // Each replica's outcome: its answer, or why there is none (Err(None) = timeout).
+            type Outcome = std::result::Result<Response, Option<anyhow::Error>>;
+            let flat = |r: std::result::Result<Result<Response>, tokio::time::error::Elapsed>| -> Outcome { match r {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err(Some(e)),
+                Err(_) => Err(None),
+            }};
+            let send_direct = |n: SocketAddr| tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                self.send_split_frame_write_request(n1, &encoded, data),
+                self.send_split_frame_write_request(n, &encoded, data),
             );
-            let t2 = tokio::time::timeout(
-                tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                self.send_split_frame_write_request(n2, &encoded, data),
-            );
-            let (r1, r2) = tokio::join!(t1, t2);
+            let chain = Self::chain_writes_enabled()
+                && self.no_chain_until.get(&n1).map_or(true, |until| std::time::Instant::now() >= *until);
+            let (r1, r2): (Outcome, Outcome) =
+                if chain {
+                    // Chain replication: the payload crosses this client's link once, to n1,
+                    // which forwards it to n2 as it arrives and answers for both.
+                    let chained = Request::WriteFileChained { data: Vec::new(), file_offset, file_id, next: n2 };
+                    let chained = MessageEnvelope::new(request_id, Message::Request(chained))
+                        .to_bytes().context("Failed to serialize chained write request")?;
+                    debug!("Chained write: {} bytes via {} to {}", data.len(), n1, n2);
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+                        self.send_split_frame_write_request(n1, &chained, data),
+                    ).await {
+                        Ok(Ok(Response::ChainedWrite { primary, secondary })) => (Ok(*primary), Ok(*secondary)),
+                        Ok(Ok(other)) => (Ok(other), Err(Some(anyhow::anyhow!("{} answered without a chained result", n1)))),
+                        Ok(Err(e)) => {
+                            // No answer at all: n1 is down, or too old to know WriteFileChained
+                            // and dropped the connection. Nothing reached n2 through it, so write
+                            // the pair the old way; n1 stays unchained for a while.
+                            warn!("Chained write via {} got no answer ({}); sending to {} and {} directly", n1, e, n1, n2);
+                            self.no_chain_until.insert(n1, std::time::Instant::now() + std::time::Duration::from_secs(300));
+                            let (r1, r2) = tokio::join!(send_direct(n1), send_direct(n2));
+                            (flat(r1), flat(r2))
+                        }
+                        // n1 is slow, not gone: it may yet have forwarded to n2, but nothing
+                        // says so. Give n2 its copy directly (rewriting the same bytes is harmless).
+                        Err(_) => (Err(None), flat(send_direct(n2).await)),
+                    }
+                } else {
+                    let (r1, r2) = tokio::join!(send_direct(n1), send_direct(n2));
+                    (flat(r1), flat(r2))
+                };
             let n1_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r1 {
                 // A replica whose own storage failed (IOError: its disk is full, an I/O error)
@@ -6918,10 +6957,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // else and one full node turned every fresh write through it into EIO (suite T79).
                 // Other refusals still end the write here for the caller's retry path: falling
                 // back on those too stalled writers after a cluster restart (T76c).
-                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { storage_refusals += 1; warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n1, message); }
-                Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
-                Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
-                Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
+                Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message }) => { storage_refusals += 1; warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n1, message); }
+                Ok(resp)      => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
+                Err(Some(e))  => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
+                Err(None)     => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
             }
             let n2_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r2 {
@@ -6931,10 +6970,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // else and one full node turned every fresh write through it into EIO (suite T79).
                 // Other refusals still end the write here for the caller's retry path: falling
                 // back on those too stalled writers after a cluster restart (T76c).
-                Ok(Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message })) => { storage_refusals += 1; warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n2, message); }
-                Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
-                Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
-                Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
+                Ok(Response::Error { code: dfs_common::ErrorCode::IOError, message }) => { storage_refusals += 1; warn!("Parallel replica write failed on {}'s storage: {}, will retry serially", n2, message); }
+                // A chained second copy that failed (the forward broke, or n2 stored something
+                // else) is placed elsewhere, like a replica that never answered.
+                Ok(Response::Error { message, .. }) if chain => { warn!("Chained replica write to {} failed: {}, will retry serially", n2, message); }
+                Ok(resp)      => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
+                Err(Some(e))  => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
+                Err(None)     => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
             }
             // Gap since this same target's previous op — see write_target_last_op_at's
             // field doc comment. None (first-ever op to this target) prints as -1 so it's
@@ -7751,6 +7793,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         ).await?;
 
         Ok((new_loc, fresh_meta))
+    }
+
+    /// Chain replication (on unless DFS_CHAIN_WRITES=0): send a fresh chunk once, to the first
+    /// replica, which forwards it to the second (`Request::WriteFileChained`), instead of
+    /// sending it to both. On the :8950 bench (rock5b, 1 GbE) a 500 MB fsync'd dd went from
+    /// ~52 to ~90 MB/s: the client's link carries each chunk once. Read once.
+    fn chain_writes_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("DFS_CHAIN_WRITES").map(|v| v != "0").unwrap_or(true))
     }
 
     /// DFS_ORDERED_WRITES=1: send patches as `Request::Ordered` to the chunk's ISR pair, so
@@ -11045,6 +11096,71 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A fake replica for the chained-write tests: stores split-frame WriteFileLocalOnly
+    /// payloads (counted in the returned counter) and answers ChunkIds. With `old`, it is a
+    /// node from before WriteFileChained: it can't decode one and drops the connection.
+    async fn local_write_server(old: bool) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stored2 = stored.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                let stored = stored2.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() { return; }
+                        let mut env = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut env).await.is_err() { return; }
+                        let Ok(env) = MessageEnvelope::from_bytes(&env) else { return };
+                        let reply = match env.message {
+                            Message::Request(Request::WriteFileChained { .. }) if old => return,
+                            Message::Request(Request::WriteFileLocalOnly { .. }) => {
+                                if s.read_exact(&mut len).await.is_err() { return; }
+                                let mut data = vec![0u8; u32::from_be_bytes(len) as usize];
+                                if s.read_exact(&mut data).await.is_err() { return; }
+                                stored.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Response::ChunkIds {
+                                    chunk_ids: vec![ChunkId::from_hash(*blake3::hash(&data).as_bytes())],
+                                    chunk_sizes: vec![data.len() as u64],
+                                    replica_nodes_per_chunk: vec![vec![]],
+                                }
+                            }
+                            _ => Response::Pong,
+                        };
+                        let reply = MessageEnvelope::new(env.request_id, Message::Response(reply)).to_bytes().unwrap();
+                        let mut out = (reply.len() as u32).to_be_bytes().to_vec();
+                        out.extend_from_slice(&reply);
+                        if s.write_all(&out).await.is_err() { return; }
+                    }
+                });
+            }
+        });
+        (addr, stored)
+    }
+
+    /// Chained writes are on by default, so a client newer than its servers (or one whose
+    /// first replica just died) sends chained requests nobody answers. It must still put the
+    /// chunk on the pair it chose, the old way, rather than lose the pair: here there is no
+    /// third node to fall back to, so losing it fails the write.
+    #[tokio::test]
+    async fn a_chained_write_to_a_node_that_cant_chain_still_lands_on_both_replicas() {
+        let (old_node, old_stored) = local_write_server(true).await;
+        let (other, other_stored) = local_write_server(false).await;
+        let client = DfsClient::new(vec![old_node, other]).unwrap();
+        let data = vec![7u8; 1024 * 1024];
+        let file_id = dfs_common::FileId::new();
+        let locs = client.write_chunk_to_replicas(&data, old_node, other, 0, 0, &[old_node, other], file_id).await
+            .expect("the write must land on the chosen pair, the old way");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].nodes.len(), 2);
+        assert_eq!(old_stored.load(std::sync::atomic::Ordering::SeqCst), 1, "the node that can't chain got its copy directly");
+        assert_eq!(other_stored.load(std::sync::atomic::Ordering::SeqCst), 1, "the second replica got its copy directly");
     }
 
     /// rock5b dd (10-13): a 500 MB burst on a 1 GbE client put ~100 4 MB uploads on the

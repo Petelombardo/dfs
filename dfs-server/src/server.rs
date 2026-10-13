@@ -1204,6 +1204,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::WriteChunk { .. }
         | Request::WriteFile { .. }
         | Request::WriteFileLocalOnly { .. }
+        | Request::WriteFileChained { .. }
         | Request::AppendFile { .. }
         | Request::GetFileMetadataByPath { .. }
         | Request::PutFileMetadata { .. }
@@ -8299,6 +8300,20 @@ impl Server {
             Request::WriteFileLocalOnly { data, file_offset, file_id } => {
                 self.ops_tracker.inc_write();
                 self.handle_write_file_local_only(data, file_offset, file_id).await
+            }
+            // The network layer forwards a split-frame chained write while reading it and
+            // hands this node only its own WriteFileLocalOnly. One that reaches here carried
+            // its payload inline, so nothing was forwarded: store this copy and say so.
+            Request::WriteFileChained { data, file_offset, file_id, next } => {
+                self.ops_tracker.inc_write();
+                let primary = self.handle_write_file_local_only(data, file_offset, file_id).await;
+                Response::ChainedWrite {
+                    primary: Box::new(primary),
+                    secondary: Box::new(Response::Error {
+                        message: format!("chained write to {} not forwarded (payload was inline)", next),
+                        code: ErrorCode::InvalidRequest,
+                    }),
+                }
             }
             Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data, new_chunk_seq } => {
                 self.ops_tracker.inc_write();

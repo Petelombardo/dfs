@@ -276,6 +276,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         server.cluster().init_known_cluster_size(dir, 1).await;
     }
 
+    // Before anything reads a patch's delta (see complete_interrupted_delta_renames).
+    server.complete_interrupted_delta_renames().await;
+
     // Rebuild the fold-origin set BEFORE the chunk map rebuild below: the chunk
     // map rebuild's per-slot merge consults this set for the fold-vs-client
     // tiebreak, so it must already be populated when that merge runs.

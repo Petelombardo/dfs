@@ -1175,6 +1175,20 @@ impl HealingManager {
             .unwrap_or(false)
     }
 
+    /// Whether this node's chunk_map gives `location`'s slot to a different chunk: the
+    /// healed chunk is a version the slot has moved past. A heal changes who holds a chunk,
+    /// never which chunk the slot is; announced to followers with its slot, a superseded
+    /// version can take the slot back, since a rewrite can carry the same client_write_seq
+    /// as the version it replaced (T57a, 2026-10-13). No view of the slot: false.
+    fn slot_names_another_chunk(chunk_map: &DashMap<FileId, (Vec<ChunkLocation>, u64)>, location: &ChunkLocation) -> bool {
+        let (Some(file_id), Some(offset)) = (location.file_id, location.file_offset) else {
+            return false;
+        };
+        chunk_map.get(&file_id).is_some_and(|e| {
+            e.value().0.iter().any(|l| l.file_offset == Some(offset) && l.chunk_id != location.chunk_id)
+        })
+    }
+
     /// Base and cap for heal_push_failure's exponential backoff — see that field's
     /// doc comment. Base 60s means a freshly-failing chunk still gets a fairly
     /// prompt second attempt (transient target-node hiccup shouldn't wait long);
@@ -4583,7 +4597,9 @@ impl HealingManager {
                 continue;
             }
             if let Some(location) = outcome.location_put {
-                if outcome.broadcast {
+                if outcome.broadcast && Self::slot_names_another_chunk(&self.chunk_map, &location) {
+                    debug!("Healer: not announcing healed chunk {}: its slot has moved on to another chunk", location.chunk_id);
+                } else if outcome.broadcast {
                     broadcasts.push(location.clone());
                 }
                 puts.push(location);
@@ -6102,6 +6118,29 @@ mod tests {
         );
         assert!(severely_under < mildly_under_but_older,
             "1-of-N must sort before 2-of-3 even when the 2-of-3 chunk is far older");
+    }
+
+    /// T57a 2026-10-13: a heal of a slot's superseded version must not be announced as the
+    /// slot's location. Both versions of a rewritten chunk carried the same
+    /// client_write_seq, so followers took whichever arrived last.
+    #[test]
+    fn heal_broadcast_skips_a_chunk_its_slot_has_moved_past() {
+        let file_id = FileId::new();
+        let loc = |n: u8, offset: u64| ChunkLocation {
+            chunk_id: ChunkId::from_hash([n; 32]), nodes: vec![NodeId::new()], size: 4096,
+            checksum: [n; 32], file_offset: Some(offset), written_at: None,
+            client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        let chunk_map: DashMap<FileId, (Vec<ChunkLocation>, u64)> = DashMap::new();
+        chunk_map.insert(file_id, (vec![loc(1, 0), loc(3, 4 << 20)], 0));
+        // Slot 1 moved from chunk 2 to chunk 3.
+        assert!(HealingManager::slot_names_another_chunk(&chunk_map, &loc(2, 4 << 20)));
+        assert!(!HealingManager::slot_names_another_chunk(&chunk_map, &loc(3, 4 << 20)));
+        assert!(!HealingManager::slot_names_another_chunk(&chunk_map, &loc(1, 0)));
+        // No view of the slot or the file (e.g. a new leader still collecting): announce.
+        assert!(!HealingManager::slot_names_another_chunk(&chunk_map, &loc(4, 8 << 20)));
+        assert!(!HealingManager::slot_names_another_chunk(&chunk_map, &ChunkLocation { file_id: Some(FileId::new()), ..loc(5, 0) }));
+        assert!(!HealingManager::slot_names_another_chunk(&chunk_map, &ChunkLocation { file_id: None, ..loc(6, 0) }));
     }
 
     /// A genuine URGENT_SINGLE_REPLICA entry must always sort before every

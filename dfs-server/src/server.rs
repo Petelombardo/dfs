@@ -965,6 +965,28 @@ fn advance_chunk_map_for_ordered_write(
 /// regardless of deploy order.
 const DELTA_ACCUMULATOR_V2_MAGIC: u64 = 0xD15A_FEED_C0FF_EE02;
 
+/// Test-only faults (DFS_FAULT_INJECTION=1): SIGKILL this process at its Nth accumulator
+/// patch, either right before the delta rename (DFS_FAULT_DIE_BEFORE_DELTA_RENAME=N, so after
+/// the patch-state commit) or right after it (DFS_FAULT_DIE_AFTER_DELTA_RENAME=N), so a test
+/// can crash every replica where a patch's rename and its commit meet (suite T83).
+fn fault_die_at_delta_rename(after: bool) {
+    static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    static PATCHES: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+    let (before_at, after_at) = *AT.get_or_init(|| {
+        if !crate::network::fault_injection_allowed() {
+            return (0, 0);
+        }
+        let n = |var: &str| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (n("DFS_FAULT_DIE_BEFORE_DELTA_RENAME"), n("DFS_FAULT_DIE_AFTER_DELTA_RENAME"))
+    });
+    let at = if after { after_at } else { before_at };
+    if at > 0 && PATCHES[after as usize].fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == at {
+        eprintln!("FAULT INJECTION: dying (SIGKILL) {} accumulator delta rename #{}", if after { "after" } else { "before" }, at);
+        // SAFETY: kill(2) on this process's own pid; nothing to uphold.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL); }
+    }
+}
+
 fn encode_delta_record(seq: u64, offset: usize, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + 8 + 4 + data.len());
     buf.extend_from_slice(&seq.to_le_bytes());
@@ -7707,6 +7729,60 @@ impl Server {
         Ok(())
     }
 
+    /// Finish the accumulator renames patches still owed when this process stopped (see
+    /// metadata's PATCH_DELTA_RENAME_TABLE). Run at startup before anything reads a delta: a
+    /// patch whose token row was committed but whose delta file kept its old name would
+    /// otherwise read as missing, and a fold would abandon it.
+    pub async fn complete_interrupted_delta_renames(&self) {
+        let metadata = self.metadata.clone();
+        let owed = match tokio::task::spawn_blocking(move || metadata.interrupted_delta_renames()).await {
+            Ok(Ok(owed)) => owed,
+            other => { warn!("startup: can't list interrupted delta renames: {:?}", other.map(|r| r.err())); return; }
+        };
+        let storage = self.storage.clone();
+        let metadata = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let (mut done, mut failed) = (0usize, 0usize);
+            for (new, prior) in &owed {
+                let new_path = storage.get_chunk_path(new);
+                if new_path.exists() {
+                    continue;
+                }
+                let prior_path = storage.get_chunk_path(prior);
+                if !prior_path.exists() {
+                    warn!("startup: delta {} is owed its rename from {}, but neither is on disk", new, prior);
+                    continue;
+                }
+                if let Some(parent) = new_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::rename(&prior_path, &new_path) {
+                    Ok(()) => done += 1,
+                    Err(e) => { warn!("startup: finishing delta rename {} -> {} failed: {}", prior, new, e); failed += 1; }
+                }
+            }
+            if done > 0 {
+                if let Err(e) = storage.sync_durable(DurabilityClass::Foreground) {
+                    warn!("startup: syncing finished delta renames failed: {}", e);
+                    failed += 1;
+                }
+            }
+            // Kept when anything failed, so the next start tries again.
+            if failed == 0 {
+                if let Err(e) = metadata.clear_delta_renames() {
+                    warn!("startup: clearing delta rename entries failed: {}", e);
+                }
+            }
+            (owed.len(), done, failed)
+        }).await;
+        match result {
+            Ok((owed, done, failed)) if owed > 0 =>
+                info!("startup: {} delta rename(s) owed by interrupted patches: {} finished, {} failed", owed, done, failed),
+            Ok(_) => {}
+            Err(e) => warn!("startup: finishing delta renames panicked: {}", e),
+        }
+    }
+
     /// `Request::SyncHeldLocations`: push every chunk location this node holds to the new
     /// leader `to`, answering once it has taken them all.
     async fn handle_sync_held_locations(&self, to: std::net::SocketAddr) -> Response {
@@ -14104,9 +14180,39 @@ impl Server {
                                     leader_acked.push(*public_token);
                                 }
                                 Message::Response(Response::FoldReceipt { applied: false, current_chunk_id }) => {
-                                    warn!("patch_fold_rebroadcast: leader still declines {} -> {} after resend — \
-                                           leader's chunk_map for file {} chunk {} currently names {}, will keep retrying",
-                                        public_token, entry.real_chunk_id, entry.file_id, entry.chunk_idx, current_chunk_id);
+                                    // The leader may still name the token this one replaced: a
+                                    // replica that died after committing the next patch but before
+                                    // answering never had that patch's token published (see
+                                    // metadata's PATCH_STATE_ALIAS_TABLE). It folded to the same
+                                    // content, so announce the fold under the name the leader has.
+                                    // Only while this slot still names the folded token: past it, the
+                                    // fold is older than what this node holds, and the leader taking
+                                    // it would send every node back to it.
+                                    let still_current = server.metadata.slot_patch_token(entry.file_id, entry.chunk_idx)
+                                        .ok().flatten() == Some(*public_token);
+                                    let alias = server.metadata.patch_token_alias(public_token).ok().flatten()
+                                        .filter(|alias| still_current && *alias == current_chunk_id);
+                                    let mut adopted = false;
+                                    if let Some(alias) = alias {
+                                        let alias_request = Request::ReplicatePatchFold {
+                                            public_token: alias, real_chunk_id: entry.real_chunk_id,
+                                            file_id: entry.file_id, chunk_idx: entry.chunk_idx,
+                                            location: Some(entry.location.clone()),
+                                        };
+                                        if let Ok(env) = server.client.send_message(node.addr, Message::Request(alias_request)).await {
+                                            if matches!(env.message, Message::Response(Response::FoldReceipt { applied: true, .. })) {
+                                                info!("patch_fold_rebroadcast: leader took fold {} -> {} under {}, the token it still named",
+                                                    public_token, entry.real_chunk_id, alias);
+                                                leader_acked.push(*public_token);
+                                                adopted = true;
+                                            }
+                                        }
+                                    }
+                                    if !adopted {
+                                        warn!("patch_fold_rebroadcast: leader still declines {} -> {} after resend — \
+                                               leader's chunk_map for file {} chunk {} currently names {}, will keep retrying",
+                                            public_token, entry.real_chunk_id, entry.file_id, entry.chunk_idx, current_chunk_id);
+                                    }
                                 }
                                 // Old-protocol leader mid-rollout, still answering with bare
                                 // Ok — accept as best-effort, same as notify_leader_of_fold's
@@ -14618,6 +14724,27 @@ impl Server {
         }
     }
 
+    /// Whether this node's chunk_map entry for a slot should replace the one a
+    /// disseminated record carries: only when location_supersedes ranks it strictly newer.
+    /// A tie keeps the leader's record. This node's chunk_map is not newer by default: a
+    /// node that missed a slot's writes (down, or its disk full) holds an older version,
+    /// and replacing the record with it reverted acked patches (T79f, 2026-10-13).
+    fn local_location_beats_disseminated(
+        disseminated: &ChunkLocation, local: &ChunkLocation,
+        fold_result_chunk_ids: &dashmap::DashSet<ChunkId>, chunk_generations: &DashMap<ChunkId, u64>,
+        durability_floor: usize,
+    ) -> bool {
+        if local.chunk_id == disseminated.chunk_id {
+            return false;
+        }
+        let local_is_fold = fold_result_chunk_ids.contains(&local.chunk_id);
+        let disseminated_is_fold = fold_result_chunk_ids.contains(&disseminated.chunk_id);
+        let local_gen = chunk_generations.get(&local.chunk_id).map(|v| *v);
+        let disseminated_gen = chunk_generations.get(&disseminated.chunk_id).map(|v| *v);
+        Self::location_supersedes(local, disseminated, local_is_fold, disseminated_is_fold, local_gen, disseminated_gen, durability_floor)
+            && !Self::location_supersedes(disseminated, local, disseminated_is_fold, local_is_fold, disseminated_gen, local_gen, durability_floor)
+    }
+
     /// Handle GetMetadataSequence — return this node's last received (follower) or
     /// last issued (leader) sequence number so a newly-elected leader can catch up.
     async fn handle_get_metadata_sequence(&self) -> Response {
@@ -14649,11 +14776,13 @@ impl Server {
 
         // Reconcile chunk_locations against the in-memory chunk_map before storing.
         // The chunk_map reflects live ReplicateChunkLocation updates (write_seq-free),
-        // which may be newer than what the leader queued. If the chunk_map has a
-        // different chunk_id for a given (file_id, file_offset), use it — this prevents
+        // which may be newer than what the leader queued. If the chunk_map has a newer
+        // chunk_id for a given (file_id, file_offset), use it — this prevents
         // DisseminateMetadata from overwriting a newer chunk_id with a stale one and
-        // causing perpetual ChunkStale loops on non-replica nodes.
+        // causing perpetual ChunkStale loops on non-replica nodes. Only newer: see
+        // local_location_beats_disseminated.
         const CHUNK_SIZE_RECONCILE: u64 = 4 * 1024 * 1024;
+        let durability_floor = self.durability_floor();
         let live_items: Vec<FileMetadata> = live_items_raw.into_iter().map(|mut m| {
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -14666,7 +14795,9 @@ impl Server {
                         if let Some(map_loc) = map_locs.iter().find(|l| {
                             l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(chunk_idx)
                         }) {
-                            if map_loc.chunk_id != loc.chunk_id {
+                            if Self::local_location_beats_disseminated(
+                                loc, map_loc, &self.fold_result_chunk_ids, &self.chunk_generations, durability_floor,
+                            ) {
                                 debug!("disseminate: reconcile file {} chunk {} {} -> {} (chunk_map newer)",
                                     m.id, chunk_idx, loc.chunk_id, map_loc.chunk_id);
                                 *loc = map_loc.clone();
@@ -16133,48 +16264,6 @@ impl Server {
         let t_permit_wait_start = std::time::Instant::now();
         let _write_permit = self.write_semaphore.acquire().await.ok();
         let t_permit_wait = t_permit_wait_start.elapsed();
-        match prior_delta {
-            Some(prior_delta_id) => {
-                let append_bytes = new_record_bytes.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    use std::io::Write;
-                    let prior_path = storage.get_chunk_path(&prior_delta_id);
-                    let mut f = std::fs::OpenOptions::new().append(true).open(&prior_path)
-                        .map_err(|e| format!("Failed to open prior delta for append: {}", e))?;
-                    f.write_all(&append_bytes).map_err(|e| format!("Failed to append patch delta: {}", e))?;
-                    // Legacy path syncs this file before rename; coalesced path renames
-                    // first and lets one shared syncfs persist both the appended data
-                    // and the rename together (see DurabilityCoalescer / write_chunk).
-                    if !storage.coalescing_enabled() {
-                        f.sync_data().map_err(|e| format!("Failed to sync appended delta: {}", e))?;
-                    }
-                    drop(f);
-                    let new_path = storage.get_chunk_path(&delta_chunk_id);
-                    if let Some(parent) = new_path.parent() {
-                        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create chunk directory: {}", e))?;
-                    }
-                    std::fs::rename(&prior_path, &new_path).map_err(|e| format!("Failed to rename appended delta: {}", e))?;
-                    if storage.coalescing_enabled() {
-                        // Client-facing patch write — block for durability.
-                        storage.sync_durable(DurabilityClass::Foreground).map_err(|e| format!("Failed to sync appended delta (coalesced): {}", e))?;
-                    }
-                    Ok(())
-                }).await
-                    .map_err(|e| (format!("spawn_blocking panicked appending patch delta: {}", e), ErrorCode::InternalError))?
-                    // Every step above is a file operation on this node's own disk.
-                    .map_err(|e| (e, ErrorCode::IOError))?;
-            }
-            None => {
-                tokio::task::spawn_blocking(move || storage.write_chunk(&delta_chunk_id, &new_record_bytes))
-                    .await
-                    .map_err(|e| (format!("spawn_blocking panicked writing patch delta: {}", e), ErrorCode::InternalError))?
-                    .map_err(|e| (format!("Failed to write patch delta: {:#}", e), ErrorCode::IOError))?;
-            }
-        }
-
-        let t_write = t_write_start.elapsed();
-        let t_state_start = std::time::Instant::now();
-
         // Public token: derived from the delta's own hash through a second,
         // domain-separated Blake3 pass, so it can never coincide with any real
         // content hash (delta_chunk_id, base_chunk_id, or a future full-chunk hash).
@@ -16195,10 +16284,72 @@ impl Server {
         info!("[MERGE-TRACE] file={} chunk_idx={} delta={} token={} needed_len={}",
             file_id, cidx, delta_chunk_id, public_token, needed_len);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut t_state = std::time::Duration::ZERO;
+        // The token -> (base, delta) row, committed before the accumulator's rename below:
+        // see PATCH_DELTA_RENAME_TABLE for the acked patches a rename-first order lost.
+        let record_state = |renamed_from: Option<ChunkId>| async move {
+            let t = std::time::Instant::now();
+            let retired = self.metadata.put_patch_state_pending_async(
+                file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq, renamed_from,
+            ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)));
+            (retired, t.elapsed())
+        };
 
-        let retired_token = self.metadata.put_patch_state_pending_async(
-            file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq,
-        ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)))?;
+        let retired_token = match prior_delta {
+            Some(prior_delta_id) => {
+                let append_bytes = new_record_bytes.clone();
+                let append_storage = storage.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    use std::io::Write;
+                    let prior_path = append_storage.get_chunk_path(&prior_delta_id);
+                    let mut f = std::fs::OpenOptions::new().append(true).open(&prior_path)
+                        .map_err(|e| format!("Failed to open prior delta for append: {}", e))?;
+                    f.write_all(&append_bytes).map_err(|e| format!("Failed to append patch delta: {}", e))?;
+                    // Legacy path syncs this file now; coalesced path lets one shared syncfs
+                    // persist the appended data and the rename together after the commit
+                    // (see DurabilityCoalescer / write_chunk).
+                    if !append_storage.coalescing_enabled() {
+                        f.sync_data().map_err(|e| format!("Failed to sync appended delta: {}", e))?;
+                    }
+                    Ok(())
+                }).await
+                    .map_err(|e| (format!("spawn_blocking panicked appending patch delta: {}", e), ErrorCode::InternalError))?
+                    // Every step above is a file operation on this node's own disk.
+                    .map_err(|e| (e, ErrorCode::IOError))?;
+                let (retired, took) = record_state(Some(prior_delta_id)).await;
+                t_state = took;
+                let retired = retired?;
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    fault_die_at_delta_rename(false);
+                    let prior_path = storage.get_chunk_path(&prior_delta_id);
+                    let new_path = storage.get_chunk_path(&delta_chunk_id);
+                    if let Some(parent) = new_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create chunk directory: {}", e))?;
+                    }
+                    std::fs::rename(&prior_path, &new_path).map_err(|e| format!("Failed to rename appended delta: {}", e))?;
+                    if storage.coalescing_enabled() {
+                        // Client-facing patch write — block for durability.
+                        storage.sync_durable(DurabilityClass::Foreground).map_err(|e| format!("Failed to sync appended delta (coalesced): {}", e))?;
+                    }
+                    fault_die_at_delta_rename(true);
+                    Ok(())
+                }).await
+                    .map_err(|e| (format!("spawn_blocking panicked renaming patch delta: {}", e), ErrorCode::InternalError))?
+                    .map_err(|e| (e, ErrorCode::IOError))?;
+                retired
+            }
+            None => {
+                tokio::task::spawn_blocking(move || storage.write_chunk(&delta_chunk_id, &new_record_bytes))
+                    .await
+                    .map_err(|e| (format!("spawn_blocking panicked writing patch delta: {}", e), ErrorCode::InternalError))?
+                    .map_err(|e| (format!("Failed to write patch delta: {:#}", e), ErrorCode::IOError))?;
+                let (retired, took) = record_state(None).await;
+                t_state = took;
+                retired?
+            }
+        };
+
+        let t_write = t_write_start.elapsed().saturating_sub(t_state);
         if let Some(retired) = retired_token {
             // The slot's previous public_token is now provably unreachable (proof:
             // we just built this new patch on top of whatever it resolved to) —
@@ -16209,7 +16360,6 @@ impl Server {
             self.pending_patch_fold_broadcasts.remove(&retired);
         }
 
-        let t_state = t_state_start.elapsed();
         let t_loc_start = std::time::Instant::now();
 
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -17527,7 +17677,7 @@ impl Server {
                                 || self.pull_chunk_from_peers(delta_chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await.is_some();
                             if have_delta {
                                 if let Err(e) = self.metadata.put_patch_state_pending_async(
-                                    file_id, cidx, fresh_loc.chunk_id, base_chunk_id, delta_chunk_id, size, written_at, peer_seq,
+                                    file_id, cidx, fresh_loc.chunk_id, base_chunk_id, delta_chunk_id, size, written_at, peer_seq, None,
                                 ).await {
                                     warn!("MultiPatch: failed to adopt peer-resolved patch_state for token {} (file {} chunk {}): {}",
                                         fresh_loc.chunk_id, file_id, cidx, e);
@@ -21283,6 +21433,30 @@ mod tests {
             client_write_seq: Some(seq),
             file_id: Some(dfs_common::FileId::new()),
         }
+    }
+
+    /// T79f 2026-10-13: a node that missed a slot's patch (its disk was full) restarted with
+    /// the pre-patch base in its chunk_map, swapped it into the leader's disseminated record
+    /// in place of the patch's token, then became leader and disseminated the base: the
+    /// acked patches read back as their old bytes. Only a strictly newer local entry may
+    /// replace a disseminated one.
+    #[test]
+    fn dissemination_keeps_the_leaders_location_unless_this_nodes_is_newer() {
+        let floor = dfs_common::types::write_quorum(3);
+        let folds = dashmap::DashSet::new();
+        let gens: DashMap<ChunkId, u64> = DashMap::new();
+        let with_nodes = |mut l: ChunkLocation| { l.nodes = vec![dfs_common::NodeId::new(), dfs_common::NodeId::new()]; l };
+        let token = with_nodes(recon_loc(4 << 20, 7, None));
+        let base = with_nodes(recon_loc(4 << 20, 1, None));
+        assert!(!Server::local_location_beats_disseminated(&token, &base, &folds, &gens, floor),
+            "a stale base must not replace the patch the leader disseminated");
+        let newer = with_nodes(recon_loc(4 << 20, 9, None));
+        assert!(Server::local_location_beats_disseminated(&token, &newer, &folds, &gens, floor),
+            "a strictly newer local write still wins");
+        let twin = ChunkLocation { chunk_id: ChunkId::from_hash([9; 32]), ..token.clone() };
+        assert!(!Server::local_location_beats_disseminated(&token, &twin, &folds, &gens, floor),
+            "a tie keeps the leader's record");
+        assert!(!Server::local_location_beats_disseminated(&token, &token, &folds, &gens, floor));
     }
 
     /// Correctness regression for reconcile_chunk_locations_with_map (2026-07-21

@@ -85,6 +85,27 @@ const CHUNK_REFCOUNT_TABLE: TableDefinition<&str, u64> = TableDefinition::new("c
 /// CHUNK_REFCOUNT_TABLE — no migration needed, not in the startup table-open list.
 const PATCH_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_state");
 
+/// "{file_id}:{chunk_idx}" -> new delta hash (32 bytes) ++ prior delta hash (32 bytes): the
+/// rename a slot's latest accumulator patch still owes. A patch appends its record to the
+/// prior delta file, commits its token -> (base, new delta) row together with this entry,
+/// and only then renames the file to the new delta id. Renamed before the commit, a
+/// process that died in between came back with the row naming the old id, whose file was
+/// gone: every acked patch in the accumulator was lost, on every replica (suite T83/T76a,
+/// 2026-10-12). At startup, interrupted_delta_renames + clear_delta_renames let the server
+/// finish such a rename before anything reads the delta. One entry per slot, overwritten by
+/// the slot's next patch, so it doesn't grow with patch volume.
+const PATCH_DELTA_RENAME_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_delta_rename");
+
+/// A slot's current token hex -> the token it replaced (hex), which keeps resolving: its
+/// PATCH_STATE_TABLE row is rewritten to the current token's (base, delta) instead of being
+/// deleted. The client publishes a patch's token to the leader only after the patch is
+/// acked, so a replica that died after committing patch k+1 but before answering came back
+/// with the leader still naming token k, which it had deleted: no node could read the slot
+/// (suite T83, 2026-10-12). Token k's content is a prefix of k+1's, so serving k+1 for it
+/// shows at most the unacked write, as any reader may see. One alias per slot: the next
+/// patch drops it; a fold folds it with its current token; the GC and abandon paths drop it.
+const PATCH_STATE_ALIAS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_state_alias");
+
 /// public_token hex string → unix seconds when that token's PATCH_STATE_TABLE row
 /// transitioned from Pending to Folded. Written alongside every
 /// PatchState::Folded update, read only by find_stale_folded_patch_state_candidates.
@@ -397,6 +418,7 @@ enum MetaWriteOp {
         size: usize,
         written_at: u64,
         client_write_seq: Option<u64>,
+        renamed_from: Option<ChunkId>,
         reply: tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>,
     },
     UpdatePatchStateFolded {
@@ -989,11 +1011,11 @@ impl MetadataStore {
                 }
                 MetaWriteOp::PutPatchStatePending {
                     file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-                    size, written_at, client_write_seq, reply,
+                    size, written_at, client_write_seq, renamed_from, reply,
                 } => {
                     let result = Self::put_patch_state_pending_in_txn(
                         &txn, file_id, chunk_idx, &public_token, base_chunk_id,
-                        delta_chunk_id, size, written_at, client_write_seq,
+                        delta_chunk_id, size, written_at, client_write_seq, renamed_from,
                     ).map(|(retired, bytes)| {
                         payload_bytes += bytes;
                         retired
@@ -1016,6 +1038,9 @@ impl MetadataStore {
                         // fold time, not the target's, is what the GC must age-check against.
                         let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
                         ts_table.insert(token_key.as_str(), dfs_common::types::current_timestamp())?;
+                        drop(table);
+                        drop(ts_table);
+                        Self::fold_alias_in_txn(&txn, &token_key, &value)?;
                         Ok(())
                     })();
                     self.note_txn("op:update_patch_state_folded", 0);
@@ -2936,7 +2961,7 @@ impl MetadataStore {
         txn.set_durability(self.next_write_durability());
         let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
             &txn, file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-            size, written_at, client_write_seq,
+            size, written_at, client_write_seq, None,
         )?;
         self.commit(txn)?;
         self.note_txn("put_patch_state_pending", payload_bytes);
@@ -2951,7 +2976,7 @@ impl MetadataStore {
     fn put_patch_state_pending_in_txn(
         txn: &redb::WriteTransaction, file_id: FileId, chunk_idx: u64, public_token: &ChunkId,
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
-        written_at: u64, client_write_seq: Option<u64>,
+        written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
     ) -> Result<(Option<ChunkId>, usize)> {
         let slot_key = format!("{}:{}", file_id, chunk_idx);
         let token_key = format!("{}", public_token);
@@ -2970,10 +2995,32 @@ impl MetadataStore {
         };
         {
             let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
-            if let Some(retired) = &retired {
-                state_table.remove(retired.as_str())?;
+            let mut alias_table = txn.open_table(PATCH_STATE_ALIAS_TABLE)?;
+            if let Some(retired) = retired.as_deref().filter(|r| *r != token_key) {
+                // The token two patches back, which the retired one aliased, goes now; the
+                // retired one stays readable as this patch's content (PATCH_STATE_ALIAS_TABLE).
+                let older = alias_table.remove(retired)?.map(|v| String::from_utf8_lossy(v.value()).to_string());
+                if let Some(older) = older.filter(|o| *o != token_key) {
+                    state_table.remove(older.as_str())?;
+                }
+                state_table.insert(retired, value.as_slice())?;
+                alias_table.insert(token_key.as_str(), retired.as_bytes())?;
             }
             state_table.insert(token_key.as_str(), value.as_slice())?;
+        }
+        {
+            // The rename this patch owes (see PATCH_DELTA_RENAME_TABLE); a patch that wrote
+            // a fresh delta owes none, and the slot's older entry is stale.
+            let mut rename_table = txn.open_table(PATCH_DELTA_RENAME_TABLE)?;
+            match renamed_from {
+                Some(prior) => {
+                    let mut entry = Vec::with_capacity(64);
+                    entry.extend_from_slice(&delta_chunk_id.hash);
+                    entry.extend_from_slice(&prior.hash);
+                    rename_table.insert(slot_key.as_str(), entry.as_slice())?;
+                }
+                None => { rename_table.remove(slot_key.as_str())?; }
+            }
         }
         let payload_bytes = value.len();
         Ok((retired.and_then(|hex| decode_hex_32(&hex)).map(ChunkId::from_hash), payload_bytes))
@@ -2986,20 +3033,127 @@ impl MetadataStore {
     pub async fn put_patch_state_pending_async(
         self: &Arc<Self>, file_id: FileId, chunk_idx: u64, public_token: ChunkId,
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
-        written_at: u64, client_write_seq: Option<u64>,
+        written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
     ) -> Result<Option<ChunkId>> {
         if !Self::group_commit_enabled() {
             let store = Arc::clone(self);
-            return tokio::task::spawn_blocking(move || store.put_patch_state_pending(
-                file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id, size, written_at, client_write_seq,
-            )).await.context("spawn_blocking panicked in put_patch_state_pending_async")?;
+            return tokio::task::spawn_blocking(move || -> Result<Option<ChunkId>> {
+                let _db = store.db.read();
+                let mut txn = store.begin_write(&_db)?;
+                txn.set_durability(store.next_write_durability());
+                let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
+                    &txn, file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id,
+                    size, written_at, client_write_seq, renamed_from,
+                )?;
+                store.commit(txn)?;
+                store.note_txn("put_patch_state_pending", payload_bytes);
+                Ok(retired)
+            }).await.context("spawn_blocking panicked in put_patch_state_pending_async")?;
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.committer_tx().send(MetaWriteOp::PutPatchStatePending {
             file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-            size, written_at, client_write_seq, reply,
+            size, written_at, client_write_seq, renamed_from, reply,
         }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
         rx.await.context("metadata group-commit thread dropped its reply")?
+    }
+
+    /// Renames a slot's latest accumulator patch still owed when the process stopped (see
+    /// PATCH_DELTA_RENAME_TABLE): (new delta, prior delta) for every entry whose slot still
+    /// resolves to a Pending row naming that new delta. Entries for slots that moved on are
+    /// skipped; clear_delta_renames drops them all once the caller has finished the renames.
+    pub fn interrupted_delta_renames(&self) -> Result<Vec<(ChunkId, ChunkId)>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let renames = match txn.open_table(PATCH_DELTA_RENAME_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let slots = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let states = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut owed = Vec::new();
+        for item in renames.iter()? {
+            let (slot, entry) = item?;
+            let entry = entry.value();
+            if entry.len() != 64 {
+                continue;
+            }
+            let new = ChunkId::from_hash(entry[..32].try_into().unwrap());
+            let prior = ChunkId::from_hash(entry[32..].try_into().unwrap());
+            let Some(token) = slots.get(slot.value())? else { continue };
+            let token = String::from_utf8_lossy(token.value()).to_string();
+            let Some(state) = states.get(token.as_str())? else { continue };
+            if let Ok(PatchState::Pending { delta_chunk_id, .. }) = bincode::deserialize::<PatchState>(state.value()) {
+                if delta_chunk_id == new {
+                    owed.push((new, prior));
+                }
+            }
+        }
+        Ok(owed)
+    }
+
+    /// Drop every PATCH_DELTA_RENAME_TABLE entry: called once the renames
+    /// interrupted_delta_renames returned are done, before this node serves anything.
+    pub fn clear_delta_renames(&self) -> Result<()> {
+        let _db = self.db.read();
+        let mut txn = self.begin_write(&_db)?;
+        txn.set_durability(Durability::Immediate);
+        txn.delete_table(PATCH_DELTA_RENAME_TABLE)?;
+        self.commit(txn)?;
+        Ok(())
+    }
+
+    /// A fold of `token_key` folds its alias too (PATCH_STATE_ALIAS_TABLE), with its own
+    /// fold time for the GC.
+    fn fold_alias_in_txn(txn: &redb::WriteTransaction, token_key: &str, folded: &[u8]) -> Result<()> {
+        let alias = txn.open_table(PATCH_STATE_ALIAS_TABLE)?.get(token_key)?
+            .map(|v| String::from_utf8_lossy(v.value()).to_string());
+        if let Some(alias) = alias {
+            txn.open_table(PATCH_STATE_TABLE)?.insert(alias.as_str(), folded)?;
+            txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?.insert(alias.as_str(), dfs_common::types::current_timestamp())?;
+        }
+        Ok(())
+    }
+
+    /// The token a slot's latest patch made current (PATCH_STATE_SLOT_TABLE), if any.
+    pub fn slot_patch_token(&self, file_id: FileId, chunk_idx: u64) -> Result<Option<ChunkId>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let token = table.get(format!("{}:{}", file_id, chunk_idx).as_str())?
+            .and_then(|v| decode_hex_32(&String::from_utf8_lossy(v.value())))
+            .map(ChunkId::from_hash);
+        Ok(token)
+    }
+
+    /// The token `token` replaced, which still resolves to its content (see
+    /// PATCH_STATE_ALIAS_TABLE). A fold announced for `token` that the leader declines is
+    /// re-announced for this one: the leader may still name it.
+    pub fn patch_token_alias(&self, token: &ChunkId) -> Result<Option<ChunkId>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_ALIAS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let alias = table.get(format!("{}", token).as_str())?
+            .and_then(|v| decode_hex_32(&String::from_utf8_lossy(v.value())))
+            .map(ChunkId::from_hash);
+        Ok(alias)
     }
 
     /// Flip an existing patch_state row from Pending to Folded once the
@@ -3028,6 +3182,7 @@ impl MetadataStore {
             let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
             ts_table.insert(token_key.as_str(), dfs_common::types::current_timestamp())?;
         }
+        Self::fold_alias_in_txn(&txn, &token_key, &value)?;
         self.commit(txn)?;
         self.note_txn("update_patch_state_folded", value.len());
         Ok(())
@@ -3062,6 +3217,11 @@ impl MetadataStore {
         {
             let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
             state_table.remove(token_key.as_str())?;
+            let mut alias_table = txn.open_table(PATCH_STATE_ALIAS_TABLE)?;
+            let alias = alias_table.remove(token_key.as_str())?.map(|v| String::from_utf8_lossy(v.value()).to_string());
+            if let Some(alias) = alias {
+                state_table.remove(alias.as_str())?;
+            }
         }
         {
             let mut slot_table = txn.open_table(PATCH_STATE_SLOT_TABLE)?;
@@ -3070,6 +3230,7 @@ impl MetadataStore {
                 .unwrap_or(false);
             if still_current {
                 slot_table.remove(slot_key.as_str())?;
+                txn.open_table(PATCH_DELTA_RENAME_TABLE)?.remove(slot_key.as_str())?;
             }
         }
         Ok(())
@@ -3689,6 +3850,11 @@ impl MetadataStore {
             let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
             for key in keys {
                 ts_table.remove(key.as_str())?;
+            }
+            // An alias outlives nothing: its own row is GC'd by the same age rule.
+            let mut alias_table = txn.open_table(PATCH_STATE_ALIAS_TABLE)?;
+            for key in keys {
+                alias_table.remove(key.as_str())?;
             }
         }
         self.commit(txn)?;
@@ -7210,13 +7376,84 @@ mod tests {
     /// had fallen behind, so chunk_seq, file_tombstone, patch_fold_timestamp and
     /// pending_fold_announce were dropped by every online compaction (and slot_isr, the
     /// ISR's Paxos acceptor state, would have been too).
+    fn pending_delta(store: &MetadataStore, token: &ChunkId) -> Option<ChunkId> {
+        match store.get_patch_state(token).unwrap() {
+            Some(PatchState::Pending { delta_chunk_id, .. }) => Some(delta_chunk_id),
+            _ => None,
+        }
+    }
+
+    /// Suite T83: patch k+1 committed, then the process died before answering, so the leader
+    /// still names token k. Token k must keep resolving (to k+1's content, a superset), and
+    /// only one such alias per slot is kept.
+    #[test]
+    fn a_replaced_patch_token_keeps_resolving_until_the_next_patch() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let file_id = FileId::new();
+        let base = ChunkId::from_hash([1; 32]);
+        let (t1, t2, t3) = (ChunkId::from_hash([11; 32]), ChunkId::from_hash([12; 32]), ChunkId::from_hash([13; 32]));
+        let (d1, d2, d3) = (ChunkId::from_hash([21; 32]), ChunkId::from_hash([22; 32]), ChunkId::from_hash([23; 32]));
+        store.put_patch_state_pending(file_id, 0, &t1, base, d1, 4096, 1, Some(1)).unwrap();
+        store.put_patch_state_pending(file_id, 0, &t2, base, d2, 4096, 2, Some(2)).unwrap();
+        assert_eq!(pending_delta(&store, &t2), Some(d2));
+        assert_eq!(pending_delta(&store, &t1), Some(d2), "the replaced token reads as its successor");
+        assert_eq!(store.patch_token_alias(&t2).unwrap(), Some(t1));
+        store.put_patch_state_pending(file_id, 0, &t3, base, d3, 4096, 3, Some(3)).unwrap();
+        assert!(store.get_patch_state(&t1).unwrap().is_none(), "two patches back: gone");
+        assert_eq!(pending_delta(&store, &t2), Some(d3));
+        assert_eq!(store.patch_token_alias(&t3).unwrap(), Some(t2));
+        assert_eq!(store.patch_token_alias(&t2).unwrap(), None);
+
+        let folded = ChunkId::from_hash([31; 32]);
+        store.update_patch_state_folded(&t3, folded).unwrap();
+        assert!(matches!(store.get_patch_state(&t2).unwrap(), Some(PatchState::Folded(c)) if c == folded),
+            "a fold folds the alias with its token");
+
+        store.put_patch_state_pending(file_id, 1, &ChunkId::from_hash([41; 32]), base, ChunkId::from_hash([51; 32]), 4096, 4, None).unwrap();
+        let (a, b) = (ChunkId::from_hash([42; 32]), ChunkId::from_hash([43; 32]));
+        store.put_patch_state_pending(file_id, 1, &a, base, ChunkId::from_hash([52; 32]), 4096, 5, None).unwrap();
+        store.put_patch_state_pending(file_id, 1, &b, base, ChunkId::from_hash([53; 32]), 4096, 6, None).unwrap();
+        store.delete_patch_state_abandoned(&b, file_id, 1).unwrap();
+        assert!(store.get_patch_state(&b).unwrap().is_none());
+        assert!(store.get_patch_state(&a).unwrap().is_none(), "abandoning a token drops its alias");
+    }
+
+    /// Suite T83: a patch's row is committed before its delta file is renamed; a death in
+    /// between leaves the rename owed, which startup finishes. Only while the slot still
+    /// names that delta.
+    #[test]
+    fn an_owed_delta_rename_is_reported_while_its_slot_still_names_the_delta() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+        let file_id = FileId::new();
+        let base = ChunkId::from_hash([1; 32]);
+        let (t1, t2) = (ChunkId::from_hash([11; 32]), ChunkId::from_hash([12; 32]));
+        let (d1, d2) = (ChunkId::from_hash([21; 32]), ChunkId::from_hash([22; 32]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            store.put_patch_state_pending_async(file_id, 0, t1, base, d1, 4096, 1, None, None).await.unwrap();
+            store.put_patch_state_pending_async(file_id, 0, t2, base, d2, 4096, 2, None, Some(d1)).await.unwrap();
+        });
+        assert_eq!(store.interrupted_delta_renames().unwrap(), vec![(d2, d1)]);
+        store.clear_delta_renames().unwrap();
+        assert!(store.interrupted_delta_renames().unwrap().is_empty());
+
+        rt.block_on(async {
+            store.put_patch_state_pending_async(file_id, 1, ChunkId::from_hash([61; 32]), base, ChunkId::from_hash([71; 32]), 4096, 3, None, None).await.unwrap();
+            store.put_patch_state_pending_async(file_id, 1, ChunkId::from_hash([62; 32]), base, ChunkId::from_hash([72; 32]), 4096, 4, None, Some(ChunkId::from_hash([71; 32]))).await.unwrap();
+        });
+        store.update_patch_state_folded(&ChunkId::from_hash([62; 32]), ChunkId::from_hash([81; 32])).unwrap();
+        assert!(store.interrupted_delta_renames().unwrap().is_empty(), "a folded slot owes nothing");
+    }
+
     #[test]
     fn test_compact_db_preserves_every_table() {
         let temp_dir = TempDir::new().unwrap();
         let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
         let bytes = [FILE_TABLE, PATH_TABLE, CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX,
                      DELETE_QUEUE_TABLE, PATCH_STATE_TABLE, PENDING_FOLD_ANNOUNCE_TABLE, PATCH_STATE_SLOT_TABLE,
-                     SLOT_ISR_TABLE];
+                     SLOT_ISR_TABLE, PATCH_DELTA_RENAME_TABLE, PATCH_STATE_ALIAS_TABLE];
         let u64s = [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE, PATCH_FOLD_TIMESTAMP_TABLE,
                     CHUNK_SEQ_TABLE, FILE_TOMBSTONE_TABLE];
         {

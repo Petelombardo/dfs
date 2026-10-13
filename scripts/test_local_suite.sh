@@ -751,6 +751,109 @@ sleep 5
 rm -f "$MOUNT"/t82_*.bin
 fi # should_run T82
 
+if should_run T83; then
+snapshot_log T83
+echo ""
+echo "=== T83: every replica dies right before or right after a patch's delta rename: every acked patch survives ==="
+# A chunk's small patches accumulate in one delta file; each new patch appends its record
+# and renames the file to the new delta id, then commits the token -> (base, delta) row. A
+# process that died between the rename and the commit came back with the row naming the old
+# id, whose file had been renamed away: the slot fell back to its pre-accumulator content
+# and every acked patch in the accumulator was lost, on every replica (T76a, 2026-10-12).
+# The fix commits first and renames second; a death between the two needs the startup step
+# to finish the rename, and a death after both needs the replaced token to stay readable,
+# since the leader still names it (the unacked patch's token was never published). Here every
+# server dies (test-only fault) at its 4th accumulator patch (patches 2-5 rename; 1 starts the
+# accumulator), once right after the rename (T83a/b) and once right before it (T83c/d).
+t83_start_all() {   # extra env for the servers, e.g. DFS_FAULT_DIE_AFTER_DELTA_RENAME=4
+    for i in 1 2 3 4 5; do
+        env $1 RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+            >> "$LOG/server${i}.log" 2>&1 &
+    done
+}
+t83_kill_all() {
+    for i in 1 2 3 4 5; do
+        pkill -9 -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true
+    done
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node" >/dev/null || break; sleep 0.1; done
+}
+t83_up() { pgrep -f "dfs-server start --config $BASE/node" | wc -l; }
+t83_wait_ready() {
+    for _ in $(seq 1 60); do
+        [ "$("$BIN/dfs-admin" --cluster "$CLUSTER" cluster status 2>/dev/null | grep -oP 'Healthy Nodes:\s+\K[0-9]+')" = 5 ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+for T83_CASE in "after DFS_FAULT_DIE_AFTER_DELTA_RENAME T83a T83b" "before DFS_FAULT_DIE_BEFORE_DELTA_RENAME T83c T83d"; do
+set -- $T83_CASE; T83_WHEN=$1; T83_FAULT=$2; T83_FIRED=$3; T83_READ=$4
+T83_SRC="$BASE/t83_src.bin"
+dd if=/dev/urandom of="$T83_SRC" bs=1M count=4 status=none
+dd if="$T83_SRC" of="$MOUNT/t83.bin" bs=1M conv=fsync status=none
+dfs_sync
+sleep 3
+t83_kill_all
+t83_start_all "$T83_FAULT=4"
+t83_wait_ready || echo "  T83: cluster not fully healthy 30s after the restart"
+sleep 8
+T83_DIE_MARK=$(cat "$LOG"/server*.log | grep -c "dying (SIGKILL) $T83_WHEN accumulator delta rename" || true)
+T83_ACKED=""; T83_UNACKED=""
+for i in 1 2 3 4 5 6; do
+    dd if=/dev/urandom of="$BASE/t83_p$i.bin" bs=4K count=1 status=none
+    if timeout 30 dd if="$BASE/t83_p$i.bin" of="$MOUNT/t83.bin" bs=4K seek=$(( i * 2 )) conv=notrunc,fsync status=none 2>>"$LOG/t83_dd.err"; then
+        T83_ACKED="$T83_ACKED $i"
+    else
+        T83_UNACKED="$T83_UNACKED $i"
+    fi
+done
+T83_DIED=$(( $(cat "$LOG"/server*.log | grep -c "dying (SIGKILL) $T83_WHEN accumulator delta rename" || true) - T83_DIE_MARK ))
+echo "  T83 ($T83_WHEN): acked patches:${T83_ACKED:- none}; not acked:${T83_UNACKED:- none}; servers that died at the fault: $T83_DIED"
+t83_kill_all
+t83_start_all ""
+t83_wait_ready || echo "  T83: cluster not fully healthy 30s after the second restart"
+sleep 10
+T83_FRESH_MNT=/tmp/dfs-mount-fresh
+mkdir -p "$T83_FRESH_MNT"
+RUST_LOG=info "$BIN/dfs-client" mount "$T83_FRESH_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t83.log" --allow-other --log-level debug &
+T83_CPID=$!
+sleep 2
+T83_GOT="$BASE/t83_got.bin"
+timeout 60 cat "$T83_FRESH_MNT/t83.bin" > "$T83_GOT" 2>/dev/null || true
+fusermount -u "$T83_FRESH_MNT" 2>/dev/null || true
+kill_client_and_wait "$T83_CPID"
+# An acked patch must read back; an unacked one may hold either its old or its new bytes;
+# every other byte must be the original.
+T83_BAD=$(python3 - "$T83_SRC" "$T83_GOT" "$BASE" "$T83_ACKED" "$T83_UNACKED" <<'PY'
+import sys
+src, got, base, acked, unacked = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(), sys.argv[5].split()
+want = bytearray(open(src, 'rb').read()); have = open(got, 'rb').read()
+if len(have) != len(want):
+    print(f"size {len(have)} != {len(want)}"); sys.exit()
+B = 4096
+bad = []
+for i in acked:
+    off = int(i) * 2 * B; p = open(f"{base}/t83_p{i}.bin", 'rb').read()
+    if have[off:off + B] != p: bad.append(f"patch{i}")
+    want[off:off + B] = p
+for i in unacked:
+    off = int(i) * 2 * B; p = open(f"{base}/t83_p{i}.bin", 'rb').read()
+    if have[off:off + B] in (p, bytes(want[off:off + B])): want[off:off + B] = have[off:off + B]
+    else: bad.append(f"patch{i}(neither old nor new)")
+if not bad and bytes(want) != have: bad.append("bytes outside the patched ranges")
+print(" ".join(bad))
+PY
+)
+[ "$T83_DIED" -gt 0 ] \
+    && check "$T83_FIRED the fault fired: $T83_DIED server(s) died $T83_WHEN an accumulator delta rename" PASS \
+    || check "$T83_FIRED the fault never fired (no server died $T83_WHEN a delta rename; $T83_READ proves nothing)" FAIL
+[ -n "$T83_ACKED" ] && [ -z "$T83_BAD" ] \
+    && check "$T83_READ every acked patch reads back after every replica died $T83_WHEN its delta rename (acked:$T83_ACKED)" PASS \
+    || check "$T83_READ lost or wrong after the crash $T83_WHEN the rename: ${T83_BAD:-no patch acked} (acked:${T83_ACKED:- none})" FAIL
+rm -f "$MOUNT/t83.bin" "$BASE"/t83_*.bin
+done
+fi # should_run T83
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

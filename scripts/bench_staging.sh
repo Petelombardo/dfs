@@ -12,6 +12,8 @@
 #   scripts/bench_staging.sh run <label>            fio jobs on the client -> /root/dfs-staging-bench-<label>.txt
 #   scripts/bench_staging.sh upgrade-node <node> <dir> [0|1]  replace one node's server binary, keep its data
 #   scripts/bench_staging.sh swap-client <path> [0|1]  replace just the client binary and remount
+#   scripts/bench_staging.sh dd <label> [N]         N x `dd 500 MB conv=fsync` on the client (the rock5b
+#                                                   10-13 EIO) -> /root/dfs-staging-dd-<label>.txt
 #   scripts/bench_staging.sh teardown               unmount, stop, delete everything
 #
 # BENCH_JOBS="seq1m_fsync ..." runs only those fio jobs (default: all).
@@ -20,7 +22,8 @@
 # read-only, for a prod-vs-new comparison). A redeploy over a running bench needs teardown first.
 set -e
 NODES="gluster2 gluster3 gluster4 gluster5"   # not gluster1: production leader, least free memory
-CLIENT=server4   # x86_64: client binary from dist/bench-x86_64 (build-x86.sh)
+CLIENT=${BENCH_CLIENT_HOST:-server4}   # server4: x86_64 client from dist/bench-x86_64 (build-x86.sh);
+                                       # rock5b (aarch64, 1 GbE): BENCH_CLIENT_BIN=target/release/dfs-client
 PORT=8950
 DIR=/mnt/gluster/dfs-bench            # on each storage node (persistent disk, not /tmp = RAM)
 CDIR=/root/dfs-bench                  # on the client
@@ -136,6 +139,16 @@ for part in raw:
              f"p99={sy['lat_ns'].get('percentile',{}).get('99.000000',0)/1000:.0f}"
              if (sy := job.get("sync", {})) and sy.get("total_ios") else ""))
 EOF
+    ;;
+dd)
+    # The 10-13 rock5b report: a 500 MB burst with fsync on a 1 GbE client.
+    out=/root/dfs-staging-dd-$2.txt; : > "$out"
+    for r in $(seq 1 "${3:-3}"); do
+        # timeouts/skipped count this run's client-log lines only (the log spans every run).
+        res=$(ssh root@"$CLIENT" "cd $MNT && rm -f dd.img; L=$CDIR/client.log; t0=\$(grep -c 'Timeout writing' \$L); k0=\$(grep -c 'skipping without attempting' \$L); s=\$(date +%s); dd if=/dev/urandom of=dd.img bs=1M count=500 conv=fsync status=none 2>&1; rc=\$?; e=\$(date +%s); echo rc=\$rc secs=\$((e - s)) timeouts=\$((\$(grep -c 'Timeout writing' \$L) - t0)) skipped=\$((\$(grep -c 'skipping without attempting' \$L) - k0)); rm -f dd.img")
+        echo "run $r: $(echo $res | tr '\n' ' ')" | tee -a "$out"
+        sleep 20
+    done
     ;;
 teardown)
     stop_bench_client; stop_bench_servers; sleep 2

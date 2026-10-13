@@ -11790,6 +11790,30 @@ impl Server {
             // primaries could accept writes at once.
             return refuse(format!("primary {} isn't expired by a majority; not taking over", failed));
         }
+        // A secondary takes over only holding every acked write. A replacement joined this
+        // epoch with none of the slot's earlier ones; until it caught up with the primary it
+        // would anchor the new epoch on whatever stale copy it has, and every later write
+        // would be applied onto that: acked writes lost (suite T74a, twice in one run). If
+        // the primary can still answer (a resigning one holds its lease), catch up from it
+        // now; otherwise refuse, and the slot waits for the primary rather than lose data.
+        if cur.members.first() == Some(&failed) && !self.caught_up_as_secondary(file_id, chunk_idx, cur.epoch).await {
+            let tag = dfs_common::WriteOrderTag { file_id, chunk_idx, isr_epoch: cur.epoch, primary: failed, secondary: me, write_id: 0 };
+            let slot = self.write_ordering.slot(file_id, chunk_idx, cur.epoch);
+            let _order = slot.order_lock.lock().await;
+            match tokio::time::timeout(std::time::Duration::from_secs(5), self.resync_from_primary(&tag)).await {
+                Ok(Some((anchor, at))) => {
+                    info!("[ISR] file {} chunk {}: caught up with primary {} at v{} ({}) before taking over",
+                        file_id, chunk_idx, failed, at, anchor);
+                    self.adopt_resync_anchor(file_id, chunk_idx, cur.epoch, &slot, anchor, at).await;
+                }
+                _ => {
+                    warn!("[ISR] file {} chunk {}: not taking over from {}: this node joined epoch {} as a replacement and never caught up",
+                        file_id, chunk_idx, failed, cur.epoch);
+                    return refuse(format!("this node joined epoch {} as a replacement and isn't caught up with primary {}; not taking over",
+                        cur.epoch, failed));
+                }
+            }
+        }
         // Replacement: prefer a node already holding the chunk, then any other online node.
         let holders: Vec<NodeId> = self.chunk_map.get(&file_id).and_then(|e| {
             let (locs, _) = e.value();
@@ -11814,6 +11838,28 @@ impl Server {
             info!("[ISR] file {} chunk {}: {} replaced {}{} -- epoch {} -> {}, members {:?}",
                 file_id, chunk_idx, me, failed, if resigned { " (its storage failed)" } else { "" },
                 cur.epoch, next.epoch, next.members);
+            // Catch the replacement up now, not at the next write: until it has, it can't take
+            // over (above), and an idle slot whose primary then died would wait for it.
+            if let Some(addr) = self.cluster.get_node(&replacement).await.map(|n| n.addr) {
+                let client = self.client.clone();
+                let epoch = next.epoch;
+                let req = Request::ResyncFromPrimary { file_id, chunk_idx, isr_epoch: epoch };
+                tokio::spawn(async move {
+                    // The replacement may not have learned the commit yet: ask a few times.
+                    for _ in 0..10 {
+                        let ok = matches!(
+                            tokio::time::timeout(std::time::Duration::from_secs(10),
+                                client.send_message(addr, Message::Request(req.clone()))).await,
+                            Ok(Ok(env)) if matches!(env.message, Message::Response(Response::Ok { .. })));
+                        if ok {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    warn!("[ISR] file {} chunk {}: replacement {} didn't catch up after joining epoch {}; its next write will",
+                        file_id, chunk_idx, addr, epoch);
+                });
+            }
         }
         Response::SlotIsrRecords { records }
     }
@@ -17002,6 +17048,7 @@ impl Server {
                 && self.ensure_anchor_local(file_id, tag.chunk_idx, primary_base, tag.primary).await
             {
                 slot.set_anchor(primary_base, version - 1);
+                self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
             }
             if slot.head_version() != Some(version - 1) {
                 let behind = slot.head_version().is_none_or(|hv| hv < version);
@@ -17010,7 +17057,7 @@ impl Server {
                         Some((anchor, at)) => {
                             info!("[ORDER] secondary: file {} chunk {}: resynced from the primary at v{} ({})",
                                 file_id, tag.chunk_idx, at, anchor);
-                            slot.set_anchor(anchor, at);
+                            self.adopt_resync_anchor(file_id, tag.chunk_idx, tag.isr_epoch, &slot, anchor, at).await;
                         }
                         None => warn!("[ORDER] secondary: file {} chunk {} v{}: resync from the primary failed",
                             file_id, tag.chunk_idx, version),
@@ -17030,6 +17077,11 @@ impl Server {
             }
             let base = slot.head().unwrap_or(primary_base);
             let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
+            if matches!(resp, Response::MultiPatchResult { .. }) {
+                // Applied onto our head at v-1, which this epoch's stream began from the
+                // primary's anchor or a resync: we hold everything the primary acked.
+                self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
+            }
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             slot.finish(tag.write_id, version, &resp);
             resp
@@ -17174,6 +17226,7 @@ impl Server {
                 return resp;
             }
             slot.set_anchor(anchor, version);
+            self.note_synced_as_secondary(file_id, chunk_idx, tag.isr_epoch).await;
             let size = self.storage.get_chunk_size(&anchor);
             if let Some(sz) = size {
                 advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, sz as usize, None);
@@ -17330,6 +17383,36 @@ impl Server {
         }
     }
 
+    /// This node caught up as the slot's secondary at `epoch` (see SLOT_SYNCED_TABLE).
+    async fn note_synced_as_secondary(&self, file_id: FileId, chunk_idx: u64, epoch: u64) {
+        if self.write_ordering.raise_synced(file_id, chunk_idx, epoch) {
+            if let Err(e) = self.metadata.put_slot_synced_epoch_async(file_id, chunk_idx, epoch).await {
+                warn!("[ISR] file {} chunk {}: recording that this node caught up at epoch {} failed: {}", file_id, chunk_idx, epoch, e);
+            }
+        }
+    }
+
+    /// Whether this node is known to hold the slot's acked writes as the secondary of `epoch`:
+    /// carried over from epoch 1 (seeded from the chunk's holders), or caught up with the
+    /// primary at this epoch. A replacement joins an epoch with none of them.
+    async fn caught_up_as_secondary(&self, file_id: FileId, chunk_idx: u64, epoch: u64) -> bool {
+        epoch <= 1
+            || self.write_ordering.synced_epoch(file_id, chunk_idx) >= epoch
+            || self.metadata.get_slot_synced_epoch_async(file_id, chunk_idx).await.is_ok_and(|e| e >= epoch)
+    }
+
+    /// Secondary: the primary's state `anchor` after version `at` is now this node's state of
+    /// the slot. The chunk map follows it: a takeover starts the new stream from the chunk map
+    /// (`ordered_stream_start`), and a secondary that resynced while the slot was idle has
+    /// no later write to move it there.
+    async fn adopt_resync_anchor(&self, file_id: FileId, chunk_idx: u64, epoch: u64, slot: &crate::write_order::SlotOrder, anchor: ChunkId, at: u64) {
+        slot.set_anchor(anchor, at);
+        if let Some(size) = self.storage.get_chunk_size(&anchor) {
+            advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, size as usize, None);
+        }
+        self.note_synced_as_secondary(file_id, chunk_idx, epoch).await;
+    }
+
     /// Secondary: ask the primary for its current state of the slot as a real chunk, and hold
     /// it locally. Returns the chunk and the version it reflects.
     async fn resync_from_primary(&self, tag: &dfs_common::WriteOrderTag) -> Option<(ChunkId, u64)> {
@@ -17359,7 +17442,7 @@ impl Server {
         match self.resync_from_primary(&tag).await {
             Some((anchor, at)) => {
                 info!("[ORDER] secondary: file {} chunk {}: resynced from the primary at v{} on its request ({})", file_id, chunk_idx, at, anchor);
-                slot.set_anchor(anchor, at);
+                self.adopt_resync_anchor(file_id, chunk_idx, isr_epoch, &slot, anchor, at).await;
                 Response::Ok { data: None }
             }
             None => Response::Error { message: "ResyncFromPrimary: resync failed".into(), code: ErrorCode::InternalError },
@@ -23813,6 +23896,51 @@ mod tests {
         let unknown = ChunkId::from_hash({ let mut x = current.hash; x[31] ^= 0xff; x });
         assert_eq!(h.server.materialize_anchor(file_id, chunk_idx, unknown).await, None,
             "an unreadable version must not be replaced by this node's own content for the slot");
+    }
+
+    /// Suite T74a (10-13): a replacement secondary that never caught up took over from a dead
+    /// primary and anchored the new epoch on its own stale copy; acked writes were lost. It
+    /// must refuse until it has caught up at its epoch. Seeded epoch-1 members (the chunk's
+    /// holders) and caught-up replacements still take over, and caught-up survives a restart.
+    #[tokio::test]
+    async fn a_replacement_that_never_caught_up_must_not_take_over() {
+        use dfs_common::NodeInfo;
+        let h = make_overlay_test_harness();
+        h.server.lease.grant_own_lease_for_test();
+        let me = h.server.cluster().local_node_id();
+        let (primary, spare) = (NodeId::new(), NodeId::new());
+        // Nothing listens on either: the primary is dead, the spare can't vote.
+        h.server.cluster().add_node(NodeInfo::new(primary, "127.0.0.1:19371".parse().unwrap(), None)).await.unwrap();
+        h.server.cluster().add_node(NodeInfo::new(spare, "127.0.0.1:19372".parse().unwrap(), None)).await.unwrap();
+        h.server.lease.declare_expired_for_test(primary);
+        let refusal = |r: &Response| match r {
+            Response::Error { message, .. } => message.clone(),
+            other => format!("{:?}", other),
+        };
+
+        // Epoch 2: this node joined as the replacement and never caught up.
+        let file_id = FileId::new();
+        h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 2, members: vec![primary, me] });
+        let r = h.server.replace_isr_member(file_id, 0, 2, primary, false).await;
+        assert!(refusal(&r).contains("isn't caught up"),
+            "BUG: a replacement that never caught up went on to take over (stale anchor, lost acked writes): {}", refusal(&r));
+
+        // Seeded at epoch 1 from the chunk's holders: carried over, may take over.
+        let file1 = FileId::new();
+        h.server.slot_isr.set_committed_for_test(file1, 0, crate::slot_isr::SlotIsr { epoch: 1, members: vec![primary, me] });
+        let r = h.server.replace_isr_member(file1, 0, 1, primary, false).await;
+        assert!(!refusal(&r).contains("caught up"), "an epoch-1 member was refused as not caught up: {}", refusal(&r));
+
+        // Caught up at epoch 2 (an ordered write applied onto the primary's anchor): may take
+        // over, and the standing is durable.
+        h.server.note_synced_as_secondary(file_id, 0, 2).await;
+        let r = h.server.replace_isr_member(file_id, 0, 2, primary, false).await;
+        assert!(!refusal(&r).contains("caught up"), "a caught-up replacement was refused: {}", refusal(&r));
+        assert_eq!(h.metadata.get_slot_synced_epoch(file_id, 0).unwrap(), 2, "caught-up must survive a restart");
+        // Caught up at an older epoch doesn't count for a newer one.
+        h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 3, members: vec![primary, me] });
+        let r = h.server.replace_isr_member(file_id, 0, 3, primary, false).await;
+        assert!(refusal(&r).contains("isn't caught up"), "caught up at epoch 2 let it take over at epoch 3: {}", refusal(&r));
     }
 
     /// Confirmed slots must not be re-reported before the re-audit interval, and a slot

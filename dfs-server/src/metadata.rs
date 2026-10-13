@@ -205,6 +205,15 @@ const CHUNK_SEQ_TABLE: TableDefinition<&str, u64> = TableDefinition::new("chunk_
 /// FILE_TOMBSTONE_RETENTION by prune_file_tombstones.
 const FILE_TOMBSTONE_TABLE: TableDefinition<&str, u64> = TableDefinition::new("file_tombstone");
 
+/// "file_id:chunk_idx" -> the highest ISR epoch at which this node, as the slot's secondary,
+/// is known to hold the primary's state (it applied an ordered write onto the primary's
+/// anchor, or resynced from it). A replacement secondary joins an epoch holding none of the
+/// slot's earlier acked writes; until it catches up it must not take over from the primary,
+/// or it anchors the new epoch on what it has and the acked writes are lost (suite T74a).
+/// A restarted secondary keeps its standing: an epoch's writes can't be acked without it.
+/// Lazily created on first write, like CHUNK_SEQ_TABLE; monotonic.
+const SLOT_SYNCED_TABLE: TableDefinition<&str, u64> = TableDefinition::new("slot_synced");
+
 // ---------------------------------------------------------------------------
 
 /// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
@@ -2222,6 +2231,14 @@ impl MetadataStore {
             for k in &seq_keys {
                 seq_table.remove(k.as_str())?;
             }
+            let mut synced_table = txn.open_table(SLOT_SYNCED_TABLE)?;
+            let synced_keys: Vec<String> = synced_table.range(lo.as_str()..hi.as_str())?
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k.value().to_string())
+                .collect();
+            for k in &synced_keys {
+                synced_table.remove(k.as_str())?;
+            }
             let mut announce_table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
             let announce_keys: Vec<String> = announce_table.range::<&str>(..)?
                 .filter_map(|r| r.ok())
@@ -2941,6 +2958,53 @@ impl MetadataStore {
             out.push((FileId::from_uuid(file_uuid), chunk_idx, seq.value()));
         }
         Ok(out)
+    }
+
+    /// The highest ISR epoch at which this node caught up as the slot's secondary (see
+    /// SLOT_SYNCED_TABLE), or 0.
+    pub fn get_slot_synced_epoch(&self, file_id: FileId, chunk_idx: u64) -> Result<u64> {
+        let key = format!("{}:{}", file_id, chunk_idx);
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(SLOT_SYNCED_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0))
+    }
+
+    /// Record that this node caught up as the slot's secondary at `epoch` (monotonic).
+    /// Durable before it returns: a takeover may rely on it after a restart.
+    pub fn put_slot_synced_epoch(&self, file_id: FileId, chunk_idx: u64, epoch: u64) -> Result<()> {
+        let key = format!("{}:{}", file_id, chunk_idx);
+        let _db = self.db.read();
+        let mut txn = self.begin_write(&_db)?;
+        txn.set_durability(Durability::Immediate);
+        {
+            let mut table = txn.open_table(SLOT_SYNCED_TABLE)?;
+            let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            if epoch > current {
+                table.insert(key.as_str(), epoch)?;
+            }
+        }
+        self.commit(txn)?;
+        self.note_txn("put_slot_synced_epoch", 0);
+        Ok(())
+    }
+
+    pub async fn get_slot_synced_epoch_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64) -> Result<u64> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_slot_synced_epoch(file_id, chunk_idx))
+            .await
+            .context("spawn_blocking panicked in get_slot_synced_epoch_async")?
+    }
+
+    pub async fn put_slot_synced_epoch_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64, epoch: u64) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_slot_synced_epoch(file_id, chunk_idx, epoch))
+            .await
+            .context("spawn_blocking panicked in put_slot_synced_epoch_async")?
     }
 
     // -------------------------------------------------------------------------
@@ -7455,7 +7519,7 @@ mod tests {
                      DELETE_QUEUE_TABLE, PATCH_STATE_TABLE, PENDING_FOLD_ANNOUNCE_TABLE, PATCH_STATE_SLOT_TABLE,
                      SLOT_ISR_TABLE, PATCH_DELTA_RENAME_TABLE, PATCH_STATE_ALIAS_TABLE];
         let u64s = [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE, PATCH_FOLD_TIMESTAMP_TABLE,
-                    CHUNK_SEQ_TABLE, FILE_TOMBSTONE_TABLE];
+                    CHUNK_SEQ_TABLE, FILE_TOMBSTONE_TABLE, SLOT_SYNCED_TABLE];
         {
             let db = store.db.read();
             let txn = db.begin_write().unwrap();

@@ -70,11 +70,17 @@ pub struct WriteOrdering {
     /// Latest ISR epoch seen per (file, chunk_idx), so an unordered write can find the
     /// slot's stream without scanning every slot.
     latest_epoch: DashMap<(FileId, u64), u64>,
+    /// Highest ISR epoch at which this node caught up as the slot's secondary (the durable
+    /// copy is the metadata store's SLOT_SYNCED_TABLE; this saves a write per ordered write).
+    synced: DashMap<(FileId, u64), u64>,
 }
 
 impl Default for WriteOrdering {
     fn default() -> Self {
-        WriteOrdering { boot: uuid::Uuid::new_v4().as_u64_pair().0, slots: DashMap::new(), latest_epoch: DashMap::new() }
+        WriteOrdering {
+            boot: uuid::Uuid::new_v4().as_u64_pair().0, slots: DashMap::new(), latest_epoch: DashMap::new(),
+            synced: DashMap::new(),
+        }
     }
 }
 
@@ -132,6 +138,22 @@ impl WriteOrdering {
     pub fn latest_slot(&self, file_id: FileId, chunk_idx: u64) -> Option<Arc<SlotOrder>> {
         let epoch = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e)?;
         self.slots.get(&(file_id, chunk_idx, epoch)).map(|s| s.clone())
+    }
+
+    /// Record that this node caught up as the slot's secondary at `epoch`. True if that's
+    /// news (the caller then persists it).
+    pub fn raise_synced(&self, file_id: FileId, chunk_idx: u64, epoch: u64) -> bool {
+        let mut e = self.synced.entry((file_id, chunk_idx)).or_insert(0);
+        if *e >= epoch {
+            return false;
+        }
+        *e = epoch;
+        true
+    }
+
+    /// The highest epoch this process saw this node catch up at as the slot's secondary.
+    pub fn synced_epoch(&self, file_id: FileId, chunk_idx: u64) -> u64 {
+        self.synced.get(&(file_id, chunk_idx)).map_or(0, |e| *e)
     }
 
     /// An unordered write changed this slot here: the ordered stream's head no longer

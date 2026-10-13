@@ -14,10 +14,16 @@
 #   scripts/bench_staging.sh swap-client <path> [0|1]  replace just the client binary and remount
 #   scripts/bench_staging.sh dd <label> [N]         N x `dd 500 MB conv=fsync` on the client (the rock5b
 #                                                   10-13 EIO) -> /root/dfs-staging-dd-<label>.txt
+#   scripts/bench_staging.sh lat <label> [N]        N x 500 4 KiB O_DSYNC writes on the client: per-write
+#                                                   latency -> /root/dfs-staging-lat-<label>.txt
+#   scripts/bench_staging.sh read <label> [N] [MB]  write one MB-sized file (default 2048: more than the
+#                                                   servers can cache), then N x remount + sequential read
+#                                                   piped through md5 -> /root/dfs-staging-read-<label>.txt
 #   scripts/bench_staging.sh teardown               unmount, stop, delete everything
 #
 # BENCH_JOBS="seq1m_fsync ..." runs only those fio jobs (default: all).
 # BENCH_SERVER_EXTRA_ENV="K=V ..." adds environment for the servers (e.g. DFS_APTIMING_INFO_MS=0).
+# BENCH_CLIENT_EXTRA_ENV="K=V ..." adds environment for the client (e.g. DFS_CHAIN_WRITES=1).
 # BENCH_SERVER_BIN_DIR / BENCH_CLIENT_BIN deploy other binaries (e.g. production's own, copied
 # read-only, for a prod-vs-new comparison). A redeploy over a running bench needs teardown first.
 set -e
@@ -59,7 +65,7 @@ start_servers() {  # $1 = DFS_ORDERED_WRITES; DFS_METADATA_DURABLE from the call
 start_client() {  # $1 = DFS_ORDERED_WRITES
     local cluster
     cluster=$(for n in $NODES; do printf '%s:%s,' "$(ip_of "$n")" "$PORT"; done); cluster=${cluster%,}
-    ssh root@"$CLIENT" "mkdir -p $MNT || exit 1; DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $CDIR/dfs-client mount $MNT --cluster $cluster --log-file $CDIR/client.log --allow-other > $CDIR/client.out 2>&1 < /dev/null & sleep 3; mountpoint -q $MNT && echo mounted || echo MOUNT-FAILED"
+    ssh root@"$CLIENT" "mkdir -p $MNT || exit 1; $BENCH_CLIENT_EXTRA_ENV DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $CDIR/dfs-client mount $MNT --cluster $cluster --log-file $CDIR/client.log --allow-other > $CDIR/client.out 2>&1 < /dev/null & sleep 3; mountpoint -q $MNT && echo mounted || echo MOUNT-FAILED"
     sleep 10   # leases, ISR seeding (default 30s cadence: the first writes may go unordered)
 }
 
@@ -145,10 +151,31 @@ dd)
     out=/root/dfs-staging-dd-$2.txt; : > "$out"
     for r in $(seq 1 "${3:-3}"); do
         # timeouts/skipped count this run's client-log lines only (the log spans every run).
-        res=$(ssh root@"$CLIENT" "cd $MNT && rm -f dd.img; L=$CDIR/client.log; t0=\$(grep -c 'Timeout writing' \$L); k0=\$(grep -c 'skipping without attempting' \$L); s=\$(date +%s); dd if=/dev/urandom of=dd.img bs=1M count=500 conv=fsync status=none 2>&1; rc=\$?; e=\$(date +%s); echo rc=\$rc secs=\$((e - s)) timeouts=\$((\$(grep -c 'Timeout writing' \$L) - t0)) skipped=\$((\$(grep -c 'skipping without attempting' \$L) - k0)); rm -f dd.img")
+        res=$(ssh root@"$CLIENT" "cd $MNT && rm -f dd.img; L=$CDIR/client.log; t0=\$(grep -c 'Timeout writing' \$L); k0=\$(grep -c 'skipping without attempting' \$L); s=\$(date +%s%N); dd if=/dev/urandom of=dd.img bs=1M count=500 conv=fsync status=none 2>&1; rc=\$?; e=\$(date +%s%N); echo rc=\$rc ms=\$(( (e - s) / 1000000 )) MBps=\$(( 500 * 1000000000 / (e - s) )) timeouts=\$((\$(grep -c 'Timeout writing' \$L) - t0)) skipped=\$((\$(grep -c 'skipping without attempting' \$L) - k0)); rm -f dd.img")
         echo "run $r: $(echo $res | tr '\n' ' ')" | tee -a "$out"
         sleep 20
     done
+    ;;
+lat)
+    out=/root/dfs-staging-lat-$2.txt; : > "$out"
+    for r in $(seq 1 "${3:-3}"); do
+        res=$(ssh root@"$CLIENT" "cd $MNT && rm -f lat.img && dd if=/dev/zero of=lat.img bs=1M count=8 conv=fsync status=none && s=\$(date +%s%N); dd if=/dev/urandom of=lat.img bs=4k count=500 oflag=dsync conv=notrunc status=none; rc=\$?; e=\$(date +%s%N); echo rc=\$rc us_per_write=\$(( (e - s) / 500000 )); rm -f lat.img")
+        echo "run $r: $res" | tee -a "$out"
+        sleep 5
+    done
+    ;;
+read)
+    out=/root/dfs-staging-read-$2.txt; : > "$out"
+    mb=${4:-2048}
+    w=$(ssh root@"$CLIENT" "cd $MNT && rm -f rd.img; s=\$(date +%s%N); dd if=/dev/urandom bs=1M count=$mb status=none | tee rd.img | md5sum | cut -d' ' -f1 > $CDIR/rd.md5; sync rd.img; e=\$(date +%s%N); echo write_MBps=\$(( $mb * 1000000000 / (e - s) ))")
+    echo "wrote $mb MB: $w" | tee -a "$out"
+    for r in $(seq 1 "${3:-3}"); do
+        # A fresh mount each run: nothing comes from the client's caches or rock5b's page cache.
+        stop_bench_client; sleep 1; start_client "${READ_ORDERED:-1}" >/dev/null
+        res=$(ssh root@"$CLIENT" "cd $MNT && s=\$(date +%s%N); m=\$(dd if=rd.img bs=1M status=none | md5sum | cut -d' ' -f1); e=\$(date +%s%N); [ \"\$m\" = \"\$(cat $CDIR/rd.md5)\" ] && ok=match || ok=MISMATCH; echo ms=\$(( (e - s) / 1000000 )) MBps=\$(( $mb * 1000000000 / (e - s) )) md5=\$ok")
+        echo "run $r: $res" | tee -a "$out"
+    done
+    ssh root@"$CLIENT" "rm -f $MNT/rd.img"
     ;;
 teardown)
     stop_bench_client; stop_bench_servers; sleep 2

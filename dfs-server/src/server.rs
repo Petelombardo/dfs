@@ -17003,7 +17003,7 @@ impl Server {
                 (head, _) => {
                     let start = match head {
                         Some(h) => h,
-                        None => self.ordered_stream_start(file_id, tag.chunk_idx, chunk_id).await,
+                        None => self.ordered_stream_start(file_id, tag.chunk_idx, tag.isr_epoch, chunk_id).await,
                     };
                     match self.materialize_anchor(file_id, tag.chunk_idx, start).await {
                         Some(anchor) => {
@@ -17507,10 +17507,12 @@ impl Server {
         }
         let slot = self.write_ordering.slot(file_id, chunk_idx, isr_epoch);
         let _order = slot.order_lock.lock().await;
-        let start = slot.head().or_else(|| self.chunk_map.get(&file_id).and_then(|e| {
-            let (locs, _) = e.value();
-            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
-        }));
+        let start = slot.head()
+            .or_else(|| self.write_ordering.previous_epoch_head(file_id, chunk_idx, isr_epoch))
+            .or_else(|| self.chunk_map.get(&file_id).and_then(|e| {
+                let (locs, _) = e.value();
+                Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+            }));
         let Some(start) = start else {
             return Response::Error { message: format!("ResyncSlot: no state here for file {} chunk {}", file_id, chunk_idx), code: ErrorCode::NotFound };
         };
@@ -17533,10 +17535,17 @@ impl Server {
     }
 
     /// Where a slot's ordered stream starts on the primary (no head yet: the first ordered
-    /// write at this epoch, or an unordered write since). This node's view of the slot when it
-    /// can resolve it locally, as the unordered staleness check would rebase onto, else the
-    /// client's id. Either way the secondary is told this exact base with `WriteOrder`.
-    async fn ordered_stream_start(&self, file_id: FileId, chunk_idx: u64, client_base: ChunkId) -> ChunkId {
+    /// write at this epoch, or an unordered write since). This node's head from the epoch
+    /// before, when it was in that ISR (`WriteOrdering::previous_epoch_head`); else its view of
+    /// the slot when it can resolve it locally, as the unordered staleness check would rebase
+    /// onto; else the client's id. Either way the secondary is told this exact base with
+    /// `WriteOrder`.
+    async fn ordered_stream_start(&self, file_id: FileId, chunk_idx: u64, isr_epoch: u64, client_base: ChunkId) -> ChunkId {
+        if let Some(head) = self.write_ordering.previous_epoch_head(file_id, chunk_idx, isr_epoch) {
+            if self.chunk_resolvable_locally(head).await {
+                return head;
+            }
+        }
         let local = self.chunk_map.get(&file_id).and_then(|e| {
             let (locs, _) = e.value();
             Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
@@ -23860,6 +23869,31 @@ mod tests {
             let share = *owned.get(n).unwrap_or(&0) as f64 / 5000.0;
             assert!((0.15..=0.25).contains(&share), "node {} owns {:.1}% of slots, expected ~20%", n, share * 100.0);
         }
+    }
+
+    /// T74d (10-13): an ISR change kept this node as the slot's primary. Its new stream
+    /// started from the client's base, a token this node had already merged past and retired:
+    /// unreadable everywhere, so no anchor, the replacement secondary couldn't resync, and the
+    /// client's fsync got EIO. The stream must start from this node's head of the epoch before.
+    #[tokio::test]
+    async fn a_primary_kept_across_an_isr_change_starts_the_new_stream_from_its_previous_head() {
+        let h = make_overlay_test_harness();
+        let file_id = FileId::new();
+        let chunk_idx = 2u64;
+        let off = chunk_idx * 4 * 1024 * 1024;
+        let content = vec![0x5au8; 4096];
+        let head = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&content, off, file_id));
+        h.storage.write_chunk(&head, &content).unwrap();
+        h.server.write_ordering.slot(file_id, chunk_idx, 2).set_anchor(head, 7);
+        let retired = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&[0x01u8; 4096], off, file_id));
+        let _ = h.server.write_ordering.slot(file_id, chunk_idx, 3);
+
+        assert_eq!(h.server.ordered_stream_start(file_id, chunk_idx, 3, retired).await, head,
+            "the new epoch's stream must start from this node's previous-epoch head, not the client's retired base");
+
+        // Moved past by an unordered write here: the old head must not carry.
+        h.server.write_ordering.clear_head(file_id, chunk_idx);
+        assert_eq!(h.server.ordered_stream_start(file_id, chunk_idx, 3, retired).await, retired);
     }
 
     /// SLOT-OWNERSHIP-PLAN.md Phase 0: the slot audit must find exactly the planted

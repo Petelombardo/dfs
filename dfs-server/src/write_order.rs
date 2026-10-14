@@ -114,12 +114,33 @@ impl WriteOrdering {
     /// same content-addressed result, so this also re-converges their ids. Compare-and-set: an
     /// ordered write that already moved the head past `token` wins.
     pub fn on_folded(&self, file_id: FileId, chunk_idx: u64, token: ChunkId, result: ChunkId) {
-        if let Some(slot) = self.latest_slot(file_id, chunk_idx) {
+        for slot in self.newest_two(file_id, chunk_idx) {
             let mut g = slot.inner.lock().unwrap();
             if g.head == Some(token) {
                 g.head = Some(result);
             }
         }
+    }
+
+    /// The slot's newest stream and the one before it (see `previous_epoch_head`).
+    fn newest_two(&self, file_id: FileId, chunk_idx: u64) -> Vec<Arc<SlotOrder>> {
+        let Some(epoch) = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e) else { return Vec::new() };
+        [Some(epoch), epoch.checked_sub(1)].into_iter().flatten()
+            .filter_map(|e| self.slots.get(&(file_id, chunk_idx, e)).map(|s| s.clone()))
+            .collect()
+    }
+
+    /// This node's continuable head of the slot's stream at the epoch just before `epoch`.
+    /// It was in that epoch's ISR, and a write there was acked only once both members applied
+    /// it, so this head holds every write acked before the change. A primary that stays on
+    /// across an ISR change starts the new stream here: from the client's base instead (often
+    /// a token this node had merged past and retired) it couldn't anchor, the replacement
+    /// secondary couldn't resync, and the client's write failed with EIO (suite T74d, 10-13).
+    /// None after an unordered write here (`clear_head`), a failed apply, or a restart.
+    pub fn previous_epoch_head(&self, file_id: FileId, chunk_idx: u64, epoch: u64) -> Option<ChunkId> {
+        let slot = self.slots.get(&(file_id, chunk_idx, epoch.checked_sub(1)?))?;
+        let g = slot.inner.lock().unwrap();
+        g.head_version.and(g.head)
     }
 
     /// Whether the slot's ordered stream applied a version here within `window`. A background
@@ -158,9 +179,10 @@ impl WriteOrdering {
 
     /// An unordered write changed this slot here: the ordered stream's head no longer
     /// names this replica's current state, so the next ordered write takes its base fresh.
+    /// Clears the previous epoch's head too: it must not carry into a new stream (see
+    /// `previous_epoch_head`) once this replica's state has moved past it.
     pub fn clear_head(&self, file_id: FileId, chunk_idx: u64) {
-        let Some(epoch) = self.latest_epoch.get(&(file_id, chunk_idx)).map(|e| *e) else { return };
-        if let Some(slot) = self.slots.get(&(file_id, chunk_idx, epoch)) {
+        for slot in self.newest_two(file_id, chunk_idx) {
             let mut g = slot.inner.lock().unwrap();
             g.head = None;
             g.head_version = None;
@@ -493,5 +515,20 @@ mod tests {
         assert_eq!((o.slot(f, 0, 1).assign(), o.slot(f, 0, 1).assign()), (1, 2));
         assert_eq!(o.slot(f, 1, 1).assign(), 1, "another chunk is its own stream");
         assert_eq!(o.slot(f, 0, 2).assign(), 1, "a new ISR epoch starts a new stream");
+    }
+
+    #[test]
+    fn the_previous_epochs_head_carries_only_to_the_next_epoch_and_only_while_current() {
+        let o = WriteOrdering::default();
+        let f = FileId::new();
+        let (a, b) = (ChunkId::from_hash([1u8; 32]), ChunkId::from_hash([2u8; 32]));
+        o.slot(f, 0, 2).set_anchor(a, 4);
+        let _ = o.slot(f, 0, 3);
+        assert_eq!(o.previous_epoch_head(f, 0, 3), Some(a));
+        assert_eq!(o.previous_epoch_head(f, 0, 4), None, "an epoch this node skipped breaks the chain");
+        o.on_folded(f, 0, a, b);
+        assert_eq!(o.previous_epoch_head(f, 0, 3), Some(b), "a fold of the carried head follows it");
+        o.clear_head(f, 0);
+        assert_eq!(o.previous_epoch_head(f, 0, 3), None, "an unordered write here retires the carried head");
     }
 }

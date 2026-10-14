@@ -1053,8 +1053,20 @@ echo "  T86: 64 MB: dd rc=$T86_RC, chained writes: $T86_CHAINED, second copies p
     && check "T86b the chained file reads back exactly through another client, every chunk on 2+ nodes" PASS \
     || check "T86b chained file: read-back ${T86_M2:-unreadable} vs $T86_M1, $T86_THIN chunk(s) under 2 copies" FAIL
 # A replica down: chains through or to it fail, and the client must place those copies itself.
-pkill -9 -f "dfs-server start --config $BASE/node5/config.toml" 2>/dev/null || true
-for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node5/config.toml" >/dev/null || break; sleep 0.1; done
+# Down a node that isn't the leader (the leader is the min-id online node): node ids are
+# random, a SIGKILLed leader isn't replaced for 2 x failure_timeout (240 s here), and with
+# none the client couldn't even create the file (T86c, 2 of 8 runs). Leader death is T51's.
+T86_VADDR=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[-1]['address'] if len(online) > 1 else '127.0.0.1:8904')
+" 2>/dev/null)
+T86_VN=$(( (${T86_VADDR##*:} - 8900) + 1 ))
+echo "  T86: downing node$T86_VN ($T86_VADDR), not the leader"
+pkill -9 -f "dfs-server start --config $BASE/node$T86_VN/config.toml" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T86_VN/config.toml" >/dev/null || break; sleep 0.1; done
 sleep 2
 dd if=/dev/urandom of="$BASE/t86_b.bin" bs=1M count=32 status=none
 T86_RC=0
@@ -1068,8 +1080,8 @@ T86_THIN=$(t86_copies_thin /t86_b.bin | wc -w)
 fusermount -u "$T86_MNT" 2>/dev/null || true
 kill_client_and_wait "$T86_CPID"
 rm -f "$MOUNT/t86_a.bin" "$MOUNT/t86_b.bin" "$BASE"/t86_*.bin
-RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
-    >> "$LOG/server5.log" 2>&1 &
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T86_VN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+    >> "$LOG/server$T86_VN.log" 2>&1 &
 for _ in $(seq 1 60); do
     [ "$("$BIN/dfs-admin" --cluster "$CLUSTER" cluster status 2>/dev/null | grep -oP 'Healthy Nodes:\s+\K[0-9]+')" = 5 ] && break
     sleep 0.5

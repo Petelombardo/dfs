@@ -530,6 +530,8 @@ async fn handle_cluster_command(
                         let output = serde_json::json!({
                             "total_nodes": total_nodes,
                             "healthy_nodes": healthy_nodes,
+                            // The answering server's leader: null while it can't see a majority.
+                            "leader": leader_node_id.and_then(|lid| nodes.iter().find(|n| n.id == lid)).map(|n| n.addr.to_string()),
                             "nodes": nodes.iter().map(|n| {
                                 let id_str = n.id.to_string();
                                 let short_id = &id_str[..8.min(id_str.len())];

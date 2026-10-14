@@ -5745,6 +5745,10 @@ impl Server {
         let lease = Arc::new(crate::lease::LeaseRuntime::new(
             cluster.local_node_id(), cluster.clone(), Arc::new(NetworkClient::new_for_peers()), &metadata_dir,
         ));
+        // Leadership skips a peer a majority voted expired (see `lease_expired_probe`). Weak:
+        // the lease runtime holds the cluster manager.
+        let lease_weak = Arc::downgrade(&lease);
+        cluster.set_lease_expired_probe(move |id| lease_weak.upgrade().is_some_and(|l| l.is_expired(id)));
         let slot_isr = Arc::new(crate::slot_isr::SlotIsrService::new(
             cluster.local_node_id(), Arc::new(NetworkClient::new_for_peers()), metadata.clone(), lease.clone(),
         ));

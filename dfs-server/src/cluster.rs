@@ -79,6 +79,14 @@ pub struct ClusterManager {
     /// file read back as 0 bytes (suite T81c).
     self_unfit_probe: Arc<std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>>,
 
+    /// Asked live whenever leadership is weighed: true for a peer a majority voted its lease
+    /// expired at its latest incarnation (`set_lease_expired_probe`). Such a node is fenced,
+    /// can't commit, and is dead or cut off. The failure detector alone marks it offline only
+    /// after `failure_timeout` (30 s in production), and a SIGKILLed leader kept leadership that
+    /// long though its lease was voted out in ~3-4 s: creates failed with EIO past the client's
+    /// 15 s budget (suite T88, Legata f2708108).
+    lease_expired_probe: Arc<std::sync::OnceLock<Box<dyn Fn(NodeId) -> bool + Send + Sync>>>,
+
     /// The term of this node's latest leadership while fit and caught up: once its election
     /// catch-up has pulled every record (`leading_caught_up`), and again whenever a peer
     /// reports a term as high, it moves above every term it knows of. Peers' terms come with
@@ -209,6 +217,7 @@ impl ClusterManager {
             became_leader_at: Arc::new(RwLock::new(None)),
             leader_unfit: Arc::new(std::sync::Mutex::new(HashMap::new())),
             self_unfit_probe: Arc::new(std::sync::OnceLock::new()),
+            lease_expired_probe: Arc::new(std::sync::OnceLock::new()),
             own_term: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             leader_terms: Arc::new(std::sync::Mutex::new(HashMap::new())),
             caught_up_generation: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
@@ -467,15 +476,19 @@ impl ClusterManager {
         if online_ids.len() < self.quorum_of(nodes.len()) {
             return None;
         }
-        let leader = self.leader_among(online_ids);
+        let leader = self.leader_among(online_ids.clone());
         let mut last = self.last_leader_seen.lock().unwrap();
         if *last != leader {
             let unfit: Vec<NodeId> = {
                 let now = std::time::Instant::now();
                 self.leader_unfit.lock().unwrap().iter().filter(|(_, until)| **until > now).map(|(id, _)| *id).collect()
             };
-            info!("[LEADER] leader in this node's view: {:?} -> {:?} (unfit: {:?}, own term {}, peer terms {:?})",
-                *last, leader, unfit, self.led_term(), self.leader_terms.lock().unwrap());
+            let lease_expired: Vec<NodeId> = match self.lease_expired_probe.get() {
+                Some(expired) => online_ids.iter().copied().filter(|id| *id != self.local_node_id && expired(*id)).collect(),
+                None => Vec::new(),
+            };
+            info!("[LEADER] leader in this node's view: {:?} -> {:?} (unfit: {:?}, lease expired: {:?}, own term {}, peer terms {:?})",
+                *last, leader, unfit, lease_expired, self.led_term(), self.leader_terms.lock().unwrap());
             let was_self = *last == Some(self.local_node_id);
             *last = leader;
             let generation = self.leader_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -575,6 +588,11 @@ impl ClusterManager {
         let _ = self.self_unfit_probe.set(Box::new(probe));
     }
 
+    /// Install the live check behind `lease_expired_probe`. Once, at startup.
+    pub fn set_lease_expired_probe(&self, probe: impl Fn(NodeId) -> bool + Send + Sync + 'static) {
+        let _ = self.lease_expired_probe.set(Box::new(probe));
+    }
+
     /// The leader among `online`: the min id, skipping nodes that reported they can't lead.
     /// A leader whose disk is full can't commit file records, so every client write failed
     /// for as long as it stayed full (suite T80c). This node judges itself live as well as
@@ -586,7 +604,17 @@ impl ClusterManager {
     /// The min id instead moved leadership onto a node that had filled first and never
     /// caught up, and a 16 MB file read back as 0 bytes (suite T81c). The terms stop moving
     /// once no node leads while fit, so every node reaches the same answer.
+    ///
+    /// A peer whose lease a majority voted expired is not a candidate at all
+    /// (`lease_expired_probe`): every voter fences what it votes, so the survivors drop it
+    /// together, seconds before their failure detectors would. It is a candidate again once
+    /// it renews under a new incarnation. Only leadership moves early: healing still waits for
+    /// the failure detector, so a brief stall doesn't start re-replicating its chunks.
     fn leader_among(&self, online: Vec<NodeId>) -> Option<NodeId> {
+        let online: Vec<NodeId> = match self.lease_expired_probe.get() {
+            Some(expired) => online.into_iter().filter(|id| *id == self.local_node_id || !expired(*id)).collect(),
+            None => online,
+        };
         let now = std::time::Instant::now();
         let self_unfit = online.contains(&self.local_node_id)
             && self.self_unfit_probe.get().is_some_and(|probe| probe());
@@ -1646,6 +1674,33 @@ mod tests {
         assert!(!manager.wait_holder_locations(short).await, "the old leadership's report doesn't count");
         manager.holder_locations_in(second);
         assert!(manager.wait_holder_locations(short).await);
+    }
+
+    /// Suite T88: a SIGKILLed leader kept leadership in every view until the failure detector
+    /// timed it out, though a majority had voted its lease expired. A peer voted expired isn't
+    /// a candidate; it is again once its lease is live (a new incarnation), and a node never
+    /// drops itself on this account.
+    #[tokio::test]
+    async fn a_peer_voted_expired_is_not_leader() {
+        let (manager, ids) = five_node_cluster().await;
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[0]), "lowest id leads");
+        let expired = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let probe = expired.clone();
+        manager.set_lease_expired_probe(move |id| probe.lock().unwrap().contains(&id));
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[0]), "nothing expired: unchanged");
+
+        expired.lock().unwrap().insert(ids[0]);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[1]), "the next lowest leads at once");
+        assert_eq!(manager.get_leader_addr().await, manager.get_all_nodes().await.iter().find(|n| n.id == ids[1]).map(|n| n.addr));
+        assert!(manager.is_leader_id(ids[1]).await && !manager.is_leader_id(ids[0]).await);
+
+        // Its own expiry (as other nodes see it) never takes this node out of its own view.
+        expired.lock().unwrap().extend([ids[1], ids[2], ids[3]]);
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[3]));
+
+        // Renewed under a new incarnation: a candidate again.
+        expired.lock().unwrap().clear();
+        assert_eq!(manager.leader_with_quorum().await, Some(ids[0]));
     }
 
     /// Suite T81c: as disks filled one by one, the min-id rule with every node unfit handed

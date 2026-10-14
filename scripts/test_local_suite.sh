@@ -1181,6 +1181,60 @@ t85_wait_ready || echo "  T87: cluster not fully healthy 30s after restoring nor
 sleep 5
 fi # should_run T87
 
+# ── T88: a crashed leader is replaced within the client's budget (gate G3, Legata f2708108) ──
+# A SIGKILLed leader stayed leader in every node's view until the failure detector timed it
+# out (failure_timeout: 30 s in production, 120 s here), although a majority had voted its
+# lease expired in ~3-4 s. Creates and metadata commits failed with EIO meanwhile (the
+# client's leader budget is 15 s). The new leader must be chosen once its lease is voted out.
+t88_leader() {
+    "$BIN/dfs-admin" --cluster "$1" --format json cluster status 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('leader') or '')" 2>/dev/null
+}
+snapshot_log T88
+if should_run T88; then
+echo "=== T88: kill -9 the leader; an fsynced create succeeds within 15 s and the survivors agree on a new leader ==="
+T88_LADDR=$(t88_leader "$CLUSTER")
+T88_LN=$(( (${T88_LADDR##*:} - 8900) + 1 ))
+echo "x" > "$MOUNT/t88_warm.txt"; dfs_sync
+echo "  T88: leader is node$T88_LN ($T88_LADDR); SIGKILL"
+pkill -9 -f "dfs-server start --config $BASE/node$T88_LN/config.toml" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T88_LN/config.toml" >/dev/null || break; sleep 0.1; done
+T88_T0=$(date +%s%N)
+T88_RC=0
+head -c 65536 /dev/urandom > "$T/t88_a.bin"
+timeout 60 dd if="$T/t88_a.bin" of="$MOUNT/t88_a.bin" bs=64k conv=fsync status=none 2>>"$LOG/t88_dd.err" || T88_RC=$?
+T88_MS=$(( ($(date +%s%N) - T88_T0) / 1000000 ))
+# Every survivor names the same leader, and not the dead one.
+T88_VIEWS=""
+for i in 1 2 3 4 5; do
+    [ "$i" = "$T88_LN" ] && continue
+    T88_VIEWS="$T88_VIEWS $(t88_leader "127.0.0.1:$((8899 + i))")"
+done
+T88_DISTINCT=$(echo $T88_VIEWS | tr ' ' '\n' | sort -u | grep -c . || true)
+echo "  T88: create+fsync rc=$T88_RC in ${T88_MS} ms; survivors' leaders:$T88_VIEWS"
+[ "$T88_RC" = 0 ] && [ "$T88_MS" -le 15000 ] \
+    && check "T88a with the leader SIGKILLed, an fsynced create succeeded in ${T88_MS} ms (budget 15000)" PASS \
+    || check "T88a with the leader SIGKILLed, an fsynced create: rc=$T88_RC after ${T88_MS} ms (budget 15000)" FAIL
+[ "$T88_DISTINCT" = 1 ] && ! echo "$T88_VIEWS" | grep -q "$T88_LADDR" \
+    && check "T88b the 4 survivors agree on a new leader ($(echo $T88_VIEWS | cut -d' ' -f1))" PASS \
+    || check "T88b survivors' leaders after the kill:$T88_VIEWS (dead: $T88_LADDR)" FAIL
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T88_LN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+    >> "$LOG/server$T88_LN.log" 2>&1 &
+t85_wait_ready || echo "  T88: node$T88_LN not back 30s after its restart"
+sleep 3
+# The restarted node rejoins under a new incarnation: leadership settles, and the file is intact.
+T88_VIEWS=""
+for i in 1 2 3 4 5; do T88_VIEWS="$T88_VIEWS $(t88_leader "127.0.0.1:$((8899 + i))")"; done
+T88_DISTINCT=$(echo $T88_VIEWS | tr ' ' '\n' | sort -u | grep -c . || true)
+T88_M1=$(md5sum < "$T/t88_a.bin" | cut -d' ' -f1)
+T88_M2=$(timeout 60 md5sum < "$MOUNT/t88_a.bin" 2>/dev/null | cut -d' ' -f1)
+[ "$T88_DISTINCT" = 1 ] && [ "$T88_M1" = "$T88_M2" ] \
+    && check "T88c after the restart all 5 nodes agree on a leader and the file reads back exactly" PASS \
+    || check "T88c after the restart: leaders:$T88_VIEWS, read-back ${T88_M2:-unreadable} vs $T88_M1" FAIL
+rm -f "$MOUNT/t88_a.bin" "$MOUNT/t88_warm.txt" "$T/t88_a.bin"
+fi # should_run T88
+
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

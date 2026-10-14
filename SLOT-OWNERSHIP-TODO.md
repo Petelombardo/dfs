@@ -4,10 +4,11 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-10-08, T78-T80 (bit rot, one node full, leader full) and their fixes pushed (365a738)_
+_Last updated: 2026-10-13, default-flip gates written down (see "Make ordering the default"); T81-T86 and chain replication_
 
-**Resume here:** 3c step 2 — next: order folds through the primary, then arbitration by version
-at the leader. Ordering kept (2026-10-03). Replica-side version identity done (T64 5/5).
+**Resume here:** the default-flip gates under 3c ("Make ordering the default"). Ordering kept
+(2026-10-03); ordering-on suites run 255-257 pass with 1-2 failures, but nearly every run still
+turns up something real. The gates below say what "stable" means before the flag flips.
 
 ## Where things stand
 
@@ -284,7 +285,38 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       lost; T61d becomes required; **primary killed mid-storm**: no acked write lost, and say
       what the client does until 3d promotes the secondary (fails/retries, or falls back to
       unordered?) — Pete's 2026-10-03 question on the dual-stream durability guarantee
-- [ ] Make the flag the default (or drop it)
+- [ ] **Make ordering the default** (DFS_ORDERED_WRITES=1). Gates, agreed 2026-10-13 (Pete:
+      "the ever elusive stable"). Also on the Legata roadmap shelf wall. Phases 3d/4/5 are NOT
+      required for the flip.
+      State 2026-10-13: ordering-on suites 1-2 failures per run (off: 4-5), but 6 of the last 9
+      runs had a non-flake failure that turned out real or test-side: T57a views diverged,
+      T74a acked loss, T74d writer EIO (a regression from the T74a fix), T76a acked loss on
+      10-12 (not since; maybe closed by T74a), T85a cleanup didn't run on one node, T86c test
+      killed the leader. All fixed or understood except T85a and T76a.
+  - [ ] **G1 Clean streak:** 5 consecutive ordering-on full suites whose only failures are the
+        mode-independent T38b heal-timing flake; each new failure root-caused before the
+        streak restarts.
+  - [ ] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
+        acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
+  - [ ] **G3 Leader crash failover** (Legata f2708108): a SIGKILLed leader stalls creates
+        2 x failure_timeout (~60 s on staging). Leadership must follow the majority-voted
+        lease expiry (~3-4 s); suite test: kill -9 the leader, an fsynced create succeeds
+        within the client's 15 s budget.
+  - [ ] **G4 New-leader chunk maps** (Legata c742039c, T79c/f): a new leader must not serve
+        GetFileChunkMap before holders' locations land (fresh readers get zeros meanwhile).
+  - [ ] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
+        chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
+        creation; T67b/T67c become required.
+  - [ ] **G6 No EIO for a retryable refusal** (Legata 7b87b67e): the client's fresh-write
+        safety-check refusal is retried within the flush deadline, not returned from fsync.
+  - [ ] **G7 Open ordering-on failures closed:** T85a (cleanup ran 0 passes on one node, both
+        modes, 10-13) and T76a (acked loss 10-12; Legata cf286166) root-caused or shown fixed.
+  - [ ] **G8 Bench soak:** the :8950 bench cluster with ordering on, 48 h of a VM-108-like
+        workload (qemu disk I/O + DVR-style sequential writes) plus periodic node kills: 0 guest
+        EIO, 0 acked loss (md5 / fsck checks), latency and throughput no worse than off.
+  - [ ] **G9 Staging soak:** Pete's go-ahead; ordering on for staging (servers, then clients;
+        outside 19:00-22:00 ET), 1 week of normal use with the DVR and VMs, then flip the
+        default in code. Rollback: DFS_ORDERED_WRITES=0 restart.
 
 ## Outside the phases
 
@@ -322,7 +354,7 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   - [x] **Mixed versions (2026-10-07):** rolling upgrade from production's build on the bench
         cluster (bb11734 upgrade-node): 0 writer errors, every file intact; old nodes log
         "Failed to deserialize" for new request types until upgraded.
-  - [ ] **ENOSPC on every node, T81 (2026-10-08, IN PROGRESS):** all 5 nodes on full loop
+  - [x] **ENOSPC on every node, T81 (2026-10-08; DONE 2026-10-12, 496fa3a, on staging):** all 5 nodes on full loop
         filesystems. Found and fixed (local commit, suites NOT yet run):
         (1) a new file's write() hung on backpressure for 600s behind other files' undrainable
         buffer: client cluster_storage_full mark (every node refused for its own storage) ->
@@ -335,6 +367,11 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         file's create record) briefly became leader and served size 0 to a fresh client.
         Next: a node that hasn't caught up must not serve as leader (or the client must not
         trust a leader that isn't caught up). Logs: /root/t81fail (dev box).
+  - [x] **2026-10-12/13, T82-T86:** T82 rolling restart of the leader (heartbeat after
+        GracefulLeave, fixed); T83 fault kills (T83d off-only, not fixed per Pete); T84 client
+        upload congestion -> EIO (6b59781); T85 superseded-version cleanup (2813c2f); T86 chain
+        replication (a9e56a1, default on, DFS_CHAIN_WRITES=0 disables: rock5b 500 MB fsync dd
+        52 -> ~90 MB/s). T38a acked loss (client adopted a leaderless one-node view) e06d02e.
   - [ ] Power loss (LazyFS / dm-flakey), and the rest of the Legata list.
 
 - **Six fix branches MERGED 2026-10-05** (fix/dir-rename-subtree, fix/is-leader-startup,

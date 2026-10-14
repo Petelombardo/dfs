@@ -49,10 +49,14 @@ pub const LEADER_CHANGE_GRACE_SECS: u64 = 1200;
 /// created copies of at least one of them, for real.
 pub const SELF_RESTART_GRACE_SECS: u64 = LEADER_CHANGE_GRACE_SECS;
 
-/// The disk orphan sweep's restart/leader-change grace: LEADER_CHANGE_GRACE_SECS, unless
-/// DFS_DESTRUCTIVE_GRACE_SECS says otherwise. Only the test suite lowers it: every run
-/// boots a fresh cluster, so a 20-minute grace made every deleting path of the sweep
-/// untestable there.
+/// The restart/leader-change grace of the disk orphan sweep and of the healer's
+/// over-replication trimming: LEADER_CHANGE_GRACE_SECS, unless DFS_DESTRUCTIVE_GRACE_SECS
+/// says otherwise. Only the test suite lowers it: every run boots a fresh cluster, so a
+/// 20-minute grace made every deleting path untestable there.
+/// How many chunks one discovery pass records an unlisted holder for. Staging's
+/// backlog (98k) drains in about 50 passes, roughly an hour.
+const UNLISTED_HOLDERS_PER_PASS: usize = 2000;
+
 fn destructive_grace_secs() -> u64 {
     std::env::var("DFS_DESTRUCTIVE_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(LEADER_CHANGE_GRACE_SECS)
 }
@@ -3325,7 +3329,7 @@ impl HealingManager {
         let nodes_down = total_nodes.saturating_sub(online_nodes);
 
         let grace_elapsed = self.cluster.time_since_became_leader().await
-            .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+            .map_or(true, |d| d.as_secs() >= destructive_grace_secs());
 
         let destructive_allowed = grace_elapsed && nodes_down <= 1;
 
@@ -3334,7 +3338,7 @@ impl HealingManager {
                 let elapsed = self.cluster.time_since_became_leader().await
                     .map_or(0.0, |d| d.as_secs_f64());
                 warn!("Skipping destructive healing operations — within grace period after leader election ({:.0}s elapsed of {}s)",
-                    elapsed, LEADER_CHANGE_GRACE_SECS);
+                    elapsed, destructive_grace_secs());
             } else {
                 warn!("Skipping destructive healing operations — {} node(s) down (max 1 allowed)", nodes_down);
             }
@@ -3655,16 +3659,31 @@ impl HealingManager {
         // replacing the old grace-period-only check — see authorize_live_file_orphan_deletes().
 
         // --- Build per-node chunk assignment maps ---
-        // For each online node, collect only the chunk IDs where that node is listed
-        // as a replica. This scopes the HasChunks payload to each node's actual
-        // assignments rather than the entire cluster chunk universe.
+        // The chunk IDs each node is asked about. On the deep pass that is every chunk
+        // this pass checks, not only the ones a node's record lists it for: a node
+        // pruned from a record while it was away keeps its copy, the healer puts a
+        // replacement elsewhere, and asked only about its listed chunks that node's
+        // copy was never counted again, so the chunk sat on RF+1 nodes for good
+        // (staging 10-14: 98k chunks, 390 GB, mostly from gluster1's 09-05 wedge; T87).
+        // The fast pass keeps the listed-only scope.
         //
-        // node_id → ordered Vec<ChunkId> that node is responsible for
+        // node_id → ordered Vec<ChunkId> that node is asked about
         let mut node_assigned: HashMap<NodeId, Vec<ChunkId>> = HashMap::new();
-        for loc in &chunks_to_check {
-            for node_id in &loc.nodes {
-                if all_known_node_ids.contains(node_id) {
-                    node_assigned.entry(*node_id).or_default().push(loc.chunk_id);
+        if deep {
+            let slot_loser_set: HashSet<ChunkId> = slot_losers.iter().copied().collect();
+            let every: Vec<ChunkId> = chunks_to_check.iter()
+                .map(|loc| loc.chunk_id)
+                .filter(|id| !id.looks_like_patch_token() && !slot_loser_set.contains(id))
+                .collect();
+            for node_info in &online_nodes {
+                node_assigned.insert(node_info.id, every.clone());
+            }
+        } else {
+            for loc in &chunks_to_check {
+                for node_id in &loc.nodes {
+                    if all_known_node_ids.contains(node_id) {
+                        node_assigned.entry(*node_id).or_default().push(loc.chunk_id);
+                    }
                 }
             }
         }
@@ -3735,6 +3754,9 @@ impl HealingManager {
 
         // Accumulate chunk location updates for batch broadcast at end of pass.
         let mut location_updates: Vec<ChunkLocation> = Vec::new();
+        // Chunks this pass found on a node their record doesn't list (see the
+        // classification loop).
+        let mut unlisted_recorded = 0usize;
 
         // Patch tokens (deferred chunk-patch consolidation) are never worth
         // actively healing directly — a token never names a real file (Pending) or
@@ -3885,6 +3907,28 @@ impl HealingManager {
                     } else {
                         nodes_without_chunk.push(*node_id);
                     }
+                }
+            }
+            // A copy on an online node the record doesn't list (see node_assigned
+            // above). Counted like a listed one, so the reconcile below records it and
+            // an over-RF chunk is trimmed back to RF. At most
+            // UNLISTED_HOLDERS_PER_PASS chunks per pass: each one is a record write
+            // here and a broadcast to every peer, and a cluster that has carried these
+            // copies for weeks (staging: 98k) would otherwise put them all into one
+            // metadata transaction and one broadcast.
+            if unlisted_recorded < UNLISTED_HOLDERS_PER_PASS {
+                let before = confirmed_alive_nodes.len();
+                for node_info in &online_nodes {
+                    if location.nodes.contains(&node_info.id) || rpc_failed_nodes.contains(&node_info.id) {
+                        continue;
+                    }
+                    if node_chunk_presence.get(&node_info.id).map_or(false, |s| s.contains(&chunk_id)) {
+                        actual_replicas += 1;
+                        confirmed_alive_nodes.push(node_info.id);
+                    }
+                }
+                if confirmed_alive_nodes.len() > before {
+                    unlisted_recorded += 1;
                 }
             }
 
@@ -4335,6 +4379,11 @@ impl HealingManager {
             });
         }
 
+        if unlisted_recorded > 0 {
+            info!("Discovery: recorded a holder its record didn't list for {} chunk(s){}",
+                unlisted_recorded,
+                if unlisted_recorded >= UNLISTED_HOLDERS_PER_PASS { " (per-pass cap; more next pass)" } else { "" });
+        }
         let under_count = work.iter().filter(|(_, s, _)| *s == ReplicationStatus::UnderReplicated).count();
         let over_count  = work.iter().filter(|(_, s, _)| *s == ReplicationStatus::OverReplicated).count();
         if under_count > 0 || over_count > 0 || pending_count > 0 {
@@ -4557,7 +4606,7 @@ impl HealingManager {
                 .count();
             let nodes_down = total.saturating_sub(online);
             let grace_elapsed = self.cluster.time_since_became_leader().await
-                .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+                .map_or(true, |d| d.as_secs() >= destructive_grace_secs());
             grace_elapsed && nodes_down <= 1
         };
 

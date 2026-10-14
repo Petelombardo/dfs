@@ -907,16 +907,7 @@ fusermount -u "$T84_MNT" 2>/dev/null || true
 kill_client_and_wait "$T84_CPID"
 fi # should_run T84
 
-# ── T85: old versions of a file rewritten in place get deleted (staging, 10-13) ──────
-# Every in-place rewrite of a chunk gives its slot a new chunk id; the old version's
-# CHUNK_TABLE row stayed, and the orphan sweep kept any chunk whose row names a live file.
-# Staging: 1.5 TB of 4.1 TB was old versions of VM disks, growing since July. The sweep
-# now deletes a copy only once every node names the same newer version for its slot.
-# The deleting paths are gated 20 min after any restart, so this test restarts the
-# cluster with those graces lowered, and restores the normal settings after.
-snapshot_log T85
-if should_run T85; then
-echo "=== T85: superseded versions of a rewritten file are deleted; every byte still reads back ==="
+# Whole-cluster restart helpers (T85, T87): restart every node with extra env, wait for 5 healthy.
 t85_kill_all() {
     for i in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true; done
     for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node" >/dev/null || break; sleep 0.1; done
@@ -934,6 +925,17 @@ t85_wait_ready() {
     done
     return 1
 }
+
+# ── T85: old versions of a file rewritten in place get deleted (staging, 10-13) ──────
+# Every in-place rewrite of a chunk gives its slot a new chunk id; the old version's
+# CHUNK_TABLE row stayed, and the orphan sweep kept any chunk whose row names a live file.
+# Staging: 1.5 TB of 4.1 TB was old versions of VM disks, growing since July. The sweep
+# now deletes a copy only once every node names the same newer version for its slot.
+# The deleting paths are gated 20 min after any restart, so this test restarts the
+# cluster with those graces lowered, and restores the normal settings after.
+snapshot_log T85
+if should_run T85; then
+echo "=== T85: superseded versions of a rewritten file are deleted; every byte still reads back ==="
 t85_ids() {
     "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t85.bin 2>/dev/null \
         | python3 -c "import json,sys; print(' '.join(c['chunk_id'] for c in json.load(sys.stdin)['chunk_locations']))" 2>/dev/null
@@ -1087,6 +1089,97 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 fi # should_run T86
+
+# ── T87: a copy a node kept while the records dropped it is counted again and trimmed (staging, 10-14) ──
+# Staging carried 98k chunks on 4-5 nodes (390 GB). A node pruned from a chunk's record
+# while it was away (gluster1's 09-05 wedge) keeps its copy; the healer adds a replacement
+# elsewhere, and discovery asked only the nodes a record lists, so the kept copy was never
+# counted or trimmed. Here: stop a node, give it a copy of two of a file's chunks it doesn't
+# hold, restart it, and expect those chunks back at 3 copies on disk and the file exact.
+snapshot_log T87
+if should_run T87; then
+echo "=== T87: a stranded extra copy of a chunk is found and trimmed back to 3; the file reads back exactly ==="
+t87_ids() {
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t87.bin 2>/dev/null \
+        | python3 -c "import json,sys; print(' '.join(c['chunk_id'] for c in json.load(sys.stdin)['chunk_locations']))" 2>/dev/null
+}
+t87_on() {   # nodes holding $1 on disk, e.g. "2 4 5"
+    for i in 1 2 3 4 5; do [ -f "$BASE/node$i/data/chunks/${1:0:2}/${1:2:2}/$1" ] && echo -n "$i "; done
+}
+t87_count() { t87_on "$1" | wc -w; }
+t85_kill_all
+t85_start_all "DFS_DESTRUCTIVE_GRACE_SECS=0"
+t85_wait_ready || echo "  T87: cluster not fully healthy 30s after the restart"
+sleep 5
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing set --healing-delay-secs 2 >/dev/null 2>&1 || true
+dd if=/dev/urandom of="$T/t87.bin" bs=1M count=48 status=none
+cp "$T/t87.bin" "$MOUNT/t87.bin"
+dfs_sync
+for _ in $(seq 1 15); do T87_IDS="$(t87_ids)"; [ "$(echo $T87_IDS | wc -w)" -ge 12 ] && break; sleep 1; done
+# The third copy lands through the healer; wait for every chunk to have 3.
+for _ in $(seq 1 30); do
+    "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger >/dev/null 2>&1 || true
+    T87_SHORT=0
+    for c in $T87_IDS; do [ "$(t87_count "$c")" -lt 3 ] && T87_SHORT=$((T87_SHORT+1)); done
+    [ "$T87_SHORT" = 0 ] && break
+    sleep 2
+done
+# The node to strand copies on: the highest-id online node, never the leader (see T86c).
+T87_VADDR=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[-1]['address'] if len(online) > 1 else '127.0.0.1:8904')
+" 2>/dev/null)
+T87_VN=$(( (${T87_VADDR##*:} - 8900) + 1 ))
+T87_PICK=""
+for c in $T87_IDS; do
+    case "$c" in df7c*) continue;; esac
+    [ "$(t87_count "$c")" = 3 ] && ! t87_on "$c" | grep -qw "$T87_VN" && T87_PICK="$T87_PICK $c"
+    [ "$(echo $T87_PICK | wc -w)" = 2 ] && break
+done
+echo "  T87: $(echo $T87_IDS | wc -w) chunk(s), ${T87_SHORT} short of 3 copies before the test; stranding copies of$(echo $T87_PICK | cut -c1-200) on node$T87_VN"
+pkill -9 -f "dfs-server start --config $BASE/node$T87_VN/config.toml" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T87_VN/config.toml" >/dev/null || break; sleep 0.1; done
+for c in $T87_PICK; do
+    src=$(t87_on "$c" | awk '{print $1}')
+    mkdir -p "$BASE/node$T87_VN/data/chunks/${c:0:2}/${c:2:2}"
+    cp "$BASE/node$src/data/chunks/${c:0:2}/${c:2:2}/$c" "$BASE/node$T87_VN/data/chunks/${c:0:2}/${c:2:2}/$c"
+done
+env DFS_DESTRUCTIVE_GRACE_SECS=0 RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T87_VN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+    >> "$LOG/server$T87_VN.log" 2>&1 &
+t85_wait_ready || echo "  T87: node$T87_VN not back 30s after its restart"
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing set --healing-delay-secs 2 >/dev/null 2>&1 || true
+T87_EXTRA=$(for c in $T87_PICK; do [ "$(t87_count "$c")" -gt 3 ] && echo "$c"; done | wc -l)
+echo "  T87: ${T87_EXTRA} of $(echo $T87_PICK | wc -w) picked chunk(s) on 4 nodes after the restart"
+for _ in $(seq 1 60); do
+    "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger >/dev/null 2>&1 || true
+    T87_EXTRA=$(for c in $T87_PICK; do [ "$(t87_count "$c")" -gt 3 ] && echo "$c"; done | wc -l)
+    [ "$T87_EXTRA" = 0 ] && break
+    sleep 2
+done
+[ -n "$T87_PICK" ] && [ "$T87_EXTRA" = 0 ] \
+    && check "T87a both stranded extra copies were found and trimmed; each chunk is back at 3 copies" PASS \
+    || check "T87a ${T87_EXTRA} chunk(s) still over 3 copies 120s after node$T87_VN came back (picked:${T87_PICK:- none})" FAIL
+if [ "$T87_EXTRA" != 0 ]; then
+    for c in $T87_PICK; do
+        echo "  T87: $c on node(s): $(t87_on "$c")"
+        "$BIN/dfs-admin" --cluster "$CLUSTER" file raw-location "$c" 2>&1 | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g; s/^/    /' | cut -c1-200
+    done
+fi
+T87_THIN=$(for c in $T87_IDS; do case "$c" in df7c*) continue;; esac; [ "$(t87_count "$c")" -lt 2 ] && echo "$c"; done | wc -l)
+T87_M1=$(md5sum < "$T/t87.bin" | cut -d' ' -f1)
+T87_M2=$(timeout 60 md5sum < "$MOUNT/t87.bin" 2>/dev/null | cut -d' ' -f1)
+[ "$T87_M1" = "$T87_M2" ] && [ "$T87_THIN" = 0 ] \
+    && check "T87b the file reads back exactly and no chunk dropped under 2 copies" PASS \
+    || check "T87b read-back ${T87_M2:-unreadable} vs $T87_M1, $T87_THIN chunk(s) under 2 copies" FAIL
+rm -f "$MOUNT/t87.bin" "$T/t87.bin"
+t85_kill_all
+t85_start_all ""
+t85_wait_ready || echo "  T87: cluster not fully healthy 30s after restoring normal settings"
+sleep 5
+fi # should_run T87
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

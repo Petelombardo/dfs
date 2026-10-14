@@ -5645,9 +5645,14 @@ impl HealingManager {
             .get_chunk_location_async(*chunk_id).await?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Resolve confirmed-alive nodes to addresses.
+        // Resolve confirmed-alive nodes to addresses. Count only holders the record
+        // still lists: confirmed_alive_nodes comes from alive_nodes_cache, which only a
+        // discovery pass refreshes, while drain_heal_queue re-dispatches this chunk
+        // every cycle. Counting from that list alone re-trimmed the same chunk each
+        // cycle down to the pair (staging 2026-10-14) — each trim drops its node from
+        // the record below, so the record is what makes the next call see RF and stop.
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
-        for node_id in &confirmed_alive_nodes {
+        for node_id in confirmed_alive_nodes.iter().filter(|n| location.nodes.contains(n)) {
             if let Some(info) = cluster.get_node(node_id).await {
                 alive.push((*node_id, info.addr));
             }
@@ -7641,6 +7646,51 @@ mod tests {
             "the post-trim metadata update must go through the group-commit queue exactly once");
         assert_eq!(count_of(&stats, "put_chunk_location") - base_solo, 0,
             "must NOT open a solo redb write transaction competing with the group committer");
+    }
+
+    /// Staging 2026-10-14: drain_heal_queue hands the trimmer the holder list from
+    /// alive_nodes_cache, which only a discovery pass refreshes. Each drain cycle
+    /// (~15 s) re-dispatched the same over-replicated chunk with the same stale
+    /// 4-holder list, and the trimmer took one more copy every time — down to the
+    /// 2-node pair, after which the healer copied it back (13,675 trims on 3,474
+    /// chunks in 8 minutes). A second call with the same stale list must see that the
+    /// record no longer lists the node it already trimmed and do nothing.
+    #[tokio::test]
+    async fn do_cleanup_excess_stale_holder_list_trims_only_once() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8902".parse().unwrap();
+        let (storage, metadata, healing, _temp_storage, _temp_metadata) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"stale-holder-list-chunk"));
+        let data = vec![7u8; 128];
+        storage.write_chunk(&chunk_id, &data).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: data.len(),
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: Some(1000),
+            client_write_seq: None,
+            file_id: Some(dfs_common::FileId::new()),
+        }).unwrap();
+
+        // RF=0 so the local node is the trim target without any peer RPC (see the
+        // test above). The first call trims it and drops it from the record.
+        HealingManager::do_cleanup_excess_inner(
+            &chunk_id, vec![node_id], &storage, &metadata, &healing.cluster, &healing.client, 0,
+        ).await.unwrap();
+        let after_first = metadata.get_chunk_location(&chunk_id).unwrap().unwrap();
+        assert!(after_first.nodes.is_empty(), "first call must trim the local node");
+
+        // The copy comes back on disk (in production: the next holder in line still
+        // has its copy); the stale list from the cache still names this node.
+        storage.write_chunk(&chunk_id, &data).unwrap();
+        HealingManager::do_cleanup_excess_inner(
+            &chunk_id, vec![node_id], &storage, &metadata, &healing.cluster, &healing.client, 0,
+        ).await.unwrap();
+        assert!(storage.read_chunk(&chunk_id).is_ok(),
+            "a holder the record no longer lists must not be trimmed again from a stale list");
     }
 
     fn make_healing(node_id: NodeId, addr: SocketAddr) -> (Arc<ChunkStorage>, Arc<MetadataStore>, HealingManager, TempDir, TempDir) {

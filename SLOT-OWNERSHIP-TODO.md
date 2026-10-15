@@ -296,19 +296,26 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
   - [ ] **G1 Clean streak:** 5 consecutive ordering-on full suites whose only failures are the
         mode-independent T38b heal-timing flake; each new failure root-caused before the
         streak restarts.
+        10-14: 1014a/b clean, 1014c broke it (T85a; its T81b was an untested G6 build);
+        1014d (G3+G6) 267/0 = 1/5.
   - [ ] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
         acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
-  - [ ] **G3 Leader crash failover** (Legata f2708108): a SIGKILLed leader stalls creates
+  - [x] **G3 Leader crash failover** (Legata f2708108): a SIGKILLed leader stalls creates
         2 x failure_timeout (~60 s on staging). Leadership must follow the majority-voted
         lease expiry (~3-4 s); suite test: kill -9 the leader, an fsynced create succeeds
         within the client's 15 s budget.
+        DONE f489f20 (10-14): leader_among skips peers a majority voted lease-expired; T88
+        0/3 on the old build (EIO at 15.0 s), 3/3 fixed (create in 6.3-6.7 s).
   - [ ] **G4 New-leader chunk maps** (Legata c742039c, T79c/f): a new leader must not serve
         GetFileChunkMap before holders' locations land (fresh readers get zeros meanwhile).
   - [ ] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.
-  - [ ] **G6 No EIO for a retryable refusal** (Legata 7b87b67e): the client's fresh-write
+  - [x] **G6 No EIO for a retryable refusal** (Legata 7b87b67e): the client's fresh-write
         safety-check refusal is retried within the flush deadline, not returned from fsync.
+        10-14: fix written (FlushAttemptRefused, 30 s budget; not when every replica refused
+        the patch for its own storage, T81); T89 (DFS_FAULT_FAIL_PATCHES=2) EIO before, 3/3
+        after. DONE (10-14) with suites 1014d: on 267/0, off 201/5 (known T38b T64b T64d T77a/b).
   - [ ] **G7 Open ordering-on failures closed:** T85a (cleanup ran 0 passes on one node, both
         modes, 10-13) and T76a (acked loss 10-12; Legata cf286166) root-caused or shown fixed.
   - [ ] **G8 Bench soak:** the :8950 bench cluster with ordering on, 48 h of a VM-108-like

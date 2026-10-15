@@ -1051,6 +1051,46 @@ const FLUSH_ALL_MAX_ITEMS: usize = 8;
 /// raising the worst-case memory ceiling for large/zero-padded slots.
 const PIPELINE_MAX_BYTES: usize = 8 * CHUNK_SIZE;
 
+/// A flush attempt the client itself turned down: the fresh-write safety check found real
+/// data under the bytes it was about to send (T74d: the slot got there after MultiPatch
+/// failed on both replicas during an ISR handover). The slot stays dirty and the next
+/// attempt goes back to the patch path, so `flush_all_pipelined` retries it instead of
+/// failing the fsync: T74d's writer got EIO from one such refusal although the attempt
+/// 3 ms later patched (Legata 7b87b67e, suite T89). Not raised when every replica refused
+/// the patch for its own storage (T81): that refusal is the error.
+#[derive(Debug)]
+struct FlushAttemptRefused(String);
+
+impl std::fmt::Display for FlushAttemptRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlushAttemptRefused {}
+
+/// How long `flush_all_pipelined` keeps retrying refused attempts (`FlushAttemptRefused`)
+/// before it reports the refusal: well past a transient, inside fsync's patience.
+const FLUSH_REFUSAL_RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Test-only (DFS_FAULT_INJECTION=1 and DFS_FAULT_FAIL_PATCHES=N): the first N MultiPatch
+/// calls fail as if every replica had, without being sent. Two failures (the first try and
+/// its leader-refresh retry) take a flush down T74d's route: rebuild from the base, then the
+/// fresh-write safety check's refusal (suite T89).
+fn fault_fail_this_patch() -> bool {
+    static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicUsize> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        let on = std::env::var("DFS_FAULT_INJECTION").map(|v| v == "1").unwrap_or(false);
+        let n = if on {
+            std::env::var("DFS_FAULT_FAIL_PATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        } else {
+            0
+        };
+        std::sync::atomic::AtomicUsize::new(n)
+    });
+    left.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+}
+
 /// TEMP DIAGNOSTIC (remove once the write-buffer-cap theory is confirmed/killed):
 /// process-wide rate limiter for BPFILLTIMING, logged from both write() back-pressure
 /// loops (fast path and slow path) whenever a write pays ANY non-zero delay (fill_pct
@@ -2999,7 +3039,10 @@ impl FlushHandle {
                     let hints: Arc<HashMap<SocketAddr, Vec<dfs_common::ChunkId>>> = {
                         self.patch_prefetch_hints.lock().unwrap().clone()
                     };
-                    let patch_result = if let Some(fid) = file_id_at_flush_start {
+                    let patch_result = if fault_fail_this_patch() {
+                        warn!("flush_buffer_async_one: ino={} chunk={} FAULT INJECTION: failing this MultiPatch", ino, chunk_idx);
+                        Err(anyhow::anyhow!("MultiPatch: all replicas failed for chunk {} (fault injection)", old_location.chunk_id))
+                    } else if let Some(fid) = file_id_at_flush_start {
                         self.client.multi_patch_chunk_on_replicas_verified(
                             old_location.chunk_id, fid, chunk_idx,
                             file_offset, patches.clone(), &old_location, None,
@@ -3063,7 +3106,10 @@ impl FlushHandle {
                                     // Retry the patch with the authoritative location.
                                     // Reuse hints from the initial attempt — any already-prefetched
                                     // chunks are no-ops on the server (contains_key guard).
-                                    let retry_result = if let Some(fid) = file_id_at_flush_start {
+                                    let retry_result = if fault_fail_this_patch() {
+                                        warn!("flush_buffer_async_one: ino={} chunk={} FAULT INJECTION: failing this MultiPatch", ino, chunk_idx);
+                                        Err(anyhow::anyhow!("MultiPatch: all replicas failed for chunk {} (fault injection)", loc.chunk_id))
+                                    } else if let Some(fid) = file_id_at_flush_start {
                                         self.client.multi_patch_chunk_on_replicas_verified(
                                             loc.chunk_id, fid, chunk_idx, file_offset,
                                             patches.clone(), &loc, None, self.use_dual_rf, hints.clone(),
@@ -3578,9 +3624,21 @@ impl FlushHandle {
                     }
                 }
                 self.notify_chunk_flush_complete(ino, chunk_idx).await;
-                anyhow::bail!(
+                let msg = format!(
                     "chunk {} fresh-write safety check found real existing data — aborting this attempt to avoid corruption", chunk_idx
                 );
+                // Any other refusal (a failed lookup, or a chunk the cache already knew,
+                // reached after its patch failed — every disk full, T81) is no stale cache:
+                // retrying it only stalls the fsync on the same answer.
+                // The next attempt goes back to the patch path, which is what heals a
+                // transient (T74d: an ISR handover). Not when every replica just refused the
+                // patch for its own storage (all disks full, T81): retrying gets the same
+                // answer, and held T81's fsync until its 150 s timeout. That one is the error.
+                return Err(if self.client.cluster_storage_full() {
+                    anyhow::anyhow!("{} (every replica's own storage refused the patch: out of space)", msg)
+                } else {
+                    FlushAttemptRefused(msg).into()
+                });
             }
         }
 
@@ -3986,6 +4044,8 @@ impl FlushHandle {
         };
 
         let mut first_err: Option<anyhow::Error> = None;
+        // When this call's first attempt was refused (`FlushAttemptRefused`).
+        let mut refused_since: Option<std::time::Instant> = None;
 
         // Keep dispatching concurrent flush_one_chunk calls until no unclaimed slots remain.
         // Enforce byte limit only (PIPELINE_MAX_BYTES). The item count limit is for
@@ -4134,9 +4194,20 @@ impl FlushHandle {
                 }));
             }
 
+            let mut refused_this_wave = false;
             for h in handles {
                 match h.await {
                     Ok(Ok(())) => {}
+                    // The slot is still dirty and unclaimed: the next wave flushes it again.
+                    Ok(Err(e)) if e.downcast_ref::<FlushAttemptRefused>().is_some() => {
+                        let since = *refused_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= FLUSH_REFUSAL_RETRY_BUDGET {
+                            if first_err.is_none() { first_err = Some(e); }
+                        } else {
+                            info!("flush_all_pipelined: ino={} attempt refused ({}); retrying", ino, e);
+                            refused_this_wave = true;
+                        }
+                    }
                     Ok(Err(e)) => { if first_err.is_none() { first_err = Some(e); } }
                     Err(e) => { if first_err.is_none() {
                         first_err = Some(anyhow::anyhow!("flush task panicked: {}", e));
@@ -4145,6 +4216,9 @@ impl FlushHandle {
             }
 
             if first_err.is_some() { break; }
+            if refused_this_wave {
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
         }
 
         if let Some(e) = first_err { return Err(e); }
@@ -10436,6 +10510,11 @@ mod fresh_write_safety_check_tests {
     /// to happen" signal, independent of exactly which RPC write_data_with_cache
     /// issues internally.
     fn spawn_fresh_write_safety_mock(addr: SocketAddr, fresh_meta: FileMetadata) -> Arc<std::sync::atomic::AtomicUsize> {
+        spawn_fresh_write_safety_mock_failing_with(addr, fresh_meta, "unhandled in mock (would have been the corrupting write)")
+    }
+
+    /// As above; every request but the metadata lookups fails with `other_error`.
+    fn spawn_fresh_write_safety_mock_failing_with(addr: SocketAddr, fresh_meta: FileMetadata, other_error: &'static str) -> Arc<std::sync::atomic::AtomicUsize> {
         use tokio::io::AsyncReadExt;
         let other_request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = other_request_count.clone();
@@ -10464,10 +10543,19 @@ mod fresh_write_safety_check_tests {
                                     metadata: fresh_meta.clone(),
                                 }).await;
                             }
+                            // The leader's view of one slot, after a failed patch.
+                            Request::GetFileChunkMap { file_id, from_chunk, count } => {
+                                let locations: Vec<ChunkLocation> = fresh_meta.chunk_locations.iter()
+                                    .skip(from_chunk as usize).take(count as usize).cloned().collect();
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id, locations, from_chunk,
+                                    total_chunks: fresh_meta.chunk_locations.len() as u32, write_seq: 1,
+                                }).await;
+                            }
                             _ => {
                                 counter.fetch_add(1, Ordering::SeqCst);
                                 write_envelope(&mut stream, request_id, Response::Error {
-                                    message: "unhandled in mock (would have been the corrupting write)".to_string(),
+                                    message: other_error.to_string(),
                                     code: ErrorCode::InternalError,
                                 }).await;
                             }
@@ -10578,12 +10666,113 @@ mod fresh_write_safety_check_tests {
             "BUG REPRODUCED: must refuse to send a fresh write with fabricated zero gaps once \
              the server confirms real existing data at chunk_idx 0 — got Ok, meaning the qcow2 \
              header would have been silently zeroed exactly like the real VM-108 incident");
-        let msg = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        assert!(err.downcast_ref::<FlushAttemptRefused>().is_some(),
+            "a refusal is retryable (flush_all_pipelined retries it), not a plain error: {}", err);
+        let msg = err.to_string();
         assert!(msg.contains("fresh-write safety check found real existing data"),
             "must fail via the safety-check abort specifically, not some unrelated error: {}", msg);
         assert_eq!(count1.load(Ordering::SeqCst), 0,
             "must never have sent the corrupting write to node1");
         assert_eq!(count2.load(Ordering::SeqCst), 0,
             "must never have sent the corrupting write to node2");
+    }
+
+    /// A chunk the cache knows, whose patch fails on both replicas with `patch_error`: the
+    /// leader-refresh retry fails too, the rebuild-from-base fallback succeeds (the base is
+    /// in chunk_cache), and the fresh-write safety check refuses (T74d 10-13, T81 1014c).
+    async fn refused_after_failed_patch(port1: u16, port2: u16, patch_error: &'static str) -> anyhow::Error {
+        let addr1: SocketAddr = format!("127.0.0.1:{}", port1).parse().unwrap();
+        let addr2: SocketAddr = format!("127.0.0.1:{}", port2).parse().unwrap();
+        let node1 = NodeId::new();
+        let node2 = NodeId::new();
+        let file_id = dfs_common::FileId::new();
+        let path = "/t81_pre.bin";
+        let ino = 27035u64;
+        let chunk_idx = 0u64;
+        let slot_len = 2000usize;
+
+        let mut meta = FileMetadata::new(path.to_string(), FileType::RegularFile);
+        meta.id = file_id;
+        meta.size = slot_len as u64;
+        meta.chunk_locations = Arc::new(vec![ChunkLocation {
+            chunk_id: ChunkId::from_hash([0x43u8; 32]),
+            nodes: vec![node1, node2],
+            size: slot_len,
+            checksum: [0x43u8; 32],
+            file_offset: Some(0),
+            written_at: Some(1_000),
+            client_write_seq: Some(58),
+            file_id: Some(file_id),
+        }]);
+        // The base is in chunk_cache, so the rebuild succeeds and reaches the safety check.
+        let _count1 = spawn_fresh_write_safety_mock_failing_with(addr1, meta.clone(), patch_error);
+        let _count2 = spawn_fresh_write_safety_mock_failing_with(addr2, meta.clone(), patch_error);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = Arc::new(DfsClient::new(vec![addr1, addr2]).unwrap());
+        *client.cluster_nodes.write().await = vec![addr1, addr2];
+        client.chunk_cache.insert(ChunkId::from_hash([0x43u8; 32]), Arc::new(vec![0x11u8; slot_len]));
+
+        let handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: Arc::new(DashMap::new()),
+            // The cache knows the chunk: nothing for the server's answer to correct.
+            metadata_cache: Arc::new(DashMap::from_iter([(ino, meta)])),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path: Arc::new(RwLock::new(HashMap::from([(ino, path.to_string())]))),
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        };
+
+        let mut slot_data = vec![0u8; slot_len];
+        for b in &mut slot_data[500..756] { *b = 0xEE; }
+        let dirty_ranges = vec![(500usize, 756usize)];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            handle.flush_buffer_async_one(ino, chunk_idx, slot_data, 0, 500, 756, dirty_ranges, SystemTime::now()),
+        ).await;
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+
+        let err = result.expect("must not hang").expect_err("every replica refused the patch");
+        assert!(err.to_string().contains("fresh-write safety check found real existing data"),
+            "the test must reach the safety check through the rebuild fallback: {}", err);
+        err
+    }
+
+    /// T74d: the patch failed for a transient (here not a storage refusal), so the refusal
+    /// is retryable: flush_all_pipelined sends the slot down the patch path again, which
+    /// patched 3 ms later instead of the fsync's EIO (Legata 7b87b67e).
+    #[tokio::test]
+    async fn refusal_after_a_transient_patch_failure_is_retryable() {
+        let err = refused_after_failed_patch(19503, 19504, "ChunkStale: chunk has moved on").await;
+        assert!(err.downcast_ref::<FlushAttemptRefused>().is_some(),
+            "BUG REPRODUCED: a refusal after a transient patch failure fails the fsync: {}", err);
+    }
+
+    /// T81: every replica refused the patch for its own storage (disk full). Retrying gets
+    /// the same answer (it held T81's fsync for 150 s), so the refusal is the error.
+    #[tokio::test]
+    async fn refusal_after_every_replica_ran_out_of_space_is_not_retryable() {
+        let err = refused_after_failed_patch(19505, 19506,
+            "Failed to write patch delta: Failed to create chunk directory: \"/d/chunks/3e/4f\": No space left on device (os error 28)").await;
+        assert!(err.downcast_ref::<FlushAttemptRefused>().is_none(),
+            "BUG REPRODUCED: a refusal with every disk full is retried: {}", err);
+        assert!(err.to_string().contains("out of space"), "the error says why: {}", err);
     }
 }

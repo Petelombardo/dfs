@@ -1234,6 +1234,66 @@ T88_M2=$(timeout 60 md5sum < "$MOUNT/t88_a.bin" 2>/dev/null | cut -d' ' -f1)
 rm -f "$MOUNT/t88_a.bin" "$MOUNT/t88_warm.txt" "$T/t88_a.bin"
 fi # should_run T88
 
+# ── T89: a flush the client refuses after a transient patch failure is retried, never an fsync EIO (gate G6, Legata 7b87b67e) ──
+# T74d (10-13): MultiPatch failed on both replicas and on its leader-refresh retry (an ISR
+# handover), the flush rebuilt the chunk from its base and went to the fresh-write path, whose
+# safety check refused to send it over the chunk's real bytes. That refusal was fsync's EIO,
+# although the next attempt, 3 ms later, patched. A test-only client fault
+# (DFS_FAULT_FAIL_PATCHES=2) fails the first try and its retry, which takes that route.
+# Its counterpart with every disk full (T81) must still fail: unit test
+# refusal_after_every_replica_ran_out_of_space_is_not_retryable.
+snapshot_log T89
+if should_run T89; then
+echo "=== T89: an overwrite whose patch fails twice (rebuild, then the safety check refuses) is retried; fsync succeeds, bytes exact ==="
+T89_MNT=/tmp/dfs-mount-t89
+mkdir -p "$T89_MNT"
+: > "$LOG/client_t89.log"
+dd if=/dev/urandom of="$T/t89.bin" bs=1M count=8 status=none
+cp "$T/t89.bin" "$MOUNT/t89.bin"
+dfs_sync
+DFS_FAULT_INJECTION=1 DFS_FAULT_FAIL_PATCHES=2 RUST_LOG=info "$BIN/dfs-client" mount "$T89_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t89.log" --allow-other --log-level debug &
+T89_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T89_MNT" && break; sleep 0.1; done
+# Two 4 KiB writes into chunk 0 with a gap between them, one fsync: one flush, two ranges.
+T89_RC=0
+python3 - "$T89_MNT/t89.bin" "$T/t89.bin" 2>>"$LOG/t89.err" <<'PYEOF' || T89_RC=$?
+import os, sys
+a, b = os.urandom(4096), os.urandom(4096)
+fd = os.open(sys.argv[1], os.O_RDWR)
+os.pwrite(fd, a, 0)
+os.pwrite(fd, b, 1 << 20)
+os.fsync(fd)
+os.close(fd)
+with open(sys.argv[2], "r+b") as f:   # the expected bytes
+    f.seek(0); f.write(a); f.seek(1 << 20); f.write(b)
+PYEOF
+T89_FAULT=$(grep -c "FAULT INJECTION: failing this MultiPatch" "$LOG/client_t89.log" || true)
+T89_REFUSED=$(grep -c "fresh-write safety check: server says this chunk actually has real data" "$LOG/client_t89.log" || true)
+fusermount -u "$T89_MNT" 2>/dev/null || true
+kill_client_and_wait "$T89_CPID"
+# Read back through a client that hasn't touched the file (the writer of the original copy
+# can still serve its own buffered bytes).
+RUST_LOG=info "$BIN/dfs-client" mount "$T89_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t89r.log" --allow-other --log-level debug &
+T89_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T89_MNT" && break; sleep 0.1; done
+T89_M1=$(md5sum < "$T/t89.bin" | cut -d' ' -f1)
+T89_M2=$(timeout 60 md5sum < "$T89_MNT/t89.bin" 2>/dev/null | cut -d' ' -f1)
+echo "  T89: faulted patches $T89_FAULT, refusals $T89_REFUSED, write+fsync rc=$T89_RC $(head -c 200 "$LOG/t89.err" 2>/dev/null)"
+[ "$T89_FAULT" -ge 2 ] && [ "$T89_REFUSED" -ge 1 ] \
+    && check "T89a both patch tries failed and the safety check refused the rebuilt write" PASS \
+    || check "T89a faulted patches $T89_FAULT (want 2), refusals $T89_REFUSED (want >= 1): the test didn't reach the case" FAIL
+[ "$T89_RC" = 0 ] \
+    && check "T89b fsync succeeded: the refused attempt was retried" PASS \
+    || check "T89b fsync failed (rc=$T89_RC) after a retryable refusal" FAIL
+[ "$T89_M1" = "$T89_M2" ] \
+    && check "T89c the file reads back exactly through a fresh client" PASS \
+    || check "T89c read-back ${T89_M2:-unreadable} vs $T89_M1" FAIL
+fusermount -u "$T89_MNT" 2>/dev/null || true
+kill_client_and_wait "$T89_CPID"
+rm -f "$MOUNT/t89.bin" "$T/t89.bin" "$LOG/t89.err"
+fi # should_run T89
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

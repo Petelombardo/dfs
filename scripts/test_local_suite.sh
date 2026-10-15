@@ -1569,6 +1569,117 @@ fi
 rm -f "$MOUNT/$T92_FILE" "$T/t92.bin" "$LOG/t92.err"
 fi # should_run T92
 
+# ── T93: a restarted leader that missed a patch serves the patched version, not the old one (gate G4) ──
+# A node that restarts rebuilds its chunk map from its own CHUNK_TABLE, which has no row for a
+# patch it wasn't a replica of. When it led again, the holders' location pull (SyncHeldLocations)
+# sent only chunks with a file of their own, and an unfolded patch has none (it lives as base +
+# delta), so the new leader named the slot's previous version until the fold landed: a fresh
+# reader got the pre-patch bytes (T79f, 1015a OFF and 1015b ON). Here chunk 0's ISR is put on two
+# nodes other than the leader, the leader is SIGKILLed, chunk 0 is patched (fsync), and the old
+# leader is restarted; it leads again (lowest node id), and a fresh client reads the file before
+# the slot folds. Ordering only: the ISR placement needs it.
+snapshot_log T93
+if should_run T93 && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+echo "=== T93: the leader misses a patch (down), restarts and leads again: a fresh client reads the patched bytes ==="
+T93_FILE=t93.bin
+T93_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$T/t93.bin" bs=4M count=2 status=none
+cp "$T/t93.bin" "$MOUNT/$T93_FILE"
+dfs_sync
+T93_MAP=$("$BIN/dfs-admin" --cluster "$T93_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+T93_LADDR=$(t88_leader "$CLUSTER")
+T93_LID=$(echo "$T93_MAP" | awk -v a="$T93_LADDR" '$2==a{print $1}')
+T93_LN=$(( ${T93_LADDR##*:} - 8900 + 1 ))
+# The leader first holds chunk 0's v1 (ISR [leader, X], one patch), as node3 held T79's setup
+# patch; then the pair moves to [X, Y], the next patch's two nodes, neither of them the leader.
+T93_OTHERS=$(echo "$T93_MAP" | awk -v l="$T93_LID" '$1!=l{print $1}')
+T93_X=$(echo "$T93_OTHERS" | sed -n 1p); T93_Y=$(echo "$T93_OTHERS" | sed -n 2p)
+T93_PAIR="$T93_X,$T93_Y"
+for _ in $(seq 1 30); do
+    "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T93_FILE" --chunks 2 >/dev/null 2>&1 && break
+    sleep 1
+done
+t93_patch() {   # t93_patch <offset>: 256 KiB into the mount and the expected copy, fsynced
+    timeout 60 python3 - "$MOUNT/$T93_FILE" "$T/t93.bin" "$1" 2>>"$LOG/t93.err" <<'PY'
+import os, sys
+x = os.urandom(262144); off = int(sys.argv[3])
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, off); os.fsync(fd); os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+PY
+}
+"$BIN/dfs-admin" --cluster "$T93_ALL" isr propose --file "/$T93_FILE" --chunk 0 --members "$T93_LID,$T93_X" >>"$LOG/t93_isr.log" 2>&1 || true
+t93_patch 0 || echo "  T93: the v1 patch failed"
+dfs_sync
+"$BIN/dfs-admin" --cluster "$T93_ALL" isr propose --file "/$T93_FILE" --chunk 0 --members "$T93_PAIR" >>"$LOG/t93_isr.log" 2>&1 || true
+T93_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T93_FILE" --chunks 2 2>/dev/null \
+    | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][0]; print(','.join(r['members']) if r else '')" 2>/dev/null || true)
+if [ -z "$T93_LID" ] || [ "$T93_ISR" != "$T93_PAIR" ]; then
+    check "T93 setup: leader $T93_LADDR ($T93_LID), chunk 0's ISR [$T93_ISR] should be [$T93_PAIR]" FAIL
+else
+    echo "  T93: leader node$T93_LN ($T93_LADDR) held chunk 0's v1; chunk 0 ISR now [$T93_PAIR]; SIGKILL the leader"
+    pkill -9 -f "dfs-server start --config $BASE/node$T93_LN/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T93_LN/config.toml" >/dev/null || break; sleep 0.1; done
+    # 256 KiB into chunk 0 while the leader is down, fsynced, mirrored into the expected copy.
+    # Patch only once the survivors lead without it, and keep it down a while after: its
+    # location then lands on the interim leader, never on the old leader as it comes back.
+    T93_NEW=""
+    for _ in $(seq 1 60); do
+        T93_NEW=$(t88_leader 127.0.0.1:$((8900 + T93_LN % 5)))
+        [ -n "$T93_NEW" ] && [ "$T93_NEW" != "$T93_LADDR" ] && break
+        sleep 0.5
+    done
+    T93_RC=0
+    T93_T0=$(date +%s)
+    t93_patch $((1024 * 1024)) || T93_RC=$?
+    dfs_sync
+    sleep 3
+    echo "  T93: patched while $T93_NEW led"
+    t93_restart() {   # SIGKILL (if running) and restart the old leader; wait until it leads again
+        pkill -9 -f "dfs-server start --config $BASE/node$T93_LN/config.toml" 2>/dev/null || true
+        for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T93_LN/config.toml" >/dev/null || break; sleep 0.1; done
+        RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T93_LN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+            >> "$LOG/server$T93_LN.log" 2>&1 &
+        T93_BACK=0
+        for _ in $(seq 1 60); do
+            [ "$(t88_leader "$T93_LADDR")" = "$T93_LADDR" ] && [ "$(t88_leader 127.0.0.1:$((8900 + T93_LN % 5)))" = "$T93_LADDR" ] && { T93_BACK=1; break; }
+            sleep 0.5
+        done
+        sleep 2
+    }
+    # Back once: it catches up the file's record (and the patch, in memory only: it holds no
+    # copy, so no CHUNK_TABLE row). Then a second restart drops that in-memory map; it rebuilds
+    # from its own CHUNK_TABLE (the pre-patch version) and leads again (T79f's sequence).
+    T93_MARK=$(cat "$LOG"/server*.log | wc -l)
+    t93_restart
+    t93_restart
+    T93_FM=/tmp/dfs-mount-t93
+    mkdir -p "$T93_FM"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T93_FM" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t93.log" --allow-other --log-level debug &
+    T93_CPID=$!
+    for _ in $(seq 1 50); do mountpoint -q "$T93_FM" && break; sleep 0.1; done
+    T93_M2=$(timeout 60 md5sum < "$T93_FM/$T93_FILE" 2>/dev/null | cut -d' ' -f1)
+    T93_DT=$(( $(date +%s) - T93_T0 ))
+    fusermount -u "$T93_FM" 2>/dev/null || true
+    kill_client_and_wait "$T93_CPID"
+    T93_M1=$(md5sum < "$T/t93.bin" | cut -d' ' -f1)
+    # Informational: a fold of the patched slot before the read hides the case (the folded chunk
+    # has a file of its own, so it was always pushed).
+    T93_FID=$(sed 's/\x1b\[[0-9;]*m//g' "$LOG/client_t93.log" | grep -ao "GetFileChunkMap { file_id: FileId([0-9a-f-]*" | head -1 | grep -o "[0-9a-f-]*$")
+    T93_FOLDS=$(cat "$LOG"/server*.log | tail -n +"$((T93_MARK + 1))" | sed 's/\x1b\[[0-9;]*m//g' | grep -a "Fold committed: file ${T93_FID:-none} chunk_idx 0 " | grep -c "" || true)
+    echo "  T93: patch rc=$T93_RC; node$T93_LN leads again=$T93_BACK; fresh read ${T93_DT}s after the patch; folds of chunk 0 before the read: $T93_FOLDS $(head -c 200 "$LOG/t93.err" 2>/dev/null)"
+    [ "$T93_RC" = 0 ] && [ "$T93_BACK" = 1 ] \
+        && check "T93a the patch fsynced with the leader down, and the restarted node leads again" PASS \
+        || check "T93a patch rc=$T93_RC, node$T93_LN leads again=$T93_BACK: the test didn't reach the case" FAIL
+    [ "$T93_M1" = "$T93_M2" ] \
+        && check "T93b a fresh client reads the patched bytes from the restarted leader" PASS \
+        || check "T93b a fresh client read ${T93_M2:-nothing}, expected $T93_M1: the restarted leader served the slot's old version" FAIL
+fi
+t85_wait_ready || echo "  T93: cluster not fully healthy 30s after node$T93_LN's restart"
+rm -f "$MOUNT/$T93_FILE" "$T/t93.bin" "$LOG/t93.err"
+fi # should_run T93
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

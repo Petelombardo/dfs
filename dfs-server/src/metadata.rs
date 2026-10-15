@@ -3740,6 +3740,26 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Every token whose patch is still Pending on this node: an unfolded slot version this
+    /// node serves from its base and delta, with no chunk file under the token's own id.
+    pub fn pending_patch_token_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(std::collections::HashSet::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids = std::collections::HashSet::new();
+        for item in table.range::<&str>(..)? {
+            let (k, v) = item?;
+            if let (Some(hash), Ok(PatchState::Pending { .. })) = (decode_hex_32(k.value()), bincode::deserialize::<PatchState>(v.value())) {
+                ids.insert(ChunkId::from_hash(hash));
+            }
+        }
+        Ok(ids)
+    }
+
     /// Async wrapper for all_patch_token_ids — see get_chunk_location_async.
     pub async fn all_patch_token_ids_async(self: &Arc<Self>) -> Result<std::collections::HashSet<ChunkId>> {
         let store = Arc::clone(self);

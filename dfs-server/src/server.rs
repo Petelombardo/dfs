@@ -7753,8 +7753,14 @@ impl Server {
         let metadata = server.metadata.clone();
         let locations = tokio::task::spawn_blocking(move || {
             let all = metadata.list_all_chunk_locations()?;
+            // An unfolded patch is held too, as its base and delta: it has no file under the
+            // token's id. Leaving it out left a new leader that had missed the patch (it was
+            // down, or full) naming the slot's previous version until the fold landed, so a
+            // fresh reader got the pre-patch bytes (T79f, T93).
+            let pending = metadata.pending_patch_token_ids()?;
             let held: Vec<_> = all.into_iter()
-                .filter(|loc| loc.nodes.contains(&my_node_id) && storage.has_chunk(&loc.chunk_id))
+                .filter(|loc| loc.nodes.contains(&my_node_id)
+                    && (storage.has_chunk(&loc.chunk_id) || pending.contains(&loc.chunk_id)))
                 .collect();
             Ok::<_, anyhow::Error>(held)
         }).await??;

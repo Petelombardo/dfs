@@ -1475,6 +1475,100 @@ for n in ${T91_ALL//,/ }; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/n
 rm -f "$MOUNT/$T91_FILE" "$LOG/t91.err"
 fi # should_run T91
 
+# ── T92: an ordered write that lands mid-fold applies the same on both replicas (gate G2) ──
+# The primary owns a quiet slot's background fold. It checked the stream was quiet once, then
+# folded without the stream's order lock: a write that arrived meanwhile applied at once on
+# the secondary (onto the unfolded accumulator) and on the primary only after the fold. The
+# replicas returned different patch tokens for one version, the client counted the primary as
+# not having applied it, and fsync failed (G2 loops 10-15, T74 #3). A test-only hook holds the
+# primary's next background fold 2s under its patch lock; the second patch is sent then.
+snapshot_log T92
+if should_run T92 && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+echo "=== T92: an ordered write that lands during the primary's background fold: fsync succeeds, replicas identical ==="
+T92_FILE=t92.bin
+T92_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$T/t92.bin" bs=4M count=2 status=none
+cp "$T/t92.bin" "$MOUNT/$T92_FILE"
+dfs_sync
+T92_ISR=""
+for _ in $(seq 1 30); do
+    T92_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T92_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+    [ -n "$T92_ISR" ] && break
+    sleep 1
+done
+T92_MAP=$("$BIN/dfs-admin" --cluster "$T92_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+read -r T92_PN T92_SN <<< "$T92_ISR"
+T92_P=$(echo "$T92_MAP" | awk -v n="$T92_PN" '$1==n{print $2}')
+T92_S=$(echo "$T92_MAP" | awk -v n="$T92_SN" '$1==n{print $2}')
+t92_patch() {   # t92_patch <offset>: 4 KiB at <offset> into the mount and the expected copy, fsynced
+    python3 - "$MOUNT/$T92_FILE" "$T/t92.bin" "$1" <<'PY'
+import os, sys, time
+x = os.urandom(4096); off = int(sys.argv[3]); t0 = time.time()
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, off); os.fsync(fd); os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+print("%.2f" % (time.time() - t0))
+PY
+}
+if [ -z "$T92_P" ] || [ -z "$T92_S" ]; then
+    check "T92 setup: chunk 1's ISR found ($T92_P,$T92_S)" FAIL
+else
+    T92_N=$(( ${T92_P##*:} - 8900 + 1 ))
+    echo "  T92: ISR primary=$T92_P (node$T92_N) secondary=$T92_S"
+    T92_MARK=$(wc -l < "$LOG/server${T92_N}.log")
+    # A first patch leaves chunk 1 dirty; its owner folds it once the stream has been quiet.
+    T92_T1=$(t92_patch $((4 * 1024 * 1024 + 8192)) 2>>"$LOG/t92.err") || T92_T1=FAIL
+    "$BIN/dfs-admin" --cluster "$T92_P" fault slow-fold --millis 2000 --count 1 >/dev/null 2>&1 || true
+    T92_HELD=0
+    for _ in $(seq 1 90); do
+        tail -n +"$((T92_MARK + 1))" "$LOG/server${T92_N}.log" | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -a "FAULT INJECTION: background fold of file" | grep -q "chunk 1 " && { T92_HELD=1; break; }
+        sleep 0.5
+    done
+    T92_RC=0; T92_T2=""
+    if [ "$T92_HELD" = 1 ]; then
+        T92_T2=$(t92_patch $((4 * 1024 * 1024 + 65536)) 2>>"$LOG/t92.err") || T92_RC=$?
+    fi
+    sleep 1
+    T92_DIS=$(sed 's/\x1b\[[0-9;]*m//g' "$CURRENT_CLIENT_LOG" | tail -n 3000 | grep -a "REPLICA DISAGREEMENT" | grep -c "" || true)
+    echo "  T92: first patch ${T92_T1}s; fold held=$T92_HELD; mid-fold patch rc=$T92_RC in ${T92_T2:-?}s; client REPLICA DISAGREEMENT lines (recent) $T92_DIS $(head -c 200 "$LOG/t92.err" 2>/dev/null)"
+    [ "$T92_HELD" = 1 ] \
+        && check "T92a the primary's background fold of chunk 1 was held, and the second patch sent during it" PASS \
+        || check "T92a the primary never started the held background fold within 45s: the test didn't reach the case" FAIL
+    [ "$T92_HELD" = 1 ] && [ "$T92_RC" = 0 ] \
+        && check "T92b the write that landed mid-fold fsynced (${T92_T2}s)" PASS \
+        || check "T92b the write that landed mid-fold failed (rc=$T92_RC)" FAIL
+    T92_READ=$("$BIN/dfs-admin" --cluster "$T92_P,$T92_S" isr read --file "/$T92_FILE" --chunk 1 2>&1 | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T92_H1 T92_H2 <<< "$T92_READ"
+    T92_M1=$(md5sum < "$T/t92.bin" | cut -d' ' -f1)
+    T92_FM=/tmp/dfs-mount-t92
+    mkdir -p "$T92_FM"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T92_FM" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t92.log" --allow-other --log-level debug &
+    T92_CPID=$!
+    for _ in $(seq 1 50); do mountpoint -q "$T92_FM" && break; sleep 0.1; done
+    T92_M2=$(timeout 60 md5sum < "$T92_FM/$T92_FILE" 2>/dev/null | cut -d' ' -f1)
+    fusermount -u "$T92_FM" 2>/dev/null || true
+    kill_client_and_wait "$T92_CPID"
+    [ -n "$T92_H1" ] && [ "$T92_H1" = "$T92_H2" ] && [ "$T92_H1" != ERR ] \
+        && check "T92c both ISR replicas hold identical bytes ($T92_H1)" PASS \
+        || check "T92c ISR replicas differ or unreadable: $T92_READ" FAIL
+    [ "$T92_M1" = "$T92_M2" ] \
+        && check "T92d a fresh client reads both patches back exactly" PASS \
+        || check "T92d fresh read ${T92_M2:-unreadable} vs expected $T92_M1" FAIL
+fi
+"$BIN/dfs-admin" --cluster "${T92_P:-127.0.0.1:8900}" fault slow-fold --millis 0 --count 0 >/dev/null 2>&1 || true
+rm -f "$MOUNT/$T92_FILE" "$T/t92.bin" "$LOG/t92.err"
+fi # should_run T92
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

@@ -49,6 +49,19 @@ pub fn take_injected_apply_failure() -> bool {
         .is_ok()
 }
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectSlowBackgroundFolds`): the next
+/// `INJECTED_SLOW_FOLDS` background folds hold the slot's patch lock this long first.
+pub static INJECTED_SLOW_FOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INJECTED_SLOW_FOLDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Consume one injected slow fold, if any are armed: how long to hold.
+pub fn take_injected_slow_fold() -> Option<u64> {
+    INJECTED_SLOW_FOLDS
+        .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+        .ok()
+        .map(|_| INJECTED_SLOW_FOLD_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// How many decided writes each slot remembers, so a resent copy of a write gets the same answer.
 const DECIDED_CAP: usize = 1024;
 

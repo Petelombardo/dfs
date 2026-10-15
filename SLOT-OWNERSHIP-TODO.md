@@ -306,6 +306,11 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         secondary's ResyncSlot request (under the slot's order lock) lost to a blackhole
         waited the 30 s RPC timeout, past the client's 20 s budget -> fsync EIO. Fixed
         (5 s resync timeout); T91 fails first (worst op 39.9 s), 3/3 fixed. Re-loop T74 to tick.
+        Re-loop (79502b5): T91 20/20, T74 19/20. The fail = the owner's idle background fold
+        checked stream_active once, then folded without the order lock; a write landing
+        mid-fold applied onto different accumulators on the pair -> client EIO. Fixed: the
+        fold holds the slot's order lock throughout (T92 fails first 2/2, fixed 4/4; fio A/B
+        no measurable cost). Suites 1015b ON 273/2 (T38b, T79f), OFF 206/3 (known).
   - [x] **G3 Leader crash failover** (Legata f2708108): a SIGKILLed leader stalls creates
         2 x failure_timeout (~60 s on staging). Leadership must follow the majority-voted
         lease expiry (~3-4 s); suite test: kill -9 the leader, an fsynced create succeeds
@@ -316,6 +321,8 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         GetFileChunkMap before holders' locations land (fresh readers get zeros meanwhile).
         10-15: T79f failed once in 1015a OFF (patched file read wrong md5; logs lost);
         3/3 alone. Watch for it before ticking.
+        1015b ON: T79f failed again with ordering on (logs /root/dfs-suite-1015b-on-logs.tgz).
+        Now a real G4 blocker: investigate.
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

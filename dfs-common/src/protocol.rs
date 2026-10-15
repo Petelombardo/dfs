@@ -1282,6 +1282,14 @@ pub enum Request {
         file_id: FileId,
         next: std::net::SocketAddr,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): this node's next `count` background folds hold the
+    /// slot's patch lock `millis` longer before folding, so a write can arrive mid-fold (suite
+    /// T92). APPENDED at end to preserve wire compatibility.
+    InjectSlowBackgroundFolds {
+        millis: u64,
+        count: u32,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

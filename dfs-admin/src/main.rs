@@ -164,6 +164,14 @@ enum FaultCommands {
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
+    /// Test-only: hold this node's next `count` background folds `millis` under the slot's
+    /// patch lock before folding, so a write can land mid-fold.
+    SlowFold {
+        #[arg(long)]
+        millis: u64,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
     /// Hold one subsystem's lock for a while: metadata-db, healer-maps or cluster-membership.
     Stall {
         #[arg(long)]
@@ -1808,6 +1816,16 @@ async fn handle_isr_command(cmd: IsrCommands, cluster_addrs: &[SocketAddr]) -> R
 }
 
 async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) -> Result<()> {
+    if let FaultCommands::SlowFold { millis, count } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectSlowBackgroundFolds { millis: *millis, count: *count }).await? {
+                Response::Ok { .. } => println!("{}: holding the next {} background fold(s) {}ms", addr, count, millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::FailOrdered { count } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectOrderedApplyFailures { count: *count }).await? {
@@ -1841,7 +1859,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
             mode: if black_hole { dfs_common::PeerFilterMode::BlackHole } else { dfs_common::PeerFilterMode::Refuse },
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
-        FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } => unreachable!("handled above"),
+        FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. } => unreachable!("handled above"),
     };
     for &addr in cluster_addrs {
         match send_request(addr, Request::SetPeerFilter { filter: filter.clone() }).await? {

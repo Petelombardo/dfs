@@ -1246,6 +1246,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetLeaseStatus
         | Request::InjectStall { .. }
         | Request::InjectOrderedApplyFailures { .. }
+        | Request::InjectSlowBackgroundFolds { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -3064,7 +3065,42 @@ impl OverlayForkCtx {
             && self.slot_isr.get(file_id, chunk_idx).is_some_and(|isr| !isr.members.contains(&me))
     }
 
+    /// A slot with an ordered stream folds holding the stream's order lock, so no ordered
+    /// version applies on this node mid-fold, and the quiet check below is made under it. A
+    /// check made once before an unlocked fold let a write that arrived during the fold apply
+    /// on the secondary onto the unfolded accumulator and on the primary after the fold: the
+    /// replicas returned different patch tokens for one version, the client counted the
+    /// primary as not having applied it, and fsync failed (G2 loops 10-15, T74). On the
+    /// primary the head then moves onto the fold's real result, so the next version's base is
+    /// a real chunk the secondary adopts, not the token the fold retired.
     async fn fold_slot_coordinated(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        mode: FoldCoordination,
+    ) -> bool {
+        let stream = self.write_ordering.latest_slot(file_id, chunk_idx);
+        let _order = match &stream {
+            Some(slot) => Some(slot.order_lock.lock().await),
+            None => None,
+        };
+        let token = self.dirty_patch_slots.get(&(file_id, chunk_idx)).map(|e| e.value().token);
+        let folded = self.fold_slot_coordinated_locked(file_id, chunk_idx, mode).await;
+        if let (true, Some(slot), Some(token)) = (folded, &stream, token) {
+            let me = self.cluster.local_node_id();
+            let primary = self.slot_isr.get(file_id, chunk_idx).is_some_and(|isr| isr.members.first() == Some(&me));
+            if primary && slot.head() == Some(token) {
+                if let Ok(Some(PatchState::Folded(real))) = self.metadata.get_patch_state_async(token).await {
+                    if self.storage.has_chunk(&real) {
+                        slot.set_anchor(real, slot.assigned());
+                    }
+                }
+            }
+        }
+        folded
+    }
+
+    async fn fold_slot_coordinated_locked(
         &self,
         file_id: FileId,
         chunk_idx: u64,
@@ -5125,6 +5161,12 @@ impl OverlayForkCtx {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock_owned().await;
+        if !is_client_initiated {
+            if let Some(ms) = crate::write_order::take_injected_slow_fold() {
+                warn!("FAULT INJECTION: background fold of file {} chunk {} holding the patch lock {}ms", file_id, chunk_idx, ms);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
 
         // Re-check under the lock: another caller (debounce task vs. forced-read
         // racing, or this slot simply has nothing pending) may have already
@@ -8206,6 +8248,18 @@ impl Server {
                 }
                 warn!("FAULT INJECTION: failing this primary's apply of the next {} ordered write(s)", count);
                 crate::write_order::INJECTED_APPLY_FAILURES.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
+            Request::InjectSlowBackgroundFolds { millis, count } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: holding the next {} background fold(s) {}ms under the patch lock", count, millis);
+                crate::write_order::INJECTED_SLOW_FOLD_MS.store(millis, std::sync::atomic::Ordering::SeqCst);
+                crate::write_order::INJECTED_SLOW_FOLDS.store(count, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
             Request::SlotIsrPrepare { items } => self.slot_isr.handle_prepare(items).await,

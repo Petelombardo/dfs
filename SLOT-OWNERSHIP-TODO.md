@@ -298,8 +298,14 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         streak restarts.
         10-14: 1014a/b clean, 1014c broke it (T85a; its T81b was an untested G6 build);
         1014d (G3+G6) 267/0 = 1/5.
+        10-15: 1015a (T91 fix) ON 271/3 = T85a (G7) + T59a/T59e (one lease lapse in a 9 s
+        db stall; 3/3 alone, logs lost to the OFF run) -> streak back to 0/5.
   - [ ] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
         acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
+        10-15 loops (ae6a40f): T69/T73/T76/T77/T86 20/20, T74 18/20. Both T74 fails = a
+        secondary's ResyncSlot request (under the slot's order lock) lost to a blackhole
+        waited the 30 s RPC timeout, past the client's 20 s budget -> fsync EIO. Fixed
+        (5 s resync timeout); T91 fails first (worst op 39.9 s), 3/3 fixed. Re-loop T74 to tick.
   - [x] **G3 Leader crash failover** (Legata f2708108): a SIGKILLed leader stalls creates
         2 x failure_timeout (~60 s on staging). Leadership must follow the majority-voted
         lease expiry (~3-4 s); suite test: kill -9 the leader, an fsynced create succeeds
@@ -308,9 +314,14 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         0/3 on the old build (EIO at 15.0 s), 3/3 fixed (create in 6.3-6.7 s).
   - [ ] **G4 New-leader chunk maps** (Legata c742039c, T79c/f): a new leader must not serve
         GetFileChunkMap before holders' locations land (fresh readers get zeros meanwhile).
-  - [ ] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
+        10-15: T79f failed once in 1015a OFF (patched file read wrong md5; logs lost);
+        3/3 alone. Watch for it before ticking.
+  - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.
+        DONE 10-15: the on-demand ISR seeding (slot_isr_for -> leader) already closed it.
+        T90 (background-flushed new file, another client's fresh file, appended chunk,
+        each patched 20-500 ms later) logs 0 UNORDERED sends and reads back exactly.
   - [x] **G6 No EIO for a retryable refusal** (Legata 7b87b67e): the client's fresh-write
         safety-check refusal is retried within the flush deadline, not returned from fsync.
         10-14: fix written (FlushAttemptRefused, 30 s budget; not when every replica refused

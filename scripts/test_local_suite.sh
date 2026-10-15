@@ -1295,6 +1295,186 @@ kill_client_and_wait "$T89_CPID"
 rm -f "$MOUNT/t89.bin" "$T/t89.bin" "$LOG/t89.err"
 fi # should_run T89
 
+# ── T90: a brand-new chunk's first patches are ordered (gate G5) ──
+# A new chunk's location reaches its holders and the leader through the metadata queue,
+# after the data. A patch that comes first finds no ISR to seed ("none" from every holder)
+# and goes out unordered: one replica applies it beside any other writer's ordered stream.
+# Three races, each repeated: (a) a background-flushed new file patched right after its first
+# flush, (b) a file another client created and fsynced a moment ago, (c) a chunk created by
+# an append, patched right after. Any "[ORDER] client: UNORDERED" line is a FAIL (ordering on).
+snapshot_log T90
+if should_run T90; then
+echo "=== T90: a brand-new chunk's first patches are ordered: background-flushed, another client's, appended ==="
+T90_MNT=/tmp/dfs-mount-t90
+mkdir -p "$T90_MNT" "$T/t90"
+: > "$LOG/client_t90.log"
+RUST_LOG=info "$BIN/dfs-client" mount "$T90_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t90.log" --allow-other --log-level debug &
+T90_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T90_MNT" && break; sleep 0.1; done
+T90_MARK=$(wc -l < "$CURRENT_CLIENT_LOG")
+T90_RC=0
+python3 - "$MOUNT" "$T90_MNT" "$T/t90" 2>>"$LOG/t90.err" <<'PYEOF' || T90_RC=$?
+import os, sys, time
+mnt, other, exp = sys.argv[1:4]
+MB = 1 << 20
+def patch(path, off, data):
+    fd = os.open(path, os.O_RDWR); os.pwrite(fd, data, off); os.fsync(fd); os.close(fd)
+def keep(name, body):
+    open(f"{exp}/{name}", "wb").write(body)
+# (a) new file, no fsync before the patch: the first flush is the background one
+for i, d in enumerate([0.02, 0.05, 0.1, 0.2, 0.5] * 2):
+    p = f"{mnt}/t90a_{i}.bin"; body = bytearray(os.urandom(4 * MB))
+    fd = os.open(p, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644); os.write(fd, body); os.close(fd)
+    time.sleep(d)
+    x = os.urandom(4096); patch(p, MB, x); body[MB:MB + 4096] = x; keep(f"t90a_{i}.bin", body)
+# (b) another client creates and fsyncs; this one patches at once
+for i in range(6):
+    body = bytearray(os.urandom(4 * MB))
+    fd = os.open(f"{other}/t90b_{i}.bin", os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+    os.write(fd, body); os.fsync(fd); os.close(fd)
+    x = os.urandom(4096); patch(f"{mnt}/t90b_{i}.bin", 2 * MB, x); body[2 * MB:2 * MB + 4096] = x
+    keep(f"t90b_{i}.bin", body)
+# (c) an append creates chunk 1, patched right after
+for i, d in enumerate([0.02, 0.1, 0.5]):
+    p = f"{mnt}/t90c_{i}.bin"; body = bytearray(os.urandom(4 * MB))
+    fd = os.open(p, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644); os.write(fd, body); os.fsync(fd); os.close(fd)
+    more = os.urandom(4 * MB)
+    fd = os.open(p, os.O_WRONLY | os.O_APPEND); os.write(fd, more); os.close(fd); body += more
+    time.sleep(d)
+    x = os.urandom(4096); patch(p, 5 * MB, x); body[5 * MB:5 * MB + 4096] = x; keep(f"t90c_{i}.bin", body)
+PYEOF
+T90_UNORD=$( { tail -n +"$((T90_MARK + 1))" "$CURRENT_CLIENT_LOG"; cat "$LOG/client_t90.log"; } 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g' | grep -a "\[ORDER\] client: UNORDERED" | grep -c "" || true)
+T90_BY=$(tail -n +"$((T90_MARK + 1))" "$CURRENT_CLIENT_LOG" | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -a "\[ORDER\] client: UNORDERED" | head -3 | cut -c1-200)
+fusermount -u "$T90_MNT" 2>/dev/null || true
+kill_client_and_wait "$T90_CPID"
+# Read back through a fresh client.
+RUST_LOG=info "$BIN/dfs-client" mount "$T90_MNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t90r.log" --allow-other --log-level debug &
+T90_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T90_MNT" && break; sleep 0.1; done
+T90_BAD=""
+for f in "$T"/t90/*.bin; do
+    n=$(basename "$f")
+    [ "$(md5sum < "$f" | cut -d' ' -f1)" = "$(timeout 60 md5sum < "$T90_MNT/$n" 2>/dev/null | cut -d' ' -f1)" ] || T90_BAD="$T90_BAD $n"
+done
+echo "  T90: writers rc=$T90_RC $(head -c 200 "$LOG/t90.err" 2>/dev/null); unordered sends $T90_UNORD${T90_BY:+; first: $T90_BY}"
+[ "$T90_RC" = 0 ] \
+    && check "T90a every write and fsync succeeded" PASS \
+    || check "T90a a writer failed (rc=$T90_RC)" FAIL
+[ "${T90_UNORD:-1}" = 0 ] \
+    && check "T90b no new chunk's patch went out unordered" PASS \
+    || check "T90b $T90_UNORD unordered MultiPatch send(s) to brand-new chunks" FAIL
+[ -z "$T90_BAD" ] \
+    && check "T90c every file reads back exactly through a fresh client" PASS \
+    || check "T90c read-back differs:$T90_BAD" FAIL
+fusermount -u "$T90_MNT" 2>/dev/null || true
+kill_client_and_wait "$T90_CPID"
+rm -f "$MOUNT"/t90[abc]_*.bin "$LOG/t90.err"; rm -rf "$T/t90"
+fi # should_run T90
+
+# ── T91: a secondary's resync request lost to a blackhole doesn't stall the slot (gate G2) ──
+# A secondary that missed a version asks the primary to resync, holding the slot's order lock.
+# Sent into a blackhole, that request waited out the full 30s RPC timeout, long after the link
+# healed, and every later write to the chunk queued behind it until the client's 20s outage
+# budget failed fsync (G2 loops 10-15: T74 #8 and #15, "missed its secondary"). Here the
+# primary loses its WriteOrders to the secondary for 1.5s (the missed version) while the
+# secondary's link to the primary blackholes for 7s (the lost resync) while one writer fsyncs 4 KiB
+# writes into chunk 1. Ordering only: unordered writes have no resync.
+snapshot_log T91
+if should_run T91 && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+echo "=== T91: a resync request lost to a blackhole doesn't stall the slot: writes resume after the heal, none fails ==="
+T91_FILE=t91.bin
+T91_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$MOUNT/$T91_FILE" bs=4M count=2 status=none
+dfs_sync
+T91_ISR=""
+for _ in $(seq 1 30); do
+    T91_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T91_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+    [ -n "$T91_ISR" ] && break
+    sleep 1
+done
+T91_MAP=$("$BIN/dfs-admin" --cluster "$T91_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+read -r T91_PN T91_SN <<< "$T91_ISR"
+T91_P=$(echo "$T91_MAP" | awk -v n="$T91_PN" '$1==n{print $2}')
+T91_S=$(echo "$T91_MAP" | awk -v n="$T91_SN" '$1==n{print $2}')
+if [ -z "$T91_P" ] || [ -z "$T91_S" ]; then
+    check "T91 setup: chunk 1's ISR found ($T91_P,$T91_S)" FAIL
+else
+    echo "  T91: ISR primary=$T91_P secondary=$T91_S"
+    T91_MARK=$(cat "$LOG"/server*.log | wc -l)
+    # One writer, 4 KiB fsynced writes into chunk 1 for 30s; the heal is at ~9s.
+    python3 - "$MOUNT/$T91_FILE" 30 > "$LOG/t91_w.out" 2>>"$LOG/t91.err" <<'PY' &
+import json, os, sys, time
+path, secs = sys.argv[1], float(sys.argv[2])
+fd = os.open(path, os.O_RDWR)
+start = time.time(); acked = []; failed = []; worst = 0.0; i = 0
+while time.time() - start < secs:
+    t0 = time.time()
+    try:
+        os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + (i % 1024) * 4096); os.fsync(fd)
+        acked.append(round(time.time() - start, 2))
+    except OSError as e:
+        failed.append([i, round(time.time() - start, 2), str(e)]); time.sleep(0.2)
+    worst = max(worst, time.time() - t0); i += 1
+os.close(fd)
+print(json.dumps({"acked": len(acked), "last_s": acked[-1] if acked else -1, "after_heal": sum(1 for t in acked if 15 < t <= secs),
+                  "failed": failed, "worst_s": round(worst, 2), "secs": secs}))
+PY
+    T91_W=$!
+    sleep 2
+    "$BIN/dfs-admin" --cluster "$T91_P" fault set --drop-to "$T91_S" >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T91_S" fault set --drop-to "$T91_P" --black-hole >/dev/null 2>&1 || true
+    sleep 1.5
+    "$BIN/dfs-admin" --cluster "$T91_P" fault clear >/dev/null 2>&1 || true
+    sleep 5.5
+    "$BIN/dfs-admin" --cluster "$T91_S" fault clear >/dev/null 2>&1 || true
+    wait "$T91_W" 2>/dev/null || true
+    T91_OUT=$(tail -1 "$LOG/t91_w.out" 2>/dev/null)
+    T91_SINCE=$(cat "$LOG"/server*.log | tail -n +"$((T91_MARK + 1))" | sed 's/\x1b\[[0-9;]*m//g')
+    T91_GAPS=$(echo "$T91_SINCE" | grep -ac "never arrived; resyncing" || true)
+    T91_LOST=$(echo "$T91_SINCE" | grep -ac "resync: primary .* answered Err(Timeout" || true)
+    echo "  T91: writer $T91_OUT; gaps seen $T91_GAPS, resync requests timed out $T91_LOST $(head -c 200 "$LOG/t91.err" 2>/dev/null)"
+    T91_V=$(echo "$T91_OUT" | python3 -c "
+import json,sys
+try: r=json.loads(sys.stdin.read())
+except Exception: print('BAD'); sys.exit()
+print(len(r['failed']), r['after_heal'], r['worst_s'])" 2>/dev/null || echo BAD)
+    read -r T91_NFAIL T91_AFTER T91_WORST <<< "$T91_V"
+    [ "$T91_NFAIL" = 0 ] \
+        && check "T91a no write failed across the lost resync" PASS \
+        || check "T91a $T91_NFAIL write(s) failed (writer: $T91_OUT)" FAIL
+    [ "${T91_AFTER:-0}" -gt 0 ] 2>/dev/null \
+        && check "T91b the writer made progress after the heal ($T91_AFTER acked from 6s after the heal)" PASS \
+        || check "T91b no write acked from 6s after the heal to the end: the slot stayed stalled behind the lost resync" FAIL
+    # The client fails an ordered write its secondary hasn't applied within 20s (the outage
+    # budget): an op that long is an fsync EIO as soon as two writers share the slot (T74).
+    python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 20 else 1)" "${T91_WORST:-99}" 2>/dev/null \
+        && check "T91d the slowest write took ${T91_WORST}s, inside the client's 20s outage budget" PASS \
+        || check "T91d the slowest write took ${T91_WORST:-?}s, past the client's 20s outage budget" FAIL
+    # Informational: the case was reached (a gap, then a resync sent into the blackhole).
+    [ "$T91_GAPS" -ge 1 ] || echo "  (T91 note: no gap was seen on the secondary; the case may not have been reached)"
+    T91_READ=$("$BIN/dfs-admin" --cluster "$T91_P,$T91_S" isr read --file "/$T91_FILE" --chunk 1 2>&1 | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T91_H1 T91_H2 <<< "$T91_READ"
+    [ -n "$T91_H1" ] && [ "$T91_H1" = "$T91_H2" ] && [ "$T91_H1" != ERR ] \
+        && check "T91c both ISR replicas hold identical bytes ($T91_H1)" PASS \
+        || check "T91c ISR replicas differ or unreadable: $T91_READ" FAIL
+fi
+for n in ${T91_ALL//,/ }; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
+rm -f "$MOUNT/$T91_FILE" "$LOG/t91.err"
+fi # should_run T91
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

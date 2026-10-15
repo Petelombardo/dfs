@@ -17465,8 +17465,14 @@ impl Server {
     /// it locally. Returns the chunk and the version it reflects.
     async fn resync_from_primary(&self, tag: &dfs_common::WriteOrderTag) -> Option<(ChunkId, u64)> {
         let addr = self.cluster.get_node(&tag.primary).await.map(|n| n.addr)?;
+        // Bounded well below the client's 20s outage budget. The caller holds the slot's order
+        // lock, so a request lost to a dead link held every later write to the chunk for the
+        // default 30s RPC timeout, long after the link healed, and the client failed fsync
+        // (suite T91; G2 loops 10-15, T74). A healthy primary answers in milliseconds (one
+        // materialize); giving up lets the next write's resync, after the heal, go through.
+        const RESYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let req = Request::ResyncSlot { file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch };
-        let (anchor, at) = match self.client.send_message(addr, Message::Request(req)).await.map(|e| e.message) {
+        let (anchor, at) = match self.client.send_message_timeout(addr, Message::Request(req), RESYNC_TIMEOUT).await.map(|e| e.message) {
             Ok(Message::Response(Response::SlotResync { chunk_id, version })) => (chunk_id, version),
             other => {
                 warn!("[ORDER] resync: primary {} answered {:?}", addr, other.map(|m| format!("{:?}", m).chars().take(200).collect::<String>()));

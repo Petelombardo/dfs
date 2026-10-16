@@ -62,6 +62,22 @@ pub fn take_injected_slow_fold() -> Option<u64> {
         .map(|_| INJECTED_SLOW_FOLD_MS.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectChunkLocationFailures`): until this
+/// time (ms since UNIX epoch), chunk-location registrations fail as a failed commit would.
+/// Time-based, not a count: the ordered and batched senders retry at very different rates.
+pub static INJECTED_LOCATION_FAILURES_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a chunk-location registration arriving now should fail.
+pub fn take_injected_location_failure() -> bool {
+    let until = INJECTED_LOCATION_FAILURES_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst);
+    until != 0 && now_ms() < until
+}
+
+/// Milliseconds since the UNIX epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 /// How many decided writes each slot remembers, so a resent copy of a write gets the same answer.
 const DECIDED_CAP: usize = 1024;
 

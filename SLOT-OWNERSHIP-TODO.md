@@ -345,6 +345,17 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         10-16: T75[secondary]a FIXED: a ForceFold on one ISR member now runs as the pair's
         ordered fold and returns once both members answered (unit test fails first). T75 6/6
         alone; suites 1016b ON 282/1 (T85a), OFF 211/4 (T83d T38b T77a/b), 46m each.
+        10-16: T95 (the leader refuses every location registration for 2 s, then a fsynced
+        patch; [up] leader stays, [dies] leader SIGKILLed right after the fsync). The client
+        took a batched ReplicateChunkLocations answered with Response::Error as success and
+        dropped the batch -> OFF read the wrong md5 after the leader died. FIXED: the batch is
+        retried and re-queued. Old client fails T95[dies] OFF; fixed 6/6. Measured, then
+        DROPPED: making fsync wait for the leader to register (bench QD1 -17%); the agreed
+        direction is holders durably own the slot's version, the leader only knows who
+        (README on the roadmap wall, steps 1-4). Suites 1016i ON 288/0 (43m11s), OFF 212/5
+        (T79a T83d T64a/d T77b, all seen before; 56m41s). Unit: client 83/0, server 346/0.
+        Next (step 1): holders record (epoch, version, chunk id) with the apply and push it
+        with the generation; fail-first T95[orphan] (leader and writing client both die).
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

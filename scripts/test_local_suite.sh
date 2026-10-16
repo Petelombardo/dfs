@@ -1760,6 +1760,82 @@ rm -f "$MOUNT/$T94_FILE" "$T/t94.bin" "$LOG/t94.err"
 done
 fi # should_run T94
 
+# ── Test 95: a patch fsynced while the leader refuses its location reads back ────
+# The leader fails every chunk-location registration for 2 s (DFS_FAULT_INJECTION) while a
+# patch is fsynced. up: once the window closes, a fresh client must read the patched bytes;
+# the batched sender took the leader's refusal as success and dropped the location, so the
+# leader went on naming the pre-patch chunk. dies: the leader is SIGKILLed right after the
+# fsync, so the location never reaches it; the new leader must learn it from the holders.
+# Both must keep holding once writes stop sending locations to the leader at all.
+snapshot_log T95
+if should_run T95; then
+echo "=== T95: a patch fsynced while the leader refuses its location reads back from a fresh client ==="
+t95_fresh_md5() {   # t95_fresh_md5 <file> <case>: the file's md5 through a new client mount
+    local fm=/tmp/dfs-mount-t95 pid m
+    mkdir -p "$fm"
+    RUST_LOG=info "$BIN/dfs-client" mount "$fm" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t95_$2.log" --allow-other --log-level debug &
+    pid=$!
+    for _ in $(seq 1 50); do mountpoint -q "$fm" && break; sleep 0.1; done
+    m=$(timeout 60 md5sum < "$fm/$1" 2>/dev/null | cut -d' ' -f1)
+    fusermount -u "$fm" 2>/dev/null || true
+    kill_client_and_wait "$pid"
+    echo "$m"
+}
+for T95_CASE in up dies; do
+T95_FILE=t95_$T95_CASE.bin
+dd if=/dev/urandom of="$T/t95.bin" bs=1M count=4 status=none
+dd if="$T/t95.bin" of="$MOUNT/$T95_FILE" bs=1M conv=fsync status=none 2>/dev/null || true
+dfs_sync
+sleep 2
+T95_LADDR=$(t88_leader "$CLUSTER")
+T95_LN=$(( ${T95_LADDR##*:} - 8900 + 1 ))
+"$BIN/dfs-admin" --cluster "$T95_LADDR" fault fail-locations --millis 2000 >/dev/null 2>&1 || true
+T95_OUT=$(timeout 60 python3 - "$MOUNT/$T95_FILE" "$T/t95.bin" 2>>"$LOG/t95.err" <<'PY'
+import os, sys, time
+x = os.urandom(65536)
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, 4096)
+t = time.time()
+try:
+    os.fsync(fd); r = "ok %.0fms" % ((time.time() - t) * 1000)
+except OSError as e:
+    r = "err errno=%d" % e.errno
+os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(4096); f.write(x)
+print(r)
+PY
+)
+if [ "$T95_CASE" = dies ]; then
+    pkill -9 -f "dfs-server start --config $BASE/node$T95_LN/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T95_LN/config.toml" >/dev/null || break; sleep 0.1; done
+    T95_NEW=""
+    for _ in $(seq 1 60); do
+        T95_NEW=$(t88_leader 127.0.0.1:$((8900 + T95_LN % 5)))
+        [ -n "$T95_NEW" ] && [ "$T95_NEW" != "$T95_LADDR" ] && break
+        sleep 0.5
+    done
+else
+    sleep 5   # the refusal window is over; the location has had time to land
+    "$BIN/dfs-admin" --cluster "$T95_LADDR" fault fail-locations --millis 0 >/dev/null 2>&1 || true
+fi
+T95_M1=$(md5sum < "$T/t95.bin" | cut -d' ' -f1)
+T95_M2=$(t95_fresh_md5 "$T95_FILE" "$T95_CASE")
+echo "  T95[$T95_CASE]: leader node$T95_LN ($T95_LADDR); fsync ${T95_OUT:-timed out}${T95_NEW:+; new leader $T95_NEW}; fresh client read ${T95_M2:-nothing}, expected $T95_M1"
+case "$T95_OUT" in
+    ok*) [ "$T95_M1" = "$T95_M2" ] \
+            && check "T95[$T95_CASE] a fresh client reads the patch fsynced while the leader refused its location" PASS \
+            || check "T95[$T95_CASE] a fresh client read ${T95_M2:-nothing}, expected $T95_M1 (the patch fsynced while the leader refused its location)" FAIL ;;
+    *) check "T95[$T95_CASE] the patch fsync failed: ${T95_OUT:-timed out}" FAIL ;;
+esac
+if [ "$T95_CASE" = dies ]; then
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T95_LN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$T95_LN.log" 2>&1 &
+    t85_wait_ready || echo "  T95[dies]: cluster not fully healthy 30s after node$T95_LN's restart"
+fi
+rm -f "$MOUNT/$T95_FILE" "$T/t95.bin"
+done
+fi # should_run T95
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

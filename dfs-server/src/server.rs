@@ -1247,6 +1247,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectStall { .. }
         | Request::InjectOrderedApplyFailures { .. }
         | Request::InjectSlowBackgroundFolds { .. }
+        | Request::InjectChunkLocationFailures { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -8231,6 +8232,12 @@ impl Server {
             Request::DeletePathIndex { path } => {
                 self.handle_delete_path_index(path).await
             }
+            Request::ReplicateChunkLocation { .. } | Request::ReplicateChunkLocations { .. } | Request::ReplicateChunkLocationsWithReceipts { .. }
+                if crate::write_order::take_injected_location_failure() =>
+            {
+                warn!("FAULT INJECTION: failing a chunk-location registration");
+                Response::Error { message: "FAULT INJECTION: chunk-location commit failed".into(), code: ErrorCode::InternalError }
+            }
             Request::ReplicateChunkLocation { location, file_id, generation } => {
                 self.handle_replicate_chunk_location(location, file_id, generation).await
             }
@@ -8254,6 +8261,18 @@ impl Server {
                 }
                 warn!("FAULT INJECTION: failing this primary's apply of the next {} ordered write(s)", count);
                 crate::write_order::INJECTED_APPLY_FAILURES.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
+            Request::InjectChunkLocationFailures { millis } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: failing every chunk-location registration for {}ms", millis);
+                let until = if millis == 0 { 0 } else { crate::write_order::now_ms() + millis };
+                crate::write_order::INJECTED_LOCATION_FAILURES_UNTIL_MS.store(until, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
             Request::InjectSlowBackgroundFolds { millis, count } => {

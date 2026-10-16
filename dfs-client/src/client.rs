@@ -6759,6 +6759,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                     self.audit_chunk_location_receipts(leader, &locations, &receipts);
                     return Ok(());
                 }
+                // The leader's commit failed: the locations aren't recorded. This used to be
+                // taken as success, so the batch was neither retried nor re-queued, and the
+                // leader kept naming the pre-patch chunk (suite T95a). Not first_err: the leader
+                // understood the request, so this is never evidence of a pre-receipt binary for
+                // the legacy fallback below.
+                Ok(Ok(Response::Error { message, .. })) => {
+                    warn!("ReplicateChunkLocations to leader {} refused (attempt {}): {}", leader, attempt, message);
+                }
                 Ok(Ok(_)) => return Ok(()),
                 Ok(Err(e)) => {
                     if first_err.is_none() { first_err = Some(e.to_string()); }

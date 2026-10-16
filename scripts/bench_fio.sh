@@ -41,7 +41,9 @@ sleep 5   # leases, ISR seeding, leader settle
 
 # O_DIRECT through FUSE if the mount allows it (what a VM with cache=none does); otherwise
 # buffered with an fsync per write, which forces the same end-to-end round trip.
-if fio --name=probe --filename="$MOUNT/probe.bin" --size=4k --bs=4k --rw=write --direct=1 \
+if [ -n "${BENCH_SYNCMODE:-}" ]; then
+    SYNCMODE="$BENCH_SYNCMODE"   # e.g. --fsync=1: every write fsynced, even where O_DIRECT works
+elif fio --name=probe --filename="$MOUNT/probe.bin" --size=4k --bs=4k --rw=write --direct=1 \
         --ioengine=psync --output=/dev/null >/dev/null 2>&1; then
     SYNCMODE="--direct=1"
 else

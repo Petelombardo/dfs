@@ -1290,6 +1290,14 @@ pub enum Request {
         millis: u64,
         count: u32,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): for the next `millis`, this node fails every
+    /// chunk-location registration it receives (ReplicateChunkLocation(s)), as a leader whose
+    /// commits fail would (suite T95). 0 clears it. APPENDED at end to preserve wire
+    /// compatibility.
+    InjectChunkLocationFailures {
+        millis: u64,
+    },
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

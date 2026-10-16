@@ -18291,6 +18291,16 @@ impl Server {
                 };
             }
         }
+        // A slot with an ISR folds as a pair. Folded here alone, this member returned while its
+        // partner was still adopting the result from a detached broadcast, and a no-op rewrite
+        // in that gap applied onto the fold result on one member and onto the unfolded
+        // accumulator on the other: two tokens for one version (T75[secondary]a, 1015c).
+        let me = self.cluster.local_node_id();
+        if let Some(isr) = self.slot_isr.get(file_id, chunk_idx) {
+            if isr.members.len() == 2 && isr.members.contains(&me) {
+                return self.force_fold_isr_pair(file_id, chunk_idx, isr).await;
+            }
+        }
         // ForceFold bypasses fold_slot_coordinated entirely — never reaches
         // announce_fold_result, so this is its only peer-directed broadcast.
         if matches!(self.overlay_ctx().fold_slot_now(file_id, chunk_idx, true, true).await, FoldSlotOutcome::Failed) {
@@ -18310,6 +18320,43 @@ impl Server {
                 code: ErrorCode::InternalError,
             },
         }
+    }
+
+    /// A ForceFold sent to one member of an ISR slot, run as the pair's ordered fold (what the
+    /// client sends when it folds both): this member and its partner each take it at the same
+    /// version, and it returns once both have answered. A partner that fails is logged; as
+    /// secondary it resyncs on the next write, as primary our own turn refuses.
+    async fn force_fold_isr_pair(&self, file_id: FileId, chunk_idx: u64, isr: crate::slot_isr::SlotIsr) -> Response {
+        let tag = dfs_common::WriteOrderTag {
+            file_id, chunk_idx, isr_epoch: isr.epoch,
+            primary: isr.members[0], secondary: isr.members[1],
+            write_id: uuid::Uuid::new_v4().as_u128(),
+        };
+        let partner = if tag.primary == self.cluster.local_node_id() { tag.secondary } else { tag.primary };
+        let fold = || Request::Ordered { tag, request: Box::new(Request::ForceFold { file_id, chunk_idx }) };
+        let remote = async {
+            let Some(addr) = self.cluster.get_node(&partner).await.map(|n| n.addr) else {
+                return Err("not a known node".to_string());
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(10), self.client.send_message(addr, Message::Request(fold()))).await {
+                Ok(Ok(envelope)) => match envelope.message {
+                    Message::Response(resp @ Response::ForceFoldResult { .. }) => Ok(resp),
+                    other => Err(format!("{:?}", other)),
+                },
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("timed out".to_string()),
+            }
+        };
+        let (local, remote) = tokio::join!(self.handle_ordered(tag, Request::ForceFold { file_id, chunk_idx }), remote);
+        match (&local, &remote) {
+            (Response::ForceFoldResult { real_chunk_id: a, .. }, Ok(Response::ForceFoldResult { real_chunk_id: b, .. })) if a != b =>
+                warn!("ForceFold: file {} chunk {}: the pair folded to different results ({} here, {} on {})",
+                    file_id, chunk_idx, a, b, partner),
+            (_, Err(e)) => warn!("ForceFold: file {} chunk {}: partner {} didn't take the ordered fold: {}",
+                file_id, chunk_idx, partner, e),
+            _ => {}
+        }
+        local
     }
 
     /// Responder side of the debounce-fold coordination protocol — see
@@ -30000,6 +30047,71 @@ mod tests {
                  — the caller (fold_slot_coordinated's Wave/Async path) is responsible for announcing instead");
             assert_eq!(fold_count.load(Ordering::Relaxed), 0,
                 "broadcast_to_peers=false must suppress run_single_fold's own ReplicatePatchFold broadcast");
+        }
+
+        /// Stands in for the other ISR member: takes 200 ms over an ordered fold, then answers.
+        struct OrderedFoldPeer {
+            done: Arc<AtomicU64>,
+        }
+
+        impl MessageHandler for OrderedFoldPeer {
+            fn handle_request(
+                &self,
+                request: Request,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move {
+                    match request {
+                        Request::Ordered { request, .. } if matches!(*request, Request::ForceFold { .. }) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            self.done.fetch_add(1, Ordering::SeqCst);
+                            Response::Error { message: "fake peer".into(), code: ErrorCode::InternalError }
+                        }
+                        Request::HasChunks { chunk_ids } => Response::BoolVec { values: vec![true; chunk_ids.len()] },
+                        _ => Response::Ok { data: None },
+                    }
+                })
+            }
+            fn handle_cluster_message(
+                &self,
+                _message: ClusterMessage,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move { Response::Ok { data: None } })
+            }
+        }
+
+        /// Suite T75[secondary]a (1015c ON): an admin ForceFold on one ISR member, with the
+        /// stream quiet, folded that member alone and returned while its partner was still
+        /// adopting the result (a detached broadcast). The next no-op rewrite applied onto the
+        /// fold result on one member and onto the unfolded accumulator on the other: two tokens
+        /// for one version. A one-sided fold of an ISR slot is the pair's ordered fold, done on
+        /// both members before it returns.
+        #[tokio::test]
+        async fn a_one_sided_force_fold_of_an_isr_slot_folds_the_pair_before_returning() {
+            let h = make_overlay_test_harness();
+            h.server.lease.grant_own_lease_for_test();
+            let peer_addr: SocketAddr = "127.0.0.1:19303".parse().unwrap();
+            let done = Arc::new(AtomicU64::new(0));
+            let mut net_server = NetworkServer::new(crate::network::peer_port_addr(peer_addr),
+                Arc::new(OrderedFoldPeer { done: done.clone() }), 10);
+            tokio::spawn(async move { net_server.start().await.ok(); });
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let peer = NodeId::from_bytes([0xffu8; 16]);
+            h.server.cluster().add_node(NodeInfo::new(peer, peer_addr, None)).await.unwrap();
+
+            let file_id = FileId::new();
+            let (public_token, ..) = setup_pending_patch(&h, file_id, 0, "one-sided");
+            let me = h.server.cluster().local_node_id();
+            h.server.chunk_map.insert(file_id, (vec![ChunkLocation {
+                chunk_id: public_token, nodes: vec![me, peer], size: 4096, checksum: public_token.hash,
+                file_offset: Some(0), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+            }], 1));
+            h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 1, members: vec![me, peer] });
+
+            let resp = h.server.handle_request(Request::ForceFold { file_id, chunk_idx: 0 }).await;
+            assert_eq!(done.load(Ordering::SeqCst), 1,
+                "BUG: ForceFold on one ISR member returned ({:?}) before its partner had folded too: \
+                 the next write splits the pair", resp);
+            assert!(matches!(resp, Response::ForceFoldResult { .. }), "the local fold must succeed: {:?}", resp);
         }
     }
 

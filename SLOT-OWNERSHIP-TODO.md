@@ -342,6 +342,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         (T90c OFF data loss); fsync waits for claimed slots. Suites 1016a ON 281/2 (T59a,
         T59e), OFF 205/10 (all seen before: T83d T85a T38b T59a T64a/b/d T65a T77a/b).
         T79f (OFF, follower never persists placement rows) still has no deterministic repro.
+        10-16: T75[secondary]a FIXED: a ForceFold on one ISR member now runs as the pair's
+        ordered fold and returns once both members answered (unit test fails first). T75 6/6
+        alone; suites 1016b ON 282/1 (T85a), OFF 211/4 (T83d T38b T77a/b), 46m each.
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

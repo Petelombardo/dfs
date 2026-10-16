@@ -4089,7 +4089,27 @@ impl FlushHandle {
                 }).count()
             }).unwrap_or(0);
 
-            if pending == 0 { break; }
+            if pending == 0 {
+                // Nothing unclaimed is not "flushed": a slot someone else claimed (the
+                // background flusher takes a chunk the moment it fills) is still on its way
+                // to the servers. Returning then acked fsync ~100 ms before the chunk was
+                // written, with a 0-chunk record published, and another client's patch
+                // zero-filled over the acked data (suite T90c). Our own tasks were awaited
+                // above, so any claimed slot is someone else's: wait it out, then look again
+                // (a failed flush leaves its slot dirty and unclaimed, for this loop to take).
+                let claimed = self.write_buffers.get(&ino).map(|buf| {
+                    buf.active_chunks.iter().any(|idx| match buf.chunk_get(*idx) {
+                        Some(shard) => match shard.try_lock() {
+                            Ok(cs) => cs.slot.flushing,
+                            Err(_) => true,
+                        },
+                        None => false,
+                    })
+                }).unwrap_or(false);
+                if !claimed { break; }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                continue;
+            }
 
             // Count currently in-flight slots for this inode (claimed, flushing=true).
             // Also sum their DIRTY byte sizes (not slot.data.len()) to enforce the byte
@@ -10233,6 +10253,72 @@ mod terminal_give_up_tests {
             "gave-up slot must be removed from active_chunks, not linger as a phantom entry");
         assert_eq!(global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed), 0,
             "discarded bytes must actually leave global_buffered_bytes accounting");
+    }
+
+    /// Suite T90c (ordering off, 10-15): a 4 MB write filled its chunk, the background
+    /// flusher claimed the slot ("chunk full"), and fsync arrived 30 µs later. Every slot left
+    /// was claimed, so flush_all_pipelined saw nothing pending and returned: fsync published
+    /// a 0-chunk record and acked ~100 ms before the chunk was written, and another client's
+    /// patch zero-filled over the acked data. fsync must wait out a slot someone else is
+    /// flushing.
+    #[tokio::test]
+    async fn fsync_waits_for_a_slot_the_background_flusher_already_claimed() {
+        let client = Arc::new(DfsClient::new(vec!["127.0.0.1:1".parse().unwrap()]).unwrap());
+        let write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>> = Arc::new(DashMap::new());
+        let ino = 43u64;
+        let buf = Arc::new(InodeWriteBuffer::new(false));
+        write_buffers.insert(ino, buf.clone());
+        {
+            let shard = buf.chunk_entry(0);
+            let mut cs = shard.lock().await;
+            cs.slot.extents.push((0, vec![0xCDu8; 4096]));
+            cs.slot.span_end = 4096;
+            cs.slot.real_data_end = 4096;
+            cs.slot.dirty_ranges = vec![(0, 4096)];
+            cs.slot.flushing = true; // claimed by the background flusher
+            buf.active_chunks.insert(0);
+        }
+        let handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: write_buffers.clone(),
+            metadata_cache: Arc::new(DashMap::new()),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path: Arc::new(RwLock::new(HashMap::new())),
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(4096)),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        };
+        // The background flush lands 100 ms later and frees the slot.
+        let bg_buf = buf.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let shard = bg_buf.chunk_get(0).unwrap();
+            let mut cs = shard.lock().await;
+            cs.slot = ChunkSlot::new();
+            bg_buf.active_chunks.remove(&0);
+        });
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.flush_all_pipelined(ino)).await;
+        let waited = started.elapsed();
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+        assert!(result.is_ok(), "flush_all_pipelined hung after the background flush completed");
+        assert!(result.unwrap().is_ok());
+        assert!(waited >= std::time::Duration::from_millis(90),
+            "BUG REPRODUCED: fsync's flush returned after {:?} with the chunk still being written by the background flusher", waited);
     }
 }
 

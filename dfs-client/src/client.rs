@@ -39,11 +39,14 @@ struct NodeHealth {
     /// The current penalty rests on proof the node is unreachable (connection refused or
     /// reset, or a liveness probe on a fresh connection failed), not just on timeouts.
     confirmed_down: bool,
+    /// Shed on a refusal (record_dead), not a failed probe: when the next real attempt may
+    /// go through anyway (see NodeHealthTracker::DEAD_RETRY_EVERY). None for any other shed.
+    dead_retry_at: Option<std::time::Instant>,
 }
 
 impl NodeHealth {
     fn new() -> Self {
-        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0, last_probe_at: None, confirmed_down: false }
+        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0, last_probe_at: None, confirmed_down: false, dead_retry_at: None }
     }
 
     fn is_penalized(&self) -> bool {
@@ -60,6 +63,7 @@ impl NodeHealth {
                 self.consecutive_failures = 0;
                 self.backoff_level = 0;
                 self.confirmed_down = false;
+                self.dead_retry_at = None;
             }
         }
     }
@@ -106,6 +110,13 @@ impl NodeHealthTracker {
     /// retry ladder from re-paying an RPC timeout against a corpse, not long enough to
     /// exile it. Data availability outranks the latency win whenever they conflict.
     const DEAD_SHED_SECS: u64 = 5;
+    /// While shed on a refusal, one real attempt goes through this often. Every refusal
+    /// re-arms the shed, so without it a node that restarted was still skipped up to 5 s
+    /// after it was listening again, past the retry ladder of an fsync that needed it
+    /// (suite T94: the patch's only reachable replica and the new leader, fsync EIO). A
+    /// refused connect costs nothing; a host that is truly gone costs one connect timeout
+    /// per interval, not one per request.
+    const DEAD_RETRY_EVERY: Duration = Duration::from_secs(1);
     /// Base probe interval (seconds) — doubles on each repeated failure.
     const BASE_PROBE_SECS: u64 = 30;
     /// Maximum probe interval (seconds).
@@ -127,6 +138,7 @@ impl NodeHealthTracker {
             h.penalized_until = None;
             h.backoff_level = 0;
             h.confirmed_down = false;
+            h.dead_retry_at = None;
         }
     }
 
@@ -188,6 +200,10 @@ impl NodeHealthTracker {
         let already_penalized = h.penalized_until.is_some();
         h.consecutive_failures = h.consecutive_failures.max(Self::PENALTY_THRESHOLD);
         h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(Self::DEAD_SHED_SECS));
+        // Keep the retry clock already running: a refusal re-arms the shed, not the retry.
+        if !already_penalized || h.dead_retry_at.is_none() {
+            h.dead_retry_at = Some(std::time::Instant::now() + Self::DEAD_RETRY_EVERY);
+        }
         h.confirmed_down = true;
         drop(h);
         if !already_penalized {
@@ -244,6 +260,7 @@ impl NodeHealthTracker {
         let secs = (Self::BASE_PROBE_SECS << h.backoff_level).min(Self::MAX_PROBE_SECS);
         h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(secs));
         h.confirmed_down = true;
+        h.dead_retry_at = None; // a failed liveness probe: no early retries
         if h.backoff_level < 8 {
             h.backoff_level += 1;
         }
@@ -260,7 +277,17 @@ impl NodeHealthTracker {
     pub async fn is_shed(&self, addr: SocketAddr) -> bool {
         if let Some(mut h) = self.inner.get_mut(&addr) {
             h.maybe_clear_expired_penalty();
-            h.is_penalized() && h.confirmed_down
+            if !(h.is_penalized() && h.confirmed_down) {
+                return false;
+            }
+            // Shed on a refusal: let one caller through per DEAD_RETRY_EVERY to find out
+            // whether it is back (single-flight: the clock moves before it returns).
+            let now = std::time::Instant::now();
+            if h.dead_retry_at.is_some_and(|t| now >= t) {
+                h.dead_retry_at = Some(now + Self::DEAD_RETRY_EVERY);
+                return false;
+            }
+            true
         } else {
             false
         }
@@ -1261,6 +1288,10 @@ pub struct DfsClient {
     /// the ISR pair had moved past (suite T74). Coalescing keeps T54's invariant (never
     /// more location updates than patches).
     pending_ordered_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, (dfs_common::ChunkLocation, u64)>>>,
+    /// When rediscover_leader last refreshed the cluster view (ms since UNIX epoch): at most
+    /// one refresh per LEADER_REDISCOVER_EVERY, so a leader that refuses rather than died
+    /// can't turn the location workers' every-tick retries into a refresh storm.
+    last_leader_rediscover_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// Whether the current leader understands Request::ReplicateChunkLocationsWithReceipts.
     /// Starts optimistic; latches off only on positive evidence of an older peer (see
@@ -1645,6 +1676,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             single_replica_followup_exhausted_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_ordered_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            last_leader_rediscover_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             chunk_location_receipts_supported: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             declined_chunk_locations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             write_seq: Arc::new(DashMap::new()),
@@ -6702,7 +6734,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// delivers the file's complete, authoritative chunk_locations state at the end of every
     /// flush cycle regardless, so this is strictly a latency optimization, not a correctness
     /// requirement. A no-op for an empty batch.
-    async fn send_chunk_locations_batched(&self, leader: SocketAddr, locations: Vec<dfs_common::ChunkLocation>) -> Result<()> {
+    async fn send_chunk_locations_batched(&self, mut leader: SocketAddr, locations: Vec<dfs_common::ChunkLocation>) -> Result<()> {
         if locations.is_empty() {
             return Ok(());
         }
@@ -6733,6 +6765,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                     warn!("ReplicateChunkLocations to leader {} failed (attempt {}): {}", leader, attempt, e);
                 }
                 Err(_) => warn!("ReplicateChunkLocations to leader {} timed out (attempt {})", leader, attempt),
+            }
+            // The leader may be gone (SIGKILLed; the client still had it cached): ask who
+            // leads now and retry there at once. Retrying the dead one kept an fsynced
+            // patch's location off the new leader for ~1.4 s, and a fresh client read the
+            // slot's previous version meanwhile (suite T94).
+            if let Some(now) = self.rediscover_leader(leader).await {
+                warn!("ReplicateChunkLocations: leader moved {} -> {}; retrying there", leader, now);
+                leader = now;
+                continue;
             }
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             backoff_ms = (backoff_ms * 2).min(4_000);
@@ -6775,6 +6816,24 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
         anyhow::bail!("ReplicateChunkLocations to leader {} failed after 4 attempts", leader)
+    }
+
+    /// After a failed send to `failed`, the client's cached leader: refresh the cluster view
+    /// and return the leader it names now, if that is a different node. None when it is
+    /// still `failed` (or no leader is known), so the caller keeps its ordinary backoff.
+    async fn rediscover_leader(&self, failed: SocketAddr) -> Option<SocketAddr> {
+        const LEADER_REDISCOVER_EVERY: Duration = Duration::from_millis(500);
+        let cached = *self.leader_addr.read().await;
+        if cached == Some(failed) {
+            let now = dfs_common::types::current_timestamp_ms();
+            let last = self.last_leader_rediscover_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= LEADER_REDISCOVER_EVERY.as_millis() as u64
+                && self.last_leader_rediscover_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let _ = self.refresh_cluster_nodes().await;
+            }
+        }
+        (*self.leader_addr.read().await).filter(|&now| now != failed)
     }
 
     /// Report any registration the leader declined. This is the signal that used to be
@@ -9933,7 +9992,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         if entries.is_empty() {
             return 0;
         }
-        let failed: Vec<(dfs_common::ChunkLocation, u64)> = match *self.leader_addr.read().await {
+        // Copied out, not matched on the guard: that held the read lock across the sends.
+        let cached_leader = *self.leader_addr.read().await;
+        let failed: Vec<(dfs_common::ChunkLocation, u64)> = match cached_leader {
             None => entries,
             Some(leader) => futures::future::join_all(entries.into_iter().map(|(location, generation)| {
                 let client = self.clone();
@@ -9948,6 +10009,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
         let unsent = failed.len();
         if unsent > 0 {
+            // A dead cached leader: find the current one for the retry (see
+            // send_chunk_locations_batched). Copy it out first: an `if let` on the read
+            // guard keeps it held through the block, and rediscover_leader's refresh takes
+            // the write lock, which deadlocked the whole client (suite T94, ordering on).
+            let cached = *self.leader_addr.read().await;
+            if let Some(leader) = cached {
+                self.rediscover_leader(leader).await;
+            }
             debug!("ordered chunk locations: {} not confirmed by the leader; re-queued", unsent);
             let mut pending = self.pending_ordered_locations.lock().await;
             for (location, generation) in failed {
@@ -11238,6 +11307,62 @@ mod tests {
         *full_view.lock().unwrap() = (vec![dfs_common::NodeInfo::new(other_id, other, None)], None);
         client.refresh_cluster_nodes().await.ok();
         assert_eq!(client.cluster_nodes.read().await.len(), 2, "a leaderless view replaced the known membership");
+    }
+
+    /// Suite T94 (full ordering-on suite, 10-15): node4 was SIGKILLed, refused connections
+    /// until it restarted, and came back as leader. Each refusal re-armed its 5 s shed, so
+    /// 2 s after it was listening again the client still skipped it without trying: the
+    /// patch's only reachable replica and the leader both, and fsync returned EIO after its
+    /// 2.3 s retry ladder. A node shed on a refusal must get a real attempt within ~1 s.
+    #[tokio::test]
+    async fn a_node_shed_for_refusing_is_tried_again_once_it_is_back() {
+        let view = Arc::new(std::sync::Mutex::new((vec![], None)));
+        let node = cluster_status_server(view).await;
+        let client = DfsClient::new(vec![node]).unwrap();
+        client.node_health.record_dead(node).await; // its last refusal, just before it came back
+        let started = std::time::Instant::now();
+        let mut answered = false;
+        while started.elapsed() < Duration::from_millis(2500) {
+            if client.send_request(node, Request::GetClusterStatus).await.is_ok() {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(answered, "BUG: a node that is listening again was skipped for {:?} on its earlier refusals", started.elapsed());
+        assert!(!client.node_health.is_shed(node).await, "an answer clears the shed");
+    }
+
+    /// Suite T94 (ordering on, 10-15): the leader was SIGKILLed with an ordered patch's
+    /// location still queued. The drain failed against the dead leader, rediscovered the
+    /// new one while still holding a read guard on leader_addr, and the refresh's write on
+    /// it waited forever; every later reader queued behind it and a patch's fsync hung for
+    /// 97 minutes. The drain must come back, re-queue, and point the client at the new leader.
+    #[tokio::test]
+    async fn an_ordered_drain_against_a_dead_leader_rediscovers_without_deadlocking() {
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let view = Arc::new(std::sync::Mutex::new((vec![], None)));
+        let live = cluster_status_server(view.clone()).await;
+        let live_id = dfs_common::NodeId::new();
+        *view.lock().unwrap() = (vec![dfs_common::NodeInfo::new(live_id, live, None)], Some(live_id));
+
+        let client = DfsClient::new(vec![live]).unwrap();
+        *client.cluster_nodes.write().await = vec![live];
+        *client.leader_addr.write().await = Some(dead);
+        let file_id = dfs_common::FileId::new();
+        client.enqueue_ordered_location(dfs_common::ChunkLocation {
+            chunk_id: chunk_id_with_hash0(1), nodes: vec![], size: 4096, checksum: [1; 32],
+            file_offset: Some(0), written_at: None, client_write_seq: None, file_id: Some(file_id),
+        }, 1).await;
+
+        let unsent = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.drain_ordered_locations(None, Duration::from_secs(1)),
+        ).await.expect("BUG: the drain deadlocked on leader_addr after a send to a dead leader failed");
+        assert_eq!(unsent, 1, "the location the dead leader never confirmed goes back in the queue");
+        let leader = tokio::time::timeout(std::time::Duration::from_secs(1), client.leader_addr.read()).await
+            .expect("leader_addr is still locked after the drain returned");
+        assert_eq!(*leader, Some(live), "the drain must leave the client pointed at the leader that answers");
     }
 
     /// rock5b dd (10-13): a 500 MB burst on a 1 GbE client put ~100 4 MB uploads on the

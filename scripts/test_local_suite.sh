@@ -1680,6 +1680,86 @@ t85_wait_ready || echo "  T93: cluster not fully healthy 30s after node$T93_LN's
 rm -f "$MOUNT/$T93_FILE" "$T/t93.bin" "$LOG/t93.err"
 fi # should_run T93
 
+# ── T94: patches right after a leader change keep the file's other bytes (gate G4) ──
+# 1015c OFF T79f: node3 led when t79_pre.bin was written, then its disk filled and server2 took
+# over. The holders' location push gave server2 nothing for the file, and GetFileMetadataByPath
+# builds chunk_locations from the in-memory chunk_map only (stored records carry none), so it
+# answered "16 MB, no chunks". The client's T79e patches then took the fresh-write path and
+# wrote each 4 MB chunk as the 256 KiB patch plus zeros: acked data gone. Here: a 16 MB file
+# written in fsynced 1 MB pieces (as t79_pre.bin), the leader SIGKILLed, and one 256 KiB patch
+# per chunk under the new leader; a fresh client must read every original byte around them.
+snapshot_log T94
+if should_run T94; then
+echo "=== T94: the leader is SIGKILLed after a file is written; patches under the new leader keep the rest of each chunk ==="
+# settled: the leader dies 12 s after the write; immediate: right after it, before the
+# file's record and locations have reached anyone else (T79's node3 was stopped 1 s after
+# t79_pre.bin's last write). bounce: T79's whole shape, the leader killed and restarted
+# 1 s after the write, then lost for good 8 s later.
+for T94_CASE in settled immediate bounce; do
+T94_FILE=t94_$T94_CASE.bin
+dd if=/dev/urandom of="$T/t94.bin" bs=4M count=4 status=none
+dd if="$T/t94.bin" of="$MOUNT/$T94_FILE" bs=1M conv=fsync status=none 2>/dev/null || true
+dfs_sync
+if [ "$T94_CASE" = settled ]; then sleep 12; fi   # quiet: the pieces' patch slots fold
+if [ "$T94_CASE" = bounce ]; then
+    # T79's shape: the leader is SIGKILLed 1 s after the write and comes straight back,
+    # inside its lease; it is the node whose departure 8 s later the patches outlive.
+    T94_BADDR=$(t88_leader "$CLUSTER")
+    T94_BN=$(( ${T94_BADDR##*:} - 8900 + 1 ))
+    echo "  T94[bounce]: leader node$T94_BN ($T94_BADDR); SIGKILL it and restart it at once"
+    pkill -9 -f "dfs-server start --config $BASE/node$T94_BN/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T94_BN/config.toml" >/dev/null || break; sleep 0.1; done
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T94_BN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$T94_BN.log" 2>&1 &
+    sleep 8
+fi
+T94_LADDR=$(t88_leader "$CLUSTER")
+T94_LN=$(( ${T94_LADDR##*:} - 8900 + 1 ))
+echo "  T94[$T94_CASE]: leader node$T94_LN ($T94_LADDR); SIGKILL it"
+pkill -9 -f "dfs-server start --config $BASE/node$T94_LN/config.toml" 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T94_LN/config.toml" >/dev/null || break; sleep 0.1; done
+T94_NEW=""
+for _ in $(seq 1 60); do
+    T94_NEW=$(t88_leader 127.0.0.1:$((8900 + T94_LN % 5)))
+    [ -n "$T94_NEW" ] && [ "$T94_NEW" != "$T94_LADDR" ] && break
+    sleep 0.5
+done
+T94_MARK=$(wc -l < "$CURRENT_CLIENT_LOG")
+T94_RC=0
+for c in 0 1 2 3; do
+    timeout 60 python3 - "$MOUNT/$T94_FILE" "$T/t94.bin" $(( c * 4194304 + 2097152 )) 2>>"$LOG/t94.err" <<'PY' || T94_RC=$?
+import os, sys
+x = os.urandom(262144); off = int(sys.argv[3])
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, off); os.fsync(fd); os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+PY
+done
+T94_FRESH=$(tail -n +"$((T94_MARK + 1))" "$CURRENT_CLIENT_LOG" | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -a "FRESH WRITE PATH: chunk_exists=true" | grep -c "" || true)
+T94_FM=/tmp/dfs-mount-t94
+mkdir -p "$T94_FM"
+RUST_LOG=info "$BIN/dfs-client" mount "$T94_FM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t94_$T94_CASE.log" --allow-other --log-level debug &
+T94_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T94_FM" && break; sleep 0.1; done
+T94_M2=$(timeout 60 md5sum < "$T94_FM/$T94_FILE" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T94_FM" 2>/dev/null || true
+kill_client_and_wait "$T94_CPID"
+T94_M1=$(md5sum < "$T/t94.bin" | cut -d' ' -f1)
+echo "  T94[$T94_CASE]: patched while ${T94_NEW:-nobody} led: rc=$T94_RC; patches sent as fresh writes over an existing chunk: $T94_FRESH $(head -c 200 "$LOG/t94.err" 2>/dev/null)"
+[ "$T94_RC" = 0 ] && [ -n "$T94_NEW" ] && [ "$T94_NEW" != "$T94_LADDR" ] \
+    && check "T94[$T94_CASE]a the patches fsynced under the new leader" PASS \
+    || check "T94[$T94_CASE]a patches rc=$T94_RC, new leader ${T94_NEW:-none}: the test didn't reach the case" FAIL
+[ "$T94_M1" = "$T94_M2" ] \
+    && check "T94[$T94_CASE]b a fresh client reads every byte: the patches and the data around them" PASS \
+    || check "T94[$T94_CASE]b a fresh client read ${T94_M2:-nothing}, expected $T94_M1 ($T94_FRESH patch(es) went as fresh writes)" FAIL
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T94_LN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+    >> "$LOG/server$T94_LN.log" 2>&1 &
+t85_wait_ready || echo "  T94[$T94_CASE]: cluster not fully healthy 30s after node$T94_LN's restart"
+rm -f "$MOUNT/$T94_FILE" "$T/t94.bin" "$LOG/t94.err"
+done
+fi # should_run T94
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

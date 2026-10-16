@@ -331,6 +331,17 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         adopts; a no-op rewrite in that ~100 ms gap splits ids, bytes identical), OFF 204/5:
         T79f failed AGAIN with ordering off, a different shape (node3 pulled locations fine;
         holders pushed pre-patch ids; node3 never refused a write). 3/3 alone. Open before ticking.
+        10-16: T94 (patch, then the leader is killed for good: settled / immediate / bounce)
+        found 4 bugs, all fixed fail-first: (1) resolve_by_slot served its slot occupant for
+        any requested id -> silent stale read; it now serves only for a known-older id.
+        (2) the client kept sending RCL to the dead leader; it rediscovers (500 ms rate
+        limit); the first cut held the leader_addr read guard across an if-let -> deadlock
+        (97-min fsync hang), fixed. (3) record_dead re-armed the 5 s shed on every refusal,
+        so a restarted node stayed skipped past fsync's ladder -> EIO; one probe/s now.
+        (4) fsync acked before a slot the background flusher had already claimed was written
+        (T90c OFF data loss); fsync waits for claimed slots. Suites 1016a ON 281/2 (T59a,
+        T59e), OFF 205/10 (all seen before: T83d T85a T38b T59a T64a/b/d T65a T77a/b).
+        T79f (OFF, follower never persists placement rows) still has no deterministic repro.
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

@@ -8773,12 +8773,24 @@ impl Server {
     /// the fold winner `467b5a3a…`, intact on three replicas throughout. So on an
     /// unreadable cache answer, escalate to authoritative re-derivation rather
     /// than giving up on the cache's word.
-    async fn resolve_by_slot(&self, file_id: FileId, chunk_idx: u64) -> Option<Arc<Vec<u8>>> {
+    ///
+    /// Only for an id this node knows is OLDER than what it serves instead
+    /// (`known_superseded_by`). An id it knows nothing about may be a version it never
+    /// received: a patch that went to the slot's two other holders. Serving its own
+    /// occupant for that returned the pre-patch bytes as the patched chunk (suite T94: a
+    /// fresh client sent chunk 1's new token to the third holder of its base, which
+    /// answered with the base). NotFound sends the client to another holder.
+    async fn resolve_by_slot(&self, file_id: FileId, chunk_idx: u64, requested: ChunkId) -> Option<Arc<Vec<u8>>> {
         let cached_id = self.chunk_map.get(&file_id).and_then(|entry| {
             let (locs, _) = entry.value();
             Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
         });
-        if let Some(current_id) = cached_id {
+        if let Some(current_id) = cached_id.filter(|&id| id != requested) {
+            if !self.known_superseded_by(requested, current_id).await {
+                info!("resolve_by_slot: not serving {} for {} at (file={}, chunk_idx={}): nothing here says {} is the older one",
+                    current_id, requested, file_id, chunk_idx, requested);
+                return None;
+            }
             match self.resolve_chunk_content(current_id).await {
                 Ok(arc) => {
                     let n = self.slot_backstop_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -8817,6 +8829,9 @@ impl Server {
             // from this node, not a staleness artifact. Keep the caller's error.
             return None;
         }
+        if fresh_id == requested || !self.known_superseded_by(requested, fresh_id).await {
+            return None;
+        }
         match self.resolve_chunk_content(fresh_id).await {
             Ok(arc) => {
                 let n = self.slot_backstop_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -8833,6 +8848,31 @@ impl Server {
                 None
             }
         }
+    }
+
+    /// Whether this node holds evidence that `requested` is an older version of its slot than
+    /// `occupant`: it was folded (its patch state names the result), it was retired by a
+    /// rewrite (an alias), or both have CHUNK_TABLE rows here and the occupant's ranks
+    /// strictly newer. With no such evidence, `requested` may be newer than anything here.
+    async fn known_superseded_by(&self, requested: ChunkId, occupant: ChunkId) -> bool {
+        if requested == occupant {
+            return false;
+        }
+        if self.retired_chunk_aliases.resolve(requested).is_some() {
+            return true;
+        }
+        if let Ok(Some(PatchState::Folded(_))) = self.metadata.get_patch_state_async(requested).await {
+            return true;
+        }
+        let rows = self.metadata.get_chunk_locations_batch_async(vec![requested, occupant]).await.unwrap_or_default();
+        let (Some(req), Some(occ)) = (rows.get(&requested), rows.get(&occupant)) else {
+            return false;
+        };
+        let fold = |id: &ChunkId| self.fold_result_chunk_ids.contains(id);
+        let gen = |id: &ChunkId| self.chunk_generations.get(id).map(|g| *g);
+        // Strictly: location_supersedes answers true on a full tie.
+        Self::location_supersedes(occ, req, fold(&occupant), fold(&requested), gen(&occupant), gen(&requested), 0)
+            && !Self::location_supersedes(req, occ, fold(&requested), fold(&occupant), gen(&requested), gen(&occupant), 0)
     }
 
     async fn resolve_chunk_content(&self, chunk_id: ChunkId) -> Result<Arc<Vec<u8>>> {
@@ -9044,7 +9084,7 @@ impl Server {
             // slot's current occupant rather than EIO-ing the guest — see
             // resolve_by_slot.
             Err(e) => match slot {
-                Some((file_id, chunk_idx)) => self.resolve_by_slot(file_id, chunk_idx).await.ok_or(e),
+                Some((file_id, chunk_idx)) => self.resolve_by_slot(file_id, chunk_idx, chunk_id).await.ok_or(e),
                 None => Err(e),
             },
         };
@@ -9160,7 +9200,7 @@ impl Server {
         let range_result: Result<Vec<u8>> = match range_result {
             Ok(d) => Ok(d),
             Err(e) => match slot {
-                Some((file_id, chunk_idx)) => match self.resolve_by_slot(file_id, chunk_idx).await {
+                Some((file_id, chunk_idx)) => match self.resolve_by_slot(file_id, chunk_idx, chunk_id).await {
                     Some(arc) => {
                         let start = (offset as usize).min(arc.len());
                         let end = (start + length as usize).min(arc.len());
@@ -23605,6 +23645,43 @@ mod tests {
         ).await;
         assert!(!matches!(resp, Response::MultiPatchResult { .. }), "a late patch must be refused, got {:?}", resp);
         assert!(!h.server.dirty_patch_slots.iter().any(|e| e.key().0 == dead), "and must leave no dirty slot");
+    }
+
+    /// The slot backstop serves this node's occupant only for an id it knows is older. Suite
+    /// T94: a fresh client asked the third holder of chunk 1's base for the slot's new patch
+    /// token (which went to the other two holders), and got the base's bytes as the patch.
+    #[tokio::test]
+    async fn slot_backstop_serves_its_occupant_only_for_a_known_older_id() {
+        let h = make_overlay_test_harness();
+        let fid = FileId::new();
+        let data = vec![5u8; 4096];
+        let base = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&data, 0, fid));
+        h.storage.write_chunk(&base, &data).unwrap();
+        let loc = |id: ChunkId, seq: u64| ChunkLocation {
+            chunk_id: id, nodes: vec![h.server.cluster.local_node_id()], size: 4096,
+            checksum: id.hash, file_offset: Some(0), written_at: Some(1000 + seq),
+            client_write_seq: Some(seq), file_id: Some(fid),
+        };
+        h.server.chunk_map.insert(fid, (vec![loc(base, 2)], 2));
+        h.server.metadata.put_chunk_location(&loc(base, 2)).unwrap();
+        let read = |id: ChunkId| Request::ReadChunk {
+            chunk_id: id, sequential_hint: None, client_write_seq: None, file_id: Some(fid), chunk_idx: Some(0),
+        };
+
+        // A version this node never received (no row, no patch state): it may be newer.
+        let unknown = ChunkId::from_hash(compute_chunk_hash(b"a patch that went elsewhere"));
+        let resp = h.server.handle_request(read(unknown)).await;
+        assert!(matches!(resp, Response::Error { code: ErrorCode::NotFound, .. }),
+            "an unknown id must not be answered with the slot's older occupant, got {:?}",
+            match &resp { Response::ChunkData { .. } => "ChunkData(occupant bytes)".to_string(), r => format!("{:?}", r) });
+
+        // An id this node knows lost the slot to the occupant (older row): the backstop serves.
+        let older = ChunkId::from_hash(compute_chunk_hash(b"the slot's previous version"));
+        h.server.metadata.put_chunk_location(&loc(older, 1)).unwrap();
+        match h.server.handle_request(read(older)).await {
+            Response::ChunkData { arc_data: Some(arc), .. } => assert_eq!(&arc[..], &data[..]),
+            other => panic!("a known-older id must get the occupant's bytes, got {:?}", other),
+        }
     }
 
     #[tokio::test]

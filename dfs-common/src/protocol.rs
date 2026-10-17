@@ -1298,6 +1298,26 @@ pub enum Request {
     InjectChunkLocationFailures {
         millis: u64,
     },
+
+    /// A holder's ordered heads, pushed to a new leader after its plain locations (see
+    /// `IsrHead`). The leader installs a head over the slot's current occupant when its own
+    /// committed ISR for the slot names the holder at `isr_epoch` and the head's generation
+    /// is newer, however few nodes the head lists: the ordered stream, not a replica count,
+    /// decides which version is current. APPENDED at end to preserve wire compatibility; a
+    /// leader too old to know it drops the connection and keeps the plain locations.
+    ReplicateIsrHeads {
+        heads: Vec<IsrHead>,
+    },
+}
+
+/// One slot's head as an ISR member applied it: `location` names the token the member's
+/// slot resolves through (its `nodes` are the members that hold it), stamped with the
+/// slot's generation and the ISR epoch the member applied it under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IsrHead {
+    pub location: ChunkLocation,
+    pub generation: u64,
+    pub isr_epoch: u64,
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member

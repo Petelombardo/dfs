@@ -1188,7 +1188,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         Request::GetOrSeedSlotIsr { .. }
         | Request::ReplaceIsrMember { .. } => ClientOther,
         Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. }
-        | Request::SyncHeldLocations { .. } | Request::CheckSupersededChunks { .. } => PeerOther,
+        | Request::SyncHeldLocations { .. } | Request::CheckSupersededChunks { .. }
+        | Request::ReplicateIsrHeads { .. } => PeerOther,
         // A client's leader-directed read, relayed by the node the client asked.
         Request::ForwardedToLeader { .. } => ClientOther,
 
@@ -7752,7 +7753,8 @@ impl Server {
         let my_node_id = server.cluster.local_node_id();
         let storage = server.storage.clone();
         let metadata = server.metadata.clone();
-        let locations = tokio::task::spawn_blocking(move || {
+        let slot_isr = server.slot_isr.clone();
+        let (locations, heads) = tokio::task::spawn_blocking(move || {
             let all = metadata.list_all_chunk_locations()?;
             // An unfolded patch is held too, as its base and delta: it has no file under the
             // token's id. Leaving it out left a new leader that had missed the patch (it was
@@ -7763,11 +7765,42 @@ impl Server {
                 .filter(|loc| loc.nodes.contains(&my_node_id)
                     && (storage.has_chunk(&loc.chunk_id) || pending.contains(&loc.chunk_id)))
                 .collect();
-            Ok::<_, anyhow::Error>(held)
+            // The slots this node applied as an ISR member, at the token its slot resolves
+            // through and the slot's generation. A leader that missed the patch knows only
+            // the version before it, which its holders' rows outnumber: when the other
+            // member died with that leader, this row names one node and lost to them on the
+            // replica count (T95[orphan]).
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            let mut heads = Vec::new();
+            for loc in held.iter().filter(|l| pending.contains(&l.chunk_id)) {
+                let (Some(fid), Some(off)) = (loc.file_id, loc.file_offset) else { continue };
+                let idx = off / CHUNK_SIZE;
+                let Some(isr) = slot_isr.get(fid, idx).filter(|i| i.members.contains(&my_node_id)) else { continue };
+                if metadata.slot_patch_token(fid, idx)? != Some(loc.chunk_id) {
+                    continue;
+                }
+                let Some(generation) = metadata.get_chunk_seq(fid, idx)? else { continue };
+                heads.push(dfs_common::protocol::IsrHead { location: loc.clone(), generation, isr_epoch: isr.epoch });
+            }
+            Ok::<_, anyhow::Error>((held, heads))
         }).await??;
 
         if locations.is_empty() {
             return Ok(());
+        }
+
+        // The files first. A leader that hasn't heard of a file (it was created while this
+        // leader was down) drops its locations as a deleted file's, and then serves the file
+        // as having no chunks: the next writer's patch went as a fresh chunk over the
+        // existing one (T95[orphan]). Deleted files stay deleted: their tombstones gate this.
+        let file_ids: Vec<FileId> = {
+            let mut seen = std::collections::HashSet::new();
+            locations.iter().filter_map(|l| l.file_id).filter(|f| seen.insert(*f)).collect()
+        };
+        let files = server.metadata.get_files_batch_async(file_ids).await?;
+        for batch in files.chunks(100) {
+            let req = dfs_common::Request::ReplicateMetadataBatch { items: batch.to_vec() };
+            server.client.send_message(target, dfs_common::Message::Request(req)).await?;
         }
 
         let total = locations.len();
@@ -7780,6 +7813,16 @@ impl Server {
             sent += batch.len();
         }
         info!("chunk_location_sync: pushed {}/{} locally-held locations to {}", sent, total, target);
+        if !heads.is_empty() {
+            // After the plain rows, so the head lands on the leader's merged row. A leader
+            // too old to know the request keeps the plain rows; that's no failure of the push.
+            let n = heads.len();
+            let req = dfs_common::Request::ReplicateIsrHeads { heads };
+            match server.client.send_message(target, dfs_common::Message::Request(req)).await {
+                Ok(_) => info!("chunk_location_sync: pushed {} ISR head(s) to {}", n, target),
+                Err(e) => warn!("chunk_location_sync: pushing {} ISR head(s) to {} failed: {}", n, target, e),
+            }
+        }
         Ok(())
     }
 
@@ -7840,9 +7883,15 @@ impl Server {
     /// `Request::SyncHeldLocations`: push every chunk location this node holds to the new
     /// leader `to`, answering once it has taken them all.
     async fn handle_sync_held_locations(&self, to: std::net::SocketAddr) -> Response {
+        // Whether this node already follows `to`, read before the push: a node that still
+        // leads (or follows another) keeps taking writes the push doesn't carry, so the pull
+        // mustn't stand in for its own push once it does follow `to` (T95[orphan]).
+        let follows_puller = self.cluster.get_leader_addr().await == Some(to);
         match Self::push_locations_to(self, to).await {
             Ok(()) => {
-                *self.cluster.held_locations_synced.lock().unwrap() = Some((to, std::time::Instant::now()));
+                if follows_puller {
+                    *self.cluster.held_locations_synced.lock().unwrap() = Some((to, std::time::Instant::now()));
+                }
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -8247,6 +8296,7 @@ impl Server {
             Request::ReplicateChunkLocationsWithReceipts { locations } => {
                 self.handle_replicate_chunk_locations(locations, true).await
             }
+            Request::ReplicateIsrHeads { heads } => self.handle_replicate_isr_heads(heads).await,
             Request::AuditSlots { entries } => self.handle_audit_slots(entries).await,
             Request::RenewNodeLease { node, incarnation } => self.lease.handle_renew(node, incarnation),
             Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
@@ -10992,6 +11042,96 @@ impl Server {
         Response::ChunkLocationReceipts { receipts }
     }
 
+    /// `Request::ReplicateIsrHeads`: install each holder's ordered head over its slot's
+    /// occupant when this node's committed ISR for the slot (caught up first if behind)
+    /// names every node the head lists at the head's epoch, and the head's generation is
+    /// newer than the occupant's. The replica count doesn't enter into it: with ordering on,
+    /// every write to the slot passes through its ISR, so a member's applied head is at
+    /// least as new as any write acked for it, even when it is the only member left. The
+    /// durability guard in location_supersedes stays for everything else (T95[orphan]).
+    async fn handle_replicate_isr_heads(&self, heads: Vec<dfs_common::protocol::IsrHead>) -> Response {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let mut installed = 0usize;
+        for head in heads {
+            let loc = head.location;
+            let (Some(fid), Some(off)) = (loc.file_id, loc.file_offset) else { continue };
+            let idx = off / CHUNK_SIZE;
+            if loc.nodes.is_empty() || self.file_recently_deleted(fid) || self.is_superseded_token_location(&loc).await {
+                continue;
+            }
+            let names_head = |isr: &dfs_common::protocol::SlotIsr| {
+                isr.epoch == head.isr_epoch && loc.nodes.iter().all(|n| isr.members.contains(n))
+            };
+            let mut isr = self.slot_isr.get(fid, idx);
+            if isr.as_ref().map_or(true, |i| i.epoch < head.isr_epoch) {
+                self.slot_isr.catch_up(vec![(fid, idx)]).await;
+                isr = self.slot_isr.get(fid, idx);
+            }
+            if !isr.as_ref().is_some_and(|i| names_head(i)) {
+                debug!("ISR head {} for file {} chunk {} not installed: this node's ISR {:?} doesn't name {:?} at epoch {}",
+                    loc.chunk_id, fid, idx, isr, loc.nodes, head.isr_epoch);
+                continue;
+            }
+            let occupant_loc = self.chunk_map.get(&fid).and_then(|e| {
+                let (locs, _) = e.value();
+                Self::chunk_map_find_by_idx(locs, idx).map(|i| locs[i].clone())
+            });
+            let occupant = occupant_loc.as_ref().map(|o| o.chunk_id);
+            if occupant == Some(loc.chunk_id) {
+                continue;
+            }
+            let occupant_gen = match occupant.and_then(|o| self.chunk_generations.get(&o).map(|g| *g)) {
+                Some(g) => Some(g),
+                None => self.metadata.get_chunk_seq_async(fid, idx).await.ok().flatten(),
+            };
+            // The usual causal order decides (generation, then client_write_seq, then a fold
+            // over a client write); only the replica count is left out (a floor of 0). Most
+            // occupants carry no generation here (batched registrations don't), and a head
+            // must not undo a newer write it never saw, like a full rewrite.
+            if let Some(occ) = &occupant_loc {
+                let inc_fold = self.fold_result_chunk_ids.contains(&loc.chunk_id);
+                let occ_fold = self.fold_result_chunk_ids.contains(&occ.chunk_id);
+                if !Self::location_supersedes(&loc, occ, inc_fold, occ_fold, Some(head.generation), occupant_gen, 0) {
+                    continue;
+                }
+            }
+            let mut merged = loc.clone();
+            if let Ok(Some(row)) = self.metadata.get_chunk_location_async(loc.chunk_id).await {
+                for n in row.nodes {
+                    if !merged.nodes.contains(&n) {
+                        merged.nodes.push(n);
+                    }
+                }
+            }
+            self.record_chunk_generation(loc.chunk_id, head.generation);
+            if let Err(e) = self.metadata.put_chunk_seq_async(fid, idx, head.generation).await {
+                warn!("ISR head {}: recording generation {} for file {} chunk {} failed: {}", loc.chunk_id, head.generation, fid, idx, e);
+                continue;
+            }
+            if let Err(e) = self.metadata.put_chunk_location_async(merged.clone()).await {
+                warn!("ISR head {}: committing its location failed: {}", loc.chunk_id, e);
+                continue;
+            }
+            {
+                let mut entry = self.chunk_map.entry(fid).or_insert_with(|| (vec![], merged.client_write_seq.unwrap_or(0)));
+                let (locs, _) = entry.value_mut();
+                let pos = locs.partition_point(|l| l.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE) < idx);
+                if pos < locs.len() && locs[pos].file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE) == idx {
+                    self.chunk_to_file.remove(&locs[pos].chunk_id);
+                    locs[pos] = merged.clone();
+                } else {
+                    locs.insert(pos, merged.clone());
+                }
+            }
+            self.chunk_to_file.insert(merged.chunk_id, fid);
+            info!("ISR head installed: file {} chunk {} -> {} (generation {}, was {:?} at {:?}; nodes {:?})",
+                fid, idx, merged.chunk_id, head.generation, occupant, occupant_gen, merged.nodes);
+            installed += 1;
+        }
+        debug!("handle_replicate_isr_heads: installed {}", installed);
+        Response::Ok { data: None }
+    }
+
     /// Batch, authoritative chunk-location replication — the healer's completion
     /// path sends one of these per peer per flush batch instead of one
     /// ReplicateChunkLocation connection per healed chunk (see
@@ -11251,6 +11391,7 @@ impl Server {
     async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
         debug!("Handling batch replicate of {} metadata items", items.len());
         const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut committed = Vec::new();
         for metadata in items {
             // Tombstone check: reject items for recently-deleted files.
             // Matches the check in handle_replicate_metadata — without this, a
@@ -11314,7 +11455,18 @@ impl Server {
             self.chunk_map_update(&metadata).await;
             if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
                 self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _ = tx.send((metadata.clone(), None));
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                if tx.send((metadata.clone(), Some(reply))).is_ok() {
+                    committed.push(rx);
+                }
+            }
+        }
+        // Answer once the files are committed (the group commit takes them together): a
+        // holder sends a file's chunk locations right behind it, and a leader whose
+        // FILE_TABLE doesn't have the file yet drops them as a deleted file's (T95[orphan]).
+        for rx in committed {
+            if let Ok(Err(e)) = rx.await {
+                return Response::Error { message: format!("metadata commit failed: {}", e), code: ErrorCode::IOError };
             }
         }
         Response::Ok { data: None }
@@ -30131,6 +30283,170 @@ mod tests {
                 "BUG: ForceFold on one ISR member returned ({:?}) before its partner had folded too: \
                  the next write splits the pair", resp);
             assert!(matches!(resp, Response::ForceFoldResult { .. }), "the local fold must succeed: {:?}", resp);
+        }
+
+        /// Records, in arrival order, which files' metadata and which chunks' locations a
+        /// fake leader was sent.
+        struct ArrivalOrderPeer {
+            arrivals: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl MessageHandler for ArrivalOrderPeer {
+            fn handle_request(
+                &self,
+                request: Request,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                {
+                    let mut a = self.arrivals.lock().unwrap();
+                    match &request {
+                        Request::ReplicateMetadataBatch { items } => a.extend(items.iter().map(|m| format!("file {}", m.id))),
+                        Request::ReplicateChunkLocations { locations } => a.extend(locations.iter().map(|l| format!("location {}", l.chunk_id))),
+                        _ => {}
+                    }
+                }
+                Box::pin(async move { Response::Ok { data: None } })
+            }
+            fn handle_cluster_message(
+                &self,
+                _message: ClusterMessage,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move { Response::Ok { data: None } })
+            }
+        }
+
+        /// Suite T95[orphan] (1016 ON): a file created while the old leader was down reached
+        /// the restarted node, once it led again, as its holders' chunk locations with no
+        /// file. Its orphan gate dropped them as a deleted file's, the pull reported done, and
+        /// the file read as having no chunks; the next writer sent its 64 KiB patch as a fresh
+        /// chunk 0 over the 4 MB one. A holder's push must carry the file before its chunks.
+        #[tokio::test]
+        async fn a_holders_location_push_sends_the_file_before_its_chunks() {
+            let h = make_overlay_test_harness();
+            let peer_addr: SocketAddr = "127.0.0.1:19304".parse().unwrap();
+            let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut net_server = NetworkServer::new(crate::network::peer_port_addr(peer_addr),
+                Arc::new(ArrivalOrderPeer { arrivals: arrivals.clone() }), 10);
+            tokio::spawn(async move { net_server.start().await.ok(); });
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            let file_id = FileId::new();
+            let mut file_meta = dfs_common::FileMetadata::new("/held-file".to_string(), dfs_common::types::FileType::RegularFile);
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+            let data = vec![7u8; 4096];
+            let chunk_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&data, 0, file_id));
+            h.storage.write_chunk(&chunk_id, &data).unwrap();
+            let me = h.server.cluster().local_node_id();
+            h.metadata.put_chunk_location(&ChunkLocation {
+                chunk_id, nodes: vec![me], size: 4096, checksum: chunk_id.hash,
+                file_offset: Some(0), written_at: None, client_write_seq: Some(1), file_id: Some(file_id),
+            }).unwrap();
+
+            Server::push_locations_to(&h.server, peer_addr).await.unwrap();
+            let got = arrivals.lock().unwrap().clone();
+            let file_at = got.iter().position(|a| *a == format!("file {}", file_id));
+            let loc_at = got.iter().position(|a| *a == format!("location {}", chunk_id));
+            assert!(loc_at.is_some(), "the held chunk's location was never pushed: {:?}", got);
+            assert!(file_at.is_some() && file_at < loc_at,
+                "BUG: the holder pushed its chunk's location without the file first ({:?}); a leader \
+                 that hasn't heard of the file drops it as a deleted file's", got);
+        }
+
+        /// Suite T95[orphan] (1016l ON): a holder pushed a file's metadata, then its locations,
+        /// to a new leader; the metadata batch was answered before the write reached
+        /// FILE_TABLE, so the locations behind it hit the orphan gate as a deleted file's.
+        /// Answering the batch means the files are committed.
+        #[tokio::test]
+        async fn a_replicated_metadata_batch_is_committed_when_answered() {
+            let h = make_overlay_test_harness();
+            let mut file_meta = dfs_common::FileMetadata::new("/batch-committed".to_string(), dfs_common::types::FileType::RegularFile);
+            file_meta.id = FileId::new();
+            file_meta.write_seq = 1;
+            let resp = h.server.handle_request(Request::ReplicateMetadataBatch { items: vec![file_meta.clone()] }).await;
+            assert!(matches!(resp, Response::Ok { .. }), "{:?}", resp);
+            assert!(h.metadata.get_file(&file_meta.id).unwrap().is_some(),
+                "BUG: ReplicateMetadataBatch answered before its file was committed");
+        }
+
+        /// Suite T95[orphan] (1016k ON): a restarted node pulled its holders' locations while
+        /// the sitting leader still took writes for 2 s; that leader, seeing the new one at
+        /// last, skipped its push as "already pulled", and the file created in the gap read
+        /// as having no chunks. A pull answered while this node names someone else (or itself)
+        /// as leader doesn't count as the new leader's.
+        #[tokio::test]
+        async fn a_pull_answered_before_this_node_follows_the_puller_doesnt_skip_its_later_push() {
+            let h = make_overlay_test_harness();
+            let puller: SocketAddr = "127.0.0.1:19305".parse().unwrap();
+            let mut net_server = NetworkServer::new(crate::network::peer_port_addr(puller),
+                Arc::new(ArrivalOrderPeer { arrivals: Arc::new(std::sync::Mutex::new(Vec::new())) }), 10);
+            tokio::spawn(async move { net_server.start().await.ok(); });
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            assert_ne!(h.server.cluster.get_leader_addr().await, Some(puller));
+
+            let resp = h.server.handle_request(Request::SyncHeldLocations { to: puller }).await;
+            assert!(matches!(resp, Response::Ok { .. }), "{:?}", resp);
+            assert!(h.server.cluster.held_locations_synced.lock().unwrap().is_none(),
+                "BUG: a pull answered while this node didn't follow {} was taken as that leader's, \
+                 so its push on the leader change is skipped", puller);
+        }
+
+        /// Suite T95[orphan] (1016 ON): the primary died with the leader right after a fsynced
+        /// patch, so the new leader heard of the patched token only from the secondary, as a
+        /// one-node row; its pre-patch record named two nodes and won on the replica count.
+        /// An ISR member's head installs on the generation; anyone else's, or an older one,
+        /// doesn't.
+        #[tokio::test]
+        async fn an_isr_members_newer_head_replaces_a_better_replicated_older_version() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let mut file_meta = dfs_common::FileMetadata::new("/isr-head".to_string(), dfs_common::types::FileType::RegularFile);
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+            let (a, b, outsider) = (NodeId::from_bytes([0xa1u8; 16]), NodeId::from_bytes([0xb2u8; 16]), NodeId::from_bytes([0xc3u8; 16]));
+            let loc = |tag: &str, nodes: Vec<NodeId>| {
+                let id = ChunkId::from_hash(compute_chunk_hash(tag.as_bytes()));
+                ChunkLocation { chunk_id: id, nodes, size: 4096, checksum: id.hash, file_offset: Some(0),
+                    written_at: None, client_write_seq: Some(1), file_id: Some(file_id) }
+            };
+            let base = loc("pre-patch", vec![a, b]);
+            h.server.chunk_map.insert(file_id, (vec![base.clone()], 1));
+            h.server.record_chunk_generation(base.chunk_id, 3);
+            h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 2, members: vec![a, b] });
+            let current = |h: &OverlayTestHarness| h.server.chunk_map.get(&file_id).unwrap().value().0[0].chunk_id;
+            let push = |head: ChunkLocation, generation: u64, isr_epoch: u64| Request::ReplicateIsrHeads {
+                heads: vec![dfs_common::protocol::IsrHead { location: head, generation, isr_epoch }],
+            };
+
+            h.server.handle_request(push(loc("outsider", vec![outsider]), 9, 2)).await;
+            assert_eq!(current(&h), base.chunk_id, "a node outside the ISR must not install a head");
+            h.server.handle_request(push(loc("older", vec![b]), 2, 2)).await;
+            assert_eq!(current(&h), base.chunk_id, "a head older than the occupant must not install");
+            h.server.handle_request(push(loc("stale-epoch", vec![b]), 9, 1)).await;
+            assert_eq!(current(&h), base.chunk_id, "a head from an earlier ISR epoch must not install");
+
+            let patched = loc("patched", vec![b]);
+            h.server.handle_request(push(patched.clone(), 4, 2)).await;
+            assert_eq!(current(&h), patched.chunk_id,
+                "BUG: the surviving ISR member's newer head lost to the 2-node pre-patch version");
+            assert_eq!(h.server.chunk_generations.get(&patched.chunk_id).map(|g| *g), Some(4));
+
+            // No generation known for the occupant (batched registrations carry none): the
+            // write order still decides, so a head can't undo a newer write it never saw.
+            let at1 = |tag: &str, nodes: Vec<NodeId>, seq: u64| {
+                let mut l = loc(tag, nodes);
+                l.file_offset = Some(4 * 1024 * 1024);
+                l.client_write_seq = Some(seq);
+                l
+            };
+            let rewrite = at1("full-rewrite", vec![a, b], 10);
+            h.server.chunk_map.get_mut(&file_id).unwrap().value_mut().0.push(rewrite.clone());
+            h.server.slot_isr.set_committed_for_test(file_id, 1, crate::slot_isr::SlotIsr { epoch: 2, members: vec![a, b] });
+            let current1 = |h: &OverlayTestHarness| h.server.chunk_map.get(&file_id).unwrap().value().0[1].chunk_id;
+            h.server.handle_request(push(at1("stale-head", vec![b], 5), 7, 2)).await;
+            assert_eq!(current1(&h), rewrite.chunk_id, "BUG: a head older than the occupant's write undid it");
+            let newer = at1("newer-head", vec![b], 11);
+            h.server.handle_request(push(newer.clone(), 8, 2)).await;
+            assert_eq!(current1(&h), newer.chunk_id, "a head newer than the occupant's write must install");
         }
     }
 

@@ -126,7 +126,9 @@ impl BandwidthLimiter {
     /// Burst cap is always 2× the new rate. Existing token balance is clamped to the
     /// new burst cap to prevent a burst of accumulated tokens at the old rate.
     pub async fn set_rate_mb(&self, mb_per_sec: usize) {
-        let rate = (mb_per_sec * 1024 * 1024) as f64;
+        // Never zero (the controller's own floor is 1 MB/s): acquire divides by the rate,
+        // and a 0 that reached here from a heartbeat panicked the heal task (1016k T45i).
+        let rate = (mb_per_sec.max(1) * 1024 * 1024) as f64;
         let burst = rate * 2.0;
         let mut state = self.state.lock().await;
         state.rate_bytes_per_sec = rate;
@@ -149,14 +151,18 @@ impl BandwidthLimiter {
                     .min(state.burst_cap);
                 state.last_refill = now;
 
-                if state.tokens >= bytes {
+                // A transfer bigger than the bucket (a 4 MB chunk at the 1 MB/s floor's 2 MB
+                // burst) goes once the bucket is full and leaves it in debt; waiting for
+                // `bytes` tokens would wait forever.
+                let need = bytes.min(state.burst_cap);
+                if state.tokens >= need {
                     state.tokens -= bytes;
                     None
                 } else {
                     // Don't consume partial tokens on failure — leave them for the
                     // next attempt so the refill computed from elapsed time is not
                     // reset to zero, which would starve concurrent waiters.
-                    let deficit = bytes - state.tokens;
+                    let deficit = need - state.tokens;
                     Some(Duration::from_secs_f64(deficit / state.rate_bytes_per_sec))
                 }
             };
@@ -6314,6 +6320,19 @@ pub struct HealingTuningSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Suites 1016k (ON T45i, OFF T81a): a new leader's heartbeat carried a heal target of
+    /// 0 MB/s (its controller hadn't ticked yet), the follower applied it, and the next heal
+    /// transfer divided by a zero rate: Duration::from_secs_f64(inf) panicked the task.
+    #[tokio::test]
+    async fn a_zero_heal_rate_throttles_instead_of_panicking() {
+        let limiter = BandwidthLimiter::new(1);
+        limiter.set_rate_mb(0).await;
+        let r = tokio::time::timeout(Duration::from_secs(5), tokio::spawn(async move {
+            limiter.acquire(4 * 1024 * 1024).await;
+        })).await;
+        assert!(matches!(r, Ok(Ok(()))), "BUG: acquire at a zero rate panicked or hung: {:?}", r);
+    }
     use crate::cluster::ClusterManager;
     use crate::metadata::MetadataStore;
     use crate::storage::ChunkStorage;

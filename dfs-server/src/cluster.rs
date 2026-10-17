@@ -1283,8 +1283,10 @@ impl ClusterManager {
         // only ever populated on the leader — see local_heal_bandwidth_mb doc
         // comment), so only advertise it when we currently believe we're leader.
         // Receivers additionally verify the sender is the leader before trusting it.
+        // 0 = this leader's controller hasn't computed a target yet (its first tick is 2 s
+        // after it starts leading); advertising it set every follower's heal rate to zero.
         let heal_bandwidth_target_mb = if self.is_leader().await {
-            Some(self.local_heal_bandwidth_mb.load(std::sync::atomic::Ordering::Relaxed))
+            Some(self.local_heal_bandwidth_mb.load(std::sync::atomic::Ordering::Relaxed)).filter(|&mb| mb > 0)
         } else {
             None
         };

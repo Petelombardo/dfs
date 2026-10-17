@@ -1766,7 +1766,9 @@ fi # should_run T94
 # the batched sender took the leader's refusal as success and dropped the location, so the
 # leader went on naming the pre-patch chunk. dies: the leader is SIGKILLed right after the
 # fsync, so the location never reaches it; the new leader must learn it from the holders.
-# Both must keep holding once writes stop sending locations to the leader at all.
+# orphan: as dies, but the patch goes through a second client that is SIGKILLed with the
+# leader, so no client is left to resend the location; the holders are the only source.
+# All must keep holding once writes stop sending locations to the leader at all.
 snapshot_log T95
 if should_run T95; then
 echo "=== T95: a patch fsynced while the leader refuses its location reads back from a fresh client ==="
@@ -1782,16 +1784,33 @@ t95_fresh_md5() {   # t95_fresh_md5 <file> <case>: the file's md5 through a new 
     kill_client_and_wait "$pid"
     echo "$m"
 }
-for T95_CASE in up dies; do
+# up is required either way. dies/orphan need ordering: without an ISR a lone surviving holder
+# can't prove its patch reached quorum, so the new leader keeps the better-replicated pre-patch
+# row until the writer's own registration lands (dies, ~1 s) or for good (orphan) -- report only.
+t95_check() {
+    if [ "$T95_CASE" = up ] || [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+for T95_CASE in up dies orphan; do
 T95_FILE=t95_$T95_CASE.bin
 dd if=/dev/urandom of="$T/t95.bin" bs=1M count=4 status=none
 dd if="$T/t95.bin" of="$MOUNT/$T95_FILE" bs=1M conv=fsync status=none 2>/dev/null || true
 dfs_sync
 sleep 2
-T95_LADDR=$(t88_leader "$CLUSTER")
+T95_LADDR=$(t88_leader "$CLUSTER") || true
 T95_LN=$(( ${T95_LADDR##*:} - 8900 + 1 ))
+T95_WM=$MOUNT T95_WPID=""
+if [ "$T95_CASE" = orphan ]; then
+    T95_WM=/tmp/dfs-mount-t95w
+    mkdir -p "$T95_WM"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T95_WM" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t95_writer.log" --allow-other --log-level debug &
+    T95_WPID=$!
+    for _ in $(seq 1 50); do mountpoint -q "$T95_WM" && break; sleep 0.1; done
+    for _ in $(seq 1 50); do [ -e "$T95_WM/$T95_FILE" ] && break; sleep 0.1; done
+fi
 "$BIN/dfs-admin" --cluster "$T95_LADDR" fault fail-locations --millis 2000 >/dev/null 2>&1 || true
-T95_OUT=$(timeout 60 python3 - "$MOUNT/$T95_FILE" "$T/t95.bin" 2>>"$LOG/t95.err" <<'PY'
+T95_OUT=$(timeout 60 python3 - "$T95_WM/$T95_FILE" "$T/t95.bin" 2>>"$LOG/t95.err" <<'PY'
 import os, sys, time
 x = os.urandom(65536)
 fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, 4096)
@@ -1804,8 +1823,9 @@ os.close(fd)
 with open(sys.argv[2], "r+b") as f: f.seek(4096); f.write(x)
 print(r)
 PY
-)
-if [ "$T95_CASE" = dies ]; then
+) || true
+if [ "$T95_CASE" != up ]; then
+    [ -n "$T95_WPID" ] && kill -9 "$T95_WPID" 2>/dev/null
     pkill -9 -f "dfs-server start --config $BASE/node$T95_LN/config.toml" 2>/dev/null || true
     for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$T95_LN/config.toml" >/dev/null || break; sleep 0.1; done
     T95_NEW=""
@@ -1823,14 +1843,21 @@ T95_M2=$(t95_fresh_md5 "$T95_FILE" "$T95_CASE")
 echo "  T95[$T95_CASE]: leader node$T95_LN ($T95_LADDR); fsync ${T95_OUT:-timed out}${T95_NEW:+; new leader $T95_NEW}; fresh client read ${T95_M2:-nothing}, expected $T95_M1"
 case "$T95_OUT" in
     ok*) [ "$T95_M1" = "$T95_M2" ] \
-            && check "T95[$T95_CASE] a fresh client reads the patch fsynced while the leader refused its location" PASS \
-            || check "T95[$T95_CASE] a fresh client read ${T95_M2:-nothing}, expected $T95_M1 (the patch fsynced while the leader refused its location)" FAIL ;;
+            && t95_check "T95[$T95_CASE] a fresh client reads the patch fsynced while the leader refused its location" PASS \
+            || t95_check "T95[$T95_CASE] a fresh client read ${T95_M2:-nothing}, expected $T95_M1 (the patch fsynced while the leader refused its location)" FAIL ;;
     *) check "T95[$T95_CASE] the patch fsync failed: ${T95_OUT:-timed out}" FAIL ;;
 esac
-if [ "$T95_CASE" = dies ]; then
+if [ -n "$T95_WPID" ]; then
+    wait "$T95_WPID" 2>/dev/null || true   # 137: it was SIGKILLed
+    fusermount -u "$T95_WM" 2>/dev/null || umount -l "$T95_WM" 2>/dev/null || true
+fi
+if [ "$T95_CASE" != up ]; then
     RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T95_LN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         >> "$LOG/server$T95_LN.log" 2>&1 &
-    t85_wait_ready || echo "  T95[dies]: cluster not fully healthy 30s after node$T95_LN's restart"
+    # The others may still count the killed node healthy (its lease hasn't lapsed), so
+    # wait for the restarted node itself to answer, then for the cluster.
+    for _ in $(seq 1 60); do "$BIN/dfs-admin" --cluster "127.0.0.1:$((8899 + T95_LN))" cluster status >/dev/null 2>&1 && break; sleep 0.5; done
+    t85_wait_ready || echo "  T95[$T95_CASE]: cluster not fully healthy 30s after node$T95_LN's restart"
 fi
 rm -f "$MOUNT/$T95_FILE" "$T/t95.bin"
 done

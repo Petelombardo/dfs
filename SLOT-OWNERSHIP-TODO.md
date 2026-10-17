@@ -354,8 +354,22 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         direction is holders durably own the slot's version, the leader only knows who
         (README on the roadmap wall, steps 1-4). Suites 1016i ON 288/0 (43m11s), OFF 212/5
         (T79a T83d T64a/d T77b, all seen before; 56m41s). Unit: client 83/0, server 346/0.
-        Next (step 1): holders record (epoch, version, chunk id) with the apply and push it
-        with the generation; fail-first T95[orphan] (leader and writing client both die).
+        10-16 step 1 (holders own the slot's version): T95[orphan] (the leader AND the writing
+        client die right after the fsync; holders are the only source) failed 5/6 on the old
+        code. Fixed, each fail-first: (1) holders pushed locations before the file's metadata,
+        so a leader that never heard of the file dropped them as a deleted file's and served it
+        with 0 chunks, and the next writer's patch went as a FRESH chunk over the 4 MB one
+        (Legata 1995942e); metadata now goes first, and ReplicateMetadataBatch answers only once
+        committed. (2) a lone surviving ISR member's 1-node token lost to the 2-node pre-patch
+        row on replica count: new Request::ReplicateIsrHeads (appended); the leader installs a
+        member's head when its committed ISR names it at that epoch, by the usual causal order
+        minus the replica count. (3) a holder that answered a pull while it still led itself
+        skipped its later push as "already pulled". (4) heal transfers panicked on followers for
+        ~2 s after every election (0 MB/s heartbeat target; Legata 0b184276), and a transfer
+        bigger than the bucket waited forever at the 1 MB/s floor. T95[dies]/[orphan] are
+        informational with ordering off (no ISR to prove quorum). Suites 1016l ON 287/2 (T85a,
+        T59a), OFF 211/5 (T38b T64b/d T77a/b); T95+T45 3/3. Unit: server 351/0, client 83/0.
+        Still to do in step 1: the generation in the same commit as the apply.
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

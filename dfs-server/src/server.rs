@@ -10365,9 +10365,28 @@ impl Server {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let mut updated_nodes = location.nodes.clone();
-        updated_nodes.push(target_node);
-        let updated_location = ChunkLocation { nodes: updated_nodes, written_at: Some(now_ms), ..location };
+        // Build on the row as it is now, not the one read before the push: other updates land
+        // during it (the client's location for this version, an ISR change), and writing the
+        // old row back undid them. In suite T66[secondary] (1017a) that restored a row with no
+        // file offset and dropped the new secondary, so the leader's map lost the slot.
+        let current = match self.metadata.get_chunk_location_async(chunk_id).await {
+            Ok(Some(current)) => current,
+            _ => {
+                debug!("HealChunkToNode: {} lost its location during the push — superseded, not recording", chunk_id);
+                return Response::Ok { data: None };
+            }
+        };
+        let mut updated_nodes = current.nodes.clone();
+        if !updated_nodes.contains(&target_node) {
+            updated_nodes.push(target_node);
+        }
+        let updated_location = ChunkLocation {
+            nodes: updated_nodes,
+            written_at: Some(now_ms),
+            file_offset: current.file_offset.or(location.file_offset),
+            file_id: current.file_id.or(location.file_id).or(file_id),
+            ..current
+        };
         if let Err(e) = self.metadata.put_chunk_location_async(updated_location.clone()).await {
             warn!("[RF-restore] chunk {} restored on {} but failed to persist updated location: {}", chunk_id, target_node, e);
             return Response::Ok { data: None };
@@ -17689,8 +17708,33 @@ impl Server {
     /// guard), and an anchor written or pulled here has none: without this every ordered write
     /// onto a fresh anchor failed (suite T34 with DFS_ORDERED_WRITES=1).
     async fn register_anchor_location(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> bool {
-        if matches!(self.metadata.get_chunk_location_async(id).await, Ok(Some(_))) {
-            return true;
+        let me = self.cluster.local_node_id();
+        let file_offset = chunk_idx * (4 * 1024 * 1024);
+        if let Ok(Some(existing)) = self.metadata.get_chunk_location_async(id).await {
+            // A row can predate this call without naming its slot: materialize_anchor stores
+            // through handle_write_chunk, which registers a bare row (no file, no offset). A
+            // leader that kept it mapped the chunk at idx 0 and its slot read as a hole
+            // (suite T66[secondary], 1017a). Complete it rather than trust it.
+            if existing.file_offset.is_some() && existing.file_id.is_some() && existing.nodes.contains(&me) {
+                return true;
+            }
+            let mut nodes = existing.nodes.clone();
+            if !nodes.contains(&me) {
+                nodes.push(me);
+            }
+            let completed = ChunkLocation {
+                nodes,
+                file_offset: existing.file_offset.or(Some(file_offset)),
+                file_id: existing.file_id.or(Some(file_id)),
+                ..existing
+            };
+            return match self.metadata.put_chunk_location_async(completed).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("[ORDER] completing anchor {}'s location for file {} chunk {} failed: {}", id, file_id, chunk_idx, e);
+                    false
+                }
+            };
         }
         let Some(size) = self.storage.get_chunk_size(&id) else { return false };
         let loc = ChunkLocation {
@@ -30116,6 +30160,50 @@ mod tests {
             vec![(20usize, vec![0xBBu8; 4])], Some(6), None, false, Some(3),
         ).await.unwrap();
         assert_eq!(metadata.get_chunk_seq(file_id, 0).unwrap(), Some(7));
+    }
+
+    /// Suite T66[secondary] (1017a ON): an ordered fold materialized its head through
+    /// handle_write_chunk, whose get_or_create_chunk_location made the result's row with no
+    /// file_offset or file_id; register_anchor_location then saw a row and left it. A leader
+    /// holding that row mapped the chunk at idx 0, and chunk 1 read as a hole. The anchor's
+    /// row must name its file and offset.
+    #[tokio::test]
+    async fn a_materialized_anchor_is_registered_at_its_slot() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let cluster = Arc::new(ClusterManager::new(node_id, "127.0.0.1:8900".parse().unwrap(), 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 1u64;
+        let chunk_file_offset = chunk_idx * 4 * 1024 * 1024;
+        let base_content = vec![0x22u8; 4096];
+        let base_chunk_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id));
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id, nodes: vec![node_id], size: base_content.len(), checksum: base_chunk_id.hash,
+            file_offset: Some(chunk_file_offset), written_at: None, client_write_seq: None, file_id: Some(file_id),
+        }).unwrap();
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token, ..) = server.apply_patch(
+            Some(lock), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xAAu8; 4])], Some(5), None, false, None,
+        ).await.unwrap();
+
+        let anchor = server.materialize_anchor(file_id, chunk_idx, token).await.expect("the head materializes");
+        assert_ne!(anchor, token, "a patch token's head is stored as a real chunk");
+        let loc = metadata.get_chunk_location(&anchor).unwrap().expect("the anchor is registered");
+        assert_eq!(loc.file_offset, Some(chunk_file_offset),
+            "BUG REPRODUCED: the materialized anchor's row has no file offset; a chunk map files it at idx 0");
+        assert_eq!(loc.file_id, Some(file_id));
+        assert!(loc.nodes.contains(&node_id));
     }
 
     /// Tests for broadcast_to_peers (added 2026-08-06 to collapse the fold

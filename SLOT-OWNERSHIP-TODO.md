@@ -298,6 +298,8 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         streak restarts.
         10-14: 1014a/b clean, 1014c broke it (T85a; its T81b was an untested G6 build);
         1014d (G3+G6) 267/0 = 1/5.
+        10-16/17: 1016i 288/0, then T85a / T59a broke it; 1017a T66[secondary]a (fixed 87286ad);
+        1017b 288/1 (T38b only) = 1/5.
         10-15: 1015a (T91 fix) ON 271/3 = T85a (G7) + T59a/T59e (one lease lapse in a 9 s
         db stall; 3/3 alone, logs lost to the OFF run) -> streak back to 0/5.
   - [x] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
@@ -369,7 +371,12 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         bigger than the bucket waited forever at the 1 MB/s floor. T95[dies]/[orphan] are
         informational with ordering off (no ISR to prove quorum). Suites 1016l ON 287/2 (T85a,
         T59a), OFF 211/5 (T38b T64b/d T77a/b); T95+T45 3/3. Unit: server 351/0, client 83/0.
-        Still to do in step 1: the generation in the same commit as the apply.
+        10-17 step 1c DONE a25bff3: the generation commits in the same transaction as the
+        patch state. Suites on it found two more bugs, fixed: a refused flush left its slot
+        claimed and sync hung 11 h (83b519a, OFF T66[leader]); an ordered fold's result row had
+        no file offset and RF-restore wrote back a stale row, so the leader lost the slot
+        (87286ad, ON T66[secondary]a; isolated 2/2 FAIL -> 10/10). Suites 1017b: ON 288/1
+        (T38b), OFF 210/6 (known). Step 1 done; next step 2 (reads resolve through the pair).
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

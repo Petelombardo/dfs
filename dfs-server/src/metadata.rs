@@ -428,6 +428,7 @@ enum MetaWriteOp {
         written_at: u64,
         client_write_seq: Option<u64>,
         renamed_from: Option<ChunkId>,
+        chunk_seq: Option<u64>,
         reply: tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>,
     },
     UpdatePatchStateFolded {
@@ -1020,11 +1021,11 @@ impl MetadataStore {
                 }
                 MetaWriteOp::PutPatchStatePending {
                     file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-                    size, written_at, client_write_seq, renamed_from, reply,
+                    size, written_at, client_write_seq, renamed_from, chunk_seq, reply,
                 } => {
                     let result = Self::put_patch_state_pending_in_txn(
                         &txn, file_id, chunk_idx, &public_token, base_chunk_id,
-                        delta_chunk_id, size, written_at, client_write_seq, renamed_from,
+                        delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq,
                     ).map(|(retired, bytes)| {
                         payload_bytes += bytes;
                         retired
@@ -3025,7 +3026,7 @@ impl MetadataStore {
         txn.set_durability(self.next_write_durability());
         let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
             &txn, file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-            size, written_at, client_write_seq, None,
+            size, written_at, client_write_seq, None, None,
         )?;
         self.commit(txn)?;
         self.note_txn("put_patch_state_pending", payload_bytes);
@@ -3041,8 +3042,19 @@ impl MetadataStore {
         txn: &redb::WriteTransaction, file_id: FileId, chunk_idx: u64, public_token: &ChunkId,
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
         written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
+        // The slot's generation for this patch, raised (never lowered) in this same
+        // transaction: a holder pushes its head to a new leader stamped with it, so a
+        // patch whose state committed without it had no head to push (step 1, T95[orphan]).
+        chunk_seq: Option<u64>,
     ) -> Result<(Option<ChunkId>, usize)> {
         let slot_key = format!("{}:{}", file_id, chunk_idx);
+        if let Some(seq) = chunk_seq {
+            let mut seq_table = txn.open_table(CHUNK_SEQ_TABLE)?;
+            let current = seq_table.get(slot_key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            if seq > current && !Self::file_tombstoned_in_txn(txn, file_id)? {
+                seq_table.insert(slot_key.as_str(), seq)?;
+            }
+        }
         let token_key = format!("{}", public_token);
         let state = PatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq };
         let value = bincode::serialize(&state).context("Failed to serialize patch state")?;
@@ -3098,6 +3110,7 @@ impl MetadataStore {
         self: &Arc<Self>, file_id: FileId, chunk_idx: u64, public_token: ChunkId,
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
         written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
+        chunk_seq: Option<u64>,
     ) -> Result<Option<ChunkId>> {
         if !Self::group_commit_enabled() {
             let store = Arc::clone(self);
@@ -3107,7 +3120,7 @@ impl MetadataStore {
                 txn.set_durability(store.next_write_durability());
                 let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
                     &txn, file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id,
-                    size, written_at, client_write_seq, renamed_from,
+                    size, written_at, client_write_seq, renamed_from, chunk_seq,
                 )?;
                 store.commit(txn)?;
                 store.note_txn("put_patch_state_pending", payload_bytes);
@@ -3117,7 +3130,7 @@ impl MetadataStore {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.committer_tx().send(MetaWriteOp::PutPatchStatePending {
             file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-            size, written_at, client_write_seq, renamed_from, reply,
+            size, written_at, client_write_seq, renamed_from, chunk_seq, reply,
         }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
         rx.await.context("metadata group-commit thread dropped its reply")?
     }
@@ -7516,16 +7529,16 @@ mod tests {
         let (d1, d2) = (ChunkId::from_hash([21; 32]), ChunkId::from_hash([22; 32]));
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            store.put_patch_state_pending_async(file_id, 0, t1, base, d1, 4096, 1, None, None).await.unwrap();
-            store.put_patch_state_pending_async(file_id, 0, t2, base, d2, 4096, 2, None, Some(d1)).await.unwrap();
+            store.put_patch_state_pending_async(file_id, 0, t1, base, d1, 4096, 1, None, None, None).await.unwrap();
+            store.put_patch_state_pending_async(file_id, 0, t2, base, d2, 4096, 2, None, Some(d1), None).await.unwrap();
         });
         assert_eq!(store.interrupted_delta_renames().unwrap(), vec![(d2, d1)]);
         store.clear_delta_renames().unwrap();
         assert!(store.interrupted_delta_renames().unwrap().is_empty());
 
         rt.block_on(async {
-            store.put_patch_state_pending_async(file_id, 1, ChunkId::from_hash([61; 32]), base, ChunkId::from_hash([71; 32]), 4096, 3, None, None).await.unwrap();
-            store.put_patch_state_pending_async(file_id, 1, ChunkId::from_hash([62; 32]), base, ChunkId::from_hash([72; 32]), 4096, 4, None, Some(ChunkId::from_hash([71; 32]))).await.unwrap();
+            store.put_patch_state_pending_async(file_id, 1, ChunkId::from_hash([61; 32]), base, ChunkId::from_hash([71; 32]), 4096, 3, None, None, None).await.unwrap();
+            store.put_patch_state_pending_async(file_id, 1, ChunkId::from_hash([62; 32]), base, ChunkId::from_hash([72; 32]), 4096, 4, None, Some(ChunkId::from_hash([71; 32])), None).await.unwrap();
         });
         store.update_patch_state_folded(&ChunkId::from_hash([62; 32]), ChunkId::from_hash([81; 32])).unwrap();
         assert!(store.interrupted_delta_renames().unwrap().is_empty(), "a folded slot owes nothing");

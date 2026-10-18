@@ -15991,6 +15991,9 @@ impl Server {
         // ordinary first attempt: the leader-confirmation is what stops a lagging
         // replica from silently building on stale-but-physically-present bytes.
         trust_local_base: bool,
+        // The slot generation this patch carries (the request's new_chunk_seq), committed
+        // with the patch state; see put_patch_state_pending_in_txn.
+        chunk_seq: Option<u64>,
     ) -> Result<(ChunkId, usize, Option<u64>, Option<Arc<Vec<u8>>>, Option<ChunkLocation>), (String, ErrorCode)> {
         if self.file_recently_deleted(file_id) {
             drop(patch_guard);
@@ -16655,7 +16658,7 @@ impl Server {
         let record_state = |renamed_from: Option<ChunkId>| async move {
             let t = std::time::Instant::now();
             let retired = self.metadata.put_patch_state_pending_async(
-                file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq, renamed_from,
+                file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq, renamed_from, chunk_seq,
             ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)));
             (retired, t.elapsed())
         };
@@ -17007,7 +17010,7 @@ impl Server {
         let patch_len = patch_data.len();
         let result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
-            vec![(intra_offset, patch_data)], None, None, false,
+            vec![(intra_offset, patch_data)], None, None, false, new_chunk_seq,
         ).await;
 
         match result {
@@ -17061,7 +17064,14 @@ impl Server {
                 // a fragile pre-seed (see dfs-client/src/client.rs seed_chunk_seq's history).
                 let mut response_chunk_seq = new_chunk_seq;
                 if let (Some(cidx), Some(seq)) = (chunk_idx, new_chunk_seq) {
-                    match self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
+                    // A patch that left a Pending token committed `seq` with its state
+                    // (apply_patch), so this is a read; one that didn't (a full rewrite)
+                    // still writes it here.
+                    let effective = match self.metadata.get_chunk_seq_async(file_id, cidx).await {
+                        Ok(Some(stored)) if stored >= seq => Ok(stored),
+                        _ => self.metadata.put_chunk_seq_async(file_id, cidx, seq).await,
+                    };
+                    match effective {
                         Ok(effective_seq) => {
                             response_chunk_seq = Some(effective_seq);
                             self.record_chunk_generation(new_chunk_id, effective_seq);
@@ -18056,7 +18066,7 @@ impl Server {
         // the leader-confirmation (trust_local_base=false) would substitute the leader's view.
         let mut result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
-            patches.clone(), client_write_seq, prefetched.clone(), ordered,
+            patches.clone(), client_write_seq, prefetched.clone(), ordered, new_chunk_seq,
         ).await;
         let apply_patch_elapsed = apply_patch_start.elapsed();
 
@@ -18140,7 +18150,7 @@ impl Server {
                                 || self.pull_chunk_from_peers(delta_chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await.is_some();
                             if have_delta {
                                 if let Err(e) = self.metadata.put_patch_state_pending_async(
-                                    file_id, cidx, fresh_loc.chunk_id, base_chunk_id, delta_chunk_id, size, written_at, peer_seq, None,
+                                    file_id, cidx, fresh_loc.chunk_id, base_chunk_id, delta_chunk_id, size, written_at, peer_seq, None, None,
                                 ).await {
                                     warn!("MultiPatch: failed to adopt peer-resolved patch_state for token {} (file {} chunk {}): {}",
                                         fresh_loc.chunk_id, file_id, cidx, e);
@@ -18211,7 +18221,7 @@ impl Server {
                 let retry_guard = lock.lock_owned().await;
                 result = self.apply_patch(
                     Some(retry_guard), retry_chunk_id, file_id, chunk_idx, chunk_file_offset,
-                    patches, client_write_seq, prefetched, trust_local_base,
+                    patches, client_write_seq, prefetched, trust_local_base, new_chunk_seq,
                 ).await;
             }
         }
@@ -18331,7 +18341,14 @@ impl Server {
                 // storm, 2026-07-28).
                 let mut response_chunk_seq = new_chunk_seq;
                 if let (Some(cidx), Some(seq)) = (chunk_idx, new_chunk_seq) {
-                    match self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
+                    // A patch that left a Pending token committed `seq` with its state
+                    // (apply_patch), so this is a read; one that didn't (a full rewrite)
+                    // still writes it here.
+                    let effective = match self.metadata.get_chunk_seq_async(file_id, cidx).await {
+                        Ok(Some(stored)) if stored >= seq => Ok(stored),
+                        _ => self.metadata.put_chunk_seq_async(file_id, cidx, seq).await,
+                    };
+                    match effective {
                         Ok(effective_seq) => {
                             response_chunk_seq = Some(effective_seq);
                             self.record_chunk_generation(new_chunk_id, effective_seq);
@@ -25129,14 +25146,14 @@ mod tests {
             let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token1, ..) = server.apply_patch(
                 Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off1, data1.to_vec())], Some(seq1), None, false,
+                vec![(off1, data1.to_vec())], Some(seq1), None, false, None,
             ).await.expect("first apply_patch should succeed");
 
             let (off2, data2, seq2) = second;
             let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token2, ..) = server.apply_patch(
                 Some(lock2), token1, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off2, data2.to_vec())], Some(seq2), None, false,
+                vec![(off2, data2.to_vec())], Some(seq2), None, false, None,
             ).await.expect("second apply_patch (merge) should succeed");
 
             let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");
@@ -25236,7 +25253,7 @@ mod tests {
             let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token1, ..) = server.apply_patch(
                 Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off1, data1.to_vec())], Some(seq1), None, false,
+                vec![(off1, data1.to_vec())], Some(seq1), None, false, None,
             ).await.expect("first apply_patch should succeed");
 
             let hits_before = server.materialized_ring_hits.load(std::sync::atomic::Ordering::Relaxed);
@@ -25246,7 +25263,7 @@ mod tests {
             let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token2, ..) = server.apply_patch(
                 Some(lock2), token1, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(off2, data2.to_vec())], Some(seq2), None, false,
+                vec![(off2, data2.to_vec())], Some(seq2), None, false, None,
             ).await.expect("second apply_patch (merge) should succeed");
 
             let hits_after = server.materialized_ring_hits.load(std::sync::atomic::Ordering::Relaxed);
@@ -25326,7 +25343,7 @@ mod tests {
         let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let result = server.apply_patch(
             Some(lock), base_chunk_id, file.id, Some(0), 0,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false, None,
         ).await;
         match result {
             Err((msg, _)) => assert!(msg.contains("was deleted"), "refused, but not as deleted: {}", msg),
@@ -25381,7 +25398,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false, None,
         ).await.expect("first apply_patch should succeed");
 
         let state_a = metadata.get_patch_state(&token_a).unwrap().expect("token_a must resolve");
@@ -25395,7 +25412,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, size_b, ts_b, buf_b, _rejected_b) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(301), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(301), None, false, None,
         ).await.expect("no-op merge apply_patch should still succeed");
 
         assert_eq!(token_b, token_a, "a merge-time no-op must return the unchanged prior identity");
@@ -25420,7 +25437,7 @@ mod tests {
         let lock_c = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_c, ..) = server.apply_patch(
             Some(lock_c), token_b, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(20usize, vec![0xDDu8; 4])], Some(302), None, false,
+            vec![(20usize, vec![0xDDu8; 4])], Some(302), None, false, None,
         ).await.expect("third (real) apply_patch should succeed");
         assert_ne!(token_c, token_b, "a genuinely new patch after a no-op must still mint a new identity");
 
@@ -25519,7 +25536,7 @@ mod tests {
         let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let result = server.apply_patch(
             Some(lock), claimed_base_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(1), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(1), None, false, None,
         ).await;
 
         let (public_token, ..) = result.expect(
@@ -26029,14 +26046,14 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false, None,
         ).await.expect("first apply_patch should succeed");
 
         // Differs by exactly one byte from what's already at this range.
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, ..) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8, 0xCCu8, 0xCCu8, 0xCDu8])], Some(301), None, false,
+            vec![(10usize, vec![0xCCu8, 0xCCu8, 0xCCu8, 0xCDu8])], Some(301), None, false, None,
         ).await.expect("genuinely-changed merge apply_patch should succeed");
 
         assert_ne!(token_b, token_a, "a genuinely-changed patch must mint a new identity, not be treated as a no-op");
@@ -26107,7 +26124,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_200, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xBBu8; 4])], Some(200), None, false,
+            vec![(10usize, vec![0xBBu8; 4])], Some(200), None, false, None,
         ).await.expect("seq=200 apply_patch should succeed");
 
         // Arrives SECOND but carries seq=100 (lower) — and its content is
@@ -26117,7 +26134,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_100, ..) = server.apply_patch(
             Some(lock_b), token_200, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xBBu8; 4])], Some(100), None, false,
+            vec![(10usize, vec![0xBBu8; 4])], Some(100), None, false, None,
         ).await.expect("reordered seq=100 apply_patch should succeed");
 
         assert_ne!(
@@ -26198,20 +26215,20 @@ mod tests {
             let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (t1, ..) = server.apply_patch(
                 Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(10usize, vec![0xAAu8; 4])], Some(100), None, false,
+                vec![(10usize, vec![0xAAu8; 4])], Some(100), None, false, None,
             ).await.unwrap();
 
             let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (t2, ..) = server.apply_patch(
                 Some(lock2), t1, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(10usize, vec![0xAAu8; 4])], Some(101), None, false,
+                vec![(10usize, vec![0xAAu8; 4])], Some(101), None, false, None,
             ).await.unwrap();
             assert_eq!(t2, t1, "sanity: this replica's own no-op detection must fire identically to the others");
 
             let lock3 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (t3, ..) = server.apply_patch(
                 Some(lock3), t2, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(30usize, vec![0xEEu8; 4])], Some(102), None, false,
+                vec![(30usize, vec![0xEEu8; 4])], Some(102), None, false, None,
             ).await.unwrap();
 
             let state = metadata.get_patch_state(&t3).unwrap().expect("final token must resolve");
@@ -26290,7 +26307,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server_a.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None, false, None,
         ).await.expect("first apply_patch should succeed");
 
         // Server B: a brand-new Server instance over the SAME storage/metadata
@@ -26310,7 +26327,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, ..) = server_b.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(301), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(301), None, false, None,
         ).await.expect("cold no-op merge apply_patch should still succeed");
 
         let misses_after = server_b.materialized_ring_misses.load(std::sync::atomic::Ordering::Relaxed);
@@ -26367,7 +26384,7 @@ mod tests {
         let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_a, ..) = server.apply_patch(
             Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], Some(5000), None, false,
+            vec![(10usize, vec![0xCCu8; 4])], Some(5000), None, false, None,
         ).await.expect("first apply_patch should succeed");
 
         let state_a = metadata.get_patch_state(&token_a).unwrap().expect("token_a must resolve");
@@ -26384,7 +26401,7 @@ mod tests {
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let (token_b, ..) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
-            vec![(10usize, vec![0xCCu8; 4])], None, None, false,
+            vec![(10usize, vec![0xCCu8; 4])], None, None, false, None,
         ).await.expect("seqless merge apply_patch should succeed");
 
         // Whether or not identity happens to change is not the point here (a
@@ -29812,7 +29829,7 @@ mod tests {
             let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
             let (token2, ..) = server.apply_patch(
                 Some(lock), public_token, file_id, Some(chunk_idx), chunk_file_offset,
-                vec![(20usize, vec![0xEFu8; 4])], Some(999), None, false,
+                vec![(20usize, vec![0xEFu8; 4])], Some(999), None, false, None,
             ).await.expect("merge onto a pre-existing legacy accumulator must succeed");
 
             let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");
@@ -30054,6 +30071,51 @@ mod tests {
             "chunk_map says this chunk is file {}'s current live content — ConfirmChunksLive \
              must not tell a follower it's safe to delete just because FILE_TABLE hasn't \
              caught up yet", file_id);
+    }
+
+    /// Step 1 of the holder-durable plan: a patch's slot generation commits with its patch
+    /// state. It was a separate commit after apply_patch whose failure was only logged, so an
+    /// acked patch could hold a Pending token with no generation, and a holder never pushes
+    /// a head for that (handle_replicate_isr_heads needs it).
+    #[tokio::test]
+    async fn a_patchs_generation_is_durable_when_apply_patch_returns() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let cluster = Arc::new(ClusterManager::new(node_id, "127.0.0.1:8900".parse().unwrap(), 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+        let file_id = dfs_common::FileId::new();
+        let base_content = vec![0x11u8; 4096];
+        let base_chunk_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base_content, 0, file_id));
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id, nodes: vec![node_id], size: base_content.len(), checksum: base_chunk_id.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: None, file_id: Some(file_id),
+        }).unwrap();
+
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token, ..) = server.apply_patch(
+            Some(lock), base_chunk_id, file_id, Some(0), 0,
+            vec![(10usize, vec![0xAAu8; 4])], Some(5), None, false, Some(7),
+        ).await.unwrap();
+        assert_eq!(metadata.slot_patch_token(file_id, 0).unwrap(), Some(token));
+        assert_eq!(metadata.get_chunk_seq(file_id, 0).unwrap(), Some(7),
+            "the patch's generation must be committed with its state");
+
+        // Never lowered: an older generation arriving later leaves the slot's max.
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        server.apply_patch(
+            Some(lock), token, file_id, Some(0), 0,
+            vec![(20usize, vec![0xBBu8; 4])], Some(6), None, false, Some(3),
+        ).await.unwrap();
+        assert_eq!(metadata.get_chunk_seq(file_id, 0).unwrap(), Some(7));
     }
 
     /// Tests for broadcast_to_peers (added 2026-08-06 to collapse the fold

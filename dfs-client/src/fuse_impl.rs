@@ -3618,10 +3618,12 @@ impl FlushHandle {
             if fresh_has_chunk {
                 warn!("flush_buffer_async_one: ino={} chunk={} fresh-write safety check: server says this chunk actually has real data (metadata_cache was stale) — refusing to send gap-fill zeros over it; will retry with corrected metadata",
                     ino, chunk_idx);
+                // lock, not try_lock: a release skipped because the shard was busy left the
+                // slot claimed with nobody flushing it, and sync waited for it forever
+                // (suite 1016m OFF T66[leader], 11 h).
                 if let Some(shard) = buf.as_ref().and_then(|b| b.chunk_get(chunk_idx)) {
-                    if let Ok(mut cs) = shard.try_lock() {
-                        cs.slot.flushing = false;
-                    }
+                    let mut cs = shard.lock().await;
+                    cs.slot.flushing = false;
                 }
                 self.notify_chunk_flush_complete(ino, chunk_idx).await;
                 let msg = format!(
@@ -4046,6 +4048,9 @@ impl FlushHandle {
         let mut first_err: Option<anyhow::Error> = None;
         // When this call's first attempt was refused (`FlushAttemptRefused`).
         let mut refused_since: Option<std::time::Instant> = None;
+        // When this call started waiting for slots someone else claimed, and the next warning.
+        let mut claimed_wait_since: Option<std::time::Instant> = None;
+        let mut next_claimed_warn = std::time::Duration::from_secs(30);
 
         // Keep dispatching concurrent flush_one_chunk calls until no unclaimed slots remain.
         // Enforce byte limit only (PIPELINE_MAX_BYTES). The item count limit is for
@@ -4107,6 +4112,13 @@ impl FlushHandle {
                     })
                 }).unwrap_or(false);
                 if !claimed { break; }
+                // Waiting is right (see above), but never silently: a claim nobody releases
+                // turned one sync into an 11 h hang with no log line (suite 1016m OFF).
+                let since = *claimed_wait_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= next_claimed_warn {
+                    warn!("flush_all_pipelined: ino={} still waiting after {:?} for a chunk another flush claimed", ino, since.elapsed());
+                    next_claimed_warn += std::time::Duration::from_secs(30);
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 continue;
             }
@@ -10319,6 +10331,79 @@ mod terminal_give_up_tests {
         assert!(result.unwrap().is_ok());
         assert!(waited >= std::time::Duration::from_millis(90),
             "BUG REPRODUCED: fsync's flush returned after {:?} with the chunk still being written by the background flusher", waited);
+    }
+
+    /// Suite 1016m OFF, T66[leader]: the background flusher's attempt on a chunk was refused
+    /// by the fresh-write safety check, and the refusal released the slot's claim with a
+    /// try_lock. The shard was busy at that instant, so the slot stayed claimed (flushing)
+    /// with nobody flushing it, and `sync` (flush_all_pipelined waits out claimed slots, the
+    /// T90c fix above) hung for 11 hours. A refused attempt must always release its claim.
+    #[tokio::test]
+    async fn a_refused_attempt_releases_its_claim_even_when_the_shard_is_busy() {
+        // A dead address: the safety check's metadata lookup fails at once, and a failed
+        // lookup is refused like confirmed real data.
+        let client = Arc::new(DfsClient::new(vec!["127.0.0.1:1".parse().unwrap()]).unwrap());
+        *client.cluster_nodes.write().await = vec![];
+        let write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>> = Arc::new(DashMap::new());
+        let ino = 44u64;
+        let buf = Arc::new(InodeWriteBuffer::new(false));
+        write_buffers.insert(ino, buf.clone());
+        {
+            let shard = buf.chunk_entry(0);
+            let mut cs = shard.lock().await;
+            cs.slot.extents.push((4096, vec![0xEEu8; 4096]));
+            cs.slot.span_end = 8192;
+            cs.slot.real_data_end = 8192;
+            cs.slot.dirty_ranges = vec![(4096, 8192)];
+            cs.slot.flushing = true; // this attempt's claim
+            buf.active_chunks.insert(0);
+        }
+        let inode_to_path = Arc::new(RwLock::new(HashMap::new()));
+        inode_to_path.write().unwrap().insert(ino, "/t66_leader.bin".to_string());
+        let handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: write_buffers.clone(),
+            metadata_cache: Arc::new(DashMap::new()),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path,
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(4096)),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        };
+        // Someone else (a write(), fsync's scan) holds the shard while the attempt is refused.
+        let shard = buf.chunk_get(0).unwrap();
+        let busy = shard.clone().lock_owned().await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            drop(busy);
+        });
+        let mut slot_data = vec![0u8; 8192];
+        slot_data[4096..].fill(0xEE);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle.flush_buffer_async_one(
+            ino, 0, slot_data, 0, 4096, 8192, vec![(4096, 8192)], std::time::SystemTime::UNIX_EPOCH,
+        )).await.expect("the refused attempt must not hang");
+        release.await.unwrap();
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+        let err = result.expect_err("the safety check must refuse this attempt");
+        assert!(err.downcast_ref::<FlushAttemptRefused>().is_some(), "refused for the wrong reason: {:#}", err);
+        let cs = shard.lock().await;
+        assert!(!cs.slot.flushing,
+            "BUG REPRODUCED: the refused attempt left its slot claimed; flush_all_pipelined (sync/fsync) waits for it forever");
+        assert!(!cs.slot.is_empty(), "the refused bytes must stay buffered for the next attempt");
     }
 }
 

@@ -1155,6 +1155,10 @@ pub struct DfsClient {
     /// Committed per-chunk ISRs this client has looked up, for `DFS_ORDERED_WRITES`
     /// (SLOT-OWNERSHIP-PLAN 3c). Dropped when a primary answers that it no longer is one.
     slot_isr_cache: Arc<DashMap<(dfs_common::FileId, u64), dfs_common::SlotIsr>>,
+    /// When a cluster refresh last named the leader. The client otherwise learns of a new
+    /// leader from NotLeader redirects, and a client that only patches in place stopped getting
+    /// those once its fsyncs skip the leader (Phase 5); see delete_file.
+    leader_view_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// First replicas a chained write got no answer from at all (down, or too old to know
     /// WriteFileChained), and until when fresh writes through them go out unchained.
     no_chain_until: Arc<DashMap<SocketAddr, std::time::Instant>>,
@@ -1658,6 +1662,7 @@ impl DfsClient {
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
             slot_isr_cache: Arc::new(DashMap::new()),
+            leader_view_at: Arc::new(std::sync::Mutex::new(None)),
             no_chain_until: Arc::new(DashMap::new()),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
@@ -10162,6 +10167,19 @@ leader_addr: Arc::new(RwLock::new(None)),
         // poll all nodes for their delete queues on election and resume the drain.
         let request = Request::DeleteFile { path: path.to_string() };
 
+        // The fan-out must include the real leader: every recipient accepts a delete, so one
+        // sent to a former leader isn't redirected, and the leader keeps the file. A later create
+        // of the same path then reopened the deleted file's id and wrote into a record the other
+        // nodes had tombstoned (suite T83d after a full-cluster restart, once fsyncs stopped
+        // contacting the leader). Re-read the leader unless a refresh named it just now.
+        const LEADER_VIEW_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
+        let fresh = self.leader_view_at.lock().unwrap().is_some_and(|t| t.elapsed() < LEADER_VIEW_FRESH);
+        if !fresh {
+            if let Err(e) = self.refresh_cluster_nodes().await {
+                debug!("delete_file: refreshing the leader before deleting {} failed: {}", path, e);
+            }
+        }
+
         let all_nodes = self.cluster_nodes.read().await.clone();
         let leader = *self.leader_addr.read().await;
 
@@ -10333,6 +10351,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             *self.leader_addr.write().await = leader;
                             if let Some(addr) = leader {
                                 info!("Leader node: {} ({})", leader_id, addr);
+                                *self.leader_view_at.lock().unwrap() = Some(std::time::Instant::now());
                             }
                         }
 

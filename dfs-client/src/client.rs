@@ -615,6 +615,10 @@ pub struct MetadataQueue {
     /// against it: a file whose size grew since must send its metadata in that fsync, not
     /// after the 500 ms debounce, or the acked size isn't durable anywhere yet (suite T79).
     delivered_size: DashMap<FileId, u64>,
+    /// How many chunk slots the newest confirmed push listed. With the size, what tells
+    /// fsync the leader already knows every slot of the file, so an in-place patch's fsync
+    /// needn't wait on it (Phase 5); a new chunk, even inside the old size, changes it.
+    delivered_slots: DashMap<FileId, usize>,
 }
 
 struct MetadataEntry {
@@ -640,6 +644,7 @@ impl MetadataQueue {
             deleted_ids: DashSet::new(),
             delivered_write_seq: DashMap::new(),
             delivered_size: DashMap::new(),
+            delivered_slots: DashMap::new(),
         })
     }
 
@@ -647,13 +652,27 @@ impl MetadataQueue {
     /// see delivered_write_seq's doc comment. Called by the queue worker after every
     /// successful PutFileMetadata response (Ok or ResyncMetadataRequested — both mean
     /// the push was persisted).
-    fn mark_delivered(&self, file_id: FileId, write_seq: u64, size: u64) {
+    fn mark_delivered(&self, file_id: FileId, write_seq: u64, size: u64, slots: usize) {
         let newest = *self.delivered_write_seq.entry(file_id)
             .and_modify(|v| *v = (*v).max(write_seq))
             .or_insert(write_seq);
         if write_seq >= newest {
             self.delivered_size.insert(file_id, size);
+            self.delivered_slots.insert(file_id, slots);
         }
+    }
+
+    /// The number of chunk slots in the newest push the leader confirmed for `file_id`.
+    pub fn delivered_slots(&self, file_id: &FileId) -> Option<usize> {
+        self.delivered_slots.get(file_id).map(|v| *v)
+    }
+
+    /// Distinct chunk slots `metadata` lists (what `delivered_slots` counts).
+    pub fn slot_count(metadata: &FileMetadata) -> usize {
+        let mut offsets: Vec<u64> = metadata.chunk_locations.iter().filter_map(|l| l.file_offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets.len()
     }
 
     /// The file size the leader last confirmed for `file_id`, if any push was confirmed.
@@ -918,6 +937,8 @@ impl MetadataQueue {
         // so nothing will ever need this entry again. Same lifecycle event as
         // deleted_ids; see delivered_write_seq's doc comment for what it tracks.
         self.delivered_write_seq.remove(&file_id);
+        self.delivered_size.remove(&file_id);
+        self.delivered_slots.remove(&file_id);
 
         let mut q = self.inner.lock().await;
         let mut idx = self.index.lock().await;
@@ -4752,9 +4773,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             // file's confirmed answer fell into the same bucket as a network error
             // (see confirmed_at_least_once's doc comment) — both left the engine
             // indistinguishable from "we don't actually know yet".
-            Ok((locs, window_from, total_chunks, _)) => {
+            Ok((mut locs, window_from, total_chunks, _)) => {
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
+                if Self::leader_off_path_enabled() {
+                    self.overlay_slot_heads(file_id, total_chunks, &mut locs, &nim).await;
+                }
                 engine.clear_failed_refresh();
                 // NOTE (2026-07-28): this used to seed chunk_seq here from
                 // loc.client_write_seq — wrong number space (client_write_seq is the
@@ -4785,6 +4809,73 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         engine.refresh_in_progress.store(false, Ordering::Release);
         engine.refresh_done.notify_waiters();
+    }
+
+    /// Phase 5: the leader's chunk map is a hint; each ordered slot's primary names its current
+    /// version. fsync no longer waits for the leader to register an in-place patch, so its map
+    /// can lag the pair, and a fresh reader that trusted it read the pre-patch bytes (suite
+    /// T96). Asks the leader for the slots' ISRs, then each primary for its heads, and puts
+    /// every head a primary named in place of the leader's entry. A primary that doesn't
+    /// answer in time leaves the leader's entry: no worse than before.
+    async fn overlay_slot_heads(
+        &self,
+        file_id: FileId,
+        total_chunks: u32,
+        locs: &mut Vec<dfs_common::ChunkLocation>,
+        nim: &std::collections::HashMap<dfs_common::NodeId, SocketAddr>,
+    ) {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        const PRIMARY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let idxs: Vec<u64> = (0..total_chunks as u64).collect();
+        if idxs.is_empty() {
+            return;
+        }
+        let heads_of = |resp: Result<Response>| match resp {
+            Ok(Response::SlotHeads { heads }) => heads,
+            _ => Vec::new(),
+        };
+        let from_leader = heads_of(self.send_to_leader_with_retry(Request::GetSlotHeads { file_id, chunk_idxs: idxs }).await);
+        let mut named: Vec<dfs_common::protocol::SlotHead> = Vec::new();
+        let mut by_primary: HashMap<SocketAddr, Vec<u64>> = HashMap::new();
+        for h in from_leader {
+            if h.head.is_some() {
+                named.push(h);
+            } else if let Some(addr) = h.isr.members.first().and_then(|p| nim.get(p)) {
+                by_primary.entry(*addr).or_default().push(h.chunk_idx);
+            }
+        }
+        let asks = by_primary.into_iter().map(|(addr, chunk_idxs)| async move {
+            tokio::time::timeout(PRIMARY_BUDGET, self.send_request(addr, Request::GetSlotHeads { file_id, chunk_idxs }))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("GetSlotHeads to {} timed out", addr)))
+        });
+        for resp in futures::future::join_all(asks).await {
+            named.extend(heads_of(resp).into_iter().filter(|h| h.head.is_some()));
+        }
+        let mut replaced = 0usize;
+        for h in named {
+            let Some(head) = h.head else { continue };
+            let off = h.chunk_idx * CHUNK_SIZE;
+            match locs.iter_mut().find(|l| l.file_offset == Some(off)) {
+                Some(l) if l.chunk_id == head.chunk_id => {}
+                Some(l) => {
+                    debug!("overlay_slot_heads: file {} chunk {}: the primary names {} over the leader's {}",
+                        file_id, h.chunk_idx, head.chunk_id, l.chunk_id);
+                    *l = head;
+                    replaced += 1;
+                }
+                None => {
+                    locs.push(head);
+                    replaced += 1;
+                }
+            }
+        }
+        if replaced > 0 {
+            locs.sort_by_key(|l| l.file_offset.unwrap_or(0));
+            info!("overlay_slot_heads: file {}: {} slot(s) read at their primary's head, not the leader's map ({:?})",
+                file_id, replaced, started.elapsed());
+        }
     }
 
     /// Notify the read engine that a new chunk was appended by the write path.
@@ -7878,7 +7969,16 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// DFS_ORDERED_WRITES=1: send patches as `Request::Ordered` to the chunk's ISR pair, so
     /// its primary orders concurrent writers (SLOT-OWNERSHIP-PLAN 3c). Read once.
-    fn ordered_writes_enabled() -> bool {
+    /// Phase 5 (with ordering): fsync doesn't wait on the leader for in-place patches, and
+    /// readers resolve slots through their primaries. DFS_LEADER_OFF_PATH=0 restores the old
+    /// leader-synchronous path, for same-binary A/B benches.
+    pub(crate) fn leader_off_path_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Self::ordered_writes_enabled()
+            && *ON.get_or_init(|| std::env::var("DFS_LEADER_OFF_PATH").map(|v| v != "0").unwrap_or(true))
+    }
+
+    pub(crate) fn ordered_writes_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("DFS_ORDERED_WRITES").map(|v| v == "1").unwrap_or(false))
     }
@@ -9350,6 +9450,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             Response::Error { message, .. } => anyhow::bail!("PutFileMetadata: {}", message),
             other => anyhow::bail!("PutFileMetadata: unexpected response: {:?}", other),
         }
+        // Every confirmed put, not only the queue's: fsync skips the leader when it already has
+        // the file's size and slots (Phase 5), so a put that changed them here (a truncate's
+        // size 0) left a stale record, and that fsync skipped the 4 MB rewrite (suite T83d).
+        self.metadata_queue.mark_delivered(metadata.id, metadata.write_seq, metadata.size, MetadataQueue::slot_count(metadata));
         let leader = self.leader_addr.read().await.unwrap_or(nodes[0]);
 
         // Step 2: Leader already broadcasts to all followers via broadcast_metadata_to_followers
@@ -9376,6 +9480,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Track which node handles the write for read-after-write consistency
         let write_node = self.send_request_with_retry_tracking(request).await?;
+        self.metadata_queue.mark_delivered(metadata.id, metadata.write_seq, metadata.size, MetadataQueue::slot_count(metadata));
 
         // If this is a SQLite file, track the write to ensure reads go to this node
         // within the consistency window (before async replication completes)
@@ -10089,7 +10194,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     entry.metadata.path, entry.metadata.id,
                                     entry.metadata.write_seq, entry.metadata.size
                                 );
-                                client.metadata_queue.mark_delivered(entry.metadata.id, entry.metadata.write_seq, entry.metadata.size);
+                                client.metadata_queue.mark_delivered(entry.metadata.id, entry.metadata.write_seq, entry.metadata.size, MetadataQueue::slot_count(&entry.metadata));
                                 // Signal the release waiter if present.
                                 if let Some(tx) = entry.done_tx {
                                     let _ = tx.send(());
@@ -11633,7 +11738,7 @@ mod tests {
         let entry = queue.pop().await.expect("first entry must be present");
         assert_eq!(entry.covers_from_write_seq, 1);
         // Simulate the queue worker confirming delivery of this push.
-        queue.mark_delivered(file_id, entry.metadata.write_seq, entry.metadata.size);
+        queue.mark_delivered(file_id, entry.metadata.write_seq, entry.metadata.size, MetadataQueue::slot_count(&entry.metadata));
 
         // Second push — write_seq=2, arrives after the first was already dequeued
         // (nothing left in the queue to coalesce with), also with no chunk_locations
@@ -11698,7 +11803,7 @@ mod tests {
     async fn test_metadata_queue_cancel_clears_delivered_write_seq() {
         let queue = MetadataQueue::new();
         let file_id = FileId::new();
-        queue.mark_delivered(file_id, 5, 0);
+        queue.mark_delivered(file_id, 5, 0, 0);
         assert!(queue.delivered_write_seq.contains_key(&file_id));
 
         queue.cancel(file_id).await;

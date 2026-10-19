@@ -178,6 +178,12 @@ enum FaultCommands {
         #[arg(long)]
         millis: u64,
     },
+    /// Test-only: keep this node's stored chunk versions when metadata puts arrive, for
+    /// `millis` (0 clears it).
+    IgnoreMetadataVersions {
+        #[arg(long)]
+        millis: u64,
+    },
     /// Hold one subsystem's lock for a while: metadata-db, healer-maps or cluster-membership.
     Stall {
         #[arg(long)]
@@ -1842,6 +1848,16 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::IgnoreMetadataVersions { millis } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectIgnoreMetadataVersions { millis: *millis }).await? {
+                Response::Ok { .. } => println!("{}: ignoring the chunk versions in metadata puts for {}ms", addr, millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::FailOrdered { count } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectOrderedApplyFailures { count: *count }).await? {
@@ -1876,7 +1892,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
-        | FaultCommands::FailLocations { .. } => unreachable!("handled above"),
+        | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. } => unreachable!("handled above"),
     };
     for &addr in cluster_addrs {
         match send_request(addr, Request::SetPeerFilter { filter: filter.clone() }).await? {

@@ -67,6 +67,16 @@ pub fn take_injected_slow_fold() -> Option<u64> {
 /// Time-based, not a count: the ordered and batched senders retry at very different rates.
 pub static INJECTED_LOCATION_FAILURES_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only (`Request::InjectIgnoreMetadataVersions`): until this time (ms since UNIX epoch),
+/// metadata puts keep the stored chunk versions.
+pub static INJECTED_IGNORE_METADATA_VERSIONS_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a metadata put arriving now should keep the stored chunk versions.
+pub fn ignoring_metadata_versions() -> bool {
+    let until = INJECTED_IGNORE_METADATA_VERSIONS_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst);
+    until != 0 && now_ms() < until
+}
+
 /// Whether a chunk-location registration arriving now should fail.
 pub fn take_injected_location_failure() -> bool {
     let until = INJECTED_LOCATION_FAILURES_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst);

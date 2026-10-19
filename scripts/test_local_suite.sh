@@ -1863,6 +1863,88 @@ rm -f "$MOUNT/$T95_FILE" "$T/t95.bin"
 done
 fi # should_run T95
 
+# ── T96: the leader's chunk map is a hint; the slot's primary names the current version ──
+# Phase 5 step 2. The leader refuses every location update for 8 s, so its map still names
+# chunk 1's pre-patch version, while the ISR pair (which excludes the leader) has applied and
+# acked a fsynced patch. A fresh client reading inside that window must get the patched bytes.
+# The pair is required with ordering; without it the leader's map is the only authority, so
+# report only.
+snapshot_log T96
+if should_run T96; then
+echo "=== T96: a fresh reader gets a fsynced patch the leader hasn't registered (reads resolve through the pair) ==="
+t96_check() {
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+T96_LADDR=""
+for _ in $(seq 1 30); do T96_LADDR=$(t88_leader "$CLUSTER") || true; [ -n "$T96_LADDR" ] && break; sleep 1; done
+T96_MAP=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904 lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+T96_FILE="" T96_PAIR=""
+# A file whose chunk 1 pair excludes the leader: a leader in the pair advances its own map.
+for T96_TRY in 1 2 3 4 5 6; do
+    f=t96_$T96_TRY.bin
+    dd if=/dev/urandom of="$T/t96.bin" bs=4M count=2 status=none
+    cp "$T/t96.bin" "$MOUNT/$f"; dfs_sync
+    isr=""
+    for _ in $(seq 1 30); do
+        isr=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$f" --chunks 2 2>/dev/null \
+            | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+        [ -n "$isr" ] && break
+        sleep 1
+    done
+    pair=$(for n in $isr; do echo "$T96_MAP" | awk -v n="$n" '$1==n{print $2}'; done | tr '\n' ' ')
+    echo "  T96 try $T96_TRY: chunk 1 isr=[${isr:-none}] pair=[${pair}]"
+    if [ -n "$isr" ] && ! echo " $pair" | grep -q " $T96_LADDR "; then T96_FILE=$f T96_PAIR=$pair; break; fi
+    rm -f "$MOUNT/$f"
+done
+if [ -z "$T96_FILE" ]; then
+    t96_check "T96 setup: a file whose chunk 1 pair excludes the leader $T96_LADDR" FAIL
+else
+    echo "  T96: leader=$T96_LADDR chunk 1 pair=$T96_PAIR file=$T96_FILE"
+    "$BIN/dfs-admin" --cluster "$T96_LADDR" fault fail-locations --millis 8000 >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T96_LADDR" fault ignore-metadata-versions --millis 8000 >/dev/null 2>&1 || true
+    T96_T0=$(date +%s.%N)
+    T96_OUT=$(timeout 30 python3 - "$MOUNT/$T96_FILE" "$T/t96.bin" 2>>"$LOG/t96.err" <<'PY'
+import os, sys
+x = os.urandom(65536)
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, 4 * 1024 * 1024 + 4096)
+try:
+    os.fsync(fd); r = "ok"
+except OSError as e:
+    r = "err errno=%d" % e.errno
+os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(4 * 1024 * 1024 + 4096); f.write(x)
+print(r)
+PY
+) || true
+    T96_WANT=$(md5sum < "$T/t96.bin" | cut -d' ' -f1)
+    T96_FM=/tmp/dfs-mount-t96
+    mkdir -p "$T96_FM"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T96_FM" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t96.log" --allow-other --log-level debug &
+    T96_PID=$!
+    for _ in $(seq 1 50); do mountpoint -q "$T96_FM" && break; sleep 0.1; done
+    T96_GOT=$(timeout 20 md5sum < "$T96_FM/$T96_FILE" 2>/dev/null | cut -d' ' -f1)
+    T96_AT=$(python3 -c "import time; print('%.1f' % (time.time() - $T96_T0))")
+    fusermount -u "$T96_FM" 2>/dev/null || true
+    kill_client_and_wait "$T96_PID"
+    "$BIN/dfs-admin" --cluster "$T96_LADDR" fault fail-locations --millis 0 >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T96_LADDR" fault ignore-metadata-versions --millis 0 >/dev/null 2>&1 || true
+    echo "  T96: fsync $T96_OUT; fresh read ${T96_AT}s after the patch (the leader refuses for 8 s)"
+    [ "$T96_OUT" = ok ] && check "T96a the patch's fsync succeeded" PASS || check "T96a the patch's fsync succeeded ($T96_OUT)" FAIL
+    if [ "$(python3 -c "print(float('$T96_AT') < 8)")" != True ]; then
+        echo "  T96b: the fresh read finished after the leader's window (${T96_AT}s): proves nothing"
+    elif [ "$T96_GOT" = "$T96_WANT" ]; then
+        t96_check "T96b a fresh reader gets the patched bytes while the leader's map is stale" PASS
+    else
+        t96_check "T96b a fresh reader gets the patched bytes while the leader's map is stale (got ${T96_GOT:-nothing})" FAIL
+    fi
+    rm -f "$MOUNT/$T96_FILE"
+fi
+rm -f "$T/t96.bin"
+fi # should_run T96
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then
@@ -7438,6 +7520,16 @@ PY
         OK*) t66_check "T66[$T66_CASE]a no acked write lost (servers hold $T66_FRESH)" PASS ;;
         *)   t66_check "T66[$T66_CASE]a servers hold $T66_FRESH, not a writer's last acked write -- acked write lost" FAIL ;;
     esac
+    # Phase 5: the leader is off the write path. In-place patches to a pair that excludes it
+    # don't wait on it, so its freeze barely shows (it stalled every fsync ~7 s before).
+    if [ "$T66_CASE" = leader ]; then
+        T66_WORST=$(echo "$T66_VERDICT" | grep -o "worst [0-9.]*" | awk '{print $2}' | sort -n | tail -1)
+        if python3 -c "import sys; sys.exit(0 if float('${T66_WORST:-99}') < 3 else 1)"; then
+            t66_check "T66[leader]d a frozen non-ISR leader doesn't stall fsync (worst ${T66_WORST}s)" PASS
+        else
+            t66_check "T66[leader]d a frozen non-ISR leader stalled fsync for ${T66_WORST}s (target < 3 s)" FAIL
+        fi
+    fi
     # Each ISR member's own bytes for the slot (ReadSlotLocal: its ordered head, else its local
     # chunk_map entry; nothing substituted). Folding and comparing fold ids proved unreliable:
     # ForceFold answers with the local chunk_map entry, which can be a token it didn't fold.

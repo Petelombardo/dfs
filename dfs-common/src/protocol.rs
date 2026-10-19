@@ -1308,6 +1308,24 @@ pub enum Request {
     ReplicateIsrHeads {
         heads: Vec<IsrHead>,
     },
+
+    /// Client -> any node (Phase 5: the leader's chunk map is a hint). For each of `chunk_idxs`,
+    /// this node's committed ISR for the slot, and the slot's current head if this node is its
+    /// primary and holds its lease. A client asks the leader for the ISRs, then each primary for
+    /// its heads, and reads the version a primary names over the leader's map. Answered with
+    /// `SlotHeads`; slots this node has no ISR for are left out. APPENDED at end.
+    GetSlotHeads {
+        file_id: FileId,
+        chunk_idxs: Vec<u64>,
+    },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): for the next `millis`, this node keeps its stored
+    /// chunk versions when a metadata put arrives (size and times still land), as a leader
+    /// whose map lags the ISR pairs would (suite T96, with InjectChunkLocationFailures).
+    /// 0 clears it. APPENDED at end to preserve wire compatibility.
+    InjectIgnoreMetadataVersions {
+        millis: u64,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's
@@ -1318,6 +1336,17 @@ pub struct IsrHead {
     pub location: ChunkLocation,
     pub generation: u64,
     pub isr_epoch: u64,
+}
+
+/// One slot in a `Response::SlotHeads`: the answering node's committed ISR for it, and when
+/// that node is the slot's primary with a live lease, the slot's current head (`location`
+/// names the version; its `nodes` include the ISR members) and the slot's generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotHead {
+    pub chunk_idx: u64,
+    pub isr: SlotIsr,
+    pub head: Option<ChunkLocation>,
+    pub generation: Option<u64>,
 }
 
 /// Which slot a `Request::Ordered` write belongs to and who orders it (the ISR's first member
@@ -1951,6 +1980,11 @@ pub enum Response {
     ChainedWrite {
         primary: Box<Response>,
         secondary: Box<Response>,
+    },
+
+    /// Answer to `Request::GetSlotHeads`. APPENDED at end to preserve wire compatibility.
+    SlotHeads {
+        heads: Vec<SlotHead>,
     },
 }
 

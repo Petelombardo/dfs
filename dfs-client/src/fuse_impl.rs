@@ -9486,7 +9486,22 @@ impl Filesystem for DfsFilesystem {
                             // this fsync acks the new size (suite T79: an fsynced 16 MB write read
                             // back empty after the leader restarted).
                             let size_unsynced = handle.client.metadata_queue.delivered_size(&meta.id) != Some(meta.size);
-                            if (needs_sync || size_unsynced) && trustworthy {
+                            // Phase 5: with ordering, an in-place patch is durable on its ISR pair
+                            // (acked by both; a new leader learns it from them), so this fsync
+                            // doesn't wait on the leader when the leader already has the file's
+                            // size and every slot. Its map catches up in the background, and
+                            // readers resolve each slot through its primary (overlay_slot_heads).
+                            // A frozen leader stalled every fsync for its whole freeze (T66[leader]).
+                            let slots_unsynced = handle.client.metadata_queue.delivered_slots(&meta.id)
+                                != Some(crate::client::MetadataQueue::slot_count(&meta));
+                            let off_leader = crate::client::DfsClient::leader_off_path_enabled()
+                                && !size_unsynced && !slots_unsynced;
+                            if off_leader && trustworthy {
+                                if needs_sync {
+                                    handle.client.metadata_queue.push(meta.clone()).await;
+                                    handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                                }
+                            } else if (needs_sync || size_unsynced) && trustworthy {
                                 if !handle.client.flush_metadata_sync(&meta).await {
                                     error!("fsync: metadata for inode {} not committed by the leader; returning EIO", ino);
                                     reply.error(libc::EIO);

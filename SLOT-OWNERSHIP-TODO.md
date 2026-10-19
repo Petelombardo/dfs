@@ -300,6 +300,8 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         1014d (G3+G6) 267/0 = 1/5.
         10-16/17: 1016i 288/0, then T85a / T59a broke it; 1017a T66[secondary]a (fixed 87286ad);
         1017b 288/1 (T38b only) = 1/5.
+        1018a 287/1 (T38b) = 2/5; 1018c broke it with T83d (root-caused, fixed b01fb4e + the
+        delivered record); 1018d 288/0 = 1/5.
         10-15: 1015a (T91 fix) ON 271/3 = T85a (G7) + T59a/T59e (one lease lapse in a 9 s
         db stall; 3/3 alone, logs lost to the OFF run) -> streak back to 0/5.
   - [x] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
@@ -377,6 +379,16 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         no file offset and RF-restore wrote back a stale row, so the leader lost the slot
         (87286ad, ON T66[secondary]a; isolated 2/2 FAIL -> 10/10). Suites 1017b: ON 288/1
         (T38b), OFF 210/6 (known). Step 1 done; next step 2 (reads resolve through the pair).
+        10-18 steps 2+3 DONE (together: step 2 alone had no failing case, since every fsync still
+        put the file's chunk locations to the leader). Step 2: GetSlotHeads; a fresh reader takes
+        each slot's version from its leased primary, the leader's map is a hint. Step 3 (ordering
+        on): an in-place patch's fsync doesn't wait on the leader when it already has the file's
+        size and slots; reports still flow in the background (dropping them waits for step 4:
+        healer/GC/sweep read the leader's map). T96 3/3 FAIL -> PASS; T66[leader]d worst fsync
+        7.1 s -> 0.2-0.3 s. :8950 A/B (DFS_LEADER_OFF_PATH, 3 rounds): no measurable cost with a
+        healthy leader (QD1 58.3 vs 56.7, 16w 49.5 vs 50.4, reads +/-1%). Suites 1018d ON 288/0,
+        OFF 215/2 (T83d, T38b known). Found on the way: a delete that missed a moved leader
+        (b01fb4e). Not measured yet: leader RPCs per write.
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

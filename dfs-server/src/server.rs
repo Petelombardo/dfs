@@ -1186,7 +1186,8 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ReadSlotLocal { .. }
         | Request::ResyncSlot { .. } => PeerOther,
         Request::GetOrSeedSlotIsr { .. }
-        | Request::ReplaceIsrMember { .. } => ClientOther,
+        | Request::ReplaceIsrMember { .. }
+        | Request::GetSlotHeads { .. } => ClientOther,
         Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. }
         | Request::SyncHeldLocations { .. } | Request::CheckSupersededChunks { .. }
         | Request::ReplicateIsrHeads { .. } => PeerOther,
@@ -1249,6 +1250,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectOrderedApplyFailures { .. }
         | Request::InjectSlowBackgroundFolds { .. }
         | Request::InjectChunkLocationFailures { .. }
+        | Request::InjectIgnoreMetadataVersions { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -8297,6 +8299,7 @@ impl Server {
                 self.handle_replicate_chunk_locations(locations, true).await
             }
             Request::ReplicateIsrHeads { heads } => self.handle_replicate_isr_heads(heads).await,
+            Request::GetSlotHeads { file_id, chunk_idxs } => self.handle_get_slot_heads(file_id, chunk_idxs).await,
             Request::AuditSlots { entries } => self.handle_audit_slots(entries).await,
             Request::RenewNodeLease { node, incarnation } => self.lease.handle_renew(node, incarnation),
             Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
@@ -8311,6 +8314,18 @@ impl Server {
                 }
                 warn!("FAULT INJECTION: failing this primary's apply of the next {} ordered write(s)", count);
                 crate::write_order::INJECTED_APPLY_FAILURES.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
+            Request::InjectIgnoreMetadataVersions { millis } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: ignoring the chunk versions in metadata puts for {}ms", millis);
+                let until = if millis == 0 { 0 } else { crate::write_order::now_ms() + millis };
+                crate::write_order::INJECTED_IGNORE_METADATA_VERSIONS_UNTIL_MS.store(until, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
             Request::InjectChunkLocationFailures { millis } => {
@@ -11068,6 +11083,59 @@ impl Server {
     /// every write to the slot passes through its ISR, so a member's applied head is at
     /// least as new as any write acked for it, even when it is the only member left. The
     /// durability guard in location_supersedes stays for everything else (T95[orphan]).
+    /// Phase 5: the slot's primary names its current version, the leader's chunk map only hints
+    /// at it. Each slot this node has a committed ISR for gets that ISR, and, when this node is
+    /// its primary and holds its lease, the head it would order the next write onto (the
+    /// ordered stream's head, else its chunk map entry: what a takeover starts from) with the
+    /// slot's generation. The lease is what makes the answer current: a primary is replaced only
+    /// after a majority voted its lease expired, so one still holding it has applied every
+    /// acked version of the slot.
+    async fn handle_get_slot_heads(&self, file_id: FileId, chunk_idxs: Vec<u64>) -> Response {
+        let me = self.cluster.local_node_id();
+        let leased = self.lease.holds_own_lease();
+        let mut heads = Vec::with_capacity(chunk_idxs.len());
+        for chunk_idx in chunk_idxs {
+            let Some(isr) = self.slot_isr.get(file_id, chunk_idx) else { continue };
+            let mut head = None;
+            let mut generation = None;
+            if leased && isr.members.first() == Some(&me) {
+                let id = self.write_ordering.latest_head(file_id, chunk_idx).or_else(|| {
+                    self.chunk_map.get(&file_id).and_then(|e| {
+                        let (locs, _) = e.value();
+                        Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+                    })
+                });
+                if let Some(id) = id {
+                    let stored = self.metadata.get_chunk_location_async(id).await.ok().flatten();
+                    // The members hold the head once it's acked, whatever the row lists; this
+                    // node first, since it applied it.
+                    let mut nodes = vec![me];
+                    for n in isr.members.iter().chain(stored.iter().flat_map(|l| l.nodes.iter())) {
+                        if !nodes.contains(n) {
+                            nodes.push(*n);
+                        }
+                    }
+                    let size = stored.as_ref().map(|l| l.size)
+                        .or_else(|| self.storage.get_chunk_size(&id).map(|s| s as usize))
+                        .unwrap_or(4 * 1024 * 1024);
+                    head = Some(ChunkLocation {
+                        chunk_id: id,
+                        nodes,
+                        size,
+                        checksum: id.hash,
+                        file_offset: Some(chunk_idx * (4 * 1024 * 1024)),
+                        written_at: stored.as_ref().and_then(|l| l.written_at),
+                        client_write_seq: stored.as_ref().and_then(|l| l.client_write_seq),
+                        file_id: Some(file_id),
+                    });
+                    generation = self.metadata.get_chunk_seq_async(file_id, chunk_idx).await.ok().flatten();
+                }
+            }
+            heads.push(dfs_common::protocol::SlotHead { chunk_idx, isr, head, generation });
+        }
+        Response::SlotHeads { heads }
+    }
+
     async fn handle_replicate_isr_heads(&self, heads: Vec<dfs_common::protocol::IsrHead>) -> Response {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let mut installed = 0usize;
@@ -14828,7 +14896,16 @@ impl Server {
     /// fully accounts for (see Request::PutFileMetadata's doc comment). Used purely
     /// as a detection signal — see the gap check below — never to change what gets
     /// persisted.
-    async fn handle_put_file_metadata(&self, metadata: FileMetadata, covers_from_write_seq: u64) -> Response {
+    async fn handle_put_file_metadata(&self, mut metadata: FileMetadata, covers_from_write_seq: u64) -> Response {
+        // Test-only (ignore-metadata-versions): the leader learns no chunk versions from a put in
+        // the window, while size and times still land. With fail-locations, a leader whose map
+        // lags the ISR pairs (Phase 5: fsync no longer waits on it), for suite T96.
+        if crate::write_order::ignoring_metadata_versions() {
+            if let Ok(Some(stored)) = self.metadata.get_file_async(metadata.id).await {
+                warn!("FAULT INJECTION: ignoring the chunk versions in a metadata put for {}", metadata.path);
+                metadata.chunk_locations = stored.chunk_locations;
+            }
+        }
         info!(
             "[META SERVER] put path={} id={} seq={} size={} is_leader={}",
             metadata.path, metadata.id, metadata.write_seq, metadata.size,
@@ -30160,6 +30237,46 @@ mod tests {
             vec![(20usize, vec![0xBBu8; 4])], Some(6), None, false, Some(3),
         ).await.unwrap();
         assert_eq!(metadata.get_chunk_seq(file_id, 0).unwrap(), Some(7));
+    }
+
+    /// Phase 5: a reader takes a slot's version from GetSlotHeads over the leader's map, so only
+    /// the slot's primary holding its lease may name one. Any node shares its ISR (that's how a
+    /// reader finds the primary); a secondary, or a primary whose lease lapsed (it may already
+    /// have been replaced), names nothing. The head names the members as holders.
+    #[tokio::test]
+    async fn only_a_leased_primary_names_a_slots_head() {
+        let h = make_overlay_test_harness();
+        let me = h.server.cluster().local_node_id();
+        let other = NodeId::new();
+        let file_id = FileId::new();
+        let head = ChunkId::from_hash([0x5a; 32]);
+        h.server.chunk_map.insert(file_id, (vec![
+            ChunkLocation { chunk_id: ChunkId::from_hash([0x11; 32]), nodes: vec![me], size: 4 * 1024 * 1024, checksum: [0x11; 32],
+                file_offset: Some(0), written_at: None, client_write_seq: None, file_id: Some(file_id) },
+            ChunkLocation { chunk_id: head, nodes: vec![me], size: 4 * 1024 * 1024, checksum: head.hash,
+                file_offset: Some(4 * 1024 * 1024), written_at: None, client_write_seq: None, file_id: Some(file_id) },
+        ], 1));
+        h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 1, members: vec![other, me] });
+        h.server.slot_isr.set_committed_for_test(file_id, 1, crate::slot_isr::SlotIsr { epoch: 3, members: vec![me, other] });
+        let heads = |r: Response| match r {
+            Response::SlotHeads { heads } => heads,
+            other => panic!("unexpected answer: {:?}", other),
+        };
+
+        // No lease: ISRs only (slot 2 has none and is left out).
+        let hs = heads(h.server.handle_get_slot_heads(file_id, vec![0, 1, 2]).await);
+        assert_eq!(hs.iter().map(|x| x.chunk_idx).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(hs.iter().all(|x| x.head.is_none()), "BUG: a primary without its lease named a head");
+        assert_eq!(hs[1].isr.members, vec![me, other]);
+
+        h.server.lease.grant_own_lease_for_test();
+        let hs = heads(h.server.handle_get_slot_heads(file_id, vec![0, 1]).await);
+        assert!(hs[0].head.is_none(), "BUG: a secondary named a head");
+        let named = hs[1].head.as_ref().expect("the leased primary names its head");
+        assert_eq!(named.chunk_id, head);
+        assert_eq!(named.file_offset, Some(4 * 1024 * 1024));
+        assert_eq!(named.file_id, Some(file_id));
+        assert_eq!(named.nodes, vec![me, other], "this node first, then the other member");
     }
 
     /// Suite T66[secondary] (1017a ON): an ordered fold materialized its head through

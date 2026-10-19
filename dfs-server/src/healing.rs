@@ -4603,6 +4603,110 @@ impl HealingManager {
     /// chunks in pending_healing that are ready (delay passed, source known, not
     /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
     /// prevents double-dispatch across 15s ticks.
+    /// Phase 5 step 4: the leader's map is a hint, the slot's primary names the version. A
+    /// chunk this node's map still names can be history at its slot: the pair folded past it
+    /// and the leader never heard (a failed fold notification; once per-write reports stop,
+    /// every un-reported write). Healing it copies dead bytes back onto the cluster on every
+    /// discovery pass (suite T97e). Each under-replicated chunk whose slot has an ISR is
+    /// checked against the head its leased primary names (GetSlotHeads); one the primary has
+    /// moved past is dropped from the heal queue and the head is installed here through the
+    /// ISR-head causal order (ReplicateIsrHeads), so the map stops naming the dead version.
+    /// Every uncertain answer (no ISR, no lease, a patch-token head that may resolve through
+    /// this chunk, an RPC failure) leaves the heal as it was.
+    async fn drop_heals_a_primary_moved_past(
+        &self,
+        work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)>,
+    ) -> Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+        let local_id = self.cluster.local_node_id();
+        let Some(local_addr) = self.cluster.get_node(&local_id).await.map(|n| n.addr) else { return work };
+
+        // (file, chunk_idx) -> the under-replicated chunk this node's map names there
+        let mut by_file: HashMap<FileId, Vec<(u64, ChunkId)>> = HashMap::new();
+        for (chunk_id, status, _) in &work {
+            if *status != ReplicationStatus::UnderReplicated || chunk_id.looks_like_patch_token() {
+                continue;
+            }
+            if let Ok(Some(loc)) = self.metadata.get_chunk_location_async(*chunk_id).await {
+                if let (Some(fid), Some(off)) = (loc.file_id, loc.file_offset) {
+                    by_file.entry(fid).or_default().push((off / CHUNK_SIZE, *chunk_id));
+                }
+            }
+        }
+        if by_file.is_empty() {
+            return work;
+        }
+
+        let ask = |addr: std::net::SocketAddr, file_id: FileId, chunk_idxs: Vec<u64>| {
+            let client = self.client.clone();
+            async move {
+                match client.send_message_timeout(addr, Message::Request(Request::GetSlotHeads { file_id, chunk_idxs }), RPC_TIMEOUT).await {
+                    Ok(env) => match env.message {
+                        Message::Response(Response::SlotHeads { heads }) => heads,
+                        _ => Vec::new(),
+                    },
+                    Err(_) => Vec::new(),
+                }
+            }
+        };
+        let mut moved_past: Vec<ChunkId> = Vec::new();
+        let mut installs: Vec<dfs_common::protocol::IsrHead> = Vec::new();
+        for (file_id, slots) in by_file {
+            // This node's committed ISRs (and heads, for slots it is primary of), then each
+            // other primary for its heads.
+            let mut named = Vec::new();
+            let mut by_primary: HashMap<std::net::SocketAddr, Vec<u64>> = HashMap::new();
+            for h in ask(local_addr, file_id, slots.iter().map(|(i, _)| *i).collect()).await {
+                if h.head.is_some() {
+                    named.push(h);
+                } else if let Some(p) = h.isr.members.first() {
+                    if let Some(n) = self.cluster.get_node(p).await {
+                        by_primary.entry(n.addr).or_default().push(h.chunk_idx);
+                    }
+                }
+            }
+            for (addr, idxs) in by_primary {
+                named.extend(ask(addr, file_id, idxs).await.into_iter().filter(|h| h.head.is_some()));
+            }
+            for h in named {
+                let Some(&(_, chunk_id)) = slots.iter().find(|(i, _)| *i == h.chunk_idx) else { continue };
+                if let Some(install) = Self::slot_head_moved_past(&chunk_id, &h) {
+                    info!("Healer: chunk {} is history at file {} chunk {}: its primary names {} — not healing it",
+                        chunk_id, file_id, h.chunk_idx, install.location.chunk_id);
+                    moved_past.push(chunk_id);
+                    installs.push(install);
+                }
+            }
+        }
+        if moved_past.is_empty() {
+            return work;
+        }
+        if let Err(e) = self.client.send_message_timeout(
+            local_addr, Message::Request(Request::ReplicateIsrHeads { heads: installs }), RPC_TIMEOUT,
+        ).await {
+            debug!("Healer: installing {} primary-named head(s) locally failed: {}", moved_past.len(), e);
+        }
+        self.clear_pending_batch(&moved_past).await;
+        work.into_iter().filter(|(id, _, _)| !moved_past.contains(id)).collect()
+    }
+
+    /// The ISR head to install when `head` (a leased primary's answer for `chunk_id`'s slot)
+    /// names a different, content-addressed version: `chunk_id` is history there. None when
+    /// the primary named nothing, names `chunk_id` itself, or names a patch token (whose base
+    /// may well be `chunk_id`: that base must keep its redundancy).
+    fn slot_head_moved_past(chunk_id: &ChunkId, head: &dfs_common::protocol::SlotHead) -> Option<dfs_common::protocol::IsrHead> {
+        let loc = head.head.as_ref()?;
+        let generation = head.generation?;
+        if loc.chunk_id == *chunk_id || loc.chunk_id.looks_like_patch_token() || head.isr.members.is_empty() {
+            return None;
+        }
+        // The install accepts only nodes the ISR names; the row it merges with adds the rest.
+        let mut location = loc.clone();
+        location.nodes = head.isr.members.clone();
+        Some(dfs_common::protocol::IsrHead { location, generation, isr_epoch: head.isr.epoch })
+    }
+
     async fn drain_heal_queue(&self) -> Result<()> {
         let destructive_allowed = {
             let all_nodes = self.cluster.get_all_nodes().await;
@@ -4739,6 +4843,10 @@ impl HealingManager {
             v
         };
 
+        if work.is_empty() {
+            return Ok(());
+        }
+        let work = self.drop_heals_a_primary_moved_past(work).await;
         if work.is_empty() {
             return Ok(());
         }
@@ -8409,6 +8517,33 @@ mod tests {
             Some(&vec![node_id]),
             "discovery must replace a held-back chunk's cached holders with the ones it just confirmed"
         );
+    }
+
+    #[test]
+    fn only_a_primary_named_content_head_makes_a_heal_history() {
+        let id = |s: &[u8]| ChunkId::from_hash(*blake3::hash(s).as_bytes());
+        let (old, head_id) = (id(b"pre-fold version"), id(b"fold result"));
+        let (a, b) = (NodeId::new(), NodeId::new());
+        let slot = |head: Option<ChunkId>, generation: Option<u64>| dfs_common::protocol::SlotHead {
+            chunk_idx: 1,
+            isr: dfs_common::protocol::SlotIsr { epoch: 7, members: vec![a, b] },
+            head: head.map(|chunk_id| ChunkLocation {
+                chunk_id, nodes: vec![a, b, NodeId::new()], size: 4 << 20, checksum: chunk_id.hash,
+                file_offset: Some(4 << 20), written_at: None, client_write_seq: None, file_id: Some(FileId::new()),
+            }),
+            generation,
+        };
+        let install = HealingManager::slot_head_moved_past(&old, &slot(Some(head_id), Some(9)))
+            .expect("a different content head makes the old version history");
+        assert_eq!(install.location.chunk_id, head_id);
+        assert_eq!(install.location.nodes, vec![a, b], "the install names only ISR members");
+        assert_eq!((install.generation, install.isr_epoch), (9, 7));
+        assert!(HealingManager::slot_head_moved_past(&old, &slot(Some(old), Some(9))).is_none(), "the head is this chunk");
+        assert!(HealingManager::slot_head_moved_past(&old, &slot(None, None)).is_none(), "no lease, no answer");
+        assert!(HealingManager::slot_head_moved_past(&old, &slot(Some(head_id), None)).is_none(), "no generation to order by");
+        let token = ChunkId::patch_token_identity(id(b"delta"));
+        assert!(HealingManager::slot_head_moved_past(&old, &slot(Some(token), Some(9))).is_none(),
+            "a token head may resolve through this chunk as its base");
     }
 
     /// The healer's own NotFound from a source commits a location without that holder;

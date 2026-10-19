@@ -4,7 +4,7 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-10-13, default-flip gates written down (see "Make ordering the default"); T81-T86 and chain replication_
+_Last updated: 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97); before that 2026-10-13, default-flip gates written down_
 
 **Resume here:** the default-flip gates under 3c ("Make ordering the default"). Ordering kept
 (2026-10-03); ordering-on suites run 255-257 pass with 1-2 failures, but nearly every run still
@@ -389,6 +389,20 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         healthy leader (QD1 58.3 vs 56.7, 16w 49.5 vs 50.4, reads +/-1%). Suites 1018d ON 288/0,
         OFF 215/2 (T83d, T38b known). Found on the way: a delete that missed a moved leader
         (b01fb4e). Not measured yet: leader RPCs per write.
+        10-19 step 4 (healing/GC/sweep against a leader whose map is only a hint): T97 (the leader
+        refuses every location report and metadata version for 180 s while the pair, which
+        excludes it, takes two fsynced patches and folds; every deleting grace at 0). The
+        deleting paths were already safe: orphan-sweep candidates come from each node's own
+        live set, and the pair knows its head. The bug: the leader kept healing the pre-fold
+        version after the pair had moved past it (any failed fold notification today; every
+        un-reported write once step 5 drops the reports), copying dead bytes back each pass.
+        Fixed: before healing, the leader asks the slot's leased primary (GetSlotHeads); a
+        different content head makes the chunk history: not healed, and the head installed
+        through the ISR-head causal order. A token head (whose base may be this chunk) or any
+        uncertain answer heals as before. Also: an ISR head the map already names (a fold's
+        peer fan-out) but that has no row gets its row, so the healer sees it under RF (T97f).
+        T97e 0/4 -> 3/3. Suites 1019a ON 293/1 (NEW T94[immediate]b, not this change: an
+        fsynced create's metadata is acked on the leader alone; next), OFF 212/6 (known set).
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

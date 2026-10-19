@@ -11164,7 +11164,12 @@ impl Server {
                 Self::chunk_map_find_by_idx(locs, idx).map(|i| locs[i].clone())
             });
             let occupant = occupant_loc.as_ref().map(|o| o.chunk_id);
-            if occupant == Some(loc.chunk_id) {
+            // Already the slot's version here; still commit its row if it has none (a fold's
+            // peer fan-out names it in the map, while its row comes only with a location
+            // registration): without one the healer can't see it under RF (suite T97f).
+            if occupant == Some(loc.chunk_id)
+                && !matches!(self.metadata.get_chunk_location_async(loc.chunk_id).await, Ok(None))
+            {
                 continue;
             }
             let occupant_gen = match occupant.and_then(|o| self.chunk_generations.get(&o).map(|g| *g)) {
@@ -11175,10 +11180,12 @@ impl Server {
             // over a client write); only the replica count is left out (a floor of 0). Most
             // occupants carry no generation here (batched registrations don't), and a head
             // must not undo a newer write it never saw, like a full rewrite.
-            if let Some(occ) = &occupant_loc {
+            if let Some(occ) = occupant_loc.as_ref().filter(|o| o.chunk_id != loc.chunk_id) {
                 let inc_fold = self.fold_result_chunk_ids.contains(&loc.chunk_id);
                 let occ_fold = self.fold_result_chunk_ids.contains(&occ.chunk_id);
                 if !Self::location_supersedes(&loc, occ, inc_fold, occ_fold, Some(head.generation), occupant_gen, 0) {
+                    debug!("ISR head {} for file {} chunk {} not installed: occupant {} (generation {:?}, seq {:?}, fold {}) is not older than it (generation {}, seq {:?}, fold {})",
+                        loc.chunk_id, fid, idx, occ.chunk_id, occupant_gen, occ.client_write_seq, occ_fold, head.generation, loc.client_write_seq, inc_fold);
                     continue;
                 }
             }
@@ -30714,6 +30721,17 @@ mod tests {
             let newer = at1("newer-head", vec![b], 11);
             h.server.handle_request(push(newer.clone(), 8, 2)).await;
             assert_eq!(current1(&h), newer.chunk_id, "a head newer than the occupant's write must install");
+
+            // The map already names the head (a fold's peer fan-out) but no row was ever
+            // registered for it: the install commits the row, so the healer can see it.
+            let folded = at1("fold-result", vec![a, b], 11);
+            h.server.chunk_map.get_mut(&file_id).unwrap().value_mut().0[1] = folded.clone();
+            assert!(h.metadata.get_chunk_location(&folded.chunk_id).unwrap().is_none());
+            h.server.handle_request(push(folded.clone(), 9, 2)).await;
+            let row = h.metadata.get_chunk_location(&folded.chunk_id).unwrap()
+                .expect("BUG: a head the map already names was left without a row");
+            assert_eq!((row.file_id, row.file_offset), (Some(file_id), Some(4 * 1024 * 1024)));
+            assert_eq!(current1(&h), folded.chunk_id);
         }
     }
 

@@ -1945,6 +1945,164 @@ fi
 rm -f "$T/t96.bin"
 fi # should_run T96
 
+# ── T97: the leader's GC/sweep/healer must not destroy a slot head it was never told about ──
+# Phase 5 step 4. Once per-write location reports stop (step 5), the leader's map names a
+# slot's pre-patch version indefinitely; only the ISR pair knows the current head. The
+# leader refuses every location registration (and keeps stored versions in metadata puts)
+# for 180 s, while the pair (which excludes the leader) applies fsynced patches and
+# an ordered fold. The deleting paths run with their graces at 0, as in T85. Every pair
+# member must still hold the head and a fresh reader must get the patched bytes, both
+# inside the window and after it. Required with ordering; informational without it.
+snapshot_log T97
+if should_run T97; then
+echo "=== T97: GC, orphan sweep and healer keep a slot head the leader never registered ==="
+t97_check() {
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t97_fresh_md5() {
+    local mnt=/tmp/dfs-mount-t97 pid got
+    mkdir -p "$mnt"
+    RUST_LOG=info "$BIN/dfs-client" mount "$mnt" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t97_$1.log" --allow-other --log-level debug &
+    pid=$!
+    for _ in $(seq 1 50); do mountpoint -q "$mnt" && break; sleep 0.1; done
+    got=$(timeout 30 md5sum < "$mnt/$T97_FILE" 2>/dev/null | cut -d' ' -f1)
+    fusermount -u "$mnt" 2>/dev/null || true
+    kill_client_and_wait "$pid"
+    echo "$got"
+}
+# "<chunk_id> <blake3>" per pair member's own copy of chunk 1, or "<addr> error"
+t97_heads() {
+    "$BIN/dfs-admin" --cluster "$(echo $T97_PAIR | tr ' ' ',')" isr read --file "/$T97_FILE" --chunk 1 2>/dev/null \
+        | python3 -c "import json,sys
+for l in sys.stdin:
+    r = json.loads(l); print(r['addr'], r.get('chunk_id', 'error'), r.get('blake3', ''))"
+}
+T97_ENV="DFS_LIVE_FILE_ORPHAN_GRACE_SECS=0 DFS_DESTRUCTIVE_GRACE_SECS=0 DFS_ORPHAN_STABILITY_SECS=0 DFS_SUPERSEDED_GRACE_SECS=0 DFS_SUPERSEDED_SETTLE_SECS=5 DFS_ORPHAN_SWEEP_PAGE_GRACE_MS=2000 DFS_ORPHAN_SWEEP_MAX_PAGE_GRACE_MS=4000 DFS_ORPHAN_SWEEP_PAGE_SIZE=100000"
+t85_kill_all
+t85_start_all "$T97_ENV"
+t85_wait_ready || echo "  T97: cluster not fully healthy 30s after the restart"
+sleep 5
+T97_LADDR=""
+for _ in $(seq 1 30); do T97_LADDR=$(t88_leader "$CLUSTER") || true; [ -n "$T97_LADDR" ] && break; sleep 1; done
+T97_MAP=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904 lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+T97_FILE="" T97_PAIR=""
+for T97_TRY in 1 2 3 4 5 6; do
+    f=t97_$T97_TRY.bin
+    dd if=/dev/urandom of="$T/t97.bin" bs=4M count=2 status=none
+    cp "$T/t97.bin" "$MOUNT/$f"; dfs_sync
+    isr=""
+    for _ in $(seq 1 30); do
+        isr=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$f" --chunks 2 2>/dev/null \
+            | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+        [ -n "$isr" ] && break
+        sleep 1
+    done
+    pair=$(for n in $isr; do echo "$T97_MAP" | awk -v n="$n" '$1==n{print $2}'; done | tr '\n' ' ')
+    echo "  T97 try $T97_TRY: chunk 1 isr=[${isr:-none}] pair=[${pair}]"
+    if [ -n "$isr" ] && ! echo " $pair" | grep -q " $T97_LADDR "; then T97_FILE=$f T97_PAIR=$pair; break; fi
+    rm -f "$MOUNT/$f"
+done
+if [ -z "$T97_FILE" ]; then
+    t97_check "T97 setup: a file whose chunk 1 pair excludes the leader $T97_LADDR" FAIL
+else
+    echo "  T97: leader=$T97_LADDR chunk 1 pair=$T97_PAIR file=$T97_FILE"
+    sleep 3   # the leader has the file's original chunk 1 before the window opens
+    T97_OLD=$(t97_heads | awk 'NR==1{print $2}')
+    "$BIN/dfs-admin" --cluster "$T97_LADDR" fault fail-locations --millis 180000 >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T97_LADDR" fault ignore-metadata-versions --millis 180000 >/dev/null 2>&1 || true
+    T97_T0=$(date +%s)
+    # two fsynced patches; the pair's idle fold then turns the head into a fold result
+    # (ordered, so ForceFold refuses it). The leader hears of neither.
+    T97_OUT=$(timeout 60 python3 - "$MOUNT/$T97_FILE" "$T/t97.bin" 1 2>>"$LOG/t97.err" <<'PY'
+import os, sys
+x = os.urandom(65536)
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, 4 * 1024 * 1024 + 4096)
+try:
+    os.fsync(fd); r = "ok"
+except OSError as e:
+    r = "err errno=%d" % e.errno
+os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(4 * 1024 * 1024 + 4096); f.write(x)
+print(r)
+PY
+) || true
+    T97_OUT2=$(timeout 60 python3 - "$MOUNT/$T97_FILE" "$T/t97.bin" 2>>"$LOG/t97.err" <<'PY'
+import os, sys
+x = os.urandom(65536)
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, 4 * 1024 * 1024 + 1024 * 1024)
+try:
+    os.fsync(fd); r = "ok"
+except OSError as e:
+    r = "err errno=%d" % e.errno
+os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(4 * 1024 * 1024 + 1024 * 1024); f.write(x)
+print(r)
+PY
+) || true
+    echo "  T97: fsyncs $T97_OUT / $T97_OUT2"
+    # Until the pair folds, the pre-patch version is the live token's base and must keep
+    # its redundancy; once the head is a fold result it is history: nothing may heal it.
+    for _ in $(seq 1 60); do t97_heads | awk 'NR==1{print $2}' | grep -q '^df7c' || break; sleep 1; done
+    T97_HEALS0=$(cat "$LOG"/server*.log | grep -c "Leader healing under-replicated chunk: $T97_OLD" || true)
+    T97_WANT=$(md5sum < "$T/t97.bin" | cut -d' ' -f1)
+    T97_H0=$(t97_heads); echo "$T97_H0" | sed 's/^/  T97 head before GC: /'
+    # let every deleting path run several passes against the leader's stale map
+    "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger >/dev/null 2>&1 || true
+    sleep 40
+    "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger >/dev/null 2>&1 || true
+    sleep 30
+    T97_H1=$(t97_heads); echo "$T97_H1" | sed 's/^/  T97 head after GC:  /'
+    T97_IN=$(t97_fresh_md5 in)
+    T97_AT=$(( $(date +%s) - T97_T0 ))
+    T97_LNOW=$(t88_leader "$CLUSTER")
+    echo "  T97: in-window fresh read at ${T97_AT}s (window 180 s); leader now ${T97_LNOW:-none}"
+    [ "$T97_LNOW" != "$T97_LADDR" ] && echo "  T97: leadership moved during the window: proves less"
+    [ "$T97_OUT" = ok ] && [ "$T97_OUT2" = ok ] && check "T97a the patches' fsyncs succeeded" PASS \
+        || check "T97a the patches' fsyncs succeeded ($T97_OUT / $T97_OUT2)" FAIL
+    # a fold changes the head's id, never its bytes
+    T97_BAD=$(echo "$T97_H1" | awk '$2=="error"' | wc -l)
+    T97_DIFF=$( { echo "$T97_H0"; echo "$T97_H1"; } | awk '{print $3}' | sort -u | wc -l)
+    echo "$T97_H1" | awk '{print $2}' | grep -q '^df7c' \
+        && echo "  T97: the head is still a patch token (no fold in the window)" \
+        || echo "  T97: the head is a fold result the leader never registered"
+    [ "$T97_BAD" = 0 ] && [ "$T97_DIFF" = 1 ] \
+        && t97_check "T97b both pair members still hold the head's bytes after GC/sweep/heal" PASS \
+        || t97_check "T97b a pair member lost or changed its head's bytes under GC/sweep/heal" FAIL
+    [ "$T97_IN" = "$T97_WANT" ] \
+        && t97_check "T97c a fresh reader gets the patched bytes while the leader's map is stale" PASS \
+        || t97_check "T97c fresh read inside the window (exp $T97_WANT got ${T97_IN:-nothing})" FAIL
+    # the head itself must reach RF (3) from the pair, with no help from the leader's map
+    T97_HEAD=$(echo "$T97_H1" | awk 'NR==1{print $2}')
+    T97_COPIES=0
+    for i in 1 2 3 4 5; do [ -f "$BASE/node$i/data/chunks/${T97_HEAD:0:2}/${T97_HEAD:2:2}/$T97_HEAD" ] && T97_COPIES=$((T97_COPIES+1)); done
+    echo "$T97_HEAD" | grep -q '^df7c' \
+        && echo "  T97f: the head is still a patch token; copy count not checked" \
+        || { [ "$T97_COPIES" -ge 3 ] \
+            && t97_check "T97f the head ${T97_HEAD:0:12} reached 3 copies while the leader's map was stale" PASS \
+            || t97_check "T97f the head ${T97_HEAD:0:12} has $T97_COPIES cop(ies) on disk, RF 3, while the leader's map was stale" FAIL; }
+    T97_HEALS=$(( $(cat "$LOG"/server*.log | grep -c "Leader healing under-replicated chunk: $T97_OLD" || true) - T97_HEALS0 ))
+    [ "$T97_HEALS" = 0 ] \
+        && t97_check "T97e the leader never heals chunk 1's pre-patch version ${T97_OLD:0:12} once the pair moved past it" PASS \
+        || t97_check "T97e the leader healed chunk 1's pre-patch version ${T97_OLD:0:12} $T97_HEALS time(s) after the pair moved past it" FAIL
+    "$BIN/dfs-admin" --cluster "$T97_LADDR" fault fail-locations --millis 0 >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T97_LADDR" fault ignore-metadata-versions --millis 0 >/dev/null 2>&1 || true
+    sleep 20
+    T97_AFTER=$(t97_fresh_md5 after)
+    [ "$T97_AFTER" = "$T97_WANT" ] \
+        && t97_check "T97d a fresh reader gets the patched bytes after the leader catches up" PASS \
+        || t97_check "T97d fresh read after the window (exp $T97_WANT got ${T97_AFTER:-nothing})" FAIL
+    grep -h "Superseded cleanup\|orphan.*delet\|DeleteChunkReplica\|data loss" "$LOG"/server*.log 2>/dev/null | tail -n 20 | cut -c1-250 | sed 's/^/  T97 log: /'
+    rm -f "$MOUNT/$T97_FILE"
+fi
+rm -f "$T/t97.bin"
+t85_kill_all
+t85_start_all ""
+t85_wait_ready || echo "  T97: cluster not fully healthy 30s after restoring normal settings"
+fi # should_run T97
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

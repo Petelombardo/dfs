@@ -4,7 +4,7 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97); before that 2026-10-13, default-flip gates written down_
+_Last updated: 2026-10-20, T94 closed (metadata majority-ack) + T59a suspect, T24b, lease-persist fixes; G1 1/5; before that 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97)_
 
 **Resume here:** the default-flip gates under 3c ("Make ordering the default"). Ordering kept
 (2026-10-03); ordering-on suites run 255-257 pass with 1-2 failures, but nearly every run still
@@ -304,6 +304,10 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         delivered record); 1018d 288/0 = 1/5.
         10-15: 1015a (T91 fix) ON 271/3 = T85a (G7) + T59a/T59e (one lease lapse in a 9 s
         db stall; 3/3 alone, logs lost to the OFF run) -> streak back to 0/5.
+        10-19/20: 1019a T94[immediate]b (fixed 295d38b), 1019b T59a, 1019c 294/1 (T38b),
+        1019e T24b (new; fixed bac3ed4), 1020a 295/0 = 1/5. T59a not reproduced since 1019b;
+        a db-lock probe found sync metadata-db access on tokio workers (fixed a6688e9), the
+        likely cause. Lease votes also raced their persist (fixed 68730a8).
   - [x] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
         acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
         10-15 loops (ae6a40f): T69/T73/T76/T77/T86 20/20, T74 18/20. Both T74 fails = a
@@ -403,6 +407,13 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         peer fan-out) but that has no row gets its row, so the healer sees it under RF (T97f).
         T97e 0/4 -> 3/3. Suites 1019a ON 293/1 (NEW T94[immediate]b, not this change: an
         fsynced create's metadata is acked on the leader alone; next), OFF 212/6 (known set).
+        10-19/20 T94[immediate]b CLOSED (295d38b): a metadata put is acked only once a majority
+        committed it (DFS_METADATA_MAJORITY_ACK=0 for A/B). T98 (fsync, kill -9 the writer and
+        the leader, read from a fresh mount). :8950 A/B, 3 rounds: data fsyncs unchanged
+        (rand4k 54.7 vs 56.1, 16w 52.1 vs 52.5), fsynced create +3.5 ms, append +4 ms (the
+        first "10x" bench was fake: the local suite's pkill -f killed the bench's mount,
+        fixed ebefd27). Also the write worker's 8 ms linger on waited-on puts (bee378f).
+        Suites 1020a ON 295/0, OFF 214/5 (known set). Next: step 5 (drop per-write reports).
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

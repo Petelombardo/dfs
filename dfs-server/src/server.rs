@@ -7291,10 +7291,10 @@ impl Server {
                     // restarts. A genuinely different leader still gets a fresh grace period.
                     let now_secs = dfs_common::types::current_timestamp();
                     let local_id = server.cluster.local_node_id();
-                    let (prev_leader, prev_since) = server.metadata.get_leader_state().unwrap_or((None, None));
+                    let (prev_leader, prev_since) = server.metadata.get_leader_state_async().await.unwrap_or((None, None));
                     let became_leader_at_secs = crate::cluster::resolve_became_leader_epoch(prev_leader, prev_since, local_id, now_secs);
                     server.cluster.set_became_leader_epoch(became_leader_at_secs, now_secs).await;
-                    if let Err(e) = server.metadata.put_leader_state(local_id, became_leader_at_secs) {
+                    if let Err(e) = server.metadata.put_leader_state_async(local_id, became_leader_at_secs).await {
                         warn!("Failed to persist leader state: {}", e);
                     }
                     info!("Became leader — announcing leadership to all peers");
@@ -8028,7 +8028,8 @@ impl Server {
         // redeploy": catchup fires immediately on leader election while the drain
         // loop waits 30 s before its first pass.
         let pending_delete_ids: std::collections::HashSet<FileId> = self.metadata
-            .get_all_pending_deletes()
+            .get_all_pending_deletes_async()
+            .await
             .unwrap_or_default()
             .into_iter()
             .map(|e| e.file_id)
@@ -13512,7 +13513,7 @@ impl Server {
                 // takes an exclusive write txn just to read stats, so this is not free
                 // — it stays because 60s of diagnostic value is worth it, but nothing
                 // may depend on it for correctness.
-                let frag_stats = metadata.redb_fragmentation_stats().ok();
+                let frag_stats = metadata.redb_fragmentation_stats_async().await.ok();
 
                 // [META TXN]: per-call-site write-transaction attribution (Phase 0 of the
                 // metadata DB growth investigation — see MetadataStore::note_txn). Computes
@@ -19067,7 +19068,7 @@ impl Server {
 
     /// Handle GetDeleteQueue — leader polls all nodes on startup/election to merge queues.
     async fn handle_get_delete_queue(&self) -> Response {
-        match self.metadata.get_all_pending_deletes() {
+        match self.metadata.get_all_pending_deletes_async().await {
             Ok(entries) => Response::DeleteQueue { entries },
             Err(e) => {
                 warn!("GetDeleteQueue: failed to read delete queue: {}", e);
@@ -19121,7 +19122,7 @@ impl Server {
                             server.send_req(node.addr, Request::GetDeleteQueue),
                         ).await {
                             Ok(Ok(Response::DeleteQueue { entries })) => {
-                                let existing = server.metadata.get_all_pending_deletes().unwrap_or_default();
+                                let existing = server.metadata.get_all_pending_deletes_async().await.unwrap_or_default();
                                 for entry in entries {
                                     if !existing.iter().any(|e| e.file_id == entry.file_id) {
                                         if let Err(e) = server.metadata.enqueue_delete_async(entry.clone()).await {
@@ -19145,7 +19146,7 @@ impl Server {
                 }
 
                 // Drain all pending entries.
-                let entries = match server.metadata.get_all_pending_deletes() {
+                let entries = match server.metadata.get_all_pending_deletes_async().await {
                     Ok(e) => e,
                     Err(e) => { warn!("delete_drain: failed to read queue: {}", e); continue; }
                 };
@@ -30409,6 +30410,44 @@ mod tests {
         match h.server.handle_put_file_metadata(meta.clone(), 2).await {
             Response::Error { code: ErrorCode::IOError, .. } => {}
             other => panic!("BUG: a put no follower committed was acked: {:?}", other),
+        }
+    }
+
+    /// T59a probe (1019): GetDeleteQueue and metadata catchup read the delete queue
+    /// synchronously on a tokio worker. A metadata-db stall parks that worker for the whole
+    /// stall, and with enough of them parked the lease loop stops renewing. Measured on a
+    /// one-thread runtime, where a parked worker is a stopped runtime.
+    #[tokio::test]
+    async fn a_db_stall_does_not_stop_the_runtime_in_delete_queue_reads() {
+        use std::time::Duration;
+        let h = make_overlay_test_harness();
+        for which in ["GetDeleteQueue", "catchup"] {
+            let max_gap = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+            let gap = max_gap.clone();
+            let ticker = tokio::spawn(async move {
+                let mut last = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let now = std::time::Instant::now();
+                    let mut g = gap.lock().unwrap();
+                    *g = (*g).max(now - last);
+                    last = now;
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let metadata = h.server.metadata.clone();
+            let stall = std::thread::spawn(move || metadata.hold_db_lock_for(Duration::from_millis(1500)));
+            std::thread::sleep(Duration::from_millis(100));
+            match which {
+                "GetDeleteQueue" => { h.server.handle_get_delete_queue().await; }
+                _ => { h.server.run_metadata_catchup().await; }
+            }
+            // Let the ticker see the gap a block ending right here would leave.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ticker.abort();
+            stall.join().unwrap();
+            let g = *max_gap.lock().unwrap();
+            assert!(g < Duration::from_millis(700), "BUG: {} stopped the runtime for {:?} during a db stall", which, g);
         }
     }
 

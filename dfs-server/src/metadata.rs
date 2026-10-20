@@ -4624,6 +4624,22 @@ impl MetadataStore {
         Ok((node_id, since))
     }
 
+    /// Async wrappers for put_leader_state/get_leader_state — the election path runs on a
+    /// tokio worker, and the put waits for redb's single writer slot.
+    pub async fn put_leader_state_async(self: &Arc<Self>, node_id: NodeId, since_secs: u64) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_leader_state(node_id, since_secs))
+            .await
+            .context("spawn_blocking panicked in put_leader_state_async")?
+    }
+
+    pub async fn get_leader_state_async(self: &Arc<Self>) -> Result<(Option<NodeId>, Option<u64>)> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_leader_state())
+            .await
+            .context("spawn_blocking panicked in get_leader_state_async")?
+    }
+
     /// Format node_id as a fixed-length hex string for use as a key prefix.
     fn node_id_hex(node_id: NodeId) -> String {
         node_id.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
@@ -5053,6 +5069,15 @@ impl MetadataStore {
             }
         }
         Ok(entries)
+    }
+
+    /// Async wrapper for get_all_pending_deletes — see get_chunk_location_async for why the
+    /// sync version must never be called directly from async code.
+    pub async fn get_all_pending_deletes_async(self: &Arc<Self>) -> Result<Vec<dfs_common::DeleteQueueEntry>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_all_pending_deletes())
+            .await
+            .context("spawn_blocking panicked in get_all_pending_deletes_async")?
     }
 
     // -------------------------------------------------------------------------
@@ -5661,6 +5686,14 @@ impl MetadataStore {
         let fragmented_bytes = stats.fragmented_bytes();
         txn.abort()?;
         Ok((live_bytes, fragmented_bytes))
+    }
+
+    /// Async wrapper for redb_fragmentation_stats: it waits for redb's single writer slot.
+    pub async fn redb_fragmentation_stats_async(self: &Arc<Self>) -> Result<(u64, u64)> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.redb_fragmentation_stats())
+            .await
+            .context("spawn_blocking panicked in redb_fragmentation_stats_async")?
     }
 }
 

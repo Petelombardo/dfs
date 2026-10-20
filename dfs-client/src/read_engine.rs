@@ -100,7 +100,7 @@ pub struct InodeReadEngine {
     /// Last chunk fetch duration in milliseconds (EMA). Used for adaptive stagger delay.
     pub last_chunk_fetch_ms: AtomicU64,
 
-    /// Byte offset one past the end of the last completed read. Used to detect sequential
+    /// Byte offset one past the end of the last read to arrive. Used to detect sequential
     /// access: if the current read starts here (or within a small tolerance), it's sequential
     /// and should use the full-chunk path rather than range-fetch.
     pub last_read_end: AtomicU64,
@@ -139,6 +139,14 @@ impl InodeReadEngine {
             last_chunk_fetch_ms: AtomicU64::new(50),
             last_read_end: AtomicU64::new(0),
         })
+    }
+
+    /// A read of `[offset, end)` arrived: marks `end` and returns where the previous read
+    /// ended, for sequential-access detection. Marked on arrival, not completion: the kernel
+    /// sends readahead in order but keeps several reads in flight, and a completion-time
+    /// mark was rewound by whichever finished last (suite T24b).
+    pub fn read_arrived(&self, _offset: u64, end: u64) -> u64 {
+        self.last_read_end.swap(end, Ordering::Relaxed)
     }
 
     /// Record that `cid` was found on NO replica the chunk map named. Called from
@@ -625,6 +633,22 @@ fn build_offsets(locations: &[ChunkLocation]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    /// Suite T24b (1019c OFF, 1019e ON): kernel readahead keeps several reads in flight and
+    /// they complete out of order. Reads A and B arrive in order; B completes, then A. The
+    /// next read C starts exactly where B ended and must be seen as sequential: a mark that
+    /// A's late completion rewound sent C, the first read of the next chunk, down the
+    /// 128 KiB range path instead of the full-chunk pipeline.
+    #[test]
+    fn an_out_of_order_completion_does_not_rewind_sequential_detection() {
+        let e = InodeReadEngine::new(7);
+        const K: u64 = 128 * 1024;
+        let (a, b, c) = (30 * K, 31 * K, 32 * K);
+        assert_eq!(e.read_arrived(a, a + K), 0);
+        assert_eq!(e.read_arrived(b, b + K), a + K);
+        // B then A complete: nothing to record.
+        assert_eq!(e.read_arrived(c, c + K), c, "BUG: C, which starts where B ended, looks random");
+    }
+
     use super::*;
 
     fn chunk_id_with_hash0(b: u8) -> ChunkId {

@@ -3239,7 +3239,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Sequential access detection: current read continues from where the last ended,
         // within the same chunk. Sequential reads use the full-chunk path so pipeline
         // prefetch fires and each 4MB chunk is fetched once, not as N × 128KB RTTs.
-        let last_end = engine.last_read_end.load(Ordering::Relaxed) as usize;
+        let this_read_end = offset + size.min((file_size as usize).saturating_sub(offset));
+        let last_end = engine.read_arrived(offset as u64, this_read_end as u64) as usize;
         let is_sequential = last_end > 0
             && offset <= last_end + size
             && offset + size > last_end
@@ -3733,7 +3734,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let copy_len = (out_end - out_start).min(data.len());
                 out[out_start..out_start + copy_len].copy_from_slice(&data[..copy_len]);
             }
-            engine.last_read_end.store((offset + clamped_size) as u64, Ordering::Relaxed);
             return Ok(out);
         }
 
@@ -4343,9 +4343,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 out[out_start..out_end].copy_from_slice(&data[local_start..clamped_local_end]);
             }
         }
-
-        // Record where this read ended so the next read can detect sequential access.
-        engine.last_read_end.store((offset + clamped_size) as u64, Ordering::Relaxed);
 
         Ok(out)
     }

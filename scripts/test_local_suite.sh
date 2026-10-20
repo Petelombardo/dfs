@@ -123,8 +123,11 @@ fresh_read() {
 }
 
 # ── cleanup ──────────────────────────────────────────────────────────────────
-pkill -f "dfs-server" 2>/dev/null || true
-pkill -f "dfs-client" 2>/dev/null || true
+# By process name (-x), not command line (-f): -f also killed every process whose
+# arguments merely mention dfs-server/dfs-client — the :8950 bench driver's ssh sessions
+# (10-19: a restart died mid-way and fio ran against the unmounted directory) and shells.
+pkill -x dfs-server 2>/dev/null || true
+pkill -x dfs-client 2>/dev/null || true
 sleep 0.5
 # Every mount the suite uses, not just $MOUNT: a run killed mid-test leaves its second
 # client's mount dead ("Transport endpoint is not connected"), and the next run's first
@@ -9309,8 +9312,8 @@ echo "=== T71: a node restarted alone (peers down) must not claim leadership ===
 dfs_sync
 fusermount -u "$MOUNT" 2>/dev/null || true
 pkill -f "dfs-client mount $MOUNT" 2>/dev/null || true
-pkill -f "dfs-server start" 2>/dev/null || true
-for _ in $(seq 1 50); do pgrep -f "dfs-server start" >/dev/null || break; sleep 0.1; done
+pkill -x dfs-server 2>/dev/null || true
+for _ in $(seq 1 50); do pgrep -x dfs-server >/dev/null || break; sleep 0.1; done
 [ -s "$BASE/node5/peers.json" ] \
     && check "T71a node5 persisted its peers before the restart" PASS \
     || check "T71a node5 has no peers.json — cannot know its cluster size" FAIL
@@ -9347,7 +9350,7 @@ sleep 0.3
 # only kills whichever one pgrep lists first, silently leaving the rest running
 # indefinitely. Same all-matches approach the top-of-script preamble already uses.
 pkill -f "dfs-client mount $MOUNT" 2>/dev/null || true
-pkill -f "dfs-server" 2>/dev/null || true
+pkill -x dfs-server 2>/dev/null || true
 rm -rf "$T"
 
 echo ""

@@ -3216,6 +3216,14 @@ impl MetadataStore {
         Ok(token)
     }
 
+    /// Async wrapper for slot_patch_token — see get_chunk_location_async.
+    pub async fn slot_patch_token_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64) -> Result<Option<ChunkId>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.slot_patch_token(file_id, chunk_idx))
+            .await
+            .context("spawn_blocking panicked in slot_patch_token_async")?
+    }
+
     /// The token `token` replaced, which still resolves to its content (see
     /// PATCH_STATE_ALIAS_TABLE). A fold announced for `token` that the leader declines is
     /// re-announced for this one: the leader may still name it.

@@ -400,6 +400,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_metadata_dissemination_loop();
     server.clone().start_leader_forward_loop();
     server.clone().start_chunk_location_sync_loop();
+    server.clone().start_head_digest_loop();
     server.clone().start_holder_location_pull_loop();
     server.clone().start_metadata_gossip_loop();
     server.clone().start_metadata_healer_loop();

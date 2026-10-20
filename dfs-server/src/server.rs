@@ -666,6 +666,12 @@ pub struct Server {
     /// Cumulative-since-startup RPC counts by class — see stats::RpcClassCounts'
     /// doc comment.
     rpc_class_counts: crate::stats::RpcClassCounts,
+    request_type_counts: crate::stats::RequestTypeCounts,
+    /// Slots this node applied an ordered write to as their primary, since its last head
+    /// digest: (file, chunk_idx) -> (head token, generation, ISR epoch), newest generation
+    /// kept. start_head_digest_loop sends them to the leader in one ReplicateIsrHeads per
+    /// interval (Phase 5 step 5), replacing the client's per-write location report.
+    dirty_heads: Arc<DashMap<(FileId, u64), (ChunkId, u64, u64)>>,
 
     /// See FoldAnnounceInflight's doc comment and drain_pending_fold_announce_writes.
     fold_announce_inflight: Arc<FoldAnnounceInflight>,
@@ -1243,6 +1249,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ListAllFiles
         | Request::GetNodeStats
         | Request::GetRpcClassCounts
+        | Request::GetRequestCounts
         | Request::GetPendingHealingSample { .. }
         | Request::SetPeerFilter { .. }
         | Request::GetLeaseStatus
@@ -1656,6 +1663,8 @@ struct OverlayForkCtx {
     slot_isr: Arc<crate::slot_isr::SlotIsrService>,
     /// Same Arc as Server::write_ordering: a slot's ordered head is never abandoned.
     write_ordering: Arc<crate::write_order::WriteOrdering>,
+    /// Same Arc as Server::dirty_heads: a fold's result goes in the primary's head digest.
+    dirty_heads: Arc<DashMap<(FileId, u64), (ChunkId, u64, u64)>>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -4121,6 +4130,16 @@ impl OverlayForkCtx {
             // below is logged only after the leader notification, which can take hundreds
             // of ms, so a fold that committed before its file's delete looked like one after.
             info!("Fold committed: file {} chunk_idx {} -> {}", file_id, chunk_idx, new_chunk_id);
+            // A fold moves the slot's head too: the primary's digest names the result, or a
+            // leader that missed the fold notification keeps the token, with no row for the
+            // result, and never heals it to RF (suite T97f).
+            if let Some(isr) = self.slot_isr.get(file_id, chunk_idx)
+                .filter(|i| i.members.first() == Some(&self.cluster.local_node_id()))
+            {
+                if let Ok(Some(generation)) = self.metadata.get_chunk_seq_async(file_id, chunk_idx).await {
+                    Server::note_dirty_head(&self.dirty_heads, file_id, chunk_idx, new_chunk_id, generation, isr.epoch);
+                }
+            }
         }
 
         // Clean up the delta's own (now dead) ChunkLocation + on-disk bytes.
@@ -5963,6 +5982,8 @@ impl Server {
             conn_semaphore: Arc::new(RwLock::new(None)),
             peer_conn_semaphore: Arc::new(RwLock::new(None)),
             rpc_class_counts: crate::stats::RpcClassCounts::new(),
+            request_type_counts: crate::stats::RequestTypeCounts::new(),
+            dirty_heads: Arc::new(DashMap::new()),
             fold_announce_inflight: Arc::new(FoldAnnounceInflight::default()),
             sled_write_done,
             sled_write_backlog,
@@ -8229,6 +8250,7 @@ impl Server {
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
         self.rpc_class_counts.record(classify_request(&request));
+        self.request_type_counts.record(&request);
         match request {
             // Liveness probe — answered before touching any lock, map, or disk, so
             // it stays accurate as a "still processing?" signal even if some
@@ -8314,6 +8336,7 @@ impl Server {
             }
             Request::ReplicateIsrHeads { heads } => self.handle_replicate_isr_heads(heads).await,
             Request::GetSlotHeads { file_id, chunk_idxs } => self.handle_get_slot_heads(file_id, chunk_idxs).await,
+            Request::GetRequestCounts => Response::RequestCounts { counts: self.request_type_counts.snapshot() },
             Request::AuditSlots { entries } => self.handle_audit_slots(entries).await,
             Request::RenewNodeLease { node, incarnation } => self.lease.handle_renew(node, incarnation),
             Request::VoteLeaseExpired { target, incarnation } => self.lease.handle_vote(target, incarnation).await,
@@ -11232,7 +11255,7 @@ impl Server {
                 }
             }
             self.chunk_to_file.insert(merged.chunk_id, fid);
-            info!("ISR head installed: file {} chunk {} -> {} (generation {}, was {:?} at {:?}; nodes {:?})",
+            debug!("ISR head installed: file {} chunk {} -> {} (generation {}, was {:?} at {:?}; nodes {:?})",
                 fid, idx, merged.chunk_id, head.generation, occupant, occupant_gen, merged.nodes);
             installed += 1;
         }
@@ -15947,6 +15970,7 @@ impl Server {
             lease: self.lease.clone(),
             slot_isr: self.slot_isr.clone(),
             write_ordering: self.write_ordering.clone(),
+            dirty_heads: self.dirty_heads.clone(),
             fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -17509,6 +17533,9 @@ impl Server {
             };
             slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
             slot.finish(tag.write_id, version, &resp);
+            if let Some(head) = Self::multi_patch_result_id(&resp) {
+                Self::note_dirty_head(&self.dirty_heads, file_id, tag.chunk_idx, head, generation, tag.isr_epoch);
+            }
             resp
         } else if me == tag.secondary {
             // A resent copy of a write this replica already applied gets the same answer.
@@ -17767,6 +17794,82 @@ impl Server {
     }
 
     /// The chunk id a successful MultiPatch produced, for the ordered stream's head.
+    /// Record a slot's new head for the next digest; an older generation never replaces a
+    /// newer one (applies can finish out of order). An equal one does: no two writes share a
+    /// generation, and a fold keeps its token's, so it is the fold result replacing the token.
+    fn note_dirty_head(dirty: &DashMap<(FileId, u64), (ChunkId, u64, u64)>, file_id: FileId, chunk_idx: u64,
+                       head: ChunkId, generation: u64, isr_epoch: u64) {
+        dirty.entry((file_id, chunk_idx))
+            .and_modify(|e| if generation >= e.1 { *e = (head, generation, isr_epoch) })
+            .or_insert((head, generation, isr_epoch));
+    }
+
+    /// Phase 5 step 5: the leader's chunk map is a cache of the primaries' heads. Every
+    /// DFS_HEAD_DIGEST_MS (default 1000), send the leader the heads of the slots this node
+    /// changed as their primary, in one ReplicateIsrHeads: one RPC per interval, however many
+    /// writes, where the client used to report each write. A head already superseded (the
+    /// slot folded, or moved on) is dropped; a send that fails is retried next interval.
+    /// The leader itself needs none: its own applies advance its map.
+    pub fn start_head_digest_loop(self: Arc<Self>) {
+        let every = std::env::var("DFS_HEAD_DIGEST_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(every.max(50)));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if self.dirty_heads.is_empty() {
+                    continue;
+                }
+                let taken: Vec<((FileId, u64), (ChunkId, u64, u64))> = {
+                    let keys: Vec<_> = self.dirty_heads.iter().map(|e| *e.key()).collect();
+                    keys.into_iter().filter_map(|k| self.dirty_heads.remove(&k)).collect()
+                };
+                if self.cluster.is_leader().await {
+                    continue;
+                }
+                // Re-queued heads only fill an empty slot: one noted since the take is at
+                // least as new (a fold result at the same generation replaces its token).
+                let Some(leader) = self.cluster.get_leader_addr().await else {
+                    for ((fid, idx), (head, generation, epoch)) in taken {
+                        self.dirty_heads.entry((fid, idx)).or_insert((head, generation, epoch));
+                    }
+                    continue;
+                };
+                let mut heads = Vec::with_capacity(taken.len());
+                for &((fid, idx), (head, generation, epoch)) in &taken {
+                    // Still the slot's head: its token, or what the ordered stream moved on to
+                    // when the token folded (the token stays the slot's public name).
+                    if self.write_ordering.latest_head(fid, idx) != Some(head)
+                        && !matches!(self.metadata.slot_patch_token_async(fid, idx).await, Ok(Some(t)) if t == head)
+                    {
+                        continue;
+                    }
+                    let Some(isr) = self.slot_isr.get(fid, idx).filter(|i| i.epoch == epoch) else { continue };
+                    if let Ok(Some(mut location)) = self.metadata.get_chunk_location_async(head).await {
+                        // The head is the pair's: a token's row inherits its base's holders
+                        // (a healed third copy holds only the old version), and the leader
+                        // installs only a head the slot's ISR names.
+                        location.nodes = isr.members.clone();
+                        heads.push(dfs_common::protocol::IsrHead { location, generation, isr_epoch: epoch });
+                    }
+                }
+                if heads.is_empty() {
+                    continue;
+                }
+                let n = heads.len();
+                let req = Request::ReplicateIsrHeads { heads };
+                let sent = tokio::time::timeout(std::time::Duration::from_secs(5),
+                    self.client.send_message(leader, Message::Request(req))).await;
+                if !matches!(sent, Ok(Ok(dfs_common::MessageEnvelope { message: Message::Response(Response::Ok { .. }), .. }))) {
+                    warn!("head digest: {} head(s) to leader {} not confirmed; retrying next interval", n, leader);
+                    for ((fid, idx), (head, generation, epoch)) in taken {
+                        self.dirty_heads.entry((fid, idx)).or_insert((head, generation, epoch));
+                    }
+                }
+            }
+        });
+    }
+
     fn multi_patch_result_id(resp: &Response) -> Option<ChunkId> {
         match resp {
             Response::MultiPatchResult { new_chunk_id, .. } => Some(*new_chunk_id),
@@ -22047,6 +22150,29 @@ mod tests {
             }
             other => panic!("expected RpcClassCounts, got {:?}", other),
         }
+    }
+
+    /// GetRequestCounts names each request type, and an Ordered request by what it carries
+    /// (Phase 5 gate: the leader's RPCs per client write, by type).
+    #[tokio::test]
+    async fn get_request_counts_reports_each_request_type() {
+        let h = make_overlay_test_harness();
+        let _ = h.server.handle_request(Request::Ping).await;
+        let _ = h.server.handle_request(Request::Ping).await;
+        let _ = h.server.handle_request(Request::HasChunks { chunk_ids: vec![] }).await;
+        let tag = dfs_common::protocol::WriteOrderTag {
+            file_id: dfs_common::FileId::new(), chunk_idx: 0, isr_epoch: 1,
+            primary: NodeId::new(), secondary: NodeId::new(), write_id: 1,
+        };
+        h.server.request_type_counts.record(&Request::Ordered { tag, request: Box::new(Request::Ping) });
+        let counts = match h.server.handle_request(Request::GetRequestCounts).await {
+            Response::RequestCounts { counts } => counts.into_iter().collect::<HashMap<_, _>>(),
+            other => panic!("expected RequestCounts, got {:?}", other),
+        };
+        assert_eq!(counts.get("Ping"), Some(&2));
+        assert_eq!(counts.get("HasChunks"), Some(&1));
+        assert_eq!(counts.get("Ordered(Ping)"), Some(&1));
+        assert_eq!(counts.get("GetRequestCounts"), Some(&1));
     }
 
     /// Regression for the 2026-07-23 double node crash: gluster4 at 18:11:39 and

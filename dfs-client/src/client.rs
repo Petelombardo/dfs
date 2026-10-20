@@ -1064,18 +1064,6 @@ fn upsert_chunk_location(
     }
 }
 
-/// pending_ordered_locations' upsert: per slot, the highest slot generation wins.
-fn upsert_ordered_location(
-    pending: &mut HashMap<ChunkLocationSlotKey, (dfs_common::ChunkLocation, u64)>,
-    location: dfs_common::ChunkLocation,
-    generation: u64,
-) {
-    let key = (location.file_id, location.file_offset);
-    if pending.get(&key).is_none_or(|(_, g)| generation >= *g) {
-        pending.insert(key, (location, generation));
-    }
-}
-
 /// Client for communicating with DFS cluster
 #[derive(Clone)]
 pub struct DfsClient {
@@ -1304,15 +1292,6 @@ pub struct DfsClient {
     /// before this dedup existed.
     pending_chunk_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, dfs_common::ChunkLocation>>>,
 
-    /// Ordered writes' new locations, each with the slot generation its primary stamped,
-    /// coalesced per slot (highest generation wins) and sent as ReplicateChunkLocation
-    /// carrying that generation, by the same drains as pending_chunk_locations. They don't
-    /// go in the batch: ReplicateChunkLocations has no generation, and a leader that
-    /// doesn't hold the chunk then arbitrated by client_write_seq, one client's own
-    /// counter: with two writers a newer write lost to an older one and readers saw bytes
-    /// the ISR pair had moved past (suite T74). Coalescing keeps T54's invariant (never
-    /// more location updates than patches).
-    pending_ordered_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, (dfs_common::ChunkLocation, u64)>>>,
     /// When rediscover_leader last refreshed the cluster view (ms since UNIX epoch): at most
     /// one refresh per LEADER_REDISCOVER_EVERY, so a leader that refuses rather than died
     /// can't turn the location workers' every-tick retries into a refresh storm.
@@ -1701,7 +1680,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             single_replica_emergency_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             single_replica_followup_exhausted_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            pending_ordered_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_leader_rediscover_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             chunk_location_receipts_supported: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             declined_chunk_locations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -8181,7 +8159,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let mut self_referential_revalidate_done = false;
         let retry_started = std::time::Instant::now();
         // The slot generation the ordered primary stamped on the write that finally landed
-        // (see pending_ordered_locations).
+        // (the slot reports itself through its primary; see the enqueue below).
         let mut ordered_generation: Option<u64> = None;
         // Attempt count is now just a hard safety backstop against a genuine infinite
         // loop bug — the real gate on connection-failure retries is CONNECT_RETRY_BUDGET
@@ -9325,9 +9303,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // is None right now" behavior — not a new gap, flush_metadata_sync is still the
         // authoritative backstop regardless.
         let enqueue_start = std::time::Instant::now();
-        match ordered_generation {
-            Some(generation) => self.enqueue_ordered_location(new_location.clone(), generation).await,
-            None => self.enqueue_chunk_location(new_location.clone()).await,
+        // An ordered write's slot reports itself: its primary sends the leader the slot's
+        // new head with its generation (Server::start_head_digest_loop, Phase 5 step 5).
+        if ordered_generation.is_none() {
+            self.enqueue_chunk_location(new_location.clone()).await;
         }
         let timing_enqueue = enqueue_start.elapsed();
 
@@ -9903,10 +9882,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // This file's ordered locations too, before its metadata: a metadata commit that
-        // reaches the leader ahead of a chunk's generation is arbitrated without it.
-        self.drain_ordered_locations(Some(metadata.id), Duration::from_secs(1)).await;
-
         let stamped = self.stamp_write_seq(metadata);
         self.metadata_queue.push_and_wait(stamped).await
     }
@@ -9934,11 +9909,6 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// FlushHandle::drain's Step 1 comment): an unreachable leader must cost one
     /// bounded wait, not an indefinite hang of the SIGTERM path.
     pub async fn drain_pending_chunk_locations_for_shutdown(&self, deadline: tokio::time::Instant) {
-        while tokio::time::Instant::now() < deadline
-            && self.drain_ordered_locations(None, Duration::from_secs(3)).await > 0
-        {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
         loop {
             let batch: Vec<dfs_common::ChunkLocation> = {
                 let mut pending = self.pending_chunk_locations.lock().await;
@@ -10011,7 +9981,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut interval = tokio::time::interval(Duration::from_millis(10));
             loop {
                 interval.tick().await;
-                client.drain_ordered_locations(None, Duration::from_secs(3)).await;
                 let mut batch: Vec<dfs_common::ChunkLocation> = {
                     let mut pending = client.pending_chunk_locations.lock().await;
                     if pending.is_empty() {
@@ -10081,64 +10050,6 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn enqueue_chunk_location(&self, location: dfs_common::ChunkLocation) {
         let mut pending = self.pending_chunk_locations.lock().await;
         upsert_chunk_location(&mut pending, location);
-    }
-
-    /// See pending_ordered_locations.
-    async fn enqueue_ordered_location(&self, location: dfs_common::ChunkLocation, generation: u64) {
-        let mut pending = self.pending_ordered_locations.lock().await;
-        upsert_ordered_location(&mut pending, location, generation);
-    }
-
-    /// Send the pending ordered locations (all, or only `file`'s) to the leader, each with
-    /// its generation; anything not confirmed goes back in the queue. Returns how many are
-    /// still unsent.
-    async fn drain_ordered_locations(&self, file: Option<FileId>, per_send: Duration) -> usize {
-        let entries: Vec<(dfs_common::ChunkLocation, u64)> = {
-            let mut pending = self.pending_ordered_locations.lock().await;
-            if pending.is_empty() {
-                return 0;
-            }
-            let taken = std::mem::take(&mut *pending);
-            let (mine, rest): (HashMap<_, _>, HashMap<_, _>) = taken.into_iter()
-                .partition(|(k, _)| file.is_none() || k.0 == file);
-            *pending = rest;
-            mine.into_values().collect()
-        };
-        if entries.is_empty() {
-            return 0;
-        }
-        // Copied out, not matched on the guard: that held the read lock across the sends.
-        let cached_leader = *self.leader_addr.read().await;
-        let failed: Vec<(dfs_common::ChunkLocation, u64)> = match cached_leader {
-            None => entries,
-            Some(leader) => futures::future::join_all(entries.into_iter().map(|(location, generation)| {
-                let client = self.clone();
-                async move {
-                    let req = Request::ReplicateChunkLocation { location: location.clone(), file_id: location.file_id, generation: Some(generation) };
-                    match tokio::time::timeout(per_send, client.send_request(leader, req)).await {
-                        Ok(Ok(Response::Error { .. })) | Ok(Err(_)) | Err(_) => Some((location, generation)),
-                        Ok(Ok(_)) => None,
-                    }
-                }
-            })).await.into_iter().flatten().collect(),
-        };
-        let unsent = failed.len();
-        if unsent > 0 {
-            // A dead cached leader: find the current one for the retry (see
-            // send_chunk_locations_batched). Copy it out first: an `if let` on the read
-            // guard keeps it held through the block, and rediscover_leader's refresh takes
-            // the write lock, which deadlocked the whole client (suite T94, ordering on).
-            let cached = *self.leader_addr.read().await;
-            if let Some(leader) = cached {
-                self.rediscover_leader(leader).await;
-            }
-            debug!("ordered chunk locations: {} not confirmed by the leader; re-queued", unsent);
-            let mut pending = self.pending_ordered_locations.lock().await;
-            for (location, generation) in failed {
-                upsert_ordered_location(&mut pending, location, generation);
-            }
-        }
-        unsent
     }
 
     /// Spawn the background metadata queue worker onto the given runtime.
@@ -11460,38 +11371,6 @@ mod tests {
         }
         assert!(answered, "BUG: a node that is listening again was skipped for {:?} on its earlier refusals", started.elapsed());
         assert!(!client.node_health.is_shed(node).await, "an answer clears the shed");
-    }
-
-    /// Suite T94 (ordering on, 10-15): the leader was SIGKILLed with an ordered patch's
-    /// location still queued. The drain failed against the dead leader, rediscovered the
-    /// new one while still holding a read guard on leader_addr, and the refresh's write on
-    /// it waited forever; every later reader queued behind it and a patch's fsync hung for
-    /// 97 minutes. The drain must come back, re-queue, and point the client at the new leader.
-    #[tokio::test]
-    async fn an_ordered_drain_against_a_dead_leader_rediscovers_without_deadlocking() {
-        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let view = Arc::new(std::sync::Mutex::new((vec![], None)));
-        let live = cluster_status_server(view.clone()).await;
-        let live_id = dfs_common::NodeId::new();
-        *view.lock().unwrap() = (vec![dfs_common::NodeInfo::new(live_id, live, None)], Some(live_id));
-
-        let client = DfsClient::new(vec![live]).unwrap();
-        *client.cluster_nodes.write().await = vec![live];
-        *client.leader_addr.write().await = Some(dead);
-        let file_id = dfs_common::FileId::new();
-        client.enqueue_ordered_location(dfs_common::ChunkLocation {
-            chunk_id: chunk_id_with_hash0(1), nodes: vec![], size: 4096, checksum: [1; 32],
-            file_offset: Some(0), written_at: None, client_write_seq: None, file_id: Some(file_id),
-        }, 1).await;
-
-        let unsent = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client.drain_ordered_locations(None, Duration::from_secs(1)),
-        ).await.expect("BUG: the drain deadlocked on leader_addr after a send to a dead leader failed");
-        assert_eq!(unsent, 1, "the location the dead leader never confirmed goes back in the queue");
-        let leader = tokio::time::timeout(std::time::Duration::from_secs(1), client.leader_addr.read()).await
-            .expect("leader_addr is still locked after the drain returned");
-        assert_eq!(*leader, Some(live), "the drain must leave the client pointed at the leader that answers");
     }
 
     /// rock5b dd (10-13): a 500 MB burst on a 1 GbE client put ~100 4 MB uploads on the

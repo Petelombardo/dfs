@@ -1326,6 +1326,11 @@ pub enum Request {
     InjectIgnoreMetadataVersions {
         millis: u64,
     },
+
+    /// Admin -> any node: how many requests of each type this node has served since it
+    /// started (Phase 5 gate: leader RPCs per client write). Answered with `RequestCounts`.
+    /// APPENDED at end to preserve wire compatibility.
+    GetRequestCounts,
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's
@@ -1985,6 +1990,13 @@ pub enum Response {
     /// Answer to `Request::GetSlotHeads`. APPENDED at end to preserve wire compatibility.
     SlotHeads {
         heads: Vec<SlotHead>,
+    },
+
+    /// Answer to `Request::GetRequestCounts`: (request type, count) pairs, cumulative since
+    /// the node started. An `Ordered` request counts as `Ordered(<inner type>)`. APPENDED at
+    /// end to preserve wire compatibility.
+    RequestCounts {
+        counts: Vec<(String, u64)>,
     },
 }
 

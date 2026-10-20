@@ -269,3 +269,45 @@ impl RpcClassCounts {
         }
     }
 }
+
+/// Requests served, by request type (RpcClassCounts' classes are too coarse to tell a
+/// location report from an ISR lookup). Phase 5's gate counts the leader's RPCs per client
+/// write with it. A type's name is formatted once, the first time that type is seen.
+pub struct RequestTypeCounts {
+    counts: dashmap::DashMap<RequestKind, (String, u64)>,
+}
+
+type RequestKind = (std::mem::Discriminant<dfs_common::protocol::Request>, Option<std::mem::Discriminant<dfs_common::protocol::Request>>);
+
+fn request_type_name(req: &dfs_common::protocol::Request) -> String {
+    let s = dfs_common::debug_truncated(req, 64);
+    s.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or_default().to_string()
+}
+
+impl RequestTypeCounts {
+    pub fn new() -> Self {
+        Self { counts: dashmap::DashMap::new() }
+    }
+
+    pub fn record(&self, req: &dfs_common::protocol::Request) {
+        let inner = match req {
+            dfs_common::protocol::Request::Ordered { request, .. } => Some(request.as_ref()),
+            _ => None,
+        };
+        let key = (std::mem::discriminant(req), inner.map(std::mem::discriminant));
+        self.counts.entry(key).or_insert_with(|| {
+            let name = match inner {
+                Some(i) => format!("Ordered({})", request_type_name(i)),
+                None => request_type_name(req),
+            };
+            (name, 0)
+        }).1 += 1;
+    }
+
+    /// (type, count) pairs, by name.
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self.counts.iter().map(|e| e.value().clone()).collect();
+        out.sort();
+        out
+    }
+}

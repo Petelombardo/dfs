@@ -74,6 +74,10 @@ enum Commands {
         watch: bool,
     },
 
+    /// Requests each node has served, by request type (one JSON line per node given in
+    /// --cluster). Cumulative since process start, in-memory only.
+    RpcCounts,
+
     /// Inject link failures for partition tests. Applies to every node given in
     /// --cluster. Refused unless that node runs with DFS_FAULT_INJECTION=1.
     Fault {
@@ -392,6 +396,18 @@ async fn main() -> Result<()> {
         Commands::Delete { cmd } => handle_delete_command(cmd, &cluster_addrs, json_output).await?,
         Commands::Stats { watch } => handle_stats_command(&cluster_addrs, watch).await?,
         Commands::RpcStats { watch } => handle_rpc_stats_command(&cluster_addrs, watch).await?,
+        Commands::RpcCounts => {
+            for &addr in &cluster_addrs {
+                match send_request(addr, Request::GetRequestCounts).await {
+                    Ok(Response::RequestCounts { counts }) => println!("{}", serde_json::json!({
+                        "addr": addr.to_string(),
+                        "counts": counts.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+                    })),
+                    Ok(other) => println!("{}", serde_json::json!({"addr": addr.to_string(), "error": format!("{:?}", other)})),
+                    Err(e) => println!("{}", serde_json::json!({"addr": addr.to_string(), "error": e.to_string()})),
+                }
+            }
+        }
         Commands::Fault { cmd } => handle_fault_command(cmd, &cluster_addrs).await?,
         Commands::Isr { cmd } => handle_isr_command(cmd, &cluster_addrs).await?,
         Commands::Lease { cmd: LeaseCommands::Status } => {

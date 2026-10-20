@@ -2172,6 +2172,103 @@ t85_wait_ready || echo "  T98: cluster not fully healthy 30s after node$T98_LN's
 rm -f "$MOUNT/t98.bin" "$T/t98.bin"
 fi # should_run T98
 
+# ── T99: an in-place fsynced patch sends the leader no per-write location report ──
+# Phase 5 step 5 gate. Primaries are the authority for their slots (steps 2-4: readers,
+# fsync and the healer resolve a slot through its pair), so the leader no longer needs each
+# write's chunk location. Counts the leader's requests by type (GetRequestCounts) over 50
+# fsynced 4 KiB in-place patches to a chunk whose pair excludes the leader, minus the same
+# window's idle background. Required with ordering; informational without it.
+snapshot_log T99
+if should_run T99; then
+echo "=== T99: an in-place fsynced patch costs the leader no location report (Phase 5 step 5) ==="
+t99_check() {
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+T99_LADDR=""
+for _ in $(seq 1 30); do T99_LADDR=$(t88_leader "$CLUSTER") || true; [ -n "$T99_LADDR" ] && break; sleep 1; done
+T99_MAP=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904 lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+T99_FILE=""
+for T99_TRY in 1 2 3 4 5 6; do
+    f=t99_$T99_TRY.bin
+    dd if=/dev/urandom of="$MOUNT/$f" bs=4M count=2 status=none; dfs_sync
+    isr=""
+    for _ in $(seq 1 30); do
+        isr=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$f" --chunks 2 2>/dev/null \
+            | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+        [ -n "$isr" ] && break
+        sleep 1
+    done
+    pair=$(for n in $isr; do echo "$T99_MAP" | awk -v n="$n" '$1==n{print $2}'; done | tr '\n' ' ')
+    if [ -n "$isr" ] && ! echo " $pair" | grep -q " $T99_LADDR "; then T99_FILE=$f; break; fi
+    rm -f "$MOUNT/$f"
+done
+if [ -z "$T99_FILE" ]; then
+    t99_check "T99 setup: a file whose chunk 1 pair excludes the leader $T99_LADDR" FAIL
+else
+    echo "  T99: leader=$T99_LADDR chunk 1 pair=$pair file=$T99_FILE"
+    t99_counts() { "$BIN/dfs-admin" --cluster "$T99_LADDR" rpc-counts 2>/dev/null | head -1; }
+    sleep 5   # let the setup writes' background reports drain
+    T99_C0=$(t99_counts); T99_T0=$(date +%s.%N)
+    sleep 10
+    T99_C1=$(t99_counts); T99_T1=$(date +%s.%N)
+    T99_W=$(timeout 60 python3 - "$MOUNT/$T99_FILE" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+bad = 0
+for k in range(50):
+    os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + k * 8192)
+    try: os.fsync(fd)
+    except OSError: bad += 1
+os.close(fd)
+print(bad)
+PY
+) || T99_W=timeout
+    sleep 3   # background reports a write still owes land inside the window
+    T99_C2=$(t99_counts); T99_T2=$(date +%s.%N)
+    T99_OUT=$(python3 - "$T99_C0" "$T99_C1" "$T99_C2" "$T99_T0" "$T99_T1" "$T99_T2" <<'PY'
+import json, sys
+c0, c1, c2 = (json.loads(a).get("counts", {}) for a in sys.argv[1:4])
+t0, t1, t2 = map(float, sys.argv[4:7])
+scale = (t2 - t1) / (t1 - t0)
+per = {}
+for k in set(c0) | set(c1) | set(c2):
+    w = (c2.get(k, 0) - c1.get(k, 0)) - (c1.get(k, 0) - c0.get(k, 0)) * scale
+    if w / 50 >= 0.05: per[k] = w / 50
+loc = sum(v for k, v in per.items() if "ChunkLocation" in k)
+print("%.2f %.2f %s" % (loc, sum(per.values()), " ".join("%s=%.2f" % kv for kv in sorted(per.items(), key=lambda kv: -kv[1]))))
+PY
+)
+    read -r T99_LOC T99_ALL T99_TYPES <<< "$T99_OUT"
+    echo "  T99: 50 fsynced patches ($T99_W failed); leader RPCs per write: ${T99_ALL:-?} total, ${T99_LOC:-?} location reports"
+    echo "  T99: by type: ${T99_TYPES:-none}"
+    [ "$T99_W" = 0 ] && check "T99a every fsynced patch succeeded" PASS || check "T99a every fsynced patch succeeded ($T99_W)" FAIL
+    if [ -n "$T99_LOC" ] && [ "$(python3 -c "print(float('$T99_LOC') <= 0.1)")" = True ]; then
+        t99_check "T99b no per-write location report to the leader (${T99_LOC}/write)" PASS
+    else
+        t99_check "T99b no per-write location report to the leader (${T99_LOC:-?}/write)" FAIL
+    fi
+    # The leader's map still follows the slot: its primary's head digest lands within ~1 s.
+    T99_PRIMARY=${pair%% *}
+    T99_HEAD="" T99_LMAP=""
+    for _ in $(seq 1 10); do
+        T99_HEAD=$("$BIN/dfs-admin" --cluster "$T99_PRIMARY" isr read --file "/$T99_FILE" --chunk 1 2>/dev/null \
+            | python3 -c "import json,sys; print(json.loads(sys.stdin.readline()).get('chunk_id',''))" 2>/dev/null || true)
+        T99_LMAP=$("$BIN/dfs-admin" --cluster "$T99_LADDR" --format json file info "/$T99_FILE" 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][1]['chunk_id'])" 2>/dev/null || true)
+        [ -n "$T99_HEAD" ] && [ "$T99_HEAD" = "$T99_LMAP" ] && break
+        sleep 0.5
+    done
+    if [ -n "$T99_HEAD" ] && [ "$T99_HEAD" = "$T99_LMAP" ]; then
+        t99_check "T99c the leader's map names the primary's head" PASS
+    else
+        t99_check "T99c the leader's map names the primary's head (primary ${T99_HEAD:-?}, leader ${T99_LMAP:-?})" FAIL
+    fi
+    rm -f "$MOUNT/$T99_FILE"
+fi
+fi # should_run T99
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

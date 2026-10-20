@@ -5522,6 +5522,40 @@ impl Drop for FoldHealingCancelGuard {
 /// disk, suite T79) or a crash before the commit lost an fsync-acked size change.
 pub(crate) type SledWrite = (FileMetadata, Option<tokio::sync::oneshot::Sender<Result<(), String>>>);
 
+/// Take the rest of a metadata write batch behind `buf[0]`, up to `max` items. Lingers up to
+/// `linger` for more fire-and-forget writes, but not while anyone waits on this commit (the
+/// leader's client-facing put, a follower's majority ack): a waited-on write commits with
+/// whatever is already queued. Writes still batch, since they queue up while the previous
+/// commit runs. Returns true if the channel closed.
+fn collect_metadata_batch(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SledWrite>,
+    buf: &mut Vec<SledWrite>,
+    max: usize,
+    linger: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool {
+    let linger = if buf[0].1.is_some() { std::time::Duration::ZERO } else { linger };
+    let mut deadline = std::time::Instant::now() + linger;
+    while buf.len() < max {
+        match rx.try_recv() {
+            Ok(m) => {
+                if m.1.is_some() {
+                    deadline = std::time::Instant::now();
+                }
+                buf.push(m);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(poll);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return true,
+        }
+    }
+    false
+}
+
 /// How many metadata writes per file are queued in sled_write_tx and not yet committed
 /// (see Server::pending_metadata_writes). A count, not a set: two writes queued back to
 /// back for one file can land in different worker batches, and a set cleared by the
@@ -5650,28 +5684,7 @@ impl Server {
                     let mut channel_closed = false;
 
                     if metadata_batch_drain_enabled {
-                        // Linger only for fire-and-forget writes. When someone waits on this
-                        // commit (the leader's client-facing put, which acks only once it's
-                        // committed), the 8 ms linger was pure added latency on every fsync
-                        // that grew a file: take what is already queued and commit now. Writes
-                        // still batch, since they queue up while the previous commit runs.
-                        let linger = if buf[0].1.is_some() { std::time::Duration::ZERO } else { BATCH_MAX_LINGER };
-                        let deadline = std::time::Instant::now() + linger;
-                        while buf.len() < BATCH_MAX_ITEMS {
-                            match rx.try_recv() {
-                                Ok(m) => buf.push(m),
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                    if std::time::Instant::now() >= deadline {
-                                        break;
-                                    }
-                                    std::thread::sleep(BATCH_POLL_INTERVAL);
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    channel_closed = true;
-                                    break;
-                                }
-                            }
-                        }
+                        channel_closed = collect_metadata_batch(&mut rx, &mut buf, BATCH_MAX_ITEMS, BATCH_MAX_LINGER, BATCH_POLL_INTERVAL);
                     }
 
                     // Snapshot ids now that the batch is fully collected — includes ones
@@ -30284,6 +30297,25 @@ mod tests {
         assert_eq!(named.file_offset, Some(4 * 1024 * 1024));
         assert_eq!(named.file_id, Some(file_id));
         assert_eq!(named.nodes, vec![me, other], "this node first, then the other member");
+    }
+
+    /// 10-19 :8950 bench: a follower's majority-ack commit took ~15 ms against the leader's
+    /// ~1 ms. The batch lingered 8 ms whenever its first write was fire-and-forget, even with
+    /// a waited-on write queued right behind it.
+    #[test]
+    fn a_waited_on_metadata_write_ends_the_linger() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SledWrite>();
+        let file = || dfs_common::FileMetadata::new("/linger".to_string(), dfs_common::types::FileType::RegularFile);
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        tx.send((file(), Some(reply))).unwrap();
+        let mut buf = vec![(file(), None)];
+        let started = std::time::Instant::now();
+        let closed = collect_metadata_batch(&mut rx, &mut buf, 256,
+            std::time::Duration::from_secs(5), std::time::Duration::from_micros(200));
+        assert!(!closed);
+        assert_eq!(buf.len(), 2, "the waited-on write joins the batch");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1),
+            "BUG: a waited-on write sat out the fire-and-forget linger ({:?})", started.elapsed());
     }
 
     /// Suite T66[secondary] (1017a ON): an ordered fold materialized its head through

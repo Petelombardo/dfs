@@ -339,6 +339,10 @@ pub struct LeaseRuntime {
     /// Last peer list read from membership. Used when the membership lock is busy, so a
     /// stall there can't stop renewals (local T59c: a 9 s hold cost that node its lease).
     peers: Mutex<Vec<(NodeId, std::net::SocketAddr)>>,
+    /// One persist at a time, each writing the state as of when it got the lock. Concurrent
+    /// votes shared the temp file: a rename found it gone and refused a grantable vote, and
+    /// an older snapshot could land after a newer one, losing a granted fence (suite 1019b).
+    persist_lock: tokio::sync::Mutex<()>,
 }
 
 fn lease_trace() -> bool {
@@ -379,6 +383,7 @@ impl LeaseRuntime {
             acks_last_round: AtomicUsize::new(0),
             declared: Mutex::new(HashMap::new()),
             peers: Mutex::new(Vec::new()),
+            persist_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -433,6 +438,7 @@ impl LeaseRuntime {
     }
 
     async fn persist(&self) -> bool {
+        let _one_at_a_time = self.persist_lock.lock().await;
         let durable = DurableLeaseState {
             incarnation: self.holder.lock().unwrap().incarnation,
             fences: self.voter.lock().unwrap().fences.clone(),
@@ -588,6 +594,12 @@ impl LeaseRuntime {
     #[cfg(test)]
     pub fn grant_own_lease_for_test(&self) {
         self.holder.lock().unwrap().on_round(Instant::now(), 1, 1, &self.cfg);
+    }
+
+    /// Test-only: the membership size majorities are counted against.
+    #[cfg(test)]
+    pub fn set_cluster_size_for_test(&self, n: usize) {
+        self.cluster_size.store(n, Ordering::Relaxed);
     }
 
     /// Test-only: behave as if a majority voted `node` expired at its latest incarnation.
@@ -837,6 +849,35 @@ mod tests {
             other => panic!("unexpected {:?}", other),
         }
         assert!(rt.voter.lock().unwrap().fences.is_empty(), "and it must not have fenced itself");
+    }
+
+    /// Suite 1019b: every node logged "failed to persist lease state: NotFound" 3-20 times
+    /// a run. Concurrent votes each wrote the same temp file and one rename found it gone,
+    /// so a grantable vote was refused; worse, an older snapshot could land after a newer
+    /// one, leaving a granted fence off disk for a restart to forget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_votes_all_persist_their_fences() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let n = ids(9);
+        let cluster = Arc::new(ClusterManager::new(n[0], "127.0.0.1:19355".parse().unwrap(), 10, 30));
+        let rt = Arc::new(LeaseRuntime::new(n[0], cluster, Arc::new(NetworkClient::new()), dir.path()));
+        for round in 0..20u64 {
+            *rt.voter.lock().unwrap() = VoterState::new(n[0], Instant::now() - rt.cfg.silence() * 2, HashMap::new());
+            let votes: Vec<_> = n[1..].iter().map(|t| {
+                let (rt, t) = (rt.clone(), *t);
+                tokio::spawn(async move { rt.handle_vote(t, round).await })
+            }).collect();
+            for v in votes {
+                match v.await.unwrap() {
+                    Response::LeaseExpiryVote { granted, .. } => assert!(granted, "round {}: a grantable vote was refused", round),
+                    other => panic!("unexpected {:?}", other),
+                }
+            }
+            let on_disk = LeaseStateFile::new(dir.path()).load().fences;
+            for t in &n[1..] {
+                assert_eq!(on_disk.get(t), Some(&round), "round {}: a granted fence is not on disk", round);
+            }
+        }
     }
 
     /// Local T59c: a 9 s hold on the membership lock cost that node its lease, because the

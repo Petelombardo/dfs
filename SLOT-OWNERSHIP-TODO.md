@@ -4,7 +4,7 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-10-20, T94 closed (metadata majority-ack) + T59a suspect, T24b, lease-persist fixes; G1 1/5; before that 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97)_
+_Last updated: 2026-10-20 (later), Phase 5 step 5 (heads batched by primaries, T99, T97f); T81c open; G1 1/5; before that 2026-10-20, T94 closed (metadata majority-ack) + T59a suspect, T24b, lease-persist fixes; G1 1/5; before that 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97)_
 
 **Resume here:** the default-flip gates under 3c ("Make ordering the default"). Ordering kept
 (2026-10-03); ordering-on suites run 255-257 pass with 1-2 failures, but nearly every run still
@@ -308,6 +308,8 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         1019e T24b (new; fixed bac3ed4), 1020a 295/0 = 1/5. T59a not reproduced since 1019b;
         a db-lock probe found sync metadata-db access on tokio workers (fixed a6688e9), the
         likely cause. Lease votes also raced their persist (fixed 68730a8).
+        1020b T97f (step 5's own, fixed 350ef89) + T81c (pre-existing, open: Legata 4cf3e7e1),
+        1020c 302/0 = 1/5.
   - [x] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
         acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
         10-15 loops (ae6a40f): T69/T73/T76/T77/T86 20/20, T74 18/20. Both T74 fails = a
@@ -414,6 +416,16 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         first "10x" bench was fake: the local suite's pkill -f killed the bench's mount,
         fixed ebefd27). Also the write worker's 8 ms linger on waited-on puts (bee378f).
         Suites 1020a ON 295/0, OFF 214/5 (known set). Next: step 5 (drop per-write reports).
+        10-20 step 5 (350ef89): clients no longer report each ordered write's location; each
+        slot's primary sends the leader the heads it changed (writes and folds), one
+        ReplicateIsrHeads per second, naming only the ISR pair. Request counts per type
+        (`dfs-admin rpc-counts`). T99 (50 fsynced 4 KiB patches, pair excludes the leader):
+        leader RPCs per write 1.12 -> 0.20 (0 location reports). The first cut missed folds:
+        the leader never got the fold result's row and it stayed at 2 copies (T97f 4/4 FAIL
+        -> 3/3). Suites 1020c ON 302/0, OFF 216/4 (known set). Found on the way, older than
+        step 5: T81c, an acked patch landed outside a 1-member ISR while its member's disk
+        was full, and a fresh reader trusted that member's stale head (Legata 4cf3e7e1).
+        Left: the staging measurement (leader RPCs per write under kdiskmark/VM-108; ask Pete).
   - [x] **G5 No unordered window at chunk creation** (3b, the part the flip needs): a new
         chunk has no ISR for ~3 s, so its first writes go unordered. Assign the ISR at
         creation; T67b/T67c become required.

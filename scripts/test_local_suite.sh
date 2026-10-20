@@ -2103,6 +2103,72 @@ t85_start_all ""
 t85_wait_ready || echo "  T97: cluster not fully healthy 30s after restoring normal settings"
 fi # should_run T97
 
+# ── T98: an fsynced create survives the leader and the writer dying right after the ack ──
+# Suite 1019a ON, T94[immediate]b: the leader acked PutFileMetadata on its own commit, and
+# followers hear of a put only from its 5 s metadata healer push. The leader was SIGKILLed
+# 70 ms after the ack, and the new leader had no record of the file until the writer re-sent
+# it. Here the writer dies with the leader, so nothing re-sends: a fresh client must still
+# find the file and read it back exactly. Mode-independent (metadata isn't ordered).
+snapshot_log T98
+if should_run T98; then
+echo "=== T98: an fsynced create survives the leader and its writer dying right after the ack ==="
+T98_WM=/tmp/dfs-mount-t98w
+mkdir -p "$T98_WM"
+RUST_LOG=info "$BIN/dfs-client" mount "$T98_WM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t98_writer.log" --allow-other --log-level debug &
+T98_WPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T98_WM" && break; sleep 0.1; done
+T98_LADDR=""
+for _ in $(seq 1 30); do T98_LADDR=$(t88_leader "$CLUSTER") || true; [ -n "$T98_LADDR" ] && break; sleep 1; done
+T98_LN=$(( ${T98_LADDR##*:} - 8900 + 1 ))
+dd if=/dev/urandom of="$T/t98.bin" bs=1M count=8 status=none
+T98_WANT=$(md5sum < "$T/t98.bin" | cut -d' ' -f1)
+# write + fsync, then SIGKILL the writer and the leader at once: no re-send can happen
+T98_OUT=$(timeout 60 python3 - "$T98_WM/t98.bin" "$T/t98.bin" <<'PY'
+import os, sys, time
+data = open(sys.argv[2], "rb").read()
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, data)
+t0 = time.time()
+try:
+    os.fsync(fd); print("ok %.0fms" % ((time.time() - t0) * 1000))
+except OSError as e:
+    print("err errno=%d" % e.errno)
+PY
+) || true
+kill -9 "$T98_WPID" 2>/dev/null || true
+pkill -9 -f "dfs-server start --config $BASE/node$T98_LN/config.toml" 2>/dev/null || true
+fusermount -u -z "$T98_WM" 2>/dev/null || true
+echo "  T98: leader node$T98_LN ($T98_LADDR); fsync $T98_OUT; writer and leader SIGKILLed right after"
+T98_NEW=""
+for _ in $(seq 1 60); do
+    T98_NEW=$(t88_leader 127.0.0.1:$((8900 + T98_LN % 5)))
+    [ -n "$T98_NEW" ] && [ "$T98_NEW" != "$T98_LADDR" ] && break
+    sleep 0.5
+done
+T98_FM=/tmp/dfs-mount-t98
+mkdir -p "$T98_FM"
+RUST_LOG=info "$BIN/dfs-client" mount "$T98_FM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t98.log" --allow-other --log-level debug &
+T98_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T98_FM" && break; sleep 0.1; done
+T98_GOT=$(timeout 60 md5sum < "$T98_FM/t98.bin" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T98_FM" 2>/dev/null || true
+kill_client_and_wait "$T98_CPID"
+echo "  T98: new leader ${T98_NEW:-none}; fresh client read ${T98_GOT:-nothing}, expected $T98_WANT"
+if [ "${T98_OUT%% *}" != ok ]; then
+    check "T98 the fsync was not acked ($T98_OUT): the test didn't reach the case" FAIL
+elif [ "$T98_GOT" = "$T98_WANT" ]; then
+    check "T98 an fsynced create reads back after the leader and its writer died right after the ack" PASS
+else
+    check "T98 an fsynced create is gone after the leader and its writer died right after the ack (got ${T98_GOT:-nothing})" FAIL
+fi
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$T98_LN/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+    >> "$LOG/server$T98_LN.log" 2>&1 &
+t85_wait_ready || echo "  T98: cluster not fully healthy 30s after node$T98_LN's restart"
+rm -f "$MOUNT/t98.bin" "$T/t98.bin"
+fi # should_run T98
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

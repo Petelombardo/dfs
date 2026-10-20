@@ -14,6 +14,8 @@
 #   scripts/bench_staging.sh swap-client <path> [0|1]  replace just the client binary and remount
 #   scripts/bench_staging.sh dd <label> [N]         N x `dd 500 MB conv=fsync` on the client (the rock5b
 #                                                   10-13 EIO) -> /root/dfs-staging-dd-<label>.txt
+#   scripts/bench_staging.sh meta <label> [N]       N x (300 fsynced 4 KiB creates + 500 fsynced 4 KiB
+#                                                   appends): metadata-commit latency -> /root/dfs-staging-meta-<label>.txt
 #   scripts/bench_staging.sh lat <label> [N]        N x 500 4 KiB O_DSYNC writes on the client: per-write
 #                                                   latency -> /root/dfs-staging-lat-<label>.txt
 #   scripts/bench_staging.sh read <label> [N] [MB]  write one MB-sized file (default 2048: more than the
@@ -154,6 +156,30 @@ dd)
         res=$(ssh root@"$CLIENT" "cd $MNT && rm -f dd.img; L=$CDIR/client.log; t0=\$(grep -c 'Timeout writing' \$L); k0=\$(grep -c 'skipping without attempting' \$L); s=\$(date +%s%N); dd if=/dev/urandom of=dd.img bs=1M count=500 conv=fsync status=none 2>&1; rc=\$?; e=\$(date +%s%N); echo rc=\$rc ms=\$(( (e - s) / 1000000 )) MBps=\$(( 500 * 1000000000 / (e - s) )) timeouts=\$((\$(grep -c 'Timeout writing' \$L) - t0)) skipped=\$((\$(grep -c 'skipping without attempting' \$L) - k0)); rm -f dd.img")
         echo "run $r: $(echo $res | tr '\n' ' ')" | tee -a "$out"
         sleep 20
+    done
+    ;;
+meta)
+    # Puts that change a file's size or slots (each one is a leader metadata commit, acked on a
+    # majority with DFS_METADATA_MAJORITY_ACK): fsynced 4 KB creates, then fsynced 4 KB appends.
+    out=/root/dfs-staging-meta-$2.txt; : > "$out"
+    for r in $(seq 1 "${3:-3}"); do
+        res=$(ssh root@"$CLIENT" "cd $MNT && rm -rf meta && mkdir meta && python3 - <<'PY'
+import os, time
+t0 = time.time()
+for i in range(300):
+    fd = os.open('meta/f%d' % i, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.write(fd, os.urandom(4096)); os.fsync(fd); os.close(fd)
+t1 = time.time()
+fd = os.open('meta/append.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+for i in range(500):
+    os.write(fd, os.urandom(4096)); os.fsync(fd)
+os.close(fd)
+t2 = time.time()
+print('create_ms_per_file=%.2f append_ms_per_fsync=%.2f' % ((t1 - t0) * 1000 / 300, (t2 - t1) * 1000 / 500))
+PY
+rm -rf meta")
+        echo "run $r: $res" | tee -a "$out"
+        sleep 5
     done
     ;;
 lat)

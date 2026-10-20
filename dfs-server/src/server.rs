@@ -11560,12 +11560,19 @@ impl Server {
                 m
             };
             self.chunk_map_update(&metadata).await;
+            let mut queued = false;
             if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
                 self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (reply, rx) = tokio::sync::oneshot::channel();
                 if tx.send((metadata.clone(), Some(reply))).is_ok() {
                     committed.push(rx);
+                    queued = true;
                 }
+            }
+            // An Ok counts toward a leader's metadata majority: never claim a commit that
+            // wasn't even queued (the write worker paused by an offline compaction).
+            if !queued {
+                return Response::Error { message: "metadata write worker is not running".into(), code: ErrorCode::IOError };
             }
         }
         // Answer once the files are committed (the group commit takes them together): a
@@ -15075,6 +15082,7 @@ impl Server {
         // reply as "the size and chunk list are durable". This used to ack on enqueue, so a
         // commit that failed (the leader's disk full, suite T79) or a crash before it lost
         // an fsync-acked size change. A failed commit is the writer's error now.
+        let replicate = metadata.clone();
         let committed: Result<(), String> = if metadata.write_seq == 0 && metadata.chunk_locations.is_empty() {
             let meta_clone = metadata.clone();
             let meta_store = self.metadata.clone();
@@ -15122,10 +15130,68 @@ impl Server {
                 code: ErrorCode::IOError,
             };
         }
+        // The client's fsync takes this reply as "durable": with only this node's commit, a
+        // leader that died right after the ack took the file with it (followers hear of a put
+        // from the 5 s metadata healer push), and a new leader served ENOENT for a fsynced
+        // create (suite T98, T94[immediate]b). Ack once a majority has committed it.
+        if let Err(e) = self.replicate_metadata_to_majority(replicate).await {
+            warn!("[META SERVER] put committed here but not on a majority, failing it: {}", e);
+            return Response::Error {
+                message: format!("metadata not committed on a majority: {}", e),
+                code: ErrorCode::IOError,
+            };
+        }
         match resync_requested_for {
             Some(file_id) => Response::ResyncMetadataRequested { file_id },
             None => Response::Ok { data: None },
         }
+    }
+
+    /// Commit `metadata` on enough followers that, with this node, a majority of the
+    /// membership (`LeaseRuntime::majority`, the size leases and ISRs use) holds it. Sent to
+    /// every online follower at once; returns as soon as enough answered (a follower answers
+    /// ReplicateMetadataBatch once committed), so one slow or frozen follower doesn't hold the
+    /// ack. The rest still get it from the metadata healer's push.
+    async fn replicate_metadata_to_majority(&self, metadata: FileMetadata) -> Result<(), String> {
+        const FOLLOWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        // DFS_METADATA_MAJORITY_ACK=0 restores the leader-only ack (same-binary A/B bench).
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("DFS_METADATA_MAJORITY_ACK").map(|v| v != "0").unwrap_or(true)) {
+            return Ok(());
+        }
+        let need = self.lease.majority().saturating_sub(1);
+        if need == 0 {
+            return Ok(());
+        }
+        let local_id = self.cluster.local_node_id();
+        let followers: Vec<SocketAddr> = self.cluster.get_all_nodes().await.into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .map(|n| n.addr)
+            .collect();
+        if followers.len() < need {
+            return Err(format!("{} online follower(s), {} needed", followers.len(), need));
+        }
+        let items = vec![metadata];
+        let mut sends: futures::stream::FuturesUnordered<_> = followers.into_iter().map(|addr| {
+            let req = Request::ReplicateMetadataBatch { items: items.clone() };
+            let client = self.client.clone();
+            async move {
+                match tokio::time::timeout(FOLLOWER_TIMEOUT, client.send_message(addr, Message::Request(req))).await {
+                    Ok(Ok(env)) => matches!(env.message, Message::Response(Response::Ok { .. })),
+                    _ => false,
+                }
+            }
+        }).collect();
+        let mut acked = 0usize;
+        while let Some(ok) = futures::StreamExt::next(&mut sends).await {
+            if ok {
+                acked += 1;
+                if acked >= need {
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!("{} of {} needed follower(s) committed", acked, need))
     }
 
     /// Block until any metadata write for `file_id` currently queued in
@@ -30316,6 +30382,34 @@ mod tests {
         assert_eq!(buf.len(), 2, "the waited-on write joins the batch");
         assert!(started.elapsed() < std::time::Duration::from_secs(1),
             "BUG: a waited-on write sat out the fire-and-forget linger ({:?})", started.elapsed());
+    }
+
+    /// Suite T98 (T94[immediate]b): a put acked on the leader's own commit died with it. A
+    /// put is acked only once a majority of the membership committed it; a leader that can't
+    /// reach enough followers fails the put instead of acking it.
+    #[tokio::test]
+    async fn a_metadata_put_is_acked_only_once_a_majority_committed_it() {
+        let h = make_overlay_test_harness();
+        let mut meta = FileMetadata::new("/majority.bin".to_string(), dfs_common::FileType::RegularFile);
+        meta.size = 4096;
+        meta.write_seq = 1;
+        // A one-node membership is its own majority.
+        assert!(matches!(h.server.handle_put_file_metadata(meta.clone(), 1).await, Response::Ok { .. }));
+
+        // Five members and no reachable follower: not durable anywhere but here.
+        h.server.lease.set_cluster_size_for_test(5);
+        // Highest ids, so this node stays the (min-id) leader; nothing listens on these ports.
+        let mut top = [0xffu8; 16];
+        for port in [1u16, 2] {
+            top[15] = 0xff - port as u8;
+            h.server.cluster().add_node(dfs_common::NodeInfo::new(NodeId::from_bytes(top), SocketAddr::from(([127, 0, 0, 1], port)), None)).await.unwrap();
+        }
+        meta.write_seq = 2;
+        meta.size = 8192;
+        match h.server.handle_put_file_metadata(meta.clone(), 2).await {
+            Response::Error { code: ErrorCode::IOError, .. } => {}
+            other => panic!("BUG: a put no follower committed was acked: {:?}", other),
+        }
     }
 
     /// Suite T66[secondary] (1017a ON): an ordered fold materialized its head through

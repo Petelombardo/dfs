@@ -8637,19 +8637,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // Determine authoritative new_chunk_id: prefer the leader's result.
-        // If the leader wasn't in replica_addrs or failed, fall back to any agreeing majority.
-        let leader_result = leader_addr.and_then(|la| {
-            replica_results.iter().find(|(a, _)| *a == la)
-                .and_then(|(_, r)| r.as_ref().ok().copied())
-        });
-
-        let authoritative: Option<(ChunkId, usize, Option<u64>)> = if let Some(lr) = leader_result {
-            Some(lr)
-        } else {
-            // No leader result — use the first successful result (they should all agree).
-            replica_results.iter().find_map(|(_, r)| r.as_ref().ok().copied())
-        };
+        let authoritative = Self::authoritative_patch_result(&replica_results, leader_addr);
 
         let (authoritative_chunk_id, authoritative_size, authoritative_patch_ts) = match authoritative {
             Some(x) => x,
@@ -9596,6 +9584,28 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// on VM-108 (2026-09-10, vm-108-disk-1 chunk_idx 9). One definition, one place.
     fn compute_required_replicas(configured_rf: usize) -> usize {
         dfs_common::types::write_quorum(configured_rf)
+    }
+
+    /// The MultiPatch result the new location records: the chunk_id the most replicas
+    /// returned. The leader's result only breaks a tie, then the first success does.
+    /// The leader is no authority on a slot's bytes: a leader holding an older copy
+    /// returns a different id from the same delta, and when that id won over two
+    /// agreeing holders it was registered with nothing behind it and the holders
+    /// abandoned the real patch (2026-10-20, staging VM-108 disk-0 chunk 3053).
+    fn authoritative_patch_result(
+        replica_results: &[(SocketAddr, Result<(ChunkId, usize, Option<u64>)>)],
+        leader_addr: Option<SocketAddr>,
+    ) -> Option<(ChunkId, usize, Option<u64>)> {
+        let successes: Vec<(SocketAddr, (ChunkId, usize, Option<u64>))> = replica_results.iter()
+            .filter_map(|(a, r)| r.as_ref().ok().map(|v| (*a, *v)))
+            .collect();
+        let votes = |id: ChunkId| successes.iter().filter(|(_, v)| v.0 == id).count();
+        let most = successes.iter().map(|(_, v)| votes(v.0)).max()?;
+        let leader_result = leader_addr.and_then(|la| successes.iter().find(|(a, _)| *a == la).map(|(_, v)| *v));
+        match leader_result {
+            Some(lr) if votes(lr.0) == most => Some(lr),
+            _ => successes.iter().find(|(_, v)| votes(v.0) == most).map(|(_, v)| *v),
+        }
     }
 
     /// Ask the leader to heal `chunk_id` immediately, bypassing healing_delay_secs —
@@ -11664,6 +11674,35 @@ mod tests {
     /// "Not unless replica < 2 in the config" — a genuine RF<2 cluster (or a
     /// single-node deployment) must not be forced to find a second replica that
     /// can't exist.
+    /// REPRO (2026-10-20, staging VM-108 disk-0 chunk 3053, ordering off): the two
+    /// holders (gluster3/5) both returned df7cbc70; the leader, holding an older copy
+    /// of the slot, returned df7c1bfb. The leader's answer won, both holders were
+    /// excluded, df7c1bfb was raw-copied and registered, and the holders then
+    /// abandoned the real patch against that phantom. Agreement decides; the leader
+    /// only breaks a tie.
+    #[test]
+    fn authoritative_patch_result_is_the_majority_not_the_leader() {
+        let g3: SocketAddr = "10.25.1.60:8900".parse().unwrap();
+        let g5: SocketAddr = "10.25.1.100:8900".parse().unwrap();
+        let leader: SocketAddr = "10.25.1.58:8900".parse().unwrap();
+        let real = ChunkId::from_hash([0xBC; 32]);
+        let stale = ChunkId::from_hash([0x1B; 32]);
+        let ok = |c: ChunkId| -> Result<(ChunkId, usize, Option<u64>)> { Ok((c, 4194304, None)) };
+
+        let results = vec![(g3, ok(real)), (g5, ok(real)), (leader, ok(stale))];
+        assert_eq!(DfsClient::authoritative_patch_result(&results, Some(leader)).map(|r| r.0), Some(real),
+            "two holders agreeing outvote a disagreeing leader");
+
+        let tie = vec![(g3, ok(real)), (leader, ok(stale))];
+        assert_eq!(DfsClient::authoritative_patch_result(&tie, Some(leader)).map(|r| r.0), Some(stale),
+            "on a tie the leader's result is still preferred");
+
+        let no_leader = vec![(g3, Err(anyhow::anyhow!("timeout"))), (g5, ok(real))];
+        assert_eq!(DfsClient::authoritative_patch_result(&no_leader, Some(leader)).map(|r| r.0), Some(real));
+        let none: Vec<(SocketAddr, Result<(ChunkId, usize, Option<u64>)>)> = vec![(g3, Err(anyhow::anyhow!("x")))];
+        assert!(DfsClient::authoritative_patch_result(&none, None).is_none());
+    }
+
     #[test]
     fn test_compute_required_replicas_respects_rf_below_two() {
         assert_eq!(DfsClient::compute_required_replicas(1), 1);

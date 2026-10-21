@@ -2874,6 +2874,22 @@ impl OverlayForkCtx {
         if current == public_token {
             return false; // still the current occupant — genuinely needs folding
         }
+        // An occupant nothing backs (no file here, no patch_state row, no CHUNK_TABLE
+        // record naming a holder) cannot have superseded anything: no read of it can
+        // succeed. Root-caused 2026-10-20 (staging VM-108, file 5f62f6a7, chunk_idx
+        // 3053): both holders' chunk_map named `df7c1bfb…` at the live patch's own
+        // client_write_seq, which the clocks below read as a fold successor's tie, and
+        // both deleted the live patch `df7cbc70…`. Same check as [GHOST-stale-check].
+        let occupant_backed = self.storage.get_chunk_path(&current).exists()
+            || matches!(self.metadata.get_patch_state_async(current).await, Ok(Some(_)))
+            || matches!(self.metadata.get_chunk_location_async(current).await,
+                        Ok(Some(loc)) if !loc.nodes.is_empty());
+        if !occupant_backed {
+            warn!("single fold: file {} chunk_idx {} chunk_map names {:?}, but no file, patch_state \
+                   row or CHUNK_TABLE record backs it — NOT abandoning Pending patch {}",
+                file_id, chunk_idx, current, public_token);
+            return false;
+        }
         // A DIFFERENT occupant is not by itself evidence this patch is dead: it also
         // has to be causally LATER. Root-caused 2026-08-30 (VM-108, file c42fa744,
         // chunk_idx 2981 — the incident this guard exists for): gluster2/3/4 held an
@@ -23920,6 +23936,7 @@ mod tests {
         // MultiPatch calls) — chunk_map now points somewhere else entirely.
         let superseding_token = ChunkId::from_hash(compute_chunk_hash(b"newer-write-token"));
         server.record_chunk_generation(superseding_token, 502);
+        storage.write_chunk(&superseding_token, &[0xCDu8; 64]).unwrap();
         server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
             chunk_id: superseding_token,
             nodes: vec![node_id],
@@ -24015,7 +24032,10 @@ mod tests {
         // (`1aea6eba…`), still claiming a healthy replica set.
         let stale_occupant = ChunkId::from_hash(compute_chunk_hash(b"eleven-day-old-occupant"));
 
+        // Every occupant here has bytes on disk, so the clocks decide (an unbacked one
+        // never supersedes — see ..._occupant_has_nothing_behind_it).
         let put_occupant = |chunk_id: ChunkId, seq: Option<u64>| {
+            storage.write_chunk(&chunk_id, b"occupant bytes").unwrap();
             server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
                 chunk_id,
                 nodes: vec![node_id],
@@ -24081,6 +24101,74 @@ mod tests {
         assert!(
             ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, unordered_patch, None).await,
             "with no generation and no seq on either side the pair is unordered — abandon, as before"
+        );
+    }
+
+    /// REPRO (2026-10-20, staging, VM-108 `vm-108-disk-0.qcow2` / file 5f62f6a7 /
+    /// chunk_idx 3053, ordering off). Both holders applied the live patch
+    /// `df7cbc70…` (client_write_seq 237618); seconds later their chunk_map named
+    /// `df7c1bfb…` at the SAME seq — an id with no file, no patch_state row and no
+    /// CHUNK_TABLE record on any of the five nodes. The equal seq read as a fold
+    /// successor's tie, so both holders abandoned the live patch and deleted its
+    /// state. The leader still named the pre-patch token, which the holders had
+    /// retired, and every read of the slot EIO'd. An occupant nothing backs is no
+    /// evidence of a supersede.
+    #[tokio::test]
+    async fn test_abandon_declines_when_chunk_map_occupant_has_nothing_behind_it() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 3053u64;
+        let chunk_file_offset = chunk_idx * 4 * 1024 * 1024;
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"live-patch-df7cbc70"));
+
+        let put_occupant = |chunk_id: ChunkId| {
+            server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+                chunk_id,
+                nodes: vec![node_id],
+                size: 4 * 1024 * 1024,
+                checksum: [0u8; 32],
+                file_offset: Some(chunk_file_offset),
+                written_at: Some(dfs_common::types::current_timestamp()),
+                client_write_seq: Some(237618),
+                file_id: Some(file_id),
+            }], 1));
+        };
+        let ctx = server.overlay_ctx();
+
+        // --- The incident: an equal-seq occupant that exists nowhere.
+        let phantom = ChunkId::from_hash(compute_chunk_hash(b"phantom-df7c1bfb"));
+        put_occupant(phantom);
+        assert!(
+            !ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, Some(237618)).await,
+            "chunk_map names an occupant with no file, no patch_state row and no CHUNK_TABLE \
+             record — nothing can be read from it, so it cannot have superseded the live patch; \
+             abandoning deleted VM-108's chunk 3053"
+        );
+
+        // --- A real fold successor (its result is a chunk file) still supersedes at the
+        // equal seq, as before.
+        let fold_result = ChunkId::from_hash(compute_chunk_hash(b"real-fold-result"));
+        storage.write_chunk(&fold_result, b"folded bytes").unwrap();
+        put_occupant(fold_result);
+        assert!(
+            ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, Some(237618)).await,
+            "an equal-seq occupant whose bytes are on disk is a real fold successor and must \
+             still be abandoned"
         );
     }
 

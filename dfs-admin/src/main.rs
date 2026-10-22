@@ -188,6 +188,12 @@ enum FaultCommands {
         #[arg(long)]
         millis: u64,
     },
+    /// Test-only: store a CHUNK_TABLE row (JSON, as `file raw-location --format json`
+    /// prints it) on each --cluster node, replacing any row for its chunk_id.
+    PlantLocation {
+        #[arg(long)]
+        json: String,
+    },
     /// Hold one subsystem's lock for a while: metadata-db, healer-maps or cluster-membership.
     Stall {
         #[arg(long)]
@@ -312,6 +318,18 @@ enum FileCommands {
     RawLocation {
         /// Chunk ID (hex string)
         chunk_id: String,
+    },
+    /// Ask the leader to rebuild one slot of a file from its CHUNK_TABLE rows
+    /// (RevalidateChunkSlot) and print the chunk it now names.
+    Revalidate {
+        /// File id (uuid)
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        chunk: u64,
+        /// The chunk id the caller distrusts (only affects the server's log line)
+        #[arg(long)]
+        distrust: String,
     },
     /// List all files in metadata database
     List {
@@ -1357,6 +1375,9 @@ async fn handle_file_command(
             for &addr in cluster_addrs {
                 let response = send_request(addr, Request::DebugGetRawChunkLocation { chunk_id: cid }).await;
                 match response {
+                    Ok(Response::DebugRawChunkLocation { location: Some(loc) }) if json_output => {
+                        println!("{}", serde_json::json!({"addr": addr.to_string(), "location": loc}));
+                    }
                     Ok(Response::DebugRawChunkLocation { location: Some(loc) }) => {
                         println!("{}: nodes={:?} size={} written_at={:?} client_write_seq={:?} file_id={:?} file_offset={:?}",
                             addr, loc.nodes, loc.size, loc.written_at, loc.client_write_seq, loc.file_id, loc.file_offset);
@@ -1367,6 +1388,18 @@ async fn handle_file_command(
                     Ok(other) => println!("{}: unexpected response {:?}", addr, other),
                     Err(e) => println!("{}: request failed — {}", addr, e),
                 }
+            }
+        }
+        FileCommands::Revalidate { file_id, chunk, distrust } => {
+            let file_id = dfs_common::FileId::from_uuid(uuid::Uuid::parse_str(&file_id).context("parse --file-id")?);
+            let distrust_chunk_id = parse_chunk_id(&distrust)?;
+            let leader = find_leader_addr(cluster_addrs).await;
+            match send_request(leader, Request::RevalidateChunkSlot { file_id, chunk_idx: chunk, distrust_chunk_id }).await? {
+                Response::FileChunkMap { locations, .. } => match locations.first() {
+                    Some(l) => println!("{}", l.chunk_id),
+                    None => println!("none"),
+                },
+                other => anyhow::bail!("unexpected response {:?}", other),
             }
         }
         FileCommands::List { local } => {
@@ -1864,6 +1897,17 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::PlantLocation { json } = &cmd {
+        let location: dfs_common::ChunkLocation = serde_json::from_str(json).context("parse --json as a ChunkLocation")?;
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectChunkLocation { location: location.clone() }).await? {
+                Response::Ok { .. } => println!("{}: planted {} nodes={:?}", addr, location.chunk_id, location.nodes),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::IgnoreMetadataVersions { millis } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectIgnoreMetadataVersions { millis: *millis }).await? {
@@ -1908,7 +1952,8 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
-        | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. } => unreachable!("handled above"),
+        | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. }
+        | FaultCommands::PlantLocation { .. } => unreachable!("handled above"),
     };
     for &addr in cluster_addrs {
         match send_request(addr, Request::SetPeerFilter { filter: filter.clone() }).await? {

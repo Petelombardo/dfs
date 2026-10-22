@@ -809,6 +809,7 @@ fn fold_successor_write_seq(current_slot_seq: Option<u64>, delta_seq: Option<u64
 /// retriable ChunkStale instead of a false success.
 fn update_chunk_map_after_patch(
     chunk_map: &Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
+    chunk_to_file: &DashMap<ChunkId, FileId>,
     file_id: FileId,
     chunk_idx: Option<u64>,
     old_chunk_id: ChunkId,
@@ -886,6 +887,7 @@ fn update_chunk_map_after_patch(
                     file_id, new_chunk_id, new_client_write_seq, loc.chunk_id, loc.client_write_seq);
                 rejected = Some(loc.clone());
             } else {
+                move_chunk_to_file(chunk_to_file, file_id, loc.chunk_id, new_chunk_id);
                 loc.chunk_id = new_chunk_id;
                 loc.checksum = new_chunk_id.hash;
                 loc.size = size;
@@ -897,6 +899,17 @@ fn update_chunk_map_after_patch(
     rejected
 }
 
+/// chunk_to_file follows a slot's chunk_map entry from `old` to `new`: every site that changes
+/// an entry's chunk_id in place must call this. The two in-place updaters below didn't, so the
+/// leader kept each patched slot's base in chunk_to_file, ConfirmChunksLive called it live, and
+/// the other holders never deleted their copies (T85a, 10-21).
+fn move_chunk_to_file(chunk_to_file: &DashMap<ChunkId, FileId>, file_id: FileId, old: ChunkId, new: ChunkId) {
+    if old != new {
+        chunk_to_file.remove_if(&old, |_, f| *f == file_id);
+    }
+    chunk_to_file.insert(new, file_id);
+}
+
 /// An ordered write's result is its replicas' state for the slot (write_order.rs), so their
 /// chunk_map entry follows it even where `update_chunk_map_after_patch`'s client_write_seq
 /// guard declined: that guard compares per-client counters, which mean nothing across two
@@ -905,6 +918,7 @@ fn update_chunk_map_after_patch(
 /// max over seqs clients really produced, never an invented one).
 fn advance_chunk_map_for_ordered_write(
     chunk_map: &Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
+    chunk_to_file: &DashMap<ChunkId, FileId>,
     file_id: FileId,
     chunk_idx: u64,
     new_chunk_id: ChunkId,
@@ -917,6 +931,7 @@ fn advance_chunk_map_for_ordered_write(
         let (locations, _) = entry.value_mut();
         if let Some(loc) = locations.iter_mut().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx)) {
             loc.client_write_seq = fold_successor_write_seq(loc.client_write_seq, client_write_seq);
+            move_chunk_to_file(chunk_to_file, file_id, loc.chunk_id, new_chunk_id);
             loc.chunk_id = new_chunk_id;
             loc.checksum = new_chunk_id.hash;
             loc.size = size;
@@ -1258,6 +1273,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectSlowBackgroundFolds { .. }
         | Request::InjectChunkLocationFailures { .. }
         | Request::InjectIgnoreMetadataVersions { .. }
+        | Request::InjectChunkLocation { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -1604,6 +1620,7 @@ struct OverlayForkCtx {
     storage: Arc<ChunkStorage>,
     metadata: Arc<MetadataStore>,
     chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
+    chunk_to_file: Arc<DashMap<ChunkId, FileId>>,
     chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>>,
     pending_patch_ids: Arc<DashMap<ChunkId, (FileId, u64)>>,
     pending_patch_fold_broadcasts: Arc<DashMap<ChunkId, PendingPatchFoldBroadcast>>,
@@ -2700,6 +2717,7 @@ impl OverlayForkCtx {
                                         let (locs, _) = entry.value_mut();
                                         if let Some(pos) = Server::chunk_map_find_by_idx(locs, chunk_idx) {
                                             if locs[pos].chunk_id == public_token {
+                                                move_chunk_to_file(&self.chunk_to_file, file_id, public_token, prior);
                                                 locs[pos].chunk_id = prior;
                                                 locs[pos].checksum = prior.hash;
                                                 locs[pos].size = prior_loc.size;
@@ -4174,7 +4192,7 @@ impl OverlayForkCtx {
         // means a genuinely newer write already advanced this slot past this fold's
         // own result while the fold was running — exactly the scenario the staleness
         // guard's doc comment describes. Logged for diagnostic visibility only.
-        if let Some(current) = update_chunk_map_after_patch(&self.chunk_map, file_id, Some(chunk_idx), public_token, new_chunk_id, final_size, now_ms, final_client_write_seq) {
+        if let Some(current) = update_chunk_map_after_patch(&self.chunk_map, &self.chunk_to_file, file_id, Some(chunk_idx), public_token, new_chunk_id, final_size, now_ms, final_client_write_seq) {
             debug!("single fold: chunk_map update for file {} chunk {} superseded by newer write ({} already current) — fold result {} not applied to chunk_map, no action needed",
                 file_id, chunk_idx, current.chunk_id, new_chunk_id);
         }
@@ -6534,6 +6552,14 @@ impl Server {
     /// Shared equal-seq tiebreak for `location_supersedes`: `ServerFold` beats `Client`
     /// outright (no clock dependence); same-origin pairs fall back to written_at, the
     /// only signal left to distinguish them.
+    ///
+    /// Between those two, a content identity beats a patch token. A token's successor at
+    /// the same seq is its fold result (folds never mint a seq), so this is the fold
+    /// tiebreak read off the identity itself. fold_result_chunk_ids cannot be relied on
+    /// for it: it is seeded from Folded rows, and once patch_state GC prunes the row a
+    /// restart forgets the fold. written_at cannot either: healing restamps it on every
+    /// holder-list edit. Both failed together on staging 2026-10-21 (VM-108 disk-1 chunk
+    /// 768): the slot went back to a token nothing could resolve.
     fn fold_then_written_at(
         incoming: &ChunkLocation,
         existing: &ChunkLocation,
@@ -6543,7 +6569,11 @@ impl Server {
         match (incoming_is_fold, existing_is_fold) {
             (true, false) => true,
             (false, true) => false,
-            _ => incoming.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0),
+            _ => match (incoming.chunk_id.looks_like_patch_token(), existing.chunk_id.looks_like_patch_token()) {
+                (false, true) => true,
+                (true, false) => false,
+                _ => incoming.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0),
+            },
         }
     }
 
@@ -8392,6 +8422,20 @@ impl Server {
                 let until = if millis == 0 { 0 } else { crate::write_order::now_ms() + millis };
                 crate::write_order::INJECTED_LOCATION_FAILURES_UNTIL_MS.store(until, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
+            }
+            Request::InjectChunkLocation { location } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: planting CHUNK_TABLE row {} nodes={:?} seq={:?}",
+                    location.chunk_id, location.nodes, location.client_write_seq);
+                match self.metadata.put_chunk_location_async(location).await {
+                    Ok(()) => Response::Ok { data: None },
+                    Err(e) => Response::Error { message: format!("put_chunk_location: {}", e), code: ErrorCode::InternalError },
+                }
             }
             Request::InjectSlowBackgroundFolds { millis, count } => {
                 if !crate::network::fault_injection_allowed() {
@@ -10579,9 +10623,14 @@ impl Server {
                 // more than one orphan-sweep page's worth) instead of unioning
                 // the whole cluster's chunk set keeps this correct: a candidate
                 // is live via chunk_map iff chunk_to_file has an entry for it.
+                // Which source called each candidate live, for the debug line below: a copy
+                // kept forever on one source's stale entry is otherwise untraceable (T85a).
+                let wanted: std::collections::HashSet<ChunkId> = chunk_ids.iter().copied().collect();
+                let mut why: std::collections::HashMap<ChunkId, Vec<String>> = std::collections::HashMap::new();
                 for candidate in &chunk_ids {
                     if self.chunk_to_file.contains_key(candidate) {
                         live_set.insert(*candidate);
+                        why.entry(*candidate).or_default().push("chunk_map".into());
                     }
                 }
                 // Third liveness source: base_chunk_id and delta_chunk_id for every
@@ -10615,7 +10664,12 @@ impl Server {
                 // reached, treat every candidate as live rather than authorize deletion
                 // of a set we couldn't fully verify.
                 match self.metadata.all_pending_patch_chunk_ids_async().await {
-                    Ok(pending_ids) => live_set.extend(pending_ids),
+                    Ok(pending_ids) => {
+                        for id in pending_ids.iter().filter(|id| wanted.contains(id)) {
+                            why.entry(*id).or_default().push("pending patch here".into());
+                        }
+                        live_set.extend(pending_ids)
+                    }
                     Err(e) => warn!("handle_confirm_chunks_live: failed to read pending patch chunk_ids: {}", e),
                 }
                 // all_pending_patch_chunk_ids only protects a Pending patch's base/delta
@@ -10640,7 +10694,12 @@ impl Server {
                     let req = Request::GetPendingPatchChunkIds;
                     match tokio::time::timeout(std::time::Duration::from_secs(5), self.client.send_message(peer.addr, Message::Request(req))).await {
                         Ok(Ok(envelope)) => match envelope.message {
-                            Message::Response(Response::PendingPatchChunkIds { ids }) => live_set.extend(ids),
+                            Message::Response(Response::PendingPatchChunkIds { ids }) => {
+                                for id in ids.iter().filter(|id| wanted.contains(id)) {
+                                    why.entry(*id).or_default().push(format!("pending patch on {}", &peer.id.to_string()[..8]));
+                                }
+                                live_set.extend(ids)
+                            }
                             _ => {
                                 warn!("handle_confirm_chunks_live: unexpected response to GetPendingPatchChunkIds from {} — treating all candidates as live this cycle", peer.id);
                                 return Response::ChunkLiveness { live: chunk_ids };
@@ -10655,6 +10714,19 @@ impl Server {
                 let live: Vec<ChunkId> = chunk_ids.into_iter()
                     .filter(|id| cached_live.contains(id) || live_set.contains(id))
                     .collect();
+                if !live.is_empty() {
+                    let named: Vec<String> = live.iter().map(|id| {
+                        let mut w = why.remove(id).unwrap_or_default();
+                        if cached_live.contains(id) {
+                            w.push("live row".into());
+                        }
+                        if w.is_empty() {
+                            w.push("token".into());
+                        }
+                        format!("{}=[{}]", &id.to_string()[..16], w.join(","))
+                    }).collect();
+                    debug!("handle_confirm_chunks_live: {} candidate(s) live: {}", live.len(), named.join(" "));
+                }
                 Response::ChunkLiveness { live }
             }
             Err(e) => {
@@ -10743,13 +10815,25 @@ impl Server {
                 let (locs, _) = e.value();
                 Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
             });
+            // A folded token's content IS its fold result: it is held only where that result
+            // is, and the result is the slot's current content, not an old version of it.
+            // Counting the Folded row alone as "held" deleted VM-108 disk-1 chunk 666's only
+            // content (10-21: slot named token df7cdbfe, cleanup took its result 6aa6c586).
+            let mut folded_into = None;
             let held = match cur {
-                Some(c) => self.storage.has_chunk(&c) || matches!(self.metadata.get_patch_state_async(c).await, Ok(Some(_))),
+                Some(c) => self.storage.has_chunk(&c) || match self.metadata.get_patch_state_async(c).await {
+                    Ok(Some(crate::metadata::PatchState::Folded(result))) => {
+                        folded_into = Some(result);
+                        result != chunk && self.storage.has_chunk(&result)
+                    }
+                    Ok(Some(_)) => true,
+                    _ => false,
+                },
                 None => false,
             };
             current.push(cur);
             holds.push(held);
-            protected.push(needed.contains(&chunk) || self.write_ordering.is_head(file_id, chunk_idx, chunk));
+            protected.push(needed.contains(&chunk) || folded_into == Some(chunk) || self.write_ordering.is_head(file_id, chunk_idx, chunk));
         }
         let uptime_secs = self.ops_tracker.get_stats().uptime_secs;
         Response::SupersededCheck { current, holds, protected, uptime_secs }
@@ -11220,8 +11304,13 @@ impl Server {
             // Already the slot's version here; still commit its row if it has none (a fold's
             // peer fan-out names it in the map, while its row comes only with a location
             // registration): without one the healer can't see it under RF (suite T97f).
+            // Or if its row lacks a holder the head names: an apply records only the node
+            // that applied it, and a leader that was in the pair has advanced its own map,
+            // so this head is the only report of the other member. A 1-holder row loses to
+            // older better-replicated rows under the durability guard (suite T100c).
             if occupant == Some(loc.chunk_id)
-                && !matches!(self.metadata.get_chunk_location_async(loc.chunk_id).await, Ok(None))
+                && matches!(self.metadata.get_chunk_location_async(loc.chunk_id).await,
+                    Ok(Some(row)) if loc.nodes.iter().all(|n| row.nodes.contains(n)))
             {
                 continue;
             }
@@ -15965,6 +16054,7 @@ impl Server {
             storage: self.storage.clone(),
             metadata: self.metadata.clone(),
             chunk_map: self.chunk_map.clone(),
+            chunk_to_file: self.chunk_to_file.clone(),
             chunk_io_locks: self.chunk_io_locks.clone(),
             pending_patch_ids: self.pending_patch_ids.clone(),
             pending_patch_fold_broadcasts: self.pending_patch_fold_broadcasts.clone(),
@@ -16258,7 +16348,7 @@ impl Server {
                 warn!("apply_patch: cancel_healing_for_chunk task panicked for {}: {}", chunk_id, e);
             }
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-            let chunk_map_rejected = update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms, client_write_seq);
+            let chunk_map_rejected = update_chunk_map_after_patch(&self.chunk_map, &self.chunk_to_file, file_id, None, chunk_id, new_chunk_id, size, now_ms, client_write_seq);
             return Ok((new_chunk_id, size, if new_chunk_id != chunk_id { Some(now_ms) } else { None }, Some(buf), chunk_map_rejected));
         };
         let patch_guard = patch_guard.expect("chunk_idx Some implies patch_guard Some (see callers)");
@@ -16992,7 +17082,7 @@ impl Server {
                 // once the client's own authoritative broadcast lands.
                 let new_loc = ChunkLocation {
                     chunk_id: public_token,
-                    nodes: vec![self.cluster.local_node_id()],
+                    nodes: self.holders_of_token_with_me(public_token).await,
                     size: needed_len,
                     checksum: public_token.hash,
                     file_offset: Some(chunk_file_offset),
@@ -17029,7 +17119,7 @@ impl Server {
                 // nodes: [local_node_id] only, not old nodes + append — see that
                 // branch's comment for why carrying the list forward caused a
                 // real T28 data corruption regression.
-                loc.nodes = vec![self.cluster.local_node_id()];
+                loc.nodes = self.holders_of_token_with_me(public_token).await;
                 if let Err(e) = self.metadata.put_chunk_location_async(loc).await {
                     warn!("apply_patch: failed to slide {} -> {} in metadata: {}", chunk_id, public_token, e);
                 }
@@ -17058,7 +17148,7 @@ impl Server {
         } else {
             None
         };
-        let chunk_map_rejected = update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms, client_write_seq);
+        let chunk_map_rejected = update_chunk_map_after_patch(&self.chunk_map, &self.chunk_to_file, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms, client_write_seq);
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
         self.pending_patch_ids.insert(base_chunk_id, (file_id, cidx));
@@ -17743,7 +17833,7 @@ impl Server {
             slot.set_anchor(anchor, version);
             let size = self.storage.get_chunk_size(&anchor);
             if let Some(sz) = size {
-                advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, sz as usize, None);
+                advance_chunk_map_for_ordered_write(&self.chunk_map, &self.chunk_to_file, file_id, chunk_idx, anchor, sz as usize, None);
             }
             send_order(version, anchor);
             let resp = fold_result(anchor, size);
@@ -17784,7 +17874,7 @@ impl Server {
             self.note_synced_as_secondary(file_id, chunk_idx, tag.isr_epoch).await;
             let size = self.storage.get_chunk_size(&anchor);
             if let Some(sz) = size {
-                advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, sz as usize, None);
+                advance_chunk_map_for_ordered_write(&self.chunk_map, &self.chunk_to_file, file_id, chunk_idx, anchor, sz as usize, None);
             }
             let resp = fold_result(anchor, size);
             slot.finish(tag.write_id, version, &resp);
@@ -17813,6 +17903,21 @@ impl Server {
     /// Record a slot's new head for the next digest; an older generation never replaces a
     /// newer one (applies can finish out of order). An equal one does: no two writes share a
     /// generation, and a fold keeps its token's, so it is the fold result replacing the token.
+    /// The holders apply_patch records for the token it just minted: itself, plus any node an
+    /// existing row for this same token already names. Holders of an earlier generation are
+    /// never carried over (that was the T28 corruption), but a row for this exact token can
+    /// only come from a report of this write: on a secondary, the primary's head digest can
+    /// land before its own apply, and overwriting it with [self] left the pair's record at
+    /// one holder for good (suite T100c).
+    async fn holders_of_token_with_me(&self, token: ChunkId) -> Vec<NodeId> {
+        let me = self.cluster.local_node_id();
+        let mut nodes = vec![me];
+        if let Ok(Some(row)) = self.metadata.get_chunk_location_async(token).await {
+            nodes.extend(row.nodes.into_iter().filter(|n| *n != me));
+        }
+        nodes
+    }
+
     fn note_dirty_head(dirty: &DashMap<(FileId, u64), (ChunkId, u64, u64)>, file_id: FileId, chunk_idx: u64,
                        head: ChunkId, generation: u64, isr_epoch: u64) {
         dirty.entry((file_id, chunk_idx))
@@ -17825,7 +17930,9 @@ impl Server {
     /// changed as their primary, in one ReplicateIsrHeads: one RPC per interval, however many
     /// writes, where the client used to report each write. A head already superseded (the
     /// slot folded, or moved on) is dropped; a send that fails is retried next interval.
-    /// The leader itself needs none: its own applies advance its map.
+    /// A leader that is the primary installs its heads itself, the same way: its own apply
+    /// advances its map but records only itself as a holder, and with no digest nothing
+    /// ever added the secondary (suite T100c).
     pub fn start_head_digest_loop(self: Arc<Self>) {
         let every = std::env::var("DFS_HEAD_DIGEST_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000);
         tokio::spawn(async move {
@@ -17840,17 +17947,16 @@ impl Server {
                     let keys: Vec<_> = self.dirty_heads.iter().map(|e| *e.key()).collect();
                     keys.into_iter().filter_map(|k| self.dirty_heads.remove(&k)).collect()
                 };
-                if self.cluster.is_leader().await {
-                    continue;
-                }
+                let is_leader = self.cluster.is_leader().await;
                 // Re-queued heads only fill an empty slot: one noted since the take is at
                 // least as new (a fold result at the same generation replaces its token).
-                let Some(leader) = self.cluster.get_leader_addr().await else {
+                let leader = if is_leader { None } else { self.cluster.get_leader_addr().await };
+                if !is_leader && leader.is_none() {
                     for ((fid, idx), (head, generation, epoch)) in taken {
                         self.dirty_heads.entry((fid, idx)).or_insert((head, generation, epoch));
                     }
                     continue;
-                };
+                }
                 let mut heads = Vec::with_capacity(taken.len());
                 for &((fid, idx), (head, generation, epoch)) in &taken {
                     // Still the slot's head: its token, or what the ordered stream moved on to
@@ -17872,6 +17978,10 @@ impl Server {
                 if heads.is_empty() {
                     continue;
                 }
+                let Some(leader) = leader else {
+                    self.handle_replicate_isr_heads(heads).await;
+                    continue;
+                };
                 let n = heads.len();
                 let req = Request::ReplicateIsrHeads { heads };
                 let sent = tokio::time::timeout(std::time::Duration::from_secs(5),
@@ -18064,7 +18174,7 @@ impl Server {
     async fn adopt_resync_anchor(&self, file_id: FileId, chunk_idx: u64, epoch: u64, slot: &crate::write_order::SlotOrder, anchor: ChunkId, at: u64) {
         slot.set_anchor(anchor, at);
         if let Some(size) = self.storage.get_chunk_size(&anchor) {
-            advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, chunk_idx, anchor, size as usize, None);
+            advance_chunk_map_for_ordered_write(&self.chunk_map, &self.chunk_to_file, file_id, chunk_idx, anchor, size as usize, None);
         }
         self.note_synced_as_secondary(file_id, chunk_idx, epoch).await;
     }
@@ -18603,7 +18713,7 @@ impl Server {
                 // the update compared two clients' unrelated client_write_seqs. The ordered
                 // result is this replica's state for the slot, so advance chunk_map to it.
                 if let (true, Some(cidx), Some(_)) = (ordered, chunk_idx, &chunk_map_rejected) {
-                    advance_chunk_map_for_ordered_write(&self.chunk_map, file_id, cidx, new_chunk_id, final_size, client_write_seq);
+                    advance_chunk_map_for_ordered_write(&self.chunk_map, &self.chunk_to_file, file_id, cidx, new_chunk_id, final_size, client_write_seq);
                 }
                 if let Some(current) = chunk_map_rejected.filter(|_| !ordered) {
                     info!("MultiPatch: {} -> {} chunk_map update rejected as stale (current is {}) — \
@@ -20538,37 +20648,58 @@ impl Server {
         // See location_supersedes' parameter of the same name.
         durability_floor: usize,
     ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+        Self::chunk_locations_and_guard_losers(metadata, fold_result_chunk_ids, file_id, durability_floor)
+            .map(|(locations, _)| locations)
+    }
+
+    /// chunk_locations_for_info's answer, plus each row that lost its slot ONLY to the
+    /// replica-count guard: it is causally newer than the winner (it would win with no floor)
+    /// but its record lists fewer than `durability_floor` holders. A record can understate its
+    /// holders (the 10-20 staging deploy: the leader had pruned itself from live tokens), so a
+    /// rebuild must ask who really holds these before letting the older version stand — see
+    /// chunk_locations_verified_async.
+    fn chunk_locations_and_guard_losers(
+        metadata: &MetadataStore,
+        fold_result_chunk_ids: &dashmap::DashSet<ChunkId>,
+        file_id: dfs_common::FileId,
+        durability_floor: usize,
+    ) -> Result<(Vec<ChunkLocation>, Vec<ChunkLocation>), anyhow::Error> {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-        let mut by_idx: std::collections::HashMap<u64, ChunkLocation> = std::collections::HashMap::new();
+        let supersedes = |a: &ChunkLocation, b: &ChunkLocation, floor: usize| Self::location_supersedes(
+            a,
+            b,
+            fold_result_chunk_ids.contains(&a.chunk_id),
+            fold_result_chunk_ids.contains(&b.chunk_id),
+            // TODO(fix-S increment 2): pass chunk_generations lookups here.
+            None,
+            None,
+            floor,
+        );
+        let mut by_idx: std::collections::HashMap<u64, Vec<ChunkLocation>> = std::collections::HashMap::new();
         metadata.scan_chunk_locations(|loc| {
             if loc.file_id == Some(file_id) {
-                let idx = loc.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE);
-                match by_idx.entry(idx) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if Self::location_supersedes(
-                            &loc,
-                            e.get(),
-                            fold_result_chunk_ids.contains(&loc.chunk_id),
-                            fold_result_chunk_ids.contains(&e.get().chunk_id),
-                            // TODO(fix-S increment 2): pass chunk_generations lookups here.
-                            None,
-                            None,
-                            durability_floor,
-                        ) {
-                            e.insert(loc);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => { e.insert(loc); }
-                }
+                by_idx.entry(loc.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE)).or_default().push(loc);
             }
             true
         })?;
-        let mut locations: Vec<ChunkLocation> = by_idx
-            .into_values()
-            .map(|loc| Self::resolve_chunk_location_for_info(metadata, &loc))
-            .collect();
+        let mut locations = Vec::with_capacity(by_idx.len());
+        let mut guard_losers = Vec::new();
+        for rows in by_idx.into_values() {
+            let mut winner = 0;
+            for i in 1..rows.len() {
+                if supersedes(&rows[i], &rows[winner], durability_floor) {
+                    winner = i;
+                }
+            }
+            for (i, row) in rows.iter().enumerate() {
+                if i != winner && !supersedes(row, &rows[winner], durability_floor) && supersedes(row, &rows[winner], 0) {
+                    guard_losers.push(row.clone());
+                }
+            }
+            locations.push(Self::resolve_chunk_location_for_info(metadata, &rows[winner]));
+        }
         locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
-        Ok(locations)
+        Ok((locations, guard_losers))
     }
 
     /// Offloaded chunk_locations_for_info. Every async caller must use this.
@@ -20591,6 +20722,95 @@ impl Server {
         tokio::task::spawn_blocking(move || Self::chunk_locations_for_info(&metadata, &fold_result_chunk_ids, file_id, durability_floor))
             .await
             .context("spawn_blocking panicked in chunk_locations_for_info_async")?
+    }
+
+    /// chunk_locations_for_info_async for a slot rebuild: a newer row the replica-count guard
+    /// kept out is asked about across the cluster, and if `durability_floor` nodes really can
+    /// serve it, its record is corrected to those holders and it takes its slot on merit.
+    ///
+    /// 10-20 staging deploy (Legata ac7a02f0): the leader's records of live tokens listed one
+    /// holder after it had pruned itself, the rebuild ranked them below older well-replicated
+    /// versions, and VM-108 disk-0 chunk 2830 went back to old content. The records' causes
+    /// are fixed; this is the check at the point a record's holder count decides which
+    /// version is current, for whatever else understates one. Holders are only ever counted
+    /// from nodes that answer yes, so an unreachable cluster leaves the guard's answer alone.
+    async fn chunk_locations_verified_async(
+        &self,
+        file_id: dfs_common::FileId,
+    ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let metadata = self.metadata.clone();
+        let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
+        let floor = self.durability_floor();
+        let (mut locations, guard_losers) = tokio::task::spawn_blocking(move || {
+            Self::chunk_locations_and_guard_losers(&metadata, &fold_result_chunk_ids, file_id, floor)
+        })
+            .await
+            .context("spawn_blocking panicked in chunk_locations_verified_async")??;
+        if guard_losers.is_empty() {
+            return Ok(locations);
+        }
+        let holders = self.nodes_that_resolve(guard_losers.iter().map(|l| l.chunk_id).collect()).await;
+        for mut row in guard_losers {
+            let Some(real) = holders.get(&row.chunk_id).filter(|h| h.len() >= floor) else { continue };
+            let listed = row.nodes.len();
+            row.nodes = real.clone();
+            let idx = row.file_offset.map(|o| o / CHUNK_SIZE);
+            let Some(pos) = locations.iter().position(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == idx) else { continue };
+            let fold = |id: &ChunkId| self.fold_result_chunk_ids.contains(id);
+            if !Self::location_supersedes(&row, &locations[pos], fold(&row.chunk_id), fold(&locations[pos].chunk_id), None, None, floor) {
+                continue;
+            }
+            info!("Slot rebuild: file {} chunk_idx {:?}: {} (seq {:?}) is held by {} node(s), not the {} its record listed; \
+                   it wins over the older {} (seq {:?}) and its record is corrected",
+                file_id, idx, row.chunk_id, row.client_write_seq, real.len(), listed, locations[pos].chunk_id,
+                locations[pos].client_write_seq);
+            if let Err(e) = self.metadata.put_chunk_location_async(row.clone()).await {
+                warn!("Slot rebuild: failed to correct the record of {}: {}", row.chunk_id, e);
+            }
+            locations[pos] = row;
+        }
+        Ok(locations)
+    }
+
+    /// For each of `ids`, the nodes that say they can serve it (HasChunks: file presence for
+    /// content, patch_state for a token), this node included. A node that doesn't answer
+    /// counts for nothing.
+    async fn nodes_that_resolve(&self, ids: Vec<ChunkId>) -> std::collections::HashMap<ChunkId, Vec<NodeId>> {
+        const HAS_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut out: std::collections::HashMap<ChunkId, Vec<NodeId>> = std::collections::HashMap::new();
+        let local_id = self.cluster.local_node_id();
+        let mut answers = vec![(local_id, self.handle_has_chunks(ids.clone()).await)];
+        let peers: Vec<_> = self.cluster.get_all_nodes().await.into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .collect();
+        let asked = futures::future::join_all(peers.iter().map(|node| {
+            let client = self.client.clone();
+            let ids = ids.clone();
+            async move {
+                match tokio::time::timeout(HAS_CHUNK_TIMEOUT,
+                    client.send_message(node.addr, Message::Request(Request::HasChunks { chunk_ids: ids }))).await {
+                    Ok(Ok(envelope)) => match envelope.message {
+                        Message::Response(r) => r,
+                        _ => Response::Ok { data: None },
+                    },
+                    _ => Response::Ok { data: None },
+                }
+            }
+        })).await;
+        answers.extend(peers.iter().map(|n| n.id).zip(asked));
+        for (node, answer) in answers {
+            let Response::BoolVec { values } = answer else { continue };
+            if values.len() != ids.len() {
+                continue;
+            }
+            for (id, present) in ids.iter().zip(values) {
+                if present {
+                    out.entry(*id).or_default().push(node);
+                }
+            }
+        }
+        out
     }
 
     /// Re-derive a file's full chunk list from authoritative CHUNK_TABLE truth
@@ -20676,9 +20896,15 @@ impl Server {
     fn is_causal_regression(current: &ChunkLocation, fresh: &ChunkLocation) -> bool {
         match (fresh.client_write_seq, current.client_write_seq) {
             (Some(fs), Some(cs)) if fs != cs => fs < cs,
-            (Some(_), Some(_)) => match (fresh.written_at, current.written_at) {
-                (Some(fw), Some(cw)) => fw < cw,
-                _ => false,
+            // Equal seq: a token never reverts its fold result, and the reverse is a
+            // revert, whatever written_at says (see fold_then_written_at).
+            (Some(_), Some(_)) => match (fresh.chunk_id.looks_like_patch_token(), current.chunk_id.looks_like_patch_token()) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => match (fresh.written_at, current.written_at) {
+                    (Some(fw), Some(cw)) => fw < cw,
+                    _ => false,
+                },
             },
             // A row with no seq losing to one that has it is the legacy case
             // location_supersedes already treats as older.
@@ -20795,7 +21021,7 @@ impl Server {
     /// reported declining had already happened — an invariant you cannot enforce from
     /// the outside is not an invariant.
     async fn re_derive_chunk_map(&self, file_id: FileId) -> (Vec<ChunkLocation>, u64) {
-        let fresh_locations = match self.chunk_locations_for_info_async(file_id).await {
+        let fresh_locations = match self.chunk_locations_verified_async(file_id).await {
             Ok(locs) => locs,
             Err(e) => {
                 warn!("re_derive_chunk_map: CHUNK_TABLE scan for file {} failed: {}", file_id, e);
@@ -22804,6 +23030,55 @@ mod tests {
         }
     }
 
+    /// A fold result must still beat its own patch token at equal seq once nothing
+    /// marks it as a fold. Staging 2026-10-21, VM-108 disk-1 chunk 768: token df7cb19f
+    /// folded to 3b2bfd5e (same cws, as fold_successor_write_seq requires). The Folded
+    /// row was GC'd, so a restart left 3b2bfd5e out of fold_result_chunk_ids, and a
+    /// holder-list prune had restamped the token's written_at to after the fold's. The
+    /// tie went to the token, which nothing could resolve any more: permanent EIO.
+    #[test]
+    fn fold_result_beats_its_token_at_equal_seq_without_the_folded_row() {
+        let node = dfs_common::NodeId::new();
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"chunk768-delta"));
+        let token_id = ChunkId::patch_token_identity(delta);
+        assert!(token_id.looks_like_patch_token());
+        let fold_hash = compute_chunk_hash(b"chunk768-fold-result");
+        let fold = ChunkLocation {
+            chunk_id: ChunkId::from_hash(fold_hash), nodes: vec![node], size: 4096,
+            checksum: fold_hash, file_offset: Some(0),
+            written_at: Some(1_792_527_778_048), client_write_seq: Some(17501), file_id: None,
+        };
+        let token = ChunkLocation {
+            chunk_id: token_id, checksum: token_id.hash,
+            written_at: Some(1_792_528_022_088), // restamped by the prune, after the fold
+            ..fold.clone()
+        };
+        let floor = dfs_common::types::write_quorum(3);
+        assert!(Server::location_supersedes(&fold, &token, false, false, None, None, floor),
+            "the fold result must supersede its token at equal seq");
+        assert!(!Server::location_supersedes(&token, &fold, false, false, None, None, floor),
+            "the token must not supersede its own fold result at equal seq");
+        assert!(!Server::is_causal_regression(&token, &fold),
+            "moving a slot from a token to its fold result is not a revert");
+        assert!(Server::is_causal_regression(&fold, &token),
+            "moving a slot from a fold result back to its token is a revert");
+
+        for (order_name, order) in [("token-then-fold", [&token, &fold]), ("fold-then-token", [&fold, &token])] {
+            let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+            let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+            let fold_ids: Arc<dashmap::DashSet<ChunkId>> = Arc::new(dashmap::DashSet::new());
+            let file_id = dfs_common::FileId::new();
+            for loc in order {
+                let mut l = loc.clone();
+                l.file_id = Some(file_id);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id, &l, floor);
+            }
+            let entry = chunk_map.get(&file_id).unwrap();
+            assert_eq!(entry.value().0[0].chunk_id, fold.chunk_id,
+                "[{}] a restart's chunk_map rebuild must keep the fold result, not the token", order_name);
+        }
+    }
+
     /// Anti-noop guard (test 2 in the plan, the T28 trap): origin only ever
     /// applies AT equal seq. A genuine later client write (strictly higher seq)
     /// must win outright regardless of origin — otherwise a fold's result could
@@ -23227,6 +23502,43 @@ mod tests {
         #[test]
         fn exactly_at_floor_does_not_skip() {
             assert!(!Server::should_skip_periodic_compaction_under_load(20, 0));
+        }
+    }
+
+    /// VM-108 disk-1 chunk 666 (10-21): a node whose slot names folded token T must not
+    /// call T held on the strength of its Folded row alone, and must protect T's result R:
+    /// R is the slot's content. Every node answering "T held, R unprotected" deleted R.
+    #[tokio::test]
+    async fn superseded_check_protects_the_fold_result_of_the_slots_token() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(NodeId::new(), "127.0.0.1:8900".parse().unwrap(), 10, 30));
+        let server = Server::new(storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster, 1,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        let mut t = [0x66u8; 32];
+        t[0] = 0xdf;
+        t[1] = 0x7c;
+        let (token, result) = (ChunkId::from_hash(t), ChunkId::from_hash([0x6a; 32]));
+        metadata.update_patch_state_folded(&token, result).unwrap();
+        storage.write_chunk(&result, b"live").unwrap();
+        let loc = ChunkLocation {
+            chunk_id: token, nodes: vec![], size: 4, checksum: token.hash, file_offset: Some(0),
+            written_at: None, client_write_seq: None, file_id: Some(file_id),
+        };
+        server.chunk_map.insert(file_id, (vec![loc], 1));
+
+        match server.handle_check_superseded_chunks(vec![(result, file_id, 0)]).await {
+            Response::SupersededCheck { current, holds, protected, .. } => {
+                assert_eq!(current, vec![Some(token)]);
+                assert!(protected[0], "BUG: the fold result of the slot's own token is unprotected");
+                assert!(!holds[0], "BUG: the token counts as held only through the very copy being judged");
+            }
+            other => panic!("unexpected response {:?}", other),
         }
     }
 
@@ -25513,6 +25825,94 @@ mod tests {
     /// order. The logically-later write (seq 200) must win the overlap on BOTH
     /// replicas regardless of arrival order — but today, whichever one is applied
     /// SECOND wins, so reversing arrival order reverses the result.
+    /// Fix A keeps the guard's job: a newer record that really reached one node (the VM-111
+    /// phantom, 2026-07-27) still loses its slot rebuild to the older well-replicated version.
+    /// Only nodes that answer yes count as holders, and here only this node can answer.
+    #[tokio::test]
+    async fn slot_rebuild_still_rejects_a_newer_record_only_one_node_holds() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+        let file_id = dfs_common::FileId::new();
+        let content = vec![7u8; 64];
+        // The older version sorts first, so the newer one meets the guard as the scan reaches it.
+        let mut old_hash = [0u8; 32];
+        old_hash[0] = 0x01;
+        let old = ChunkId::from_hash(old_hash);
+        let mut new_hash = [0u8; 32];
+        new_hash[0] = 0x02;
+        let newer = ChunkId::from_hash(new_hash);
+        storage.write_chunk(&newer, &content).unwrap();
+        let row = |id: ChunkId, nodes: Vec<NodeId>, seq: u64| ChunkLocation {
+            chunk_id: id, nodes, size: content.len(), checksum: id.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: Some(seq), file_id: Some(file_id),
+        };
+        metadata.put_chunk_location(&row(old, vec![NodeId::new(), NodeId::new(), NodeId::new()], 1)).unwrap();
+        metadata.put_chunk_location(&row(newer, vec![node_id], 2)).unwrap();
+
+        let locs = server.chunk_locations_verified_async(file_id).await.unwrap();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].chunk_id, old, "a newer record held by one node must not win the rebuild");
+        assert_eq!(metadata.get_chunk_location(&newer).unwrap().map(|l| l.nodes.len()), Some(1),
+            "its record must not be rewritten either");
+    }
+
+    /// A patch moves its slot's chunk_map entry from the base to the token, and every later
+    /// patch to the next token; chunk_to_file must move with it. It didn't: the leader kept the
+    /// base in chunk_to_file, ConfirmChunksLive (which trusts chunk_to_file) called it live
+    /// forever, and the other holders' copies of every old version leaked (T85a, 10-21).
+    #[tokio::test]
+    async fn apply_patch_moves_chunk_to_file_from_the_base_to_the_token() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+        let file_id = dfs_common::FileId::new();
+        let base_content = vec![0u8; 64];
+        let base = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base_content, 0, file_id));
+        storage.write_chunk(&base, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base, base).unwrap();
+        let base_loc = ChunkLocation {
+            chunk_id: base, nodes: vec![node_id], size: base_content.len(), checksum: base.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        metadata.put_chunk_location(&base_loc).unwrap();
+        server.commit_chunk_map(file_id, vec![base_loc], 1);
+
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token1, ..) = server.apply_patch(
+            Some(lock), base, file_id, Some(0), 0, vec![(10, vec![0xAA; 4])], Some(2), None, false, None,
+        ).await.expect("first apply_patch");
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token2, ..) = server.apply_patch(
+            Some(lock), token1, file_id, Some(0), 0, vec![(20, vec![0xBB; 4])], Some(3), None, false, None,
+        ).await.expect("second apply_patch (merge)");
+
+        let slot = server.chunk_map.get(&file_id).map(|e| e.value().0[0].chunk_id);
+        assert_eq!(slot, Some(token2), "the slot names the latest token");
+        assert!(!server.chunk_to_file.contains_key(&base), "chunk_to_file still names the base the slot left");
+        assert!(!server.chunk_to_file.contains_key(&token1), "chunk_to_file still names the retired token");
+        assert_eq!(server.chunk_to_file.get(&token2).map(|e| *e.value()), Some(file_id),
+            "chunk_to_file lacks the token the slot names");
+    }
+
     #[tokio::test]
     async fn test_concurrent_overlapping_patches_diverge_by_arrival_order() {
         // Runs one full "replica": writes a base chunk, applies `first` then `second`

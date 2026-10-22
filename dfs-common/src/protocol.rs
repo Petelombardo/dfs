@@ -1331,6 +1331,14 @@ pub enum Request {
     /// started (Phase 5 gate: leader RPCs per client write). Answered with `RequestCounts`.
     /// APPENDED at end to preserve wire compatibility.
     GetRequestCounts,
+
+    /// Test-only (DFS_FAULT_INJECTION=1): store `location` in this node's CHUNK_TABLE as
+    /// given, replacing any row for its chunk_id: a record that understates a chunk's
+    /// holders, or an old version's row the patch path retired (suite T100e). APPENDED at
+    /// end to preserve wire compatibility.
+    InjectChunkLocation {
+        location: ChunkLocation,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

@@ -982,7 +982,7 @@ for _ in $(seq 1 90); do
     [ "$T85_LEFT" = 0 ] && break
     sleep 2
 done
-T85_DELETED=$(cat "$LOG"/server*.log | grep -c "Superseded cleanup: .* old version(s) deleted" || true)
+T85_DELETED=$(cat "$LOG"/server*.log | grep -cE "Superseded cleanup: .* old version\(s\) deleted|Live-file orphan sweep: evicted" || true)
 [ "$T85_OLD_N" -gt 0 ] && [ "$T85_LEFT" = 0 ] \
     && check "T85a all ${T85_OLD_N} old version(s) of the rewritten file's chunks deleted from every node" PASS \
     || check "T85a ${T85_LEFT} of ${T85_OLD_N} old version(s) still on disk after 180s (cleanup passes logged: $T85_DELETED)" FAIL
@@ -2268,6 +2268,276 @@ PY
     rm -f "$MOUNT/$T99_FILE"
 fi
 fi # should_run T99
+
+# ── T100: phantom reconciliation never prunes a holder that can resolve a live patch token ──
+# 2026-10-20 staging: the leader checked its OWN presence by listing raw chunk files, while it
+# asks peers with HasChunks (which resolves a token through patch_state). A patch token has no
+# raw file, so the leader pruned itself from every live token it held: gluster1 cut itself
+# from df7cb9f6 at 17:47Z, leaving 2-holder patches recorded at 1 holder. The durability guard
+# then ranked those below older well-replicated records, and the 10-21 deploy's re-derive
+# walked VM-108 disk-0 chunk 2830 back to an older version. Folds are held so the tokens stay
+# live; the leader's own CHUNK_TABLE record must still list the leader after a pass.
+snapshot_log T100
+if should_run T100; then
+echo "=== T100: phantom reconciliation keeps the leader as a holder of a live patch token ==="
+t85_kill_all
+t85_start_all "DFS_DESTRUCTIVE_GRACE_SECS=0 DFS_PHANTOM_RECONCILE_INTERVAL_SECS=100000"
+t85_wait_ready || echo "  T100: cluster not fully healthy 30s after the restart"
+sleep 5
+T100_LADDR=""
+for _ in $(seq 1 30); do T100_LADDR=$(t88_leader "$CLUSTER") || true; [ -n "$T100_LADDR" ] && break; sleep 1; done
+T100_LID=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node']) for r in map(json.loads, sys.stdin) if r.get('addr') == sys.argv[1]]" "$T100_LADDR" 2>/dev/null | head -1)
+"$BIN/dfs-admin" --cluster "$CLUSTER" fault slow-fold --millis 300000 --count 100 >/dev/null 2>&1 || true
+dd if=/dev/urandom of="$T/t100.bin" bs=4M count=12 status=none
+cp "$T/t100.bin" "$MOUNT/t100.bin"; dfs_sync
+if [ "${DFS_ORDERED_WRITES:-0}" = 1 ] && [ -n "$T100_LID" ]; then
+    # Put the leader in every pair, as primary of the even chunks and secondary of the odd: the two
+    # shapes whose heads the leader never got a digest for.
+    T100_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+    T100_PEER=$("$BIN/dfs-admin" --cluster "$T100_ALL" --format json lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node']) for r in map(json.loads, sys.stdin) if r.get('node') != sys.argv[1]]" "$T100_LID" 2>/dev/null | head -1)
+    for _ in $(seq 1 30); do
+        "$BIN/dfs-admin" --cluster "$T100_LADDR" isr get --file /t100.bin --chunks 12 >/dev/null 2>&1 && break
+        sleep 1
+    done
+    for c in $(seq 0 11); do
+        if [ $((c % 2)) = 0 ]; then m="$T100_LID,$T100_PEER"; else m="$T100_PEER,$T100_LID"; fi
+        "$BIN/dfs-admin" --cluster "$T100_ALL" isr propose --file /t100.bin --chunk $c --members "$m" >>"$LOG/t100_isr.log" 2>&1 || true
+    done
+fi
+T100_OUT=$(timeout 120 python3 - "$MOUNT/t100.bin" "$T/t100.bin" 2>>"$LOG/t100.err" <<'PY'
+import os, sys
+res = []
+for c in range(12):
+    x = os.urandom(65536); off = c * 4 * 1024 * 1024 + 8192
+    fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, off)
+    try:
+        os.fsync(fd); res.append("ok")
+    except OSError as e:
+        res.append("err%d" % e.errno)
+    os.close(fd)
+    with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+print(" ".join(res))
+PY
+) || true
+dfs_sync
+sleep 3
+echo "  T100: leader=$T100_LADDR (${T100_LID:0:8}) patch fsyncs: $T100_OUT"
+T100_TOKEN="" T100_BEFORE=""
+for c in $(seq 0 11); do
+    tok=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json file info /t100.bin 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][$c]['chunk_id'])" 2>/dev/null || true)
+    raw=$("$BIN/dfs-admin" --cluster "$T100_LADDR" file raw-location "$tok" 2>/dev/null | head -1)
+    echo "  T100 chunk $c: ${tok:0:12} leader record: $(echo "$raw" | grep -oE 'nodes=\[[^]]*\]' | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g')"
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+        # T100c: an ordered head's record names its whole pair. An apply records only the node
+        # that applied it; the primary's head digest adds the rest, and a leader that was the
+        # primary (or the secondary, with its map already advanced) never got one (10-21 ON
+        # run: every head read [leader]). Fewer holders than the write reached makes the
+        # durability guard rank older rows above it.
+        isr=$("$BIN/dfs-admin" --cluster "$T100_LADDR" isr get --file /t100.bin --chunks 12 2>/dev/null | python3 -c "
+import json,sys
+r=json.loads(sys.stdin.readline())['isr'][$c]
+print(' '.join(m[:8] for m in r['members']) if r else '')" 2>/dev/null || true)
+        missing=""
+        for m in $isr; do echo "$raw" | grep -q "NodeId($m" || missing="$missing $m"; done
+        [ -n "$isr" ] && [ -z "$missing" ] \
+            && check "T100c chunk $c head record lists its ISR ($isr)" PASS \
+            || check "T100c chunk $c head record lacks ISR member(s)${missing:- (no ISR)} (ISR: ${isr:-none})" FAIL
+    fi
+    if [ -z "$T100_TOKEN" ] && [ -n "$T100_LID" ] && echo "$tok" | grep -q '^df7c' && echo "$raw" | grep -q "$T100_LID" \
+        && [ "$(echo "$raw" | grep -oE 'nodes=\[[^]]*\]' | grep -o 'NodeId' | wc -l)" -ge 2 ]; then
+        T100_TOKEN=$tok T100_BEFORE=$raw
+    fi
+done
+# Unordered placement keeps new data off the leader (10-21: all 12 chunks on the other three
+# nodes, and leadership only moved between the two non-holders). Stop every node holding none
+# of the file so a holder must lead, then bring them back, as on staging where the leader holds
+# data written before it led.
+T100_TRY=0
+while [ -z "$T100_TOKEN" ] && [ "${DFS_ORDERED_WRITES:-0}" != 1 ] && [ $T100_TRY -lt 2 ]; do
+    T100_TRY=$((T100_TRY + 1))
+    T100_HOLDERS=$(for c in $(seq 0 11); do
+        tok=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json file info /t100.bin 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][$c]['chunk_id'])" 2>/dev/null || true)
+        "$BIN/dfs-admin" --cluster "$T100_LADDR" file raw-location "$tok" 2>/dev/null | head -1 | grep -oE 'NodeId\([0-9a-f-]+' | sed 's/NodeId(//'
+    done | sort -u | tr '\n' ' ')
+    T100_STOP=""
+    for i in 1 2 3 4 5; do
+        id=$("$BIN/dfs-admin" --cluster "127.0.0.1:$((8899 + i))" --format json lease status 2>/dev/null \
+            | python3 -c "import json,sys; [print(r['node']) for r in map(json.loads, sys.stdin) if r.get('addr') == sys.argv[1]]" "127.0.0.1:$((8899 + i))" 2>/dev/null | head -1)
+        [ -n "$id" ] && ! echo "$T100_HOLDERS" | grep -q "$id" && T100_STOP="$T100_STOP $i"
+    done
+    echo "  T100: the leader holds none of the file's chunks; stopping non-holder node(s)$T100_STOP so a holder leads (try $T100_TRY)"
+    for i in $T100_STOP; do pkill -f -- "--config $BASE/node$i/config.toml" || true; done
+    T100_NEW=""
+    for _ in $(seq 1 40); do
+        T100_NEW=$(t88_leader "$CLUSTER") || true
+        [ -n "$T100_NEW" ] && ! echo " $T100_STOP " | grep -q " $(( ${T100_NEW##*:} - 8899 )) " && break
+        T100_NEW=""; sleep 1
+    done
+    [ -n "$T100_NEW" ] || break
+    # Bring back one stopped node (a pass tolerates one down); if it takes leadership back,
+    # stop it again and bring back the other. Teardown restarts the whole cluster.
+    for i in $T100_STOP; do
+        env DFS_DESTRUCTIVE_GRACE_SECS=0 DFS_PHANTOM_RECONCILE_INTERVAL_SECS=100000 RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 \
+            "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" >> "$LOG/server${i}.log" 2>&1 &
+        sleep 10
+        T100_NEW=$(t88_leader "$CLUSTER") || true
+        [ -n "$T100_NEW" ] && [ "$(( ${T100_NEW##*:} - 8899 ))" != "$i" ] && break
+        pkill -f -- "--config $BASE/node$i/config.toml" || true
+        sleep 5
+        T100_NEW=$(t88_leader "$CLUSTER") || true
+    done
+    [ -n "$T100_NEW" ] || break
+    T100_LADDR=$T100_NEW
+    T100_LID=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node']) for r in map(json.loads, sys.stdin) if r.get('addr') == sys.argv[1]]" "$T100_LADDR" 2>/dev/null | head -1)
+    for c in $(seq 0 11); do
+        tok=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json file info /t100.bin 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][$c]['chunk_id'])" 2>/dev/null || true)
+        raw=$("$BIN/dfs-admin" --cluster "$T100_LADDR" file raw-location "$tok" 2>/dev/null | head -1)
+        if [ -n "$T100_LID" ] && echo "$tok" | grep -q '^df7c' && echo "$raw" | grep -q "$T100_LID" \
+            && [ "$(echo "$raw" | grep -oE 'nodes=\[[^]]*\]' | grep -o 'NodeId' | wc -l)" -ge 2 ]; then
+            T100_TOKEN=$tok T100_BEFORE=$raw
+            echo "  T100: leader now $T100_LADDR (${T100_LID:0:8}); chunk $c token ${tok:0:12} lists it"
+            break
+        fi
+    done
+done
+if [ -z "$T100_TOKEN" ] && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+    # Ordered writes pick the pair per chunk; with no pair including the leader there is nothing
+    # here for the pass to prune.
+    echo "  T100: no live token recorded at 2+ holders including the leader (ordered writes); T100a not applicable"
+elif [ -z "$T100_TOKEN" ]; then
+    check "T100 setup: a live patch token whose leader record lists the leader among 2+ holders" FAIL
+else
+    T100_MARK=$(wc -l < "$LOG/server$(( ${T100_LADDR##*:} - 8899 )).log")
+    "$BIN/dfs-admin" --cluster "$T100_LADDR" healing reconcile >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+        tail -n +"$T100_MARK" "$LOG/server$(( ${T100_LADDR##*:} - 8899 )).log" | grep -q "Phantom reconciliation: verifying presence" && break
+        sleep 1
+    done
+    sleep 8
+    T100_AFTER=$("$BIN/dfs-admin" --cluster "$T100_LADDR" file raw-location "$T100_TOKEN" 2>/dev/null | head -1)
+    tail -n +"$T100_MARK" "$LOG/server$(( ${T100_LADDR##*:} - 8899 )).log" | grep "Phantom reconciliation" | cut -c1-220 | sed 's/^/  T100 log: /' | head -5
+    echo "$T100_AFTER" | grep -q "$T100_LID" \
+        && check "T100a the leader is still a listed holder of live token ${T100_TOKEN:0:12} after a phantom pass" PASS \
+        || check "T100a the phantom pass pruned the leader from live token ${T100_TOKEN:0:12} (before: $(echo "$T100_BEFORE" | grep -oE 'nodes=\[[^]]*\]' | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g') after: $(echo "$T100_AFTER" | grep -oE 'nodes=\[[^]]*\]' | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g'))" FAIL
+    if [ "${DFS_ORDERED_WRITES:-0}" != 1 ]; then
+        # T100d: a token record that lost a holder gets it back. Staging still has records the
+        # old self-prune left at one holder, and nothing re-added a holder to a token. Make one:
+        # the leader's location registrations fail while it applies a patch to a chunk it
+        # holds, so its record names only itself, though the other holder applied it too.
+        T100_C=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json file info /t100.bin 2>/dev/null \
+            | python3 -c "import json,sys; print([c['chunk_id'] for c in json.load(sys.stdin)['chunk_locations']].index(sys.argv[1]))" "$T100_TOKEN" 2>/dev/null || true)
+        "$BIN/dfs-admin" --cluster "$T100_LADDR" fault fail-locations --millis 40000 >/dev/null 2>&1 || true
+        timeout 60 python3 - "$MOUNT/t100.bin" "$T/t100.bin" "${T100_C:-0}" 2>>"$LOG/t100.err" <<'PY' || true
+import os, sys
+x = os.urandom(65536); off = int(sys.argv[3]) * 4 * 1024 * 1024 + 131072
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, off)
+try:
+    os.fsync(fd)
+except OSError:
+    pass
+os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+PY
+        sleep 41
+        T100_D=$("$BIN/dfs-admin" --cluster "$T100_LADDR" --format json file info /t100.bin 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][$T100_C]['chunk_id'])" 2>/dev/null || true)
+        T100_DB=$("$BIN/dfs-admin" --cluster "$T100_LADDR" file raw-location "$T100_D" 2>/dev/null | head -1 | grep -oE 'nodes=\[[^]]*\]' | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g')
+        echo "  T100d: chunk $T100_C token ${T100_D:0:12} leader record before the pass: $T100_DB"
+        if [ "$T100_D" = "$T100_TOKEN" ] || ! echo "$T100_D" | grep -q '^df7c' || [ "$(echo "$T100_DB" | tr ',' '\n' | grep -c .)" -ge 2 ]; then
+            check "T100d setup: a live token whose leader record names only the leader (got ${T100_D:0:12} $T100_DB)" FAIL
+        else
+            T100_MARK=$(wc -l < "$LOG/server$(( ${T100_LADDR##*:} - 8899 )).log")
+            "$BIN/dfs-admin" --cluster "$T100_LADDR" healing reconcile >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+                tail -n +"$T100_MARK" "$LOG/server$(( ${T100_LADDR##*:} - 8899 )).log" | grep -q "Phantom reconciliation: verifying presence" && break
+                sleep 1
+            done
+            sleep 8
+            T100_DA=$("$BIN/dfs-admin" --cluster "$T100_LADDR" file raw-location "$T100_D" 2>/dev/null | head -1 | grep -oE 'nodes=\[[^]]*\]' | sed -E 's/NodeId\(([0-9a-f]{8})[^)]*\)/\1/g')
+            [ "$(echo "$T100_DA" | tr ',' '\n' | grep -c .)" -ge 2 ] \
+                && check "T100d a phantom pass restores the token's missing holder ($T100_DB -> $T100_DA)" PASS \
+                || check "T100d the token's record still lacks its other holder after a phantom pass ($T100_DB -> $T100_DA)" FAIL
+        fi
+    fi
+fi
+"$BIN/dfs-admin" --cluster "$CLUSTER" fault slow-fold --millis 0 --count 0 >/dev/null 2>&1 || true
+T100_WANT=$(md5sum < "$T/t100.bin" | cut -d' ' -f1)
+T100_GOT=$(timeout 60 md5sum < "$MOUNT/t100.bin" 2>/dev/null | cut -d' ' -f1)
+[ "$T100_GOT" = "$T100_WANT" ] && check "T100b the patched file reads back intact" PASS \
+    || check "T100b patched file read (exp $T100_WANT got ${T100_GOT:-nothing})" FAIL
+rm -f "$MOUNT/t100.bin" "$T/t100.bin"
+t85_kill_all
+t85_start_all ""
+t85_wait_ready || echo "  T100: cluster not fully healthy 30s after restoring normal settings"
+fi # should_run T100
+
+# ── T100e: a slot rebuild doesn't let an older version beat a newer patch on a short holder list ──
+# 10-20 staging deploy: the leader rebuilt slots from CHUNK_TABLE, its record of the newer patch
+# listed one holder (the old self-prune), and the replica-count guard let the older,
+# well-replicated version win: VM-108 disk-0 chunk 2830 went back to old content. Plant both rows
+# on the leader (the old version's, as it stood, and the patch's at one holder), rebuild the slot,
+# and the patch must still win, its record corrected to the holders that really have it.
+snapshot_log T100e
+if should_run T100e; then
+echo "=== T100e: a slot rebuild keeps a newer patch whose record lists too few holders ==="
+T100E_L=""
+for _ in $(seq 1 30); do T100E_L=$(t88_leader "$CLUSTER") || true; [ -n "$T100E_L" ] && break; sleep 1; done
+t100e_cur() {
+    "$BIN/dfs-admin" --cluster "$T100E_L" --format json file info /t100e.bin 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][0]['chunk_id'])" 2>/dev/null
+}
+t100e_row() {
+    "$BIN/dfs-admin" --cluster "$T100E_L" --format json file raw-location "$1" 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline()); print(json.dumps(r['location']) if r.get('location') else '')" 2>/dev/null
+}
+# The rebuild walks a file's rows in chunk-id order and the guard only rules on a row that
+# arrives after the current pick, so the older row must sort first (any id below df7c).
+for _ in 1 2 3 4 5; do
+    rm -f "$MOUNT/t100e.bin"
+    dd if=/dev/urandom of="$T/t100e.bin" bs=1M count=4 status=none
+    cp "$T/t100e.bin" "$MOUNT/t100e.bin"
+    dfs_sync
+    sleep 2
+    T100E_BASE=$(t100e_cur)
+    [[ "$T100E_BASE" < "df7c" ]] && break
+done
+T100E_BASE_ROW=$(t100e_row "$T100E_BASE")
+python3 - "$MOUNT/t100e.bin" "$T/t100e.bin" 2>>"$LOG/t100e.err" <<'PY' || true
+import os, sys
+x = os.urandom(65536)
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, 131072); os.fsync(fd); os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(131072); f.write(x)
+PY
+dfs_sync
+sleep 2
+T100E_TOK=$(t100e_cur)
+T100E_TOK_ROW=$(t100e_row "$T100E_TOK")
+T100E_N=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null || echo 0)
+echo "  T100e: leader $T100E_L base ${T100E_BASE:0:12} patch ${T100E_TOK:0:12} (${T100E_N} holder(s) recorded)"
+if [ -z "$T100E_BASE_ROW" ] || ! echo "$T100E_TOK" | grep -q '^df7c' || [ "$T100E_N" -lt 2 ]; then
+    check "T100e setup: a fresh chunk's row, then a live patch token recorded at 2+ holders (base ${T100E_BASE:0:12} patch ${T100E_TOK:0:12} holders $T100E_N)" FAIL
+else
+    T100E_SHORT=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; r=json.load(sys.stdin); r['nodes']=r['nodes'][:1]; print(json.dumps(r))")
+    "$BIN/dfs-admin" --cluster "$T100E_L" fault plant-location --json "$T100E_BASE_ROW" >>"$LOG/t100e.err" 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T100E_L" fault plant-location --json "$T100E_SHORT" >>"$LOG/t100e.err" 2>&1 || true
+    T100E_FID=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; print(json.load(sys.stdin)['file_id'])")
+    T100E_GOT=$("$BIN/dfs-admin" --cluster "$T100E_L" file revalidate --file-id "$T100E_FID" --chunk 0 --distrust "$T100E_TOK" 2>>"$LOG/t100e.err")
+    [ "$T100E_GOT" = "$T100E_TOK" ] \
+        && check "T100e the rebuilt slot keeps the newer patch ${T100E_TOK:0:12} over the older ${T100E_BASE:0:12}" PASS \
+        || check "T100e the rebuilt slot went back to ${T100E_GOT:0:12} (patch ${T100E_TOK:0:12}, older ${T100E_BASE:0:12})" FAIL
+    T100E_AFTER=$(t100e_row "$T100E_TOK" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null || echo 0)
+    [ "$T100E_AFTER" -ge 2 ] \
+        && check "T100f the patch's record lists its real holders again (1 -> $T100E_AFTER)" PASS \
+        || check "T100f the patch's record still lists $T100E_AFTER holder(s) after the rebuild" FAIL
+fi
+rm -f "$MOUNT/t100e.bin" "$T/t100e.bin"
+fi # should_run T100e
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

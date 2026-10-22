@@ -1639,6 +1639,34 @@ impl HealingManager {
         self.run_phantom_reconciliation_pass_inner().await;
     }
 
+    /// The chunks of `assigned` this node holds, answered the way a peer's HasChunks
+    /// answers: raw files from one directory walk (spawn_blocking, see the 2026-06-20
+    /// freeze in the callers' comments), plus patch tokens through PATCH_STATE_TABLE,
+    /// since a token has no raw file. With the raw listing alone the leader found itself
+    /// "absent" from every live token it held and pruned itself whenever a peer
+    /// confirmed. Staging 2026-10-20: gluster1 cut itself from df7cb9f6, the 2-holder
+    /// patch read as 1 holder, the durability guard ranked an older record above it, and
+    /// a re-derive walked VM-108 disk-0 chunk 2830 back (suite T100).
+    ///
+    /// None when either lookup fails: unknown, not absent, so this node gives no verdict.
+    async fn local_chunk_presence(&self, assigned: &[ChunkId], pass: &str) -> Option<HashSet<ChunkId>> {
+        let storage = self.storage.clone();
+        let mut set = match tokio::task::spawn_blocking(move || {
+            storage.list_chunks().map(|v| v.into_iter().collect::<HashSet<_>>())
+        }).await {
+            Ok(Ok(set)) => set,
+            Ok(Err(e)) => { warn!("{}: local chunk listing failed: {}", pass, e); return None; }
+            Err(e) => { warn!("{}: local chunk listing panicked: {}", pass, e); return None; }
+        };
+        let tokens: Vec<ChunkId> = assigned.iter().copied()
+            .filter(|id| id.looks_like_patch_token() && !set.contains(id))
+            .collect();
+        match self.metadata.get_patch_states_present_batch_async(tokens).await {
+            Ok(resolvable) => { set.extend(resolvable); Some(set) }
+            Err(e) => { warn!("{}: local patch_state lookup failed: {}", pass, e); None }
+        }
+    }
+
     async fn run_phantom_reconciliation_pass_inner(&self) {
         if !self.cluster.is_leader().await {
             return;
@@ -1653,11 +1681,17 @@ impl HealingManager {
         let nodes_down = total_nodes.saturating_sub(online_nodes.len());
 
         let grace_elapsed = self.cluster.time_since_became_leader().await
-            .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+            .map_or(true, |d| d.as_secs() >= destructive_grace_secs());
 
-        if nodes_down > 1 || !grace_elapsed {
-            debug!("Phantom reconciliation: skipping — nodes_down={} grace_elapsed={}", nodes_down, grace_elapsed);
+        if nodes_down > 1 {
+            debug!("Phantom reconciliation: skipping — nodes_down={}", nodes_down);
             return;
+        }
+        // Within the grace only holders are restored, never pruned: adding a node that just
+        // answered yes destroys nothing, and a restart (a deploy) is exactly when a rebuild
+        // reads the records and the durability guard punishes a short holder list.
+        if !grace_elapsed {
+            debug!("Phantom reconciliation: within the leader-change grace — restoring holders only");
         }
 
         let local_id = self.cluster.local_node_id();
@@ -1666,30 +1700,41 @@ impl HealingManager {
         // live file (same liveness source as the deep discovery scan) with more
         // than one listed node — a single-node record can't have a "phantom" to
         // prune without risking stranding the chunk at zero replicas.
+        //
+        // Patch tokens listing fewer holders than write_quorum go to a second list, to be
+        // asked of every node instead: a holder can drop off a token's record (an apply
+        // records only the node that applied it; before 2026-10-21 the leader also pruned
+        // itself, see local_chunk_presence) and nothing else ever adds it back. Ordinary
+        // chunks get that from the deep discovery pass, which skips tokens.
+        let floor = dfs_common::types::write_quorum(self.replication_factor.load(Ordering::Relaxed));
         let metadata = self.metadata.clone();
-        let scan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChunkLocation>> {
+        let scan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<ChunkLocation>, Vec<ChunkLocation>)> {
             // Combined single CHUNK_TABLE pass — see scan_live_chunk_locations's doc
             // comment (was two full scans: live_chunk_ids then scan_chunk_locations).
             let mut chunks = Vec::new();
+            let mut understated = Vec::new();
             metadata.scan_live_chunk_locations(|loc| {
-                if loc.nodes.len() > 1 {
+                if loc.chunk_id.looks_like_patch_token() && loc.nodes.len() < floor {
+                    understated.push(loc);
+                } else if loc.nodes.len() > 1 {
                     chunks.push(loc);
                 }
             })?;
-            Ok(chunks)
+            Ok((chunks, understated))
         }).await;
 
-        let chunks_to_check = match scan_result {
-            Ok(Ok(v)) => v,
+        let (chunks_to_check, understated_tokens) = match scan_result {
+            Ok(Ok((chunks, understated))) => (if grace_elapsed { chunks } else { Vec::new() }, understated),
             Ok(Err(e)) => { warn!("Phantom reconciliation: scan error: {}", e); return; }
             Err(e) => { warn!("Phantom reconciliation: scan panicked: {}", e); return; }
         };
 
-        if chunks_to_check.is_empty() {
+        if chunks_to_check.is_empty() && understated_tokens.is_empty() {
             return;
         }
 
-        info!("Phantom reconciliation: verifying presence for {} chunks", chunks_to_check.len());
+        info!("Phantom reconciliation: verifying presence for {} chunks ({} understated token(s))",
+            chunks_to_check.len() + understated_tokens.len(), understated_tokens.len());
 
         // Build per-node assignment, scoped like the discovery pass — each node is
         // only asked about chunks it's actually listed for.
@@ -1697,6 +1742,11 @@ impl HealingManager {
         for loc in &chunks_to_check {
             for &node_id in &loc.nodes {
                 node_assigned.entry(node_id).or_default().push(loc.chunk_id);
+            }
+        }
+        for loc in &understated_tokens {
+            for node in &online_nodes {
+                node_assigned.entry(node.id).or_default().push(loc.chunk_id);
             }
         }
 
@@ -1709,15 +1759,9 @@ impl HealingManager {
         // lookups, and it still must run in spawn_blocking since it's real disk I/O
         // (the inline version of the per-chunk loop froze the leader for ~2.5 hours
         // with zero log output — incident 2026-06-20).
-        if node_assigned.contains_key(&local_id) {
-            let storage = self.storage.clone();
-            let local_set = tokio::task::spawn_blocking(move || {
-                storage.list_chunks().map(|v| v.into_iter().collect::<HashSet<_>>())
-            }).await;
-            match local_set {
-                Ok(Ok(set)) => { node_chunk_presence.insert(local_id, set); }
-                Ok(Err(e)) => warn!("Phantom reconciliation: local chunk listing failed: {}", e),
-                Err(e) => warn!("Phantom reconciliation: local chunk listing panicked: {}", e),
+        if let Some(assigned) = node_assigned.get(&local_id) {
+            if let Some(set) = self.local_chunk_presence(assigned, "Phantom reconciliation").await {
+                node_chunk_presence.insert(local_id, set);
             }
         }
 
@@ -1864,6 +1908,27 @@ impl HealingManager {
 
             db_puts.push(updated.clone());
             broadcasts.push(updated);
+        }
+
+        // Add back every node that resolves an understated token. Only ever adds a node
+        // that answered yes for this exact token, so the record moves toward the truth and
+        // never away from it. written_at is kept: it is the write's time, not this edit's,
+        // and a restamped token must not look newer than its own fold result.
+        for loc in understated_tokens {
+            let found: Vec<NodeId> = online_nodes.iter()
+                .map(|n| n.id)
+                .filter(|id| !loc.nodes.contains(id))
+                .filter(|id| node_chunk_presence.get(id).is_some_and(|s| s.contains(&loc.chunk_id)))
+                .collect();
+            if found.is_empty() {
+                continue;
+            }
+            info!("Phantom reconciliation: token {} lists {:?} but also resolves on {:?} — restoring holders",
+                loc.chunk_id, loc.nodes, found);
+            let mut restored = loc.clone();
+            restored.nodes.extend(found);
+            db_puts.push(restored.clone());
+            broadcasts.push(restored);
         }
 
         let pruned_count = db_puts.len();
@@ -2426,7 +2491,7 @@ impl HealingManager {
         };
         let mut moved = 0usize;
         for (chunk, file_id, idx) in &authorized {
-            if chunk.looks_like_patch_token() || self.slot_current(*file_id, *idx) == Some(*chunk) {
+            if chunk.looks_like_patch_token() || self.slot_names(*file_id, *idx, *chunk).await {
                 continue;
             }
             match self.storage.move_superseded_aside(chunk, *file_id, *idx) {
@@ -2436,6 +2501,17 @@ impl HealingManager {
         }
         info!("Superseded cleanup: {} of {} candidate(s) confirmed old by every node; {} moved aside for deletion",
             authorized.len(), ready.len(), moved);
+    }
+
+    /// Whether slot (file_id, chunk_idx) names `chunk` here: directly, or as the fold
+    /// result of the patch token it names (that token's content IS `chunk`).
+    async fn slot_names(&self, file_id: FileId, chunk_idx: u64, chunk: ChunkId) -> bool {
+        match self.slot_current(file_id, chunk_idx) {
+            Some(cur) if cur == chunk => true,
+            Some(cur) if cur.looks_like_patch_token() => matches!(self.metadata.get_patch_state_async(cur).await,
+                Ok(Some(crate::metadata::PatchState::Folded(result))) if result == chunk),
+            _ => false,
+        }
     }
 
     /// This node's current chunk for slot (file_id, chunk_idx), from its chunk map.
@@ -2527,7 +2603,7 @@ impl HealingManager {
         }
         let (mut gone, mut back) = (Vec::new(), 0usize);
         for (path, chunk, file_id, idx, _) in entries {
-            if disabled || self.slot_current(file_id, idx) == Some(chunk) || tracked.contains(&chunk) || self.storage.has_chunk(&chunk) {
+            if disabled || self.slot_names(file_id, idx, chunk).await || tracked.contains(&chunk) || self.storage.has_chunk(&chunk) {
                 match self.storage.restore_superseded(&chunk, &path) {
                     Ok(()) => back += 1,
                     Err(e) => warn!("Superseded cleanup: couldn't restore {}: {}", chunk, e),
@@ -3708,15 +3784,9 @@ impl HealingManager {
         // that many scattered random lookups, and still run via spawn_blocking since
         // it's real disk I/O (the inline per-chunk version of this loop froze the
         // leader for ~2.5 hours with zero log output — incident 2026-06-20).
-        if node_assigned.contains_key(&local_id) {
-            let storage = self.storage.clone();
-            let local_set = tokio::task::spawn_blocking(move || {
-                storage.list_chunks().map(|v| v.into_iter().collect::<HashSet<_>>())
-            }).await;
-            match local_set {
-                Ok(Ok(set)) => { node_chunk_presence.insert(local_id, set); }
-                Ok(Err(e)) => warn!("Discovery pass: local chunk listing failed: {}", e),
-                Err(e) => warn!("Discovery pass: local chunk listing panicked: {}", e),
+        if let Some(assigned) = node_assigned.get(&local_id) {
+            if let Some(set) = self.local_chunk_presence(assigned, "Discovery pass").await {
+                node_chunk_presence.insert(local_id, set);
             }
         }
 
@@ -8875,6 +8945,35 @@ mod tests {
         healing.drain_superseded_trash().await;
         std::env::remove_var("DFS_SUPERSEDED_CLEANUP");
         assert_eq!(storage.read_chunk(&again).unwrap(), b"agn!", "switched off, the trash must be restored, not deleted");
+    }
+
+    /// VM-108 disk-1 chunk 666 (10-21): the slot named patch token T, folded into R. R is
+    /// T's content, so a copy of R moved aside must come back, not be deleted as old.
+    #[tokio::test]
+    async fn superseded_trash_keeps_the_fold_result_of_the_token_its_slot_names() {
+        let (storage, metadata, healing, _t1, _t2) = make_healing(NodeId::new(), "127.0.0.1:8912".parse().unwrap());
+        let file_id = FileId::new();
+        let mut t = [0x66u8; 32];
+        t[0] = 0xdf;
+        t[1] = 0x7c;
+        let (token, result) = (ChunkId::from_hash(t), ChunkId::from_hash([0x6a; 32]));
+        assert!(token.looks_like_patch_token());
+        metadata.update_patch_state_folded(&token, result).unwrap();
+        let at = ChunkLocation {
+            chunk_id: token, nodes: vec![], size: 4, checksum: token.hash, file_offset: Some(0),
+            written_at: None, client_write_seq: None, file_id: Some(file_id),
+        };
+        healing.chunk_map.insert(file_id, (vec![at], 1));
+        storage.write_chunk(&result, b"live").unwrap();
+        storage.move_superseded_aside(&result, file_id, 0).unwrap();
+        for (path, ..) in storage.superseded_trash_entries() {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let (stem, ts) = name.rsplit_once('.').unwrap();
+            std::fs::rename(&path, path.with_file_name(format!("{}.{}", stem, ts.parse::<u64>().unwrap() - 600))).unwrap();
+        }
+        healing.drain_superseded_trash().await;
+        assert_eq!(storage.read_chunk(&result).unwrap(), b"live",
+            "BUG: deleted the fold result of the token its slot names — the slot's only content");
     }
 
     /// Superseded-version cleanup (10-13): a copy is deletable only when every node names

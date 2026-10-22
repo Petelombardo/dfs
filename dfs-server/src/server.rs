@@ -910,6 +910,48 @@ fn move_chunk_to_file(chunk_to_file: &DashMap<ChunkId, FileId>, file_id: FileId,
     chunk_to_file.insert(new, file_id);
 }
 
+/// For each of `ids`, the online peers (not this node) that say they can serve it — HasChunks:
+/// file presence for content, patch_state for a token. A peer that doesn't answer within
+/// `timeout` counts for nothing, so an unreachable cluster yields no holders.
+async fn peers_that_resolve(
+    cluster: &ClusterManager,
+    client: &Arc<NetworkClient>,
+    ids: &[ChunkId],
+    timeout: std::time::Duration,
+) -> HashMap<ChunkId, Vec<NodeId>> {
+    let local_id = cluster.local_node_id();
+    let peers: Vec<_> = cluster.get_all_nodes().await.into_iter()
+        .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+        .collect();
+    let asked = futures::future::join_all(peers.iter().map(|node| {
+        let client = client.clone();
+        let ids = ids.to_vec();
+        async move {
+            match tokio::time::timeout(timeout,
+                client.send_message(node.addr, Message::Request(Request::HasChunks { chunk_ids: ids }))).await {
+                Ok(Ok(envelope)) => match envelope.message {
+                    Message::Response(r) => r,
+                    _ => Response::Ok { data: None },
+                },
+                _ => Response::Ok { data: None },
+            }
+        }
+    })).await;
+    let mut out: HashMap<ChunkId, Vec<NodeId>> = HashMap::new();
+    for (node, answer) in peers.iter().map(|n| n.id).zip(asked) {
+        let Response::BoolVec { values } = answer else { continue };
+        if values.len() != ids.len() {
+            continue;
+        }
+        for (id, present) in ids.iter().zip(values) {
+            if present {
+                out.entry(*id).or_default().push(node);
+            }
+        }
+    }
+    out
+}
+
 /// An ordered write's result is its replicas' state for the slot (write_order.rs), so their
 /// chunk_map entry follows it even where `update_chunk_map_after_patch`'s client_write_seq
 /// guard declined: that guard compares per-client counters, which mean nothing across two
@@ -2892,21 +2934,41 @@ impl OverlayForkCtx {
         if current == public_token {
             return false; // still the current occupant — genuinely needs folding
         }
-        // An occupant nothing backs (no file here, no patch_state row, no CHUNK_TABLE
-        // record naming a holder) cannot have superseded anything: no read of it can
-        // succeed. Root-caused 2026-10-20 (staging VM-108, file 5f62f6a7, chunk_idx
-        // 3053): both holders' chunk_map named `df7c1bfb…` at the live patch's own
-        // client_write_seq, which the clocks below read as a fold successor's tie, and
-        // both deleted the live patch `df7cbc70…`. Same check as [GHOST-stale-check].
-        let occupant_backed = self.storage.get_chunk_path(&current).exists()
+        // An occupant nothing backs anywhere cannot have superseded anything: no read of
+        // it can succeed. Root-caused 2026-10-20 (staging VM-108, file 5f62f6a7,
+        // chunk_idx 3053): both holders' chunk_map named `df7c1bfb…` at the live patch's
+        // own client_write_seq, which the clocks below read as a fold successor's tie,
+        // and both deleted the live patch `df7cbc70…`.
+        //
+        // "Anywhere", not "here": this node's file, patch_state row and CHUNK_TABLE
+        // record are only what has reached it. A holder that missed newer patches (they
+        // went to the other holders) learns the slot's new occupant from file metadata
+        // before its CHUNK_TABLE row arrives, so locally it looks exactly like that
+        // phantom. Folding its older patch then published the older bytes with a newer
+        // generation and the next write landed on them on every holder: acked writes
+        // lost (upgrade test c8637fb -> 57182f2, 10-21; suite T101). So when nothing
+        // here backs the occupant, ask the other nodes; one that can serve it makes it
+        // real, and the causal checks below decide.
+        const PEER_HOLDS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        let backed_here = self.storage.get_chunk_path(&current).exists()
             || matches!(self.metadata.get_patch_state_async(current).await, Ok(Some(_)))
             || matches!(self.metadata.get_chunk_location_async(current).await,
                         Ok(Some(loc)) if !loc.nodes.is_empty());
-        if !occupant_backed {
-            warn!("single fold: file {} chunk_idx {} chunk_map names {:?}, but no file, patch_state \
-                   row or CHUNK_TABLE record backs it — NOT abandoning Pending patch {}",
-                file_id, chunk_idx, current, public_token);
-            return false;
+        if !backed_here {
+            let held_by = peers_that_resolve(&self.cluster, &self.client, &[current], PEER_HOLDS_TIMEOUT)
+                .await
+                .remove(&current)
+                .unwrap_or_default();
+            if held_by.is_empty() {
+                warn!("single fold: file {} chunk_idx {} chunk_map names {:?}, but no node holds it \
+                       (no file, patch_state row or CHUNK_TABLE record here, and no peer can serve it) \
+                       — NOT abandoning Pending patch {}",
+                    file_id, chunk_idx, current, public_token);
+                return false;
+            }
+            info!("single fold: file {} chunk_idx {} chunk_map names {:?}, which this node hasn't \
+                   received but {} peer(s) hold — judging Pending patch {} against it",
+                file_id, chunk_idx, current, held_by.len(), public_token);
         }
         // A DIFFERENT occupant is not by itself evidence this patch is dead: it also
         // has to be causally LATER. Root-caused 2026-08-30 (VM-108, file c42fa744,
@@ -20778,35 +20840,14 @@ impl Server {
     /// counts for nothing.
     async fn nodes_that_resolve(&self, ids: Vec<ChunkId>) -> std::collections::HashMap<ChunkId, Vec<NodeId>> {
         const HAS_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        let mut out: std::collections::HashMap<ChunkId, Vec<NodeId>> = std::collections::HashMap::new();
-        let local_id = self.cluster.local_node_id();
-        let mut answers = vec![(local_id, self.handle_has_chunks(ids.clone()).await)];
-        let peers: Vec<_> = self.cluster.get_all_nodes().await.into_iter()
-            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
-            .collect();
-        let asked = futures::future::join_all(peers.iter().map(|node| {
-            let client = self.client.clone();
-            let ids = ids.clone();
-            async move {
-                match tokio::time::timeout(HAS_CHUNK_TIMEOUT,
-                    client.send_message(node.addr, Message::Request(Request::HasChunks { chunk_ids: ids }))).await {
-                    Ok(Ok(envelope)) => match envelope.message {
-                        Message::Response(r) => r,
-                        _ => Response::Ok { data: None },
-                    },
-                    _ => Response::Ok { data: None },
-                }
-            }
-        })).await;
-        answers.extend(peers.iter().map(|n| n.id).zip(asked));
-        for (node, answer) in answers {
-            let Response::BoolVec { values } = answer else { continue };
-            if values.len() != ids.len() {
-                continue;
-            }
-            for (id, present) in ids.iter().zip(values) {
-                if present {
-                    out.entry(*id).or_default().push(node);
+        let mut out = peers_that_resolve(&self.cluster, &self.client, &ids, HAS_CHUNK_TIMEOUT).await;
+        if let Response::BoolVec { values } = self.handle_has_chunks(ids.clone()).await {
+            if values.len() == ids.len() {
+                let local_id = self.cluster.local_node_id();
+                for (id, present) in ids.iter().zip(values) {
+                    if present {
+                        out.entry(*id).or_default().push(local_id);
+                    }
                 }
             }
         }

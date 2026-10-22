@@ -2518,8 +2518,25 @@ dfs_sync
 sleep 2
 T100E_TOK=$(t100e_cur)
 T100E_TOK_ROW=$(t100e_row "$T100E_TOK")
-T100E_N=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null || echo 0)
+t100e_n() { echo "$1" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null || echo 0; }
+T100E_N=$(t100e_n "$T100E_TOK_ROW")
 echo "  T100e: leader $T100E_L base ${T100E_BASE:0:12} patch ${T100E_TOK:0:12} (${T100E_N} holder(s) recorded)"
+if [ "$T100E_N" -lt 2 ]; then
+    # Seen once (1022a ON suite), never alone or in context (8 runs): tell a late location report
+    # from an acked ordered write that sits on one node.
+    echo "  T100e: nodes serving the patch now: $("$BIN/dfs-admin" --cluster "$CLUSTER" isr read --file /t100e.bin --chunk 0 2>/dev/null \
+        | python3 -c "import json,sys
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    print(r.get('addr'), (r.get('blake3') or 'ERR')[:12], end='; ')")"
+    for t100e_w in $(seq 1 10); do
+        sleep 1
+        T100E_TOK_ROW=$(t100e_row "$T100E_TOK"); T100E_N=$(t100e_n "$T100E_TOK_ROW")
+        [ "$T100E_N" -ge 2 ] && break
+    done
+    echo "  T100e: the leader's row lists ${T100E_N} holder(s) after ${t100e_w} more second(s)"
+fi
 if [ -z "$T100E_BASE_ROW" ] || ! echo "$T100E_TOK" | grep -q '^df7c' || [ "$T100E_N" -lt 2 ]; then
     check "T100e setup: a fresh chunk's row, then a live patch token recorded at 2+ holders (base ${T100E_BASE:0:12} patch ${T100E_TOK:0:12} holders $T100E_N)" FAIL
 else
@@ -2538,6 +2555,128 @@ else
 fi
 rm -f "$MOUNT/t100e.bin" "$T/t100e.bin"
 fi # should_run T100e
+
+# ── T101: a holder that missed a newer patch must not fold its older one over it ─
+# Upgrade test c8637fb -> 57182f2, 10-21: node3 held patch T1 of u2.bin chunk 2 but missed the
+# newer T2 (it went to the other two holders). node3's chunk_map named T2 (file metadata
+# arrives separately from CHUNK_TABLE rows), and with no file, patch_state row or CHUNK_TABLE
+# row for T2 on node3 the fold called T2 a phantom, folded T1 onto the base and published
+# that older result with a newer generation. The client's next patch applied on top of it on
+# every holder: T2's acked bytes were gone. Here: T1 on all holders, then T2 while one holder
+# refuses the client and fails every location registration, then force that holder's fold.
+snapshot_log T101
+if should_run T101; then
+echo "=== T101: a holder that missed a newer patch does not fold its older one over it ==="
+T101_ALL=$(echo "$CLUSTER" | tr ',' ' ')
+t101_read() {   # "<addr> <blake3-16>" for each node holding a full copy of chunk 0
+    "$BIN/dfs-admin" --cluster "$CLUSTER" isr read --file /t101.bin --chunk 0 2>/dev/null | python3 -c "
+import json,sys
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    if r.get('len') == 4194304: print(r['addr'], r['blake3'][:16])"
+}
+# t101_write <off> <len>: an fsynced write. Only an acked one goes into the reference copy; every
+# attempt's bytes go into t101.writes, so the final check can tell a lost ack from a write that
+# failed (EIO) and was flushed later anyway.
+t101_write() {
+    python3 - "$MOUNT/t101.bin" "$T/t101.bin" "$1" "$2" "$T/t101.writes" <<'PY' 2>>"$LOG/t101.err" || true
+import json, os, sys
+off, n = int(sys.argv[3]), int(sys.argv[4]); x = os.urandom(n); acked = False
+try:
+    fd = os.open(sys.argv[1], os.O_RDWR)
+    try: os.pwrite(fd, x, off); os.fsync(fd); acked = True
+    finally: os.close(fd)
+except OSError as e: print(f"t101 write at {off}: {e}", file=sys.stderr)
+if acked:
+    with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+with open(sys.argv[5], "a") as f: f.write(json.dumps({"off": off, "hex": x.hex(), "acked": acked}) + "\n")
+PY
+}
+rm -f "$T/t101.writes"
+dd if=/dev/urandom of="$T/t101.bin" bs=1M count=4 status=none
+cp "$T/t101.bin" "$MOUNT/t101.bin"
+dfs_sync
+sleep 2
+t101_write 0 65536
+sleep 1
+T101_L=$(t88_leader "$CLUSTER")
+# C: a holder of T1 that is not the leader.
+T101_H1=$(t101_read)
+T101_T1=$(echo "$T101_H1" | awk '{print $2}' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+T101_C=$(echo "$T101_H1" | awk -v h="$T101_T1" -v l="$T101_L" '$2==h && $1!=l {print $1; exit}')
+echo "  T101: leader $T101_L, holders of T1 ($T101_T1): $(echo "$T101_H1" | awk -v h="$T101_T1" '$2==h{printf "%s ", $1}')-> C=$T101_C"
+if [ -z "$T101_C" ] || [ "$(echo "$T101_H1" | awk -v h="$T101_T1" '$2==h' | wc -l)" -lt 2 ]; then
+    check "T101 setup: patch T1 on 2+ holders, one of them not the leader (got: $(echo $T101_H1))" FAIL
+else
+    "$BIN/dfs-admin" --cluster "$T101_C" fault fail-locations --millis 150000 >>"$LOG/t101.err" 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T101_C" fault set --refuse-clients >>"$LOG/t101.err" 2>&1 || true
+    t101_write 1048576 65536
+    echo "  T101: T2 written while C refused the client: $(t101_read | tr '\n' ' ')"
+    # C's own background fold of T1 (as the slot's fold owner 20 s after ITS last patch, or as
+    # a holder after 60 s). The writer keeps patching every 2 s meanwhile, as in the incident:
+    # that keeps pushing back the fold of the newest patch on the other holders, so C's
+    # chunk_map keeps naming an unfolded patch C has neither the bytes nor a CHUNK_TABLE row
+    # for. Not `isr fold`: ForceFold serves the slot's current entry from a peer instead of
+    # folding this node's own patch.
+    T101_FID=$("$BIN/dfs-admin" --cluster "$T101_L" --format json file raw-location \
+        "$("$BIN/dfs-admin" --cluster "$T101_L" --format json file info /t101.bin 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][0]['chunk_id'])" 2>/dev/null)" 2>/dev/null \
+        | python3 -c "import json,sys; print(json.loads(sys.stdin.readline())['location']['file_id'])" 2>/dev/null || true)
+    T101_CLOG="$LOG/server$(( ${T101_C##*:} - 8899 )).log"
+    T101_FOLDED=""
+    T101_T0=$SECONDS
+    for t101_i in $(seq 1 50); do
+        # Wall clock, not iterations: with ordering ON a write the unreachable secondary can't
+        # take fails only after the client's whole outage budget.
+        [ $(( SECONDS - T101_T0 )) -ge 100 ] && break
+        T101_FOLDED=$(grep -aE "(single fold|Single fold|Fold committed): file $T101_FID chunk_idx 0\b" "$T101_CLOG" | tail -1 | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-220)
+        [ -n "$T101_FID" ] && [ -n "$T101_FOLDED" ] && break
+        t101_write $(( 1048576 + 131072 + t101_i * 8192 )) 4096
+        sleep 2
+    done
+    T101_CHASH=$(t101_read | awk -v c="$T101_C" '$1==c{print $2}')
+    "$BIN/dfs-admin" --cluster "$T101_C" fault clear >>"$LOG/t101.err" 2>&1 || true
+    echo "  T101: C serves ${T101_CHASH:-nothing}; its fold of T1: ${T101_FOLDED:-none seen in 100 s (file ${T101_FID:-?})}"
+    sleep 3
+    "$BIN/dfs-admin" --cluster "$T101_C" fault fail-locations --millis 0 >>"$LOG/t101.err" 2>&1 || true
+    # The next write lands on whatever each holder now names: the incident's second half.
+    t101_write 2097152 4096
+    dfs_sync
+    sleep 3
+    T101_M=/tmp/dfs-mount-fresh
+    mkdir -p "$T101_M"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T101_M" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_fresh.log" --allow-other --log-level debug &
+    T101_PID=$!
+    sleep 2
+    # Every acked write must read back; a write that failed may read back old or new.
+    T101_GOT=$(python3 - "$T101_M/t101.bin" "$T/t101.bin" "$T/t101.writes" <<'PY' 2>&1
+import json, sys
+try: got = bytearray(open(sys.argv[1], "rb").read())
+except OSError as e: print("read failed:", e); sys.exit()
+want = open(sys.argv[2], "rb").read()
+failed = [w for w in map(json.loads, open(sys.argv[3])) if not w["acked"]]
+for w in failed:
+    x = bytes.fromhex(w["hex"]); o = w["off"]
+    if got[o:o+len(x)] == x: got[o:o+len(x)] = want[o:o+len(x)]
+note = f" ({len(failed)} write(s) failed, not counted)" if failed else ""
+if got == want: print("OK" + note); sys.exit()
+bad = [f"{o}:{o+4096}" for o in range(0, len(want), 4096) if got[o:o+4096] != want[o:o+4096]]
+print("differs at", " ".join(bad[:8]), f"({len(bad)} 4K blocks, len {len(got)})" + note)
+PY
+)
+    fusermount -u "$T101_M" 2>/dev/null || true
+    kill_client_and_wait "$T101_PID"
+    echo "  T101: fresh read: $T101_GOT"
+    [ "${T101_GOT%% *}" = "OK" ] \
+        && check "T101 every acked patch survives a holder that missed one folding its own" PASS \
+        || check "T101 a fresh read lost acked bytes: $T101_GOT (C=$T101_C)" FAIL
+fi
+"$BIN/dfs-admin" --cluster "$CLUSTER" fault clear >/dev/null 2>&1 || true
+"$BIN/dfs-admin" --cluster "$CLUSTER" fault fail-locations --millis 0 >/dev/null 2>&1 || true
+rm -f "$MOUNT/t101.bin" "$T/t101.bin" "$T/t101.writes"
+fi # should_run T101
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

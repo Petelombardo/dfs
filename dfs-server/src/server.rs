@@ -12447,7 +12447,12 @@ impl Server {
                 }
             }
         }
-        // Replacement: prefer a node already holding the chunk, then any other online node.
+        // Replacement: prefer a node already holding the chunk, then any other online node,
+        // never one that reported its own storage failing. With every disk nearly full, the
+        // replacement couldn't take the slot's anchor either, resigned in turn, and was
+        // replaced by the next full node: 6471 epochs in 20 minutes while the client resent
+        // the write to each new pair and it never returned (suite T81b, T104). With no fit
+        // node left, the slot stays where it is and the write fails.
         let holders: Vec<NodeId> = self.chunk_map.get(&file_id).and_then(|e| {
             let (locs, _) = e.value();
             Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].nodes.clone())
@@ -12455,11 +12460,13 @@ impl Server {
         let online: Vec<NodeId> = self.cluster.get_all_nodes().await.into_iter()
             .filter(|n| n.status == dfs_common::NodeStatus::Online).map(|n| n.id).collect();
         let pick = |pool: Vec<NodeId>| {
-            let pool: Vec<NodeId> = pool.into_iter().filter(|n| !cur.members.contains(n) && online.contains(n)).collect();
+            let pool: Vec<NodeId> = pool.into_iter()
+                .filter(|n| !cur.members.contains(n) && online.contains(n) && !self.cluster.reported_unfit(*n))
+                .collect();
             crate::slot_isr::initial_members(file_id, chunk_idx, &pool, 1).first().copied()
         };
         let Some(replacement) = pick(holders).or_else(|| pick(online.clone())) else {
-            return refuse("no online node to replace it with".into());
+            return refuse("no online node with working storage to replace it with".into());
         };
         let next = crate::slot_isr::SlotIsr { epoch: cur.epoch + 1, members: vec![me, replacement] };
         let records = match tokio::time::timeout(std::time::Duration::from_secs(3),

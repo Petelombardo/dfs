@@ -2826,6 +2826,105 @@ fi
 rm -f "$MOUNT/t103.bin" "$T/t103.bin"
 fi # should_run T103
 
+# ── Test 104: every disk nearly full: a patch that can't reach two copies fails, no ISR churn ──
+#
+# T81b's intermittent hang (10-20 1020d ON): every node had a few MB left -- under the 64 MiB
+# "storage failing" mark, enough for a 256 KiB patch delta, not for the 4 MiB anchor the primary
+# stores when a slot's ordered stream starts. The secondary's resync failed because the PRIMARY
+# couldn't store that anchor, but the secondary, its own disk also low, took the failure as its
+# own and resigned; the primary picked another low node, which did the same, and the client
+# resent to every new pair with no budget. 6471 ISR epochs in 20 minutes; the patch never
+# returned. Here every node keeps ~3 MB and one fsynced patch goes to a slot with no stream yet:
+# it must return (an error is fine) and the slot's ISR must not churn.
+if should_run T104; then
+snapshot_log T104
+echo ""
+echo "=== T104: every disk nearly full: a patch that can't reach two copies fails cleanly, no ISR churn ==="
+t104_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$1.log" 2>&1 &
+}
+t104_stop() {
+    pkill -9 -f "dfs-server start --config $BASE/node$1/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do pgrep -f "dfs-server start --config $BASE/node$1/config.toml" >/dev/null || break; sleep 0.1; done
+}
+dd if=/dev/urandom of="$T/t104.bin" bs=4M count=2 status=none
+dd if="$T/t104.bin" of="$MOUNT/t104.bin" bs=1M conv=fsync status=none 2>/dev/null || true
+dfs_sync
+T104_MOUNTED=""
+for n in 1 2 3 4 5; do t104_stop $n; done
+for n in 1 2 3 4 5; do
+    d="$BASE/node$n"; img="$BASE/t104_$n.img"; save="$BASE/t104_save$n"
+    rm -rf "$save"; mv "$d" "$save"; mkdir "$d"
+    truncate -s $(( $(du -sm "$save" | cut -f1) + 160 ))M "$img"
+    mkfs.ext4 -q -F -m 0 "$img" >/dev/null 2>&1
+    if mount -o loop "$img" "$d" 2>/dev/null; then
+        cp -a "$save"/. "$d"/; rm -rf "$save"; T104_MOUNTED="$T104_MOUNTED $n"
+    else
+        rmdir "$d"; mv "$save" "$d"
+    fi
+done
+for n in 1 2 3 4 5; do t104_start $n; done
+sleep 8
+for i in $(seq 1 20); do
+    dd if=/dev/urandom of="$MOUNT/t104_warm.bin" bs=1M count=1 conv=fsync status=none 2>/dev/null && break
+    sleep 2
+done
+rm -f "$MOUNT/t104_warm.bin"
+sleep 3
+# Chunk 0's ISR: two of its holders, so the primary can be filled to 0 (its apply fails and it
+# resigns) and the secondary left ~3 MB (it applies the 256 KiB patch, takes over, and then
+# can't store the 4 MiB anchor a replacement resyncs from).
+T104_HOLDERS=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t104.bin 2>/dev/null \
+    | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)['chunk_locations'][0]['nodes'][:2]))" 2>/dev/null || true)
+read -r T104_P T104_S <<< "$T104_HOLDERS"
+T104_PN=""
+for n in 1 2 3 4 5; do grep -q "\"${T104_P:-none}\"" "$BASE/node$n/config.toml" && T104_PN=$n; done
+[ -n "$T104_S" ] && "$BIN/dfs-admin" --cluster "$CLUSTER" isr propose --file /t104.bin --chunk 0 --members "$T104_P,$T104_S" >>"$LOG/t104_isr.log" 2>&1 || true
+echo "  T104: chunk 0 ISR proposed [${T104_P:-?} (node${T104_PN:-?}), ${T104_S:-?}]"
+for n in $T104_MOUNTED; do
+    d="$BASE/node$n"
+    mountpoint -q "$d" || { echo "  T104: node$n is no longer on its loop filesystem; not filling it"; continue; }
+    if [ "$n" = "$T104_PN" ]; then
+        fallocate -l $(( $(df -Pm "$d" | awk 'NR==2{print $4}') - 2 ))M "$d/filler" 2>/dev/null || true
+        dd if=/dev/zero of="$d/filler2" bs=64K status=none 2>/dev/null || true
+    else
+        fallocate -l $(( $(df -Pm "$d" | awk 'NR==2{print $4}') - 3 ))M "$d/filler" 2>/dev/null || true
+    fi
+done
+echo "  T104: nodes on loop filesystems:${T104_MOUNTED:- none}; free MB: $(for n in 1 2 3 4 5; do df -Pm "$BASE/node$n" | awk 'NR==2{printf "%s ", $4}'; done)"
+sleep 12   # every node notices its own storage failing (and reports it) before the patch
+declare -A T104_OFF
+for i in 1 2 3 4 5; do T104_OFF[$i]=$(stat -c %s "$LOG/server${i}.log" 2>/dev/null || echo 0); done
+dd if=/dev/urandom of="$T/t104_piece.bin" bs=256K count=1 status=none
+T104_T0=$SECONDS; T104_RC=0
+timeout 60 dd if="$T/t104_piece.bin" of="$MOUNT/t104.bin" bs=256K seek=2 conv=notrunc,fsync status=none 2>"$LOG/t104_dd.err" || T104_RC=$?
+T104_TOOK=$((SECONDS - T104_T0))
+sleep 30
+T104_FID=$(for i in 1 2 3 4 5; do sed 's/\x1b\[[0-9;]*m//g' "$LOG/server${i}.log"; done \
+    | grep -o -m1 "put path=/t104.bin id=[0-9a-f-]\{36\}" | head -1 | sed 's/.*id=//')
+T104_CHURN=$(for i in 1 2 3 4 5; do tail -c +$((T104_OFF[$i] + 1)) "$LOG/server${i}.log"; done \
+    | sed 's/\x1b\[[0-9;]*m//g' | grep -c "\[ISR\] file ${T104_FID:-none} chunk 0: .* replaced" || true)
+echo "  T104: patch rc=$T104_RC after ${T104_TOOK} s ($(head -c 150 "$LOG/t104_dd.err")); ISR replacements for chunk 0 in the next 30 s: $T104_CHURN (file ${T104_FID:-?})"
+if [ "$T104_RC" != 124 ] && [ "$T104_CHURN" -le 4 ]; then
+    check "T104 with every disk nearly full the patch returned (rc=$T104_RC, ${T104_TOOK} s) and the slot's ISR settled ($T104_CHURN replacement(s))" PASS
+else
+    check "T104 with every disk nearly full: patch rc=$T104_RC after ${T104_TOOK} s, $T104_CHURN ISR replacement(s) for its slot" FAIL
+fi
+for n in $T104_MOUNTED; do rm -f "$BASE/node$n/filler" "$BASE/node$n/filler2"; done
+for n in 1 2 3 4 5; do t104_stop $n; done
+for n in $T104_MOUNTED; do
+    d="$BASE/node$n"; save="$BASE/t104_save$n"
+    rm -rf "$save"; mkdir -p "$save"; cp -a "$d"/. "$save"/
+    umount "$d" 2>/dev/null || umount -l "$d"
+    rmdir "$d"; mv "$save" "$d"
+done
+rm -f "$BASE"/t104_*.img "$T/t104.bin" "$T/t104_piece.bin"
+for n in 1 2 3 4 5; do t104_start $n; done
+sleep 8
+rm -f "$MOUNT/t104.bin"
+fi # should_run T104
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

@@ -557,6 +557,13 @@ impl ClusterManager {
         }
     }
 
+    /// Whether `node` reported within `LEADER_UNFIT_TTL` that it can't lead: its storage is
+    /// failing (disk full, metadata I/O errors), or it is still catching up after that.
+    pub fn reported_unfit(&self, node: NodeId) -> bool {
+        let now = std::time::Instant::now();
+        self.leader_unfit.lock().unwrap().get(&node).is_some_and(|until| *until > now)
+    }
+
     /// Record a peer's `Request::LeaderUnfit` report: whether it can lead, and its term.
     pub fn record_leader_report(&self, node: NodeId, unfit: bool, led_term: u64) {
         if node != self.local_node_id {

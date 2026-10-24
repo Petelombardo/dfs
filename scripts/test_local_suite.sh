@@ -126,9 +126,23 @@ fresh_read() {
 # By process name (-x), not command line (-f): -f also killed every process whose
 # arguments merely mention dfs-server/dfs-client — the :8950 bench driver's ssh sessions
 # (10-19: a restart died mid-way and fio ran against the unmounted directory) and shells.
-pkill -x dfs-server 2>/dev/null || true
-pkill -x dfs-client 2>/dev/null || true
-sleep 0.5
+# stop_dfs_processes: SIGTERM every dfs-server/dfs-client, wait up to 15 s for them to exit,
+# then SIGKILL what's left. Starting the next cluster while an old server is still shutting
+# down lets it keep renewing its lease against the new servers on the same ports, and the new
+# cluster adopts it as a member (10-23: an isolated T38 run had 5 ghosts, majority size 10).
+stop_dfs_processes() {
+    pkill -x dfs-server 2>/dev/null || true
+    pkill -x dfs-client 2>/dev/null || true
+    for _ in $(seq 1 150); do
+        pgrep -x dfs-server >/dev/null || pgrep -x dfs-client >/dev/null || return 0
+        sleep 0.1
+    done
+    echo "  (dfs processes still running 15 s after SIGTERM; killing them)"
+    pkill -9 -x dfs-server 2>/dev/null || true
+    pkill -9 -x dfs-client 2>/dev/null || true
+    sleep 0.5
+}
+stop_dfs_processes
 # Every mount the suite uses, not just $MOUNT: a run killed mid-test leaves its second
 # client's mount dead ("Transport endpoint is not connected"), and the next run's first
 # mkdir there aborts the whole suite (T64, 2026-10-07). Lazy, since the client is gone.
@@ -1192,6 +1206,32 @@ fi # should_run T87
 t88_leader() {
     "$BIN/dfs-admin" --cluster "$1" --format json cluster status 2>/dev/null \
         | python3 -c "import json,sys; print(json.load(sys.stdin).get('leader') or '')" 2>/dev/null
+}
+# any_leader: the leader as named by the first node that answers (dfs-admin's cluster status
+# asks only the first --cluster address, so "$CLUSTER" says nothing while node1 is down).
+any_leader() {
+    local l
+    for i in 1 2 3 4 5; do l=$(t88_leader "127.0.0.1:$((8899 + i))" || true); [ -n "$l" ] && { echo "$l"; return 0; }; done
+    return 0
+}
+# settled_leader: the leader once all 5 nodes have named the same one on 3 polls in a row
+# (30 s at most; then whatever the cluster address says). Right after a whole-cluster restart
+# nodes briefly name different leaders, and a request sent to one that loses the race fails.
+settled_leader() {
+    local prev="" same=0 views l
+    for _ in $(seq 1 30); do
+        views=""; for i in 1 2 3 4 5; do views="$views $(t88_leader "127.0.0.1:$((8899 + i))" || true)"; done
+        l=$(echo $views | tr ' ' '\n' | sort -u)
+        if [ "$(echo "$l" | grep -c .)" = 1 ] && [ "$(echo $views | wc -w)" = 5 ]; then
+            [ "$l" = "$prev" ] && same=$((same + 1)) || same=1
+            prev=$l
+            [ $same -ge 3 ] && { echo "$l"; return 0; }
+        else
+            same=0; prev=""
+        fi
+        sleep 1
+    done
+    t88_leader "$CLUSTER" || true
 }
 snapshot_log T88
 if should_run T88; then
@@ -2373,7 +2413,7 @@ while [ -z "$T100_TOKEN" ] && [ "${DFS_ORDERED_WRITES:-0}" != 1 ] && [ $T100_TRY
     for i in $T100_STOP; do pkill -f -- "--config $BASE/node$i/config.toml" || true; done
     T100_NEW=""
     for _ in $(seq 1 40); do
-        T100_NEW=$(t88_leader "$CLUSTER") || true
+        T100_NEW=$(any_leader)
         [ -n "$T100_NEW" ] && ! echo " $T100_STOP " | grep -q " $(( ${T100_NEW##*:} - 8899 )) " && break
         T100_NEW=""; sleep 1
     done
@@ -2384,11 +2424,11 @@ while [ -z "$T100_TOKEN" ] && [ "${DFS_ORDERED_WRITES:-0}" != 1 ] && [ $T100_TRY
         env DFS_DESTRUCTIVE_GRACE_SECS=0 DFS_PHANTOM_RECONCILE_INTERVAL_SECS=100000 RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 \
             "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" >> "$LOG/server${i}.log" 2>&1 &
         sleep 10
-        T100_NEW=$(t88_leader "$CLUSTER") || true
+        T100_NEW=$(any_leader)
         [ -n "$T100_NEW" ] && [ "$(( ${T100_NEW##*:} - 8899 ))" != "$i" ] && break
         pkill -f -- "--config $BASE/node$i/config.toml" || true
         sleep 5
-        T100_NEW=$(t88_leader "$CLUSTER") || true
+        T100_NEW=$(any_leader)
     done
     [ -n "$T100_NEW" ] || break
     T100_LADDR=$T100_NEW
@@ -2486,8 +2526,9 @@ fi # should_run T100
 snapshot_log T100e
 if should_run T100e; then
 echo "=== T100e: a slot rebuild keeps a newer patch whose record lists too few holders ==="
-T100E_L=""
-for _ in $(seq 1 30); do T100E_L=$(t88_leader "$CLUSTER") || true; [ -n "$T100E_L" ] && break; sleep 1; done
+# T100 just restarted every node: wait for leadership to settle, or the rows below can come
+# from a node that loses the election a second later (10-23 OFF: the suite died right here).
+T100E_L=$(settled_leader)
 t100e_cur() {
     "$BIN/dfs-admin" --cluster "$T100E_L" --format json file info /t100e.bin 2>/dev/null \
         | python3 -c "import json,sys; print(json.load(sys.stdin)['chunk_locations'][0]['chunk_id'])" 2>/dev/null
@@ -2504,10 +2545,10 @@ for _ in 1 2 3 4 5; do
     cp "$T/t100e.bin" "$MOUNT/t100e.bin"
     dfs_sync
     sleep 2
-    T100E_BASE=$(t100e_cur)
+    T100E_BASE=$(t100e_cur) || true
     [[ "$T100E_BASE" < "df7c" ]] && break
 done
-T100E_BASE_ROW=$(t100e_row "$T100E_BASE")
+T100E_BASE_ROW=$(t100e_row "$T100E_BASE") || true
 python3 - "$MOUNT/t100e.bin" "$T/t100e.bin" 2>>"$LOG/t100e.err" <<'PY' || true
 import os, sys
 x = os.urandom(65536)
@@ -2516,8 +2557,8 @@ with open(sys.argv[2], "r+b") as f: f.seek(131072); f.write(x)
 PY
 dfs_sync
 sleep 2
-T100E_TOK=$(t100e_cur)
-T100E_TOK_ROW=$(t100e_row "$T100E_TOK")
+T100E_TOK=$(t100e_cur) || true
+T100E_TOK_ROW=$(t100e_row "$T100E_TOK") || true
 t100e_n() { echo "$1" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['nodes']))" 2>/dev/null || echo 0; }
 T100E_N=$(t100e_n "$T100E_TOK_ROW")
 echo "  T100e: leader $T100E_L base ${T100E_BASE:0:12} patch ${T100E_TOK:0:12} (${T100E_N} holder(s) recorded)"
@@ -2540,11 +2581,11 @@ fi
 if [ -z "$T100E_BASE_ROW" ] || ! echo "$T100E_TOK" | grep -q '^df7c' || [ "$T100E_N" -lt 2 ]; then
     check "T100e setup: a fresh chunk's row, then a live patch token recorded at 2+ holders (base ${T100E_BASE:0:12} patch ${T100E_TOK:0:12} holders $T100E_N)" FAIL
 else
-    T100E_SHORT=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; r=json.load(sys.stdin); r['nodes']=r['nodes'][:1]; print(json.dumps(r))")
+    T100E_SHORT=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; r=json.load(sys.stdin); r['nodes']=r['nodes'][:1]; print(json.dumps(r))") || true
     "$BIN/dfs-admin" --cluster "$T100E_L" fault plant-location --json "$T100E_BASE_ROW" >>"$LOG/t100e.err" 2>&1 || true
     "$BIN/dfs-admin" --cluster "$T100E_L" fault plant-location --json "$T100E_SHORT" >>"$LOG/t100e.err" 2>&1 || true
-    T100E_FID=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; print(json.load(sys.stdin)['file_id'])")
-    T100E_GOT=$("$BIN/dfs-admin" --cluster "$T100E_L" file revalidate --file-id "$T100E_FID" --chunk 0 --distrust "$T100E_TOK" 2>>"$LOG/t100e.err")
+    T100E_FID=$(echo "$T100E_TOK_ROW" | python3 -c "import json,sys; print(json.load(sys.stdin)['file_id'])") || true
+    T100E_GOT=$("$BIN/dfs-admin" --cluster "$T100E_L" file revalidate --file-id "$T100E_FID" --chunk 0 --distrust "$T100E_TOK" 2>>"$LOG/t100e.err") || true
     [ "$T100E_GOT" = "$T100E_TOK" ] \
         && check "T100e the rebuilt slot keeps the newer patch ${T100E_TOK:0:12} over the older ${T100E_BASE:0:12}" PASS \
         || check "T100e the rebuilt slot went back to ${T100E_GOT:0:12} (patch ${T100E_TOK:0:12}, older ${T100E_BASE:0:12})" FAIL
@@ -2677,6 +2718,66 @@ fi
 "$BIN/dfs-admin" --cluster "$CLUSTER" fault fail-locations --millis 0 >/dev/null 2>&1 || true
 rm -f "$MOUNT/t101.bin" "$T/t101.bin" "$T/t101.writes"
 fi # should_run T101
+
+# ── Test 102: a fold owner that restarts with a dirty slot folds it on the normal debounce ──
+#
+# T38b's intermittent failure (10-23): a rolling restart killed a slot's fold owner a few seconds
+# after the slot's last patch. The owner's debounce_fold_slot task died with it; on restart the
+# patch_state resume sweep made ONE fold attempt before the node held its lease (so it couldn't
+# act as owner), then left the slot to the 60 s backstop sweep, while every other holder waited
+# FOLD_OWNER_PATIENCE (60 s) for the owner. The patch sat unfolded at 2 copies for ~60 s instead
+# of ~20 s. Here every node restarts right after one fsynced patch, so the owner always does,
+# and the slot must fold on the debounce: no "[FOLD-OWNER] ... never folded it" takeover for it,
+# and folded well inside FOLD_OWNER_PATIENCE (the backstop and the takeover both land at >= 60 s).
+if should_run T102; then
+snapshot_log T102
+echo ""
+echo "=== T102: a fold owner restarted with a dirty slot folds it on the debounce, not the 60 s backstop ==="
+dd if=/dev/urandom of="$T/t102.bin" bs=1M count=8 status=none
+cp "$T/t102.bin" "$MOUNT/t102.bin"
+dfs_sync
+sleep 2
+T102_CHUNK1() {   # "<chunk id> <holder count>" for chunk 1 of /t102.bin
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t102.bin 2>/dev/null \
+        | python3 -c "import json,sys; c=json.load(sys.stdin)['chunk_locations'][1]; print(c['chunk_id'], len(c['nodes']))" 2>/dev/null
+}
+read -r T102_BASE _ <<< "$(T102_CHUNK1)"   # chunk 1 before the patch: a fold is a third id
+declare -A T102_OFF
+for i in 1 2 3 4 5; do T102_OFF[$i]=$(stat -c %s "$LOG/server${i}.log" 2>/dev/null || echo 0); done
+python3 - "$MOUNT/t102.bin" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + 8192); os.fsync(fd); os.close(fd)
+PY
+T102_T0=$SECONDS
+echo "  T102: after the patch, chunk 1 = $(T102_CHUNK1)"
+for i in 1 2 3 4 5; do
+    pkill -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true
+    sleep 0.5
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server${i}.log" 2>&1 &
+    sleep 1
+done
+echo "  T102: every node restarted $((SECONDS - T102_T0)) s after the patch"
+T102_DONE=""
+while [ $((SECONDS - T102_T0)) -lt 120 ]; do
+    read -r T102_ID T102_N <<< "$(T102_CHUNK1)"
+    case "$T102_ID" in df7c*|""|"$T102_BASE") ;; *) T102_DONE=$((SECONDS - T102_T0)); break ;; esac
+    sleep 1
+done
+T102_FID=$(for i in 1 2 3 4 5; do tail -c +$((T102_OFF[$i] + 1)) "$LOG/server${i}.log"; done \
+    | sed 's/\x1b\[[0-9;]*m//g' | grep -o -m1 "file [0-9a-f-]\{36\} chunk_idx 1 consolidated" | awk '{print $2}')
+T102_LATE=$(for i in 1 2 3 4 5; do tail -c +$((T102_OFF[$i] + 1)) "$LOG/server${i}.log" | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E "\[FOLD-OWNER\] file ${T102_FID:-none} chunk 1 " | sed "s/^/server$i: /"; done)
+echo "  T102: chunk 1 folded ${T102_DONE:-never} s after the patch (file ${T102_FID:-?}); now $(T102_CHUNK1)"
+[ -n "$T102_LATE" ] && echo "$T102_LATE" | cut -c1-200 | sed 's/^/    /'
+if [ -n "$T102_DONE" ] && [ "$T102_DONE" -lt 45 ] && [ -z "$T102_LATE" ]; then
+    check "T102 the restarted owner folded its resumed patch on the debounce (${T102_DONE} s)" PASS
+else
+    check "T102 the patch waited for a takeover or the backstop (folded ${T102_DONE:-never} s after the patch)" FAIL
+fi
+rm -f "$MOUNT/t102.bin" "$T/t102.bin"
+fi # should_run T102
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
@@ -5515,6 +5616,22 @@ done
 [ "$T38_UNDER_AFTER" = "0" ] \
     && check "T38b all chunks reach RF=3 after healing (was ${T38_UNDER_BEFORE:-?} under-replicated)" PASS \
     || check "T38b ${T38_UNDER_AFTER:-?} chunks still under-replicated after healing (was ${T38_UNDER_BEFORE:-?})" FAIL
+
+# Diagnostics only (the verdict above stands): name the short chunks, then keep watching
+# for up to 180 s more to tell "converges late" from "stays short".
+if [ "$T38_UNDER_AFTER" != "0" ]; then
+    T38_SHORT() { "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(' '.join('%d:%s:%d' % (i, c.get('chunk_id','?')[:16], len(c['nodes'])) for i, c in enumerate(d['chunk_locations']) if len(c['nodes']) < 3))" 2>/dev/null; }
+    echo "  T38b short chunks (idx:id:holders): $(T38_SHORT)"
+    T38_T0=$SECONDS
+    while [ $((SECONDS - T38_T0)) -lt 180 ]; do
+        sleep 5
+        T38_S=$(T38_SHORT)
+        [ -z "$T38_S" ] && break
+    done
+    if [ -z "$T38_S" ]; then echo "  T38b: every chunk reached RF=3 after $((SECONDS - T38_T0)) more second(s)"
+    else echo "  T38b: still short after 180 more seconds: $T38_S"; fi
+fi
 
 # Restore the production default so later tests (and anyone poking at the cluster
 # after this suite finishes) see realistic healing behavior, not this test's
@@ -9856,7 +9973,7 @@ sleep 0.3
 # only kills whichever one pgrep lists first, silently leaving the rest running
 # indefinitely. Same all-matches approach the top-of-script preamble already uses.
 pkill -f "dfs-client mount $MOUNT" 2>/dev/null || true
-pkill -x dfs-server 2>/dev/null || true
+stop_dfs_processes
 rm -rf "$T"
 
 echo ""

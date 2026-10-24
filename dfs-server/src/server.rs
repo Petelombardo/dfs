@@ -14428,12 +14428,11 @@ impl Server {
                     continue;
                 }
                 // Escalated slots (see MAX_FOLD_FAILURES_BEFORE_ESCALATION) are
-                // throttled to FOLD_ESCALATED_RETRY_INTERVAL here too — this loop
-                // is the ONLY thing retrying a slot resumed from a restart (the
-                // resume sweep makes exactly one attempt, no debounce_fold_slot
-                // task), so without this check an escalated-but-resumed slot
-                // would still get hammered every SWEEP_INTERVAL forever, which is
-                // exactly the waste this whole mechanism exists to stop.
+                // throttled to FOLD_ESCALATED_RETRY_INTERVAL here too, as
+                // debounce_fold_slot throttles its own retries — without this check
+                // an escalated slot (one resumed from a restart starts escalated when
+                // presumed chronic) would still get hammered every SWEEP_INTERVAL
+                // forever, which is exactly the waste this whole mechanism exists to stop.
                 let stale: Vec<(FileId, u64)> = server.dirty_patch_slots.iter()
                     .filter(|e| {
                         e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE
@@ -14602,26 +14601,33 @@ impl Server {
                            so the 60s backstop doesn't re-earn another ~10 minutes of unthrottled retries",
                         file_id, chunk_idx, age_secs);
                 }
-                // entry().or_insert_with(), not a blind insert: real write
-                // traffic may have already started by the time this sweep
-                // runs and created its own fresh (newer) entry for this exact
-                // slot — must not clobber that with the stale on-disk token
-                // this sweep found.
-                server.dirty_patch_slots.entry((file_id, chunk_idx)).or_insert_with(|| DirtyPatchSlot {
-                    token,
-                    last_patch_at: std::time::Instant::now(),
-                    delta_hasher: blake3::Hasher::new(),
-                    verified: false, // unknown until a merge cold-reads this accumulator
-                    legacy_delta_format: false, // unused while verified is false
-                    fold_failures: if presumed_chronic { MAX_FOLD_FAILURES_BEFORE_ESCALATION } else { 0 },
-                    last_fold_attempt_at: std::time::Instant::now(),
-                    // materialized_ring is in-memory-only and empty after every
-                    // restart, so it always misses on this slot's first
-                    // post-restart merge regardless of this value — nothing to
-                    // get wrong here.
-                    materialized_max_seq: None,
-                    prior_chunk_id: None, // resume sweep, no live snapshot available
-                });
+                // Vacant only, not a blind insert: real write traffic may have
+                // already started by the time this sweep runs and created its own
+                // fresh (newer) entry for this exact slot — must not clobber that
+                // with the stale on-disk token this sweep found. That traffic's
+                // apply_patch also spawned the slot's debounce task, so only a slot
+                // this sweep tracks gets one below.
+                let resumed = match server.dirty_patch_slots.entry((file_id, chunk_idx)) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => false,
+                    dashmap::mapref::entry::Entry::Vacant(e) => {
+                        e.insert(DirtyPatchSlot {
+                            token,
+                            last_patch_at: std::time::Instant::now(),
+                            delta_hasher: blake3::Hasher::new(),
+                            verified: false, // unknown until a merge cold-reads this accumulator
+                            legacy_delta_format: false, // unused while verified is false
+                            fold_failures: if presumed_chronic { MAX_FOLD_FAILURES_BEFORE_ESCALATION } else { 0 },
+                            last_fold_attempt_at: std::time::Instant::now(),
+                            // materialized_ring is in-memory-only and empty after every
+                            // restart, so it always misses on this slot's first
+                            // post-restart merge regardless of this value — nothing to
+                            // get wrong here.
+                            materialized_max_seq: None,
+                            prior_chunk_id: None, // resume sweep, no live snapshot available
+                        });
+                        true
+                    }
+                };
                 // Restore the in-memory pending_patch_ids entry too. It is
                 // populated only by apply_patch (this process's own writes) and
                 // wiped on restart — a resumed Pending token that we DON'T re-track
@@ -14634,17 +14640,17 @@ impl Server {
                 // unreadable. or_insert so live traffic that already re-tracked this
                 // slot with a newer token wins.
                 server.pending_patch_ids.entry(token).or_insert((file_id, chunk_idx));
-                let ctx = server.overlay_ctx();
-                tokio::spawn(async move {
-                    // Right after a restart this node rarely holds its lease yet, so the
-                    // slot's owner usually can't act here; the backstop sweep folds it once
-                    // ownership settles (the slot is dirty from now on).
-                    if matches!(ctx.fold_if_owner(file_id, chunk_idx).await, CoordinatedFoldOutcome::Failed) {
-                        warn!("patch_state resume sweep: fold failed for file={} chunk={} — \
-                               left Pending, will retry via the normal backstop paths",
-                            file_id, chunk_idx);
-                    }
-                });
+                // The same debounce task a live patch gets. One fold attempt here used to
+                // run before this node held its lease, so the slot's owner couldn't act on
+                // it, and the slot then waited for the 60 s backstop sweep while every
+                // other holder waited FOLD_OWNER_PATIENCE for that owner: a patch whose
+                // owner restarted stayed unfolded (2 copies) ~60 s instead of
+                // PATCH_DEBOUNCE_IDLE (suite T38b, T102). The task folds once the slot has
+                // been quiet that long, defers to the owner while it should, and retries.
+                if resumed {
+                    let ctx = server.overlay_ctx();
+                    tokio::spawn(async move { ctx.debounce_fold_slot(file_id, chunk_idx).await; });
+                }
             }
         });
     }

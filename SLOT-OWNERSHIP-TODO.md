@@ -313,8 +313,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         10-20..22: 1020d T81b + T85a + T38b, 1021b T85a, 1021c 314/0, 1022a T81b + T100e + T38b
         -> 0/5. 10-23/24: T38b root-caused (cause A 03303ea + T102, cause B 612d9c0 + T103);
         1023a 318/1 (T100e: a suite bug, leader lookup after T100's restart; fixed), 1023b 316/0,
-        1024c 321/0 = 2/5. Still breaking it: T81b (all-disks-full hang, Legata 7e7f4713) and
-        T85a (G7).
+        1024c 321/0 = 2/5. 10-24: T81b root-caused and fixed (922c597 + T104: an ISR member is
+        never replaced by a node whose storage is failing); 1024d ON 318/0 = 3/5. T85a has
+        passed 11 straight suites (ON+OFF) since its fix in 82e97b2 (10-21).
   - [x] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
         acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
         10-15 loops (ae6a40f): T69/T73/T76/T77/T86 20/20, T74 18/20. Both T74 fails = a

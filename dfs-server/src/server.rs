@@ -5396,6 +5396,9 @@ impl OverlayForkCtx {
     /// indefinitely. Now retries with capped backoff until it succeeds.
     async fn debounce_fold_slot(&self, file_id: FileId, chunk_idx: u64) {
         let mut retry_backoff = PATCH_DEBOUNCE_IDLE;
+        // What the next sleep starts from: retry_backoff after a failed or deferred
+        // fold, or what's left of the window after the slot's last patch.
+        let mut next_sleep = PATCH_DEBOUNCE_IDLE;
         const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
             // Jittered, not a fixed sleep — see PATCH_DEBOUNCE_IDLE's doc
@@ -5410,7 +5413,7 @@ impl OverlayForkCtx {
             // (a real burst in progress), while staying tight-to-zero when
             // fold activity is already quiet.
             let active = self.active_fold_count.load(std::sync::atomic::Ordering::Relaxed);
-            let sleep_for = jittered_debounce_sleep(retry_backoff, active, file_id, chunk_idx);
+            let sleep_for = jittered_debounce_sleep(next_sleep, active, file_id, chunk_idx);
             tokio::time::sleep(sleep_for).await;
 
             let Some(last_patch_at) = self.dirty_patch_slots
@@ -5425,11 +5428,11 @@ impl OverlayForkCtx {
                 //
                 // A fold mints a NEW chunk identity, so the only nodes that can
                 // hold its bytes are the ones that actually ran it. This
-                // backstop is per-node and re-sleeps a whole fresh
-                // PATCH_DEBOUNCE_IDLE whenever it wakes to find the slot was
+                // backstop is per-node and used to re-sleep a whole fresh
+                // PATCH_DEBOUNCE_IDLE whenever it woke to find the slot was
                 // touched inside the window, so a sub-second difference in when
-                // a generation started on each replica becomes a ~20s
-                // difference in when each one fires. Whoever fired first used to
+                // a generation started on each replica became a ~20s
+                // difference in when each one fired. Whoever fired first used to
                 // fold ALONE and broadcast ReplicatePatchFold, at which point
                 // the peer's own fold_slot_now saw PatchState::Folded, dropped
                 // the dirty slot and returned WITHOUT folding — one holder, and
@@ -5472,6 +5475,7 @@ impl OverlayForkCtx {
                         // wake) or its grant expires (crash/partition) and
                         // this node competes again.
                         retry_backoff = FOLD_COORD_DEFER_RECHECK;
+                        next_sleep = retry_backoff;
                         continue;
                     }
                     CoordinatedFoldOutcome::Failed => {}
@@ -5495,10 +5499,15 @@ impl OverlayForkCtx {
                 };
                 warn!("debounce_fold_slot: fold failed for file={} chunk={} ({} consecutive failure(s)), retrying in {:?}",
                     file_id, chunk_idx, failures, retry_backoff);
+                next_sleep = retry_backoff;
                 continue;
             }
-            // Else: a patch landed within the last debounce window — loop and
-            // sleep again rather than folding yet.
+            // Else: a patch landed within the last debounce window. Sleep only until
+            // the window closes after THAT patch, not a whole fresh window: a slot
+            // patched again a few seconds after its first patch used to fold up to
+            // 2x PATCH_DEBOUNCE_IDLE after its last patch, sitting at write quorum
+            // that much longer (suite T38b, T103).
+            next_sleep = PATCH_DEBOUNCE_IDLE.saturating_sub(last_patch_at.elapsed());
         }
     }
 }

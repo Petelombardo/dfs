@@ -2779,6 +2779,53 @@ fi
 rm -f "$MOUNT/t102.bin" "$T/t102.bin"
 fi # should_run T102
 
+# ── Test 103: a slot patched again inside its debounce window folds PATCH_DEBOUNCE_IDLE after its LAST patch ──
+#
+# T38b's cause B (10-23): debounce_fold_slot sleeps PATCH_DEBOUNCE_IDLE from the slot's FIRST patch;
+# when it wakes and finds a later patch inside the window, it used to sleep a whole fresh
+# PATCH_DEBOUNCE_IDLE again, so the slot folded 20-40 s after its last patch, not ~20 s, and sat
+# at 2 copies (write quorum) that much longer. Here two fsynced patches land 5 s apart: the
+# old loop folds ~35 s after the second one, the fixed loop ~20 s.
+if should_run T103; then
+snapshot_log T103
+echo ""
+echo "=== T103: a slot patched twice inside the debounce window folds ~20 s after its last patch ==="
+dd if=/dev/urandom of="$T/t103.bin" bs=1M count=8 status=none
+cp "$T/t103.bin" "$MOUNT/t103.bin"
+dfs_sync
+sleep 2
+T103_CHUNK1() {   # "<chunk id> <holder count>" for chunk 1 of /t103.bin
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t103.bin 2>/dev/null \
+        | python3 -c "import json,sys; c=json.load(sys.stdin)['chunk_locations'][1]; print(c['chunk_id'], len(c['nodes']))" 2>/dev/null || true
+}
+T103_PATCH() {    # one fsynced 4K patch into chunk 1 at offset 4 MiB + $1
+    python3 - "$MOUNT/t103.bin" "$1" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + int(sys.argv[2])); os.fsync(fd); os.close(fd)
+PY
+}
+read -r T103_BASE _ <<< "$(T103_CHUNK1)"
+T103_PATCH 8192
+sleep 5
+T103_PATCH 65536
+T103_T0=$SECONDS
+echo "  T103: after the second patch, chunk 1 = $(T103_CHUNK1) (before the patches: ${T103_BASE:-?})"
+T103_DONE=""
+while [ $((SECONDS - T103_T0)) -lt 90 ]; do
+    read -r T103_ID T103_N <<< "$(T103_CHUNK1)"
+    case "$T103_ID" in df7c*|""|"$T103_BASE") ;; *) T103_DONE=$((SECONDS - T103_T0)); break ;; esac
+    sleep 1
+done
+echo "  T103: chunk 1 folded ${T103_DONE:-never} s after the last patch; now $(T103_CHUNK1)"
+if [ -n "$T103_DONE" ] && [ "$T103_DONE" -lt 30 ]; then
+    check "T103 the slot folded ${T103_DONE} s after its last patch (debounce counts from the last patch)" PASS
+else
+    check "T103 the slot folded ${T103_DONE:-never} s after its last patch, a whole extra debounce window late" FAIL
+fi
+rm -f "$MOUNT/t103.bin" "$T/t103.bin"
+fi # should_run T103
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

@@ -334,7 +334,7 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         within the client's 15 s budget.
         DONE f489f20 (10-14): leader_among skips peers a majority voted lease-expired; T88
         0/3 on the old build (EIO at 15.0 s), 3/3 fixed (create in 6.3-6.7 s).
-  - [ ] **G4 New-leader chunk maps** (Legata c742039c, T79c/f): a new leader must not serve
+  - [x] **G4 New-leader chunk maps** (Legata c742039c, T79c/f): a new leader must not serve
         GetFileChunkMap before holders' locations land (fresh readers get zeros meanwhile).
         10-15: T79f failed once in 1015a OFF (patched file read wrong md5; logs lost);
         3/3 alone. Watch for it before ticking.
@@ -358,6 +358,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         (T90c OFF data loss); fsync waits for claimed slots. Suites 1016a ON 281/2 (T59a,
         T59e), OFF 205/10 (all seen before: T83d T85a T38b T59a T64a/b/d T65a T77a/b).
         T79f (OFF, follower never persists placement rows) still has no deterministic repro.
+        10-24: TICKED (Pete): T79f last failed in 1015c (10-15), none in ~40 suites since; reads
+        now resolve each slot through its primary. Legata c742039c stays open as an OFF watch
+        item: if T79f fails again, reopen G4 and reproduce.
         10-16: T75[secondary]a FIXED: a ForceFold on one ISR member now runs as the pair's
         ordered fold and returns once both members answered (unit test fails first). T75 6/6
         alone; suites 1016b ON 282/1 (T85a), OFF 211/4 (T83d T38b T77a/b), 46m each.
@@ -445,6 +448,9 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         after. DONE (10-14) with suites 1014d: on 267/0, off 201/5 (known T38b T64b T64d T77a/b).
   - [ ] **G7 Open ordering-on failures closed:** T85a (cleanup ran 0 passes on one node, both
         modes, 10-13) and T76a (acked loss 10-12; Legata cf286166) root-caused or shown fixed.
+        10-24: T76a ACCEPTED by Pete as not seen since 10-12 (likely closed by T74a); if it
+        shows up again, reopen and reproduce. T85a: fixed 82e97b2, 11 straight passes; tick
+        G7 when G1 closes.
   - [ ] **G8 Bench soak:** the :8950 bench cluster with ordering on, 48 h of a VM-108-like
         workload (qemu disk I/O + DVR-style sequential writes) plus periodic node kills: 0 guest
         EIO, 0 acked loss (md5 / fsck checks), latency and throughput no worse than off.

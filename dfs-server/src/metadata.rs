@@ -6,7 +6,7 @@ use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefi
 // process crash: redb records a None commit only in its in-memory header, so a reopen
 // returns to the last durable commit (verified 2026-10-06, suite T76). Commits are
 // durable by default; see durable_commits_enabled.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 // Fair (queue-ordered) RwLock for MetadataStore.db specifically — see its field doc
@@ -621,6 +621,21 @@ struct CommitterStats {
     last_log: Option<std::time::Instant>,
 }
 
+/// Builder for every on-disk redb handle.
+///
+/// Caps redb's page cache to prevent OOM on low-RAM nodes (default is 1GB); 256MB is plenty
+/// for our working set, the rest stays on disk.
+///
+/// Creates files in redb's file format v3. In v2, open repairs only when the header's
+/// recovery flag is set, so a cleanly closed header over a file longer than its recorded
+/// layout made open panic (suite T79d, 2026-10-24: a node SIGKILLed on a full disk). v3
+/// always repairs or loads the allocator state saved at close.
+fn db_builder() -> redb::Builder {
+    let mut builder = Database::builder();
+    builder.set_cache_size(256 * 1024 * 1024).create_with_file_format_v3(true);
+    builder
+}
+
 impl MetadataStore {
     /// Create a new metadata store (creates the redb file if it does not exist).
     pub fn new(metadata_dir: PathBuf) -> Result<Self> {
@@ -638,32 +653,7 @@ impl MetadataStore {
             let _ = std::fs::remove_file(&shadow_path);
         }
 
-        // Cap redb's page cache to prevent OOM on low-RAM nodes (default is 1GB).
-        // 256MB is plenty for our working set; the rest stays on disk.
-        //
-        // Retry briefly on DatabaseAlreadyOpen: a just-killed previous instance's
-        // graceful-shutdown flush can still hold the file lock for a moment after
-        // the process exits, which would otherwise turn a fast restart (SIGTERM
-        // immediately followed by respawn) into a permanent crash loop.
-        let mut db = {
-            let mut attempt = 0;
-            loop {
-                match Database::builder()
-                    .set_cache_size(256 * 1024 * 1024)
-                    .create(&db_path)
-                {
-                    Ok(db) => break db,
-                    Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt < 10 => {
-                        attempt += 1;
-                        warn!("redb at {:?} still locked by previous instance, retrying ({}/10)...", db_path, attempt);
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("Failed to open redb at {:?}", db_path));
-                    }
-                }
-            }
-        };
+        let mut db = Self::open_db_file(&db_path)?;
 
         // Check structural integrity on every startup. redb's check_integrity()
         // validates B-tree page allocations and repairs any inconsistency left by
@@ -1237,6 +1227,40 @@ impl MetadataStore {
     /// that sees a failure holds the handle's read lock. If the file can't be reopened,
     /// exit: a node with no usable metadata store must not keep serving (its supervisor
     /// restarts it, and leadership moves meanwhile).
+    /// Opens (or creates) the store's redb file at startup.
+    ///
+    /// Retries briefly on DatabaseAlreadyOpen: a just-killed previous instance's
+    /// graceful-shutdown flush can still hold the file lock for a moment after
+    /// the process exits, which would otherwise turn a fast restart (SIGTERM
+    /// immediately followed by respawn) into a permanent crash loop.
+    ///
+    /// A file in redb's older format (v2, what builds before 2026-10-24 created) is upgraded
+    /// to v3 in place (see db_builder). Builds since c8637fb run the same redb, which reads
+    /// v3, so rolling back to one of them still opens the file.
+    fn open_db_file(db_path: &Path) -> Result<Database> {
+        let mut attempt = 0;
+        loop {
+            match db_builder().create(db_path) {
+                Ok(mut db) => {
+                    match db.upgrade() {
+                        Ok(true) => info!("redb at {:?} upgraded to file format v3", db_path),
+                        Ok(false) => {}
+                        Err(e) => warn!("redb at {:?}: upgrade to file format v3 failed, staying on v2: {}", db_path, e),
+                    }
+                    return Ok(db);
+                }
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt < 10 => {
+                    attempt += 1;
+                    warn!("redb at {:?} still locked by previous instance, retrying ({}/10)...", db_path, attempt);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Failed to open redb at {:?}", db_path));
+                }
+            }
+        }
+    }
+
     fn spawn_reopener(db: Weak<RwLock<Database>>, needs_reopen: Arc<std::sync::atomic::AtomicBool>, path: PathBuf) -> std::sync::mpsc::SyncSender<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         std::thread::Builder::new()
@@ -1258,7 +1282,7 @@ impl MetadataStore {
                         }
                     };
                     drop(std::mem::replace(&mut *live, placeholder));
-                    match Database::builder().set_cache_size(256 * 1024 * 1024).create(&path) {
+                    match db_builder().create(&path) {
                         Ok(reopened) => {
                             *live = reopened;
                             warn!("redb reopened after an I/O error");
@@ -5465,8 +5489,7 @@ impl MetadataStore {
 
         let shadow_path = self.db_path.with_extension("redb.shadow");
         let _ = std::fs::remove_file(&shadow_path);
-        let shadow_db = Database::builder()
-            .set_cache_size(256 * 1024 * 1024)
+        let shadow_db = db_builder()
             .create(&shadow_path)
             .map_err(|e| anyhow::anyhow!("compact: failed to create shadow db: {}", e))?;
 
@@ -5570,8 +5593,7 @@ impl MetadataStore {
             drop(shadow_db);
             std::fs::rename(&shadow_path, &self.db_path)
                 .map_err(|e| anyhow::anyhow!("compact: failed to swap in shadow db: {}", e))?;
-            let new_db = Database::builder()
-                .set_cache_size(256 * 1024 * 1024)
+            let new_db = db_builder()
                 .open(&self.db_path)
                 .map_err(|e| anyhow::anyhow!("compact: failed to reopen post-swap db: {}", e))?;
             *live = new_db;
@@ -5775,6 +5797,39 @@ mod tests {
             Ok(Ok(())) => panic!("test setup: the queued commit succeeded, so the race wasn't reproduced"),
             Err(_) => panic!("commit of a transaction queued behind a failed grow panicked instead of returning an error"),
         }
+    }
+
+    /// Suite T79d, 2026-10-24: a node SIGKILLed while its disk was full PANICKED in redb's open
+    /// on restart (page_manager.rs:851). In redb's file format v2, open repairs only when the
+    /// header's recovery flag is set: a cleanly closed header over a file longer than its recorded
+    /// layout marks the database as needing recovery but skips the repair, and open's own write
+    /// transaction then asserts. Format v3 always goes through repair or the saved allocator
+    /// state. Covers a file created by an older build (v2) and one created by this one.
+    #[test]
+    fn a_cleanly_closed_db_whose_file_grew_reopens() {
+        const T: TableDefinition<u64, &[u8]> = TableDefinition::new("t");
+        let grow_and_reopen = |path: &Path| {
+            let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            f.set_len(f.metadata().unwrap().len() + 4096).unwrap();
+            drop(f);
+            let reopened = std::panic::catch_unwind(|| MetadataStore::open_db_file(path));
+            assert!(matches!(reopened, Ok(Ok(_))), "reopening a cleanly closed db whose file grew panicked or failed");
+        };
+        let tmp = TempDir::new().unwrap();
+
+        let old = tmp.path().join("old.redb");
+        {
+            let db = Database::create(&old).unwrap();   // what builds before 2026-10-24 created
+            let txn = db.begin_write().unwrap();
+            txn.open_table(T).unwrap().insert(1, &b"row"[..]).unwrap();
+            txn.commit().unwrap();
+        }
+        drop(MetadataStore::open_db_file(&old).unwrap());   // one startup with this build
+        grow_and_reopen(&old);
+
+        let new = tmp.path().join("new.redb");
+        drop(MetadataStore::open_db_file(&new).unwrap());
+        grow_and_reopen(&new);
     }
 
     /// A put_file that has returned (what a write's ack waits on) must survive the

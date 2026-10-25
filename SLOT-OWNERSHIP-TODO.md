@@ -4,7 +4,7 @@ Pick-up point for SLOT-OWNERSHIP-PLAN.md. Update this file whenever a box is tic
 Sizes are rough: **S** = hours, **M** = about a day, **L** = several days. Each phase still ends
 with the gate in SLOT-OWNERSHIP-PLAN §8a (build, full timed suite, unit failure set vs baseline).
 
-_Last updated: 2026-10-20 (later), Phase 5 step 5 (heads batched by primaries, T99, T97f); T81c open; G1 1/5; before that 2026-10-20, T94 closed (metadata majority-ack) + T59a suspect, T24b, lease-persist fixes; G1 1/5; before that 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97)_
+_Last updated: 2026-10-24, G1 + G4 + G7 closed (only G8/G9 soaks left); before that 2026-10-20 (later), Phase 5 step 5 (heads batched by primaries, T99, T97f); T81c open; G1 1/5; before that 2026-10-20, T94 closed (metadata majority-ack) + T59a suspect, T24b, lease-persist fixes; G1 1/5; before that 2026-10-19, Phase 5 step 4 (healer resolves a slot through its primary, T97)_
 
 **Resume here:** the default-flip gates under 3c ("Make ordering the default"). Ordering kept
 (2026-10-03); ordering-on suites run 255-257 pass with 1-2 failures, but nearly every run still
@@ -293,7 +293,7 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
       T74a acked loss, T74d writer EIO (a regression from the T74a fix), T76a acked loss on
       10-12 (not since; maybe closed by T74a), T85a cleanup didn't run on one node, T86c test
       killed the leader. All fixed or understood except T85a and T76a.
-  - [ ] **G1 Clean streak:** 5 consecutive ordering-on full suites whose only failures are the
+  - [x] **G1 Clean streak:** 5 consecutive ordering-on full suites whose only failures are the
         mode-independent T38b heal-timing flake; each new failure root-caused before the
         streak restarts.
         10-14: 1014a/b clean, 1014c broke it (T85a; its T81b was an untested G6 build);
@@ -316,6 +316,7 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         1024c 321/0 = 2/5. 10-24: T81b root-caused and fixed (922c597 + T104: an ISR member is
         never replaced by a node whose storage is failing); 1024d ON 318/0 = 3/5. T85a has
         passed 11 straight suites (ON+OFF) since its fix in 82e97b2 (10-21).
+        1024e ON 322/0 (55m51s) = 4/5, 1024f ON 318/0 (53m39s) = 5/5: G1 CLOSED 10-24.
   - [x] **G2 Chaos loops:** T74, T69, T73, T76, T77 and T86 looped 20x each with ordering on, 0
         acked writes lost and 0 writer EIOs. Writer EIO counts as a failure (T74d).
         10-15 loops (ae6a40f): T69/T73/T76/T77/T86 20/20, T74 18/20. Both T74 fails = a
@@ -446,11 +447,11 @@ SLOT-OWNERSHIP-PLAN 3c). Behind `DFS_ORDERED_WRITES`; kept or dropped on fio num
         10-14: fix written (FlushAttemptRefused, 30 s budget; not when every replica refused
         the patch for its own storage, T81); T89 (DFS_FAULT_FAIL_PATCHES=2) EIO before, 3/3
         after. DONE (10-14) with suites 1014d: on 267/0, off 201/5 (known T38b T64b T64d T77a/b).
-  - [ ] **G7 Open ordering-on failures closed:** T85a (cleanup ran 0 passes on one node, both
+  - [x] **G7 Open ordering-on failures closed:** T85a (cleanup ran 0 passes on one node, both
         modes, 10-13) and T76a (acked loss 10-12; Legata cf286166) root-caused or shown fixed.
         10-24: T76a ACCEPTED by Pete as not seen since 10-12 (likely closed by T74a); if it
-        shows up again, reopen and reproduce. T85a: fixed 82e97b2, 11 straight passes; tick
-        G7 when G1 closes.
+        shows up again, reopen and reproduce. T85a: fixed 82e97b2, 13 straight passes through
+        1024f. G7 CLOSED 10-24 with G1.
   - [ ] **G8 Bench soak:** the :8950 bench cluster with ordering on, 48 h of a VM-108-like
         workload (qemu disk I/O + DVR-style sequential writes) plus periodic node kills: 0 guest
         EIO, 0 acked loss (md5 / fsck checks), latency and throughput no worse than off.

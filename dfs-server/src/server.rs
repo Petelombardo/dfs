@@ -4064,8 +4064,23 @@ impl OverlayForkCtx {
         // fold_result_chunk_ids insert directly above: a no-op fold still
         // consolidates a real delta and must still stamp at least that delta's
         // generation, or it re-loses the very reject this pair of fixes closes.
+        //
+        // CORRECTED 2026-10-25 (Legata 6f283180, an acked write lost with ordering off):
+        // "the write's own generation" is the generation recorded for public_token, NOT
+        // fold_seq. fold_seq is a client_write_seq, the client's per-FILE counter, which
+        // every other chunk of the file advances too; a generation is the per-SLOT
+        // counter. Stamping fold_seq put the fold of chunk 1 at generation 80 while the
+        // patch that raced it (patched from the very token being folded, so causally
+        // newer) carried the slot's real generation 73, and the leader kept the fold. It
+        // also wrote 80 into the slot's durable CHUNK_SEQ_TABLE row. The token's
+        // generation is in memory on every holder that applied the patch; after a
+        // restart the slot's durable counter stands in for it, in the same units.
         let base_gen = self.chunk_generations.get(&base_chunk_id).map(|v| *v);
-        let stamped_gen = match (base_gen, fold_seq) {
+        let token_gen = match self.chunk_generations.get(&public_token).map(|v| *v) {
+            Some(g) => Some(g),
+            None => self.metadata.get_chunk_seq_async(file_id, chunk_idx).await.ok().flatten(),
+        };
+        let stamped_gen = match (base_gen, token_gen) {
             (Some(g), Some(s)) => Some(g.max(s)),
             (Some(g), None) => Some(g),
             (None, Some(s)) => Some(s),
@@ -24236,6 +24251,113 @@ mod tests {
              pending overlay) and which has no backing chunk file (unresolvable as a real \
              chunk either) — a permanent dangling pointer, exactly the 2026-07-28 VM-108 \
              incident"
+        );
+    }
+
+    /// 2026-10-25 upgrade test run 3 (Legata 6f283180, an ACKED WRITE LOST with ordering
+    /// off): a fold stamped its result's generation with the folded write's
+    /// client_write_seq. Generations are the client's per-SLOT counter (new_chunk_seq);
+    /// client_write_seq is its per-FILE counter, which every other chunk of the file also
+    /// advances, so it runs far ahead. The fold of chunk 1 came out at generation 80 (its
+    /// write seq) while the patch that raced it, newer by both seq (91) and causality (its
+    /// base was the very token the fold consolidated), carried the slot's real generation
+    /// 73. The leader ranks generation first and kept the fold: "RCL-rejected-NEWER".
+    #[tokio::test]
+    async fn test_run_single_fold_generation_is_the_slot_counter_not_the_file_write_seq() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let client = Arc::new(NetworkClient::new());
+        let healing = Arc::new(HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client,
+            Arc::new(std::sync::atomic::AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        server.set_healing_manager(healing.clone()).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 1u64;
+        let chunk_file_offset = 4 * 1024 * 1024u64;
+
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        server.record_chunk_generation(base_chunk_id, 5);
+
+        // The write being folded: slot generation 72, file write seq 80.
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"pending-patch-token-slot-1"));
+        server.record_chunk_generation(public_token, 72);
+        metadata.put_chunk_seq_async(file_id, chunk_idx, 72).await.unwrap();
+        server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+            chunk_id: public_token,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(80),
+            file_id: Some(file_id),
+        }], 1));
+
+        let mut delta_record = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_record.extend_from_slice(&encode_delta_record(80, 0, &[0xABu8]));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
+        storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
+
+        let ctx = server.overlay_ctx();
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let (new_chunk_id, ..) = ctx.run_single_fold(
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(80), now_secs, false, true, None,
+        ).await.expect("fold should succeed: base and delta are both valid");
+        assert_ne!(new_chunk_id, base_chunk_id);
+
+        let new_gen = server.chunk_generations_ref().get(&new_chunk_id).map(|v| *v);
+        assert_eq!(new_gen, Some(72), "the fold's generation is the folded write's slot generation");
+        assert_eq!(metadata.get_chunk_seq_async(file_id, chunk_idx).await.unwrap(), Some(72),
+            "the fold must not push a file write seq into the slot's durable counter");
+
+        // The next write on this slot, patched from the folded token: generation 73, seq 91.
+        let fold_loc = ChunkLocation {
+            chunk_id: new_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: new_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(80),
+            file_id: Some(file_id),
+        };
+        let newer_patch = ChunkLocation {
+            chunk_id: ChunkId::from_hash(compute_chunk_hash(b"newer-patch-token-slot-1")),
+            nodes: vec![node_id, NodeId::new()],
+            size: base_content.len(),
+            checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(91),
+            file_id: Some(file_id),
+        };
+        assert!(
+            Server::location_supersedes(&newer_patch, &fold_loc, false, true, Some(73), new_gen, dfs_common::types::write_quorum(3)),
+            "a newer acked write on the slot must beat the fold of its predecessor"
         );
     }
 

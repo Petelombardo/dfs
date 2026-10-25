@@ -194,6 +194,15 @@ sleep 5
 OLD_BAD=0; compare "old" || OLD_BAD=$?
 [ "$OLD_BAD" = 0 ] && check "U0 the old release itself reads back every byte it acked" PASS \
     || check "U0 the old release reads back $OLD_BAD file(s) wrong BEFORE the upgrade (an old-release bug, not the upgrade's)" FAIL
+# A file the old release already lost would fail every later phase too and hide whatever the
+# new release does. Re-baseline it to what the old release serves, so U1-U4 judge the upgrade
+# and the new release only.
+if [ "$OLD_BAD" != 0 ]; then
+    for f in "$REF"/*; do
+        n=$(basename "$f")
+        cmp -s "$f" "$MOUNT/$n" || { cp "$MOUNT/$n" "$f" && echo "  re-baselined $n to the old release's content"; }
+    done
+fi
 stop_client
 
 # ── Phase 2: upgrade node by node ────────────────────────────────────────────

@@ -5228,6 +5228,28 @@ impl DfsFilesystem {
         }
     }
 
+    /// FileAttr for a LOOKUP reply. The kernel replaces its i_size with whatever size a
+    /// LOOKUP reports, and an O_APPEND write goes at that i_size — so a LOOKUP must report
+    /// at least every byte this client has accepted, the same floor getattr reports. Each
+    /// `echo ... >> log` is lookup + open + write + release, and the previous append's bytes
+    /// are still in the write buffer or the release flush when the next LOOKUP comes; with
+    /// the committed size it reported, every append landed on top of the one before
+    /// (Legata 1e111d42, suite T106: the staging DVR's log, garbled on every start).
+    /// size_high_water is raised by every write and dropped only once the release flush
+    /// has landed, so it covers exactly that window.
+    fn lookup_attr_static(ino: u64, metadata: &FileMetadata, size_high_water: &DashMap<u64, u64>) -> FileAttr {
+        let mut attr = Self::metadata_to_attr_static(ino, metadata);
+        if metadata.file_type == FileType::RegularFile {
+            if let Some(hwm) = size_high_water.get(&ino).map(|v| *v) {
+                if hwm > attr.size {
+                    attr.size = hwm;
+                    attr.blocks = (hwm + 511) / 512;
+                }
+            }
+        }
+        attr
+    }
+
     /// Get or allocate inode for a path
     fn get_or_create_inode(&self, path: &str) -> u64 {
         let path_map = self.path_to_inode.read().unwrap();
@@ -5444,7 +5466,7 @@ impl Filesystem for DfsFilesystem {
         };
 
         if let Some((ino, metadata)) = cached {
-            let attr = self.metadata_to_attr(ino, &metadata);
+            let attr = Self::lookup_attr_static(ino, &metadata, &self.size_high_water);
             reply.entry(&Duration::ZERO, &attr, 0);
             return;
         }
@@ -5471,6 +5493,8 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let write_open_counts = self.write_open_counts.clone();
         let pending_creates = self.pending_creates.clone();
+        let size_high_water = self.size_high_water.clone();
+        let release_in_flight = self.release_in_flight.clone();
 
         self.runtime.spawn(async move {
             let result = client.get_file_metadata_conditional(&path, cached_write_seq).await;
@@ -5500,12 +5524,16 @@ impl Filesystem for DfsFilesystem {
                     let is_open_for_write = write_open_counts.get(&ino)
                         .map(|c| *c > 0).unwrap_or(false);
                     let create_in_flight = pending_creates.contains(&path);
-                    if !is_open_for_write && !create_in_flight {
+                    // A release flush still in flight is local data the server hasn't
+                    // committed yet, just like an open writer's.
+                    let release_pending = release_in_flight.get(&ino)
+                        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) > 0).unwrap_or(false);
+                    if !is_open_for_write && !create_in_flight && !release_pending {
                         metadata_cache.insert(ino, metadata.clone());
                         last_metadata_update.insert(ino, std::time::Instant::now());
                     }
 
-                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                    let attr = DfsFilesystem::lookup_attr_static(ino, &metadata, &size_high_water);
                     reply.entry(&Duration::ZERO, &attr, 0);
                 }
                 Ok(None) => {
@@ -5516,7 +5544,7 @@ impl Filesystem for DfsFilesystem {
                         if let Some(&ino) = path_map.get(&path) {
                             if let Some(metadata) = metadata_cache.get(&ino) {
                                 debug!("Using cached metadata for {} (not modified)", path);
-                                let attr = DfsFilesystem::metadata_to_attr_static(ino, &*metadata);
+                                let attr = DfsFilesystem::lookup_attr_static(ino, &*metadata, &size_high_water);
                                 reply.entry(&Duration::ZERO, &attr, 0);
                                 return;
                             }
@@ -5545,11 +5573,13 @@ impl Filesystem for DfsFilesystem {
                             let is_open_for_write = write_open_counts.get(&ino)
                                 .map(|c| *c > 0).unwrap_or(false);
                             let create_in_flight = pending_creates.contains(&path);
-                            if !is_open_for_write && !create_in_flight {
+                            let release_pending = release_in_flight.get(&ino)
+                                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) > 0).unwrap_or(false);
+                            if !is_open_for_write && !create_in_flight && !release_pending {
                                 metadata_cache.insert(ino, metadata.clone());
                                 last_metadata_update.insert(ino, std::time::Instant::now());
                             }
-                            let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                            let attr = DfsFilesystem::lookup_attr_static(ino, &metadata, &size_high_water);
                             reply.entry(&Duration::ZERO, &attr, 0);
                         }
                         _ => reply.error(libc::ENOENT),

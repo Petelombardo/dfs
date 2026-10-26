@@ -3005,6 +3005,53 @@ echo "  T105: file ${T105_FID:-?}; fold owner node${T105_FOLD:-?}; client REPLIC
 rm -f "$MOUNT/$T105_FILE" "$T/t105.bin"
 fi # should_run T105
 
+# T106 (Legata 1e111d42, 2026-10-26): the staging DVR's startup script writes its log as a burst of
+# shell appends (`echo ... >> log`, each its own open O_APPEND/write/close), and on DFS some of
+# them land on top of earlier ones: lines cut short, fragments of old lines left behind. Every
+# start since at least 10-23 garbled it. An append must go at the end of everything already
+# written, whatever handle wrote it.
+if should_run T106; then
+snapshot_log T106
+echo ""
+echo "=== T106: a burst of shell appends (echo >> f) to one file keeps every line, in order, intact ==="
+T106_D="$MOUNT/t106"; mkdir -p "$T106_D"
+echo "previous run's log" > "$T106_D/app.log"
+dfs_sync
+mv "$T106_D/app.log" "$T106_D/app.log0"
+echo "app.log moved to app.log0, starting anew ..." > "$T106_D/app.log"
+cp /dev/null "$T/t106.exp"; echo "app.log moved to app.log0, starting anew ..." >> "$T/t106.exp"
+for i in $(seq 1 60); do
+    T106_LINE="$(date -u +%T) line $i of the sequential burst: some padding to look like a log line"
+    echo "$T106_LINE" >> "$T106_D/app.log"
+    echo "$T106_LINE" >> "$T/t106.exp"
+done
+T106_SEQ_BAD=$(diff "$T/t106.exp" "$T106_D/app.log" | grep -c '^[<>]' || true)
+# Two shells appending to one file at once: O_APPEND puts every write at the end, so whatever the
+# interleaving, each line is whole and none is missing.
+t106_writer() { for i in $(seq 1 40); do echo "writer $1 line $i: some padding to look like a log line" >> "$T106_D/both.log"; done; }
+: > "$T106_D/both.log"
+t106_writer A & T106_PA=$!
+t106_writer B & T106_PB=$!
+wait $T106_PA $T106_PB
+T106_CONC_BAD=$(python3 - "$T106_D/both.log" <<'PY'
+import re, sys
+lines = open(sys.argv[1], "rb").read().decode(errors="replace").split("\n")
+want = {f"writer {w} line {i}: some padding to look like a log line" for w in "AB" for i in range(1, 41)}
+got = [l for l in lines if l]
+print(len(want - set(got)) + sum(1 for l in got if l not in want))
+PY
+)
+dfs_sync
+sleep 2
+T106_FRESH=$(fresh_read t106/app.log 0 100000)
+T106_FRESH_BAD=$(diff "$T/t106.exp" <(printf '%s\n' "$T106_FRESH") | grep -c '^[<>]' || true)
+echo "  T106: sequential burst: $T106_SEQ_BAD differing line(s); two writers: $T106_CONC_BAD missing or broken line(s); fresh client: $T106_FRESH_BAD differing line(s)"
+[ "$T106_SEQ_BAD" != 0 ] && { echo "    app.log: $(wc -c < "$T106_D/app.log") bytes, $(wc -l < "$T106_D/app.log") lines; head:"; head -c 600 "$T106_D/app.log" | od -c | head -12 | sed "s/^/    /"; }
+check "T106a 60 sequential shell appends read back as written" "$([ "$T106_SEQ_BAD" = 0 ] && echo PASS || echo FAIL)"
+check "T106b two shells appending at once: every line whole, none lost" "$([ "$T106_CONC_BAD" = 0 ] && echo PASS || echo FAIL)"
+check "T106c a fresh client reads the appended log as written" "$([ "$T106_FRESH_BAD" = 0 ] && echo PASS || echo FAIL)"
+fi # should_run T106
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

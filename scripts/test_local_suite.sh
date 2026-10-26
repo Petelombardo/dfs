@@ -3052,6 +3052,52 @@ check "T106b two shells appending at once: every line whole, none lost" "$([ "$T
 check "T106c a fresh client reads the appended log as written" "$([ "$T106_FRESH_BAD" = 0 ] && echo PASS || echo FAIL)"
 fi # should_run T106
 
+if should_run T107; then
+snapshot_log T107
+echo ""
+echo "=== T107: a truncate right after writes wins: rewriting a file (O_TRUNC) or emptying it (: >) leaves only the new bytes ==="
+T107_D="$MOUNT/t107"; mkdir -p "$T107_D"
+# Rewrite: the way programs save a settings file. The old content's write is still buffered (or
+# being flushed) when the file is reopened with O_TRUNC and the short new content written.
+T107_RW_BAD=0; T107_RW_SAMPLE=""
+for r in 1 2 3 4 5; do
+    T107_OUT=$(python3 - "$T107_D/rw$r.json" <<'PY'
+import os, sys, time
+p = sys.argv[1]
+open(p, "w").write('{"big": "' + "x" * 700 + '"}\n')
+open(p, "w").write("{}\n")
+s1 = os.path.getsize(p); time.sleep(3); s2 = os.path.getsize(p); d = open(p, "rb").read()
+print("ok" if (s1, s2, d) == (3, 3, b"{}\n") else "bad sizes %d %d content %r" % (s1, s2, d[:24]))
+PY
+)
+    [ "$T107_OUT" = ok ] || { T107_RW_BAD=$((T107_RW_BAD+1)); T107_RW_SAMPLE="$T107_OUT"; }
+done
+# Empty and append: `: > f` while the previous appends to f are still being flushed, then append.
+T107_AP_BAD=0; T107_AP_SAMPLE=""
+for r in 1 2 3 4 5; do
+    f="$T107_D/ap$r.log"
+    for k in $(seq 1 20); do echo "round $r old line $k: padding to look like a log line" >> "$f"; done
+    : > "$f"
+    echo "new" >> "$f"
+    sleep 3
+    T107_GOT=$(od -An -c "$f" | tr -s ' ' | head -c 80)
+    [ "$(stat -c %s "$f")" = 4 ] && [ "$(cat "$f")" = new ] || { T107_AP_BAD=$((T107_AP_BAD+1)); T107_AP_SAMPLE="size $(stat -c %s "$f"):$T107_GOT"; }
+done
+dfs_sync
+sleep 2
+T107_FRESH_BAD=0; T107_FRESH_SAMPLE=""
+for r in 1 2 3 4 5; do
+    T107_GOT=$(fresh_read t107/rw$r.json 0 100000)
+    [ "$T107_GOT" = "{}" ] || { T107_FRESH_BAD=$((T107_FRESH_BAD+1)); T107_FRESH_SAMPLE="rw$r.json: $(printf '%s' "$T107_GOT" | head -c 60 | od -An -c | tr -s ' ' | head -c 90)"; }
+    T107_GOT=$(fresh_read t107/ap$r.log 0 100000)
+    [ "$T107_GOT" = "new" ] || { T107_FRESH_BAD=$((T107_FRESH_BAD+1)); T107_FRESH_SAMPLE="ap$r.log: $(printf '%s' "$T107_GOT" | head -c 60 | od -An -c | tr -s ' ' | head -c 90)"; }
+done
+echo "  T107: rewrite with O_TRUNC: $T107_RW_BAD/5 wrong ${T107_RW_SAMPLE:+(e.g. $T107_RW_SAMPLE)}; empty-then-append: $T107_AP_BAD/5 wrong ${T107_AP_SAMPLE:+(e.g. $T107_AP_SAMPLE)}; fresh client: $T107_FRESH_BAD/10 wrong ${T107_FRESH_SAMPLE:+(e.g. $T107_FRESH_SAMPLE)}"
+check "T107a a file rewritten with O_TRUNC right after a write holds only the new content" "$([ "$T107_RW_BAD" = 0 ] && echo PASS || echo FAIL)"
+check "T107b a file emptied (: >) right after appends, then appended to, holds only the new line" "$([ "$T107_AP_BAD" = 0 ] && echo PASS || echo FAIL)"
+check "T107c a fresh client reads only the new content of both" "$([ "$T107_FRESH_BAD" = 0 ] && echo PASS || echo FAIL)"
+fi # should_run T107
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

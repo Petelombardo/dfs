@@ -5228,6 +5228,30 @@ impl DfsFilesystem {
         }
     }
 
+    /// Wait (up to 10 s) until no earlier write session's release task for `ino` is still
+    /// flushing and committing its metadata.
+    fn wait_release_in_flight(&self, ino: u64, caller: &str) {
+        let pending = |r: &DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>| {
+            r.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0
+        };
+        if !pending(&self.release_in_flight) {
+            return;
+        }
+        let release_in_flight = self.release_in_flight.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                while pending(&release_in_flight) {
+                    if std::time::Instant::now() >= deadline {
+                        warn!("{}: timed out waiting for release_in_flight on ino={}", caller, ino);
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                }
+            });
+        });
+    }
+
     /// FileAttr for a LOOKUP reply. The kernel replaces its i_size with whatever size a
     /// LOOKUP reports, and an O_APPEND write goes at that i_size — so a LOOKUP must report
     /// at least every byte this client has accepted, the same floor getattr reports. Each
@@ -5863,19 +5887,7 @@ impl Filesystem for DfsFilesystem {
         let had_inflight = !has_active_writer &&
             self.release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0;
         if had_inflight {
-            let release_in_flight = self.release_in_flight.clone();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            tokio::task::block_in_place(|| {
-                self.runtime.block_on(async {
-                    while release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0 {
-                        if std::time::Instant::now() >= deadline {
-                            warn!("open: timed out waiting for release_in_flight on ino={}", ino);
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                    }
-                });
-            });
+            self.wait_release_in_flight(ino, "open");
         }
         if is_read_open && !has_active_writer && !has_inflight_flush {
             if let Some(meta) = self.metadata_cache.get(&ino) {
@@ -9084,6 +9096,16 @@ impl Filesystem for DfsFilesystem {
     ) {
         debug!("setattr: ino={}, mode={:?}, uid={:?}, gid={:?}, size={:?}",
                ino, mode, uid, gid, size);
+
+        // A size change must land after every earlier write session's close-time flush. An
+        // O_TRUNC open (rewriting a settings file, `: > log`) counts itself as a writer, so
+        // open() doesn't wait for the previous session's release; the truncate then commits
+        // first and that release's flush lands on top of it with the old chunks and size,
+        // leaving the new bytes followed by the old file's tail (T107). The release task
+        // runs on the flush runtime, so waiting for it here can't hold it up.
+        if size.is_some() {
+            self.wait_release_in_flight(ino, "setattr");
+        }
 
         let mut metadata = match self.metadata_cache.get(&ino) {
             Some(m) => m.clone(),

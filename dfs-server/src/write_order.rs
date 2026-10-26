@@ -230,6 +230,16 @@ impl WriteOrdering {
         self.synced.get(&(file_id, chunk_idx)).map_or(0, |e| *e)
     }
 
+    /// The file was truncated to zero: every slot of it this node has an ordered stream for
+    /// ends here (`clear_head` on each). Its bytes are gone, so no stream head may still name
+    /// them to a reader or serve as the next ordered write's base.
+    pub fn clear_file_heads(&self, file_id: FileId) {
+        let idxs: Vec<u64> = self.latest_epoch.iter().filter(|e| e.key().0 == file_id).map(|e| e.key().1).collect();
+        for idx in idxs {
+            self.clear_head(file_id, idx);
+        }
+    }
+
     /// An unordered write changed this slot here: the ordered stream's head no longer
     /// names this replica's current state, so the next ordered write takes its base fresh.
     /// Clears the previous epoch's head too: it must not carry into a new stream (see
@@ -583,5 +593,19 @@ mod tests {
         assert_eq!(o.previous_epoch_head(f, 0, 3), Some(b), "a fold of the carried head follows it");
         o.clear_head(f, 0);
         assert_eq!(o.previous_epoch_head(f, 0, 3), None, "an unordered write here retires the carried head");
+    }
+
+    #[test]
+    fn a_truncate_to_zero_ends_every_slot_stream_of_that_file_only() {
+        let o = WriteOrdering::default();
+        let (f, g) = (FileId::new(), FileId::new());
+        for (file, idx, n) in [(f, 0, 1), (f, 3, 2), (g, 0, 3)] {
+            let s = o.slot(file, idx, 1);
+            s.set_anchor(cid(n), 0);
+            s.applied(1, 1, Some(cid(n)));
+        }
+        o.clear_file_heads(f);
+        assert_eq!((o.latest_head(f, 0), o.latest_head(f, 3)), (None, None), "the truncated file's heads are gone");
+        assert_eq!(o.latest_head(g, 0), Some(cid(3)), "another file's stream is untouched");
     }
 }

@@ -6869,6 +6869,12 @@ impl Server {
                 for loc in old_locs.iter() {
                     self.chunk_to_file.remove(&loc.chunk_id);
                 }
+                // The truncate ends the file's ordered streams too. A slot's primary names its
+                // stream head to readers ahead of the leader's map (GetSlotHeads), and the
+                // write that refills the slot after a truncate is a fresh, unordered one that
+                // never moves that head: left set, a fresh reader got the old content back
+                // (T107c, ordering on).
+                self.write_ordering.clear_file_heads(metadata.id);
                 self.chunk_map.insert(metadata.id, (vec![], metadata.write_seq));
             }
         }

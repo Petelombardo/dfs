@@ -1316,6 +1316,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectChunkLocationFailures { .. }
         | Request::InjectIgnoreMetadataVersions { .. }
         | Request::InjectChunkLocation { .. }
+        | Request::InjectSlowFoldAdopts { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -8535,6 +8536,18 @@ impl Server {
                 crate::write_order::INJECTED_SLOW_FOLDS.store(count, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
+            Request::InjectSlowFoldAdopts { millis, count } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: the next {} peer fold result(s) wait {}ms before this node records them", count, millis);
+                crate::write_order::INJECTED_SLOW_FOLD_ADOPT_MS.store(millis, std::sync::atomic::Ordering::SeqCst);
+                crate::write_order::INJECTED_SLOW_FOLD_ADOPTS.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
             Request::SlotIsrPrepare { items } => self.slot_isr.handle_prepare(items).await,
             Request::SlotIsrAccept { items } => self.slot_isr.handle_accept(items).await,
             Request::SlotIsrCommit { items } => self.slot_isr.handle_commit(items).await,
@@ -11551,6 +11564,11 @@ impl Server {
         &self, public_token: ChunkId, real_chunk_id: ChunkId, file_id: FileId, chunk_idx: u64,
         location: Option<ChunkLocation>,
     ) -> Response {
+        if let Some(ms) = crate::write_order::take_injected_slow_fold_adopt() {
+            warn!("FAULT INJECTION: fold of file {} chunk {} ({} -> {}) waiting {}ms before this node records it",
+                file_id, chunk_idx, public_token, real_chunk_id, ms);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         // Read BEFORE the flip below: a Pending row here means this node was
         // genuinely tracking this slot — it holds the base and the delta and is
         // a real replica, whatever any published ChunkLocation happens to say.

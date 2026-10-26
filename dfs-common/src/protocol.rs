@@ -1339,6 +1339,15 @@ pub enum Request {
     InjectChunkLocation {
         location: ChunkLocation,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): the next `count` peer fold results this node
+    /// receives (ReplicatePatchFold) wait `millis` before it records them, so a write can
+    /// land between a fold and its other holders adopting it (suite T105). APPENDED at end
+    /// to preserve wire compatibility.
+    InjectSlowFoldAdopts {
+        millis: u64,
+        count: u32,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

@@ -8639,7 +8639,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let authoritative = Self::authoritative_patch_result(&replica_results, leader_addr);
 
-        let (authoritative_chunk_id, authoritative_size, authoritative_patch_ts) = match authoritative {
+        let (mut authoritative_chunk_id, authoritative_size, authoritative_patch_ts) = match authoritative {
             Some(x) => x,
             None => {
                 // All replicas failed. If every single failure was transient — a node
@@ -8693,8 +8693,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // cycle. Re-pushing is not our job: we already have our dual-RF write guarantee
         // from the nodes that succeeded, and re-pushing risks pushing incorrect data to
         // nodes whose state we don't fully know.
-        let new_size: usize = authoritative_size;
+        let mut new_size: usize = authoritative_size;
         let mut patched_node_ids: Vec<dfs_common::NodeId> = Vec::new();
+        let mut applied_addrs: Vec<SocketAddr> = Vec::new();
+        let mut disagreeing = false;
 
         for (addr, result) in &replica_results {
             match result {
@@ -8702,10 +8704,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                     if let Some(&nid) = addr_to_node_id_snap.get(addr) {
                         patched_node_ids.push(nid);
                     }
+                    applied_addrs.push(*addr);
                 }
                 Ok((ncid, _, _)) => {
-                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — excluding, healer will correct",
+                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — settling it below",
                         addr, ncid, authoritative_chunk_id);
+                    applied_addrs.push(*addr);
+                    disagreeing = true;
                 }
                 Err(e) if e.to_string().contains("chunk stale") => {
                     // Check if this replica already had the target chunk (healer beat us to it).
@@ -8724,6 +8729,58 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 }
                 Err(_) => {} // connection/other failure — already logged
+            }
+        }
+
+        // Replicas that applied the patch but returned different versions (Legata a91d2a0c, suite
+        // T105): with ordering off, a fold and a patch can reach a slot's holders in either order.
+        // The fold owner applied this patch to its fold result, another holder to the token it had
+        // not yet seen folded: the same bytes, but a token's id is the hash of its accumulator, so
+        // the ids differ. Excluding one holder and raw-copying the other's token onto it left that
+        // copy with no patch state, every later patch minted different ids again, and a holder
+        // finally rebased onto an old fold and lost the acked writes in between. A fold result's
+        // id is its content hash, so fold every holder that applied it: if they agree, that is
+        // this write's version on all of them. If they don't, the bytes really differ, and the
+        // write goes on as before (the majority's version, backfilled).
+        if disagreeing && order_tags.is_empty() {
+            if let Some(cidx) = chunk_idx {
+                let permit_wait_start = std::time::Instant::now();
+                let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
+                timing_fold_permit_wait += permit_wait_start.elapsed();
+                let folds = futures::future::join_all(applied_addrs.iter().map(|&addr| async move {
+                    (addr, self.send_request(addr, Request::ForceFold { file_id, chunk_idx: cidx }).await)
+                })).await;
+                let mut agreed: Option<(ChunkId, usize)> = None;
+                let mut nodes: Vec<dfs_common::NodeId> = Vec::new();
+                let mut all_agree = true;
+                for (addr, response) in folds {
+                    match response {
+                        Ok(Response::ForceFoldResult { real_chunk_id, size })
+                            if agreed.is_none_or(|(id, _)| id == real_chunk_id) =>
+                        {
+                            agreed = Some((real_chunk_id, size));
+                            if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
+                                nodes.push(nid);
+                            }
+                        }
+                        other => {
+                            warn!("MultiPatch: fold of file {} chunk {} on {} to settle a disagreement: {:?}",
+                                file_id, cidx, addr, other.map(|r| format!("{:?}", r)));
+                            all_agree = false;
+                        }
+                    }
+                }
+                match agreed {
+                    Some((real_chunk_id, size)) if all_agree => {
+                        info!("MultiPatch: replicas {:?} disagreed on the version of file {} chunk {} but fold to the same {} — using it",
+                            applied_addrs, file_id, cidx, real_chunk_id);
+                        authoritative_chunk_id = real_chunk_id;
+                        new_size = size;
+                        patched_node_ids = nodes;
+                    }
+                    _ => warn!("MultiPatch: replicas {:?} of file {} chunk {} did not fold to one version — keeping {}",
+                        applied_addrs, file_id, cidx, authoritative_chunk_id),
+                }
             }
         }
 
@@ -8949,7 +9006,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         let mut new_chunk_id = authoritative_chunk_id;
-        let mut new_size = new_size;
 
         // Active-fold timer: this client (not each server independently) now owns
         // the decision to fold a hot slot's accumulated patches into real content.

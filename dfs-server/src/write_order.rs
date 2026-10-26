@@ -62,6 +62,20 @@ pub fn take_injected_slow_fold() -> Option<u64> {
         .map(|_| INJECTED_SLOW_FOLD_MS.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectSlowFoldAdopts`): the next
+/// `INJECTED_SLOW_FOLD_ADOPTS` peer fold results this node receives wait this long before
+/// it records them, so a write can land between a fold and its holders adopting it.
+pub static INJECTED_SLOW_FOLD_ADOPT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INJECTED_SLOW_FOLD_ADOPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Consume one injected slow fold adopt, if any are armed: how long to wait.
+pub fn take_injected_slow_fold_adopt() -> Option<u64> {
+    INJECTED_SLOW_FOLD_ADOPTS
+        .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+        .ok()
+        .map(|_| INJECTED_SLOW_FOLD_ADOPT_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectChunkLocationFailures`): until this
 /// time (ms since UNIX epoch), chunk-location registrations fail as a failed commit would.
 /// Time-based, not a count: the ordered and batched senders retry at very different rates.

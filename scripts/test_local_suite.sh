@@ -2925,6 +2925,86 @@ sleep 8
 rm -f "$MOUNT/t104.bin"
 fi # should_run T104
 
+# ── T105: a patch between the owner's fold and the other holder adopting it (Legata a91d2a0c) ──
+#
+# Ordering off (10-25 upgrade test, old-release phase, 3 of 4 runs): the fold owner folded a slot,
+# and the next fsynced patch reached the other holder before that holder had recorded the fold.
+# The owner applied it to the fold result (a fresh accumulator), the other holder to the unfolded
+# token (its old accumulator plus the patch): the same bytes, but a token's id is its accumulator's
+# hash, so the ids differed. The client logged a REPLICA DISAGREEMENT, raw-copied one holder's
+# token onto the other, the holders kept minting different ids, and about a minute later a holder
+# rebased onto the old fold result and the acked writes in between were lost. Here every node
+# waits 6 s before recording a peer's fold result, a patch lands in that window, and six more
+# follow; the holders must agree on every patch and a fresh client must read every one back.
+if should_run T105; then
+snapshot_log T105
+echo ""
+echo "=== T105: a patch between a fold and its holders adopting it: the holders agree, no acked write lost ==="
+T105_FILE=t105.bin
+T105_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$T/t105.bin" bs=4M count=2 status=none
+cp "$T/t105.bin" "$MOUNT/$T105_FILE"
+dfs_sync
+sleep 2
+t105_patch() {   # t105_patch <offset>: 4 KiB at <offset> into the mount and the expected copy, fsynced
+    python3 - "$MOUNT/$T105_FILE" "$T/t105.bin" "$1" <<'PY'
+import os, sys
+x = os.urandom(4096); off = int(sys.argv[3])
+fd = os.open(sys.argv[1], os.O_RDWR); os.pwrite(fd, x, off); os.fsync(fd); os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+PY
+}
+T105_FID=$(grep -h "\[META SERVER\] put path=/$T105_FILE id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+declare -A T105_MARK
+for n in 1 2 3 4 5; do T105_MARK[$n]=$(wc -l < "$LOG/server$n.log"); done
+T105_CMARK=$(wc -l < "$CURRENT_CLIENT_LOG")
+"$BIN/dfs-admin" --cluster "$T105_ALL" fault slow-fold-adopt --millis 6000 --count 1000 >/dev/null 2>&1 || true
+t105_patch $((4 * 1024 * 1024 + 8192))
+T105_FOLD=""
+for _ in $(seq 1 300); do
+    for n in 1 2 3 4 5; do
+        tail -n +"$((T105_MARK[$n] + 1))" "$LOG/server$n.log" | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -a "FOLD OWNER: file $T105_FID chunk 1 " | grep -q . && { T105_FOLD=$n; break; }
+    done
+    [ -n "$T105_FOLD" ] && break
+    sleep 0.2
+done
+if [ -n "$T105_FOLD" ]; then
+    t105_patch $((4 * 1024 * 1024 + 65536))
+    for i in 1 2 3 4 5 6; do sleep 1.5; t105_patch $((4 * 1024 * 1024 + 65536 + i * 131072)); done
+fi
+sleep 8
+"$BIN/dfs-admin" --cluster "$T105_ALL" fault slow-fold-adopt --millis 0 --count 0 >/dev/null 2>&1 || true
+T105_CL=$(tail -n +"$((T105_CMARK + 1))" "$CURRENT_CLIENT_LOG" | sed 's/\x1b\[[0-9;]*m//g')
+T105_DIS=$(echo "$T105_CL" | grep -a "REPLICA DISAGREEMENT" | grep -c "" || true)
+# A disagreement is settled when the holders fold to one version; it splits them when the client
+# falls back to raw-copying one holder's token onto the other, or they fold to different versions.
+T105_SPLIT=$(echo "$T105_CL" | grep -aE "with a direct raw copy|did not fold to one version" | grep -c "" || true)
+dfs_sync
+sleep 25
+T105_M1=$(md5sum < "$T/t105.bin" | cut -d' ' -f1)
+T105_FM=/tmp/dfs-mount-t105
+mkdir -p "$T105_FM"
+RUST_LOG=info "$BIN/dfs-client" mount "$T105_FM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t105.log" --allow-other --log-level debug &
+T105_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T105_FM" && break; sleep 0.1; done
+T105_M2=$(timeout 60 md5sum < "$T105_FM/$T105_FILE" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T105_FM" 2>/dev/null || true
+kill_client_and_wait "$T105_CPID"
+echo "  T105: file ${T105_FID:-?}; fold owner node${T105_FOLD:-?}; client REPLICA DISAGREEMENT lines $T105_DIS, left split $T105_SPLIT"
+[ -n "$T105_FOLD" ] \
+    && check "T105a the owner folded chunk 1 and a patch was sent while its holders' adopts were held" PASS \
+    || check "T105a no fold of chunk 1 within 60 s: the test didn't reach the case" FAIL
+[ -n "$T105_FOLD" ] && [ "$T105_SPLIT" = 0 ] \
+    && check "T105b every patch left both holders on one version ($T105_DIS disagreement(s), all settled)" PASS \
+    || check "T105b $T105_SPLIT patch(es) left the holders on different versions (raw-copied or unsettled)" FAIL
+[ "$T105_M1" = "$T105_M2" ] \
+    && check "T105c a fresh client reads every acked patch back" PASS \
+    || check "T105c fresh read ${T105_M2:-unreadable} vs expected $T105_M1: an acked write was lost" FAIL
+rm -f "$MOUNT/$T105_FILE" "$T/t105.bin"
+fi # should_run T105
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

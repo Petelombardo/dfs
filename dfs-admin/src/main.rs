@@ -176,6 +176,14 @@ enum FaultCommands {
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
+    /// Test-only: the next `count` peer fold results this node receives wait `millis` before
+    /// it records them, so a write can land between a fold and its holders adopting it.
+    SlowFoldAdopt {
+        #[arg(long)]
+        millis: u64,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
     /// Test-only: fail every chunk-location registration this node receives for `millis`
     /// (0 clears it).
     FailLocations {
@@ -1887,6 +1895,16 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::SlowFoldAdopt { millis, count } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectSlowFoldAdopts { millis: *millis, count: *count }).await? {
+                Response::Ok { .. } => println!("{}: the next {} peer fold result(s) wait {}ms", addr, count, millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::FailLocations { millis } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectChunkLocationFailures { millis: *millis }).await? {
@@ -1952,6 +1970,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
+        | FaultCommands::SlowFoldAdopt { .. }
         | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. }
         | FaultCommands::PlantLocation { .. } => unreachable!("handled above"),
     };

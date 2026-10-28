@@ -13,10 +13,10 @@
 # Results: /root/g8-soak/summary.log here (one health line per 10 min, every kill/restart, a
 # final verdict), worker logs on the client in /root/dfs-bench/soak/. Any worker FAIL line, a
 # bench server panic, or a DATA LOSS line fails G8.
-NODES="gluster2 gluster3 gluster4 gluster5"
+NODES=${BENCH_NODES:-"gluster2 gluster3 gluster4 gluster5"}   # as scripts/bench_staging.sh
 CLIENT=${BENCH_CLIENT_HOST:-server4}
 PORT=8950
-DIR=/mnt/gluster/dfs-bench
+DIR=${BENCH_DIR:-/mnt/gluster/dfs-bench}
 CDIR=/root/dfs-bench
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=/root/g8-soak
@@ -57,7 +57,7 @@ start)
     while [ "$(date +%s)" -lt "$end" ] && [ ! -f "$OUT/stop" ]; do
         now=$(date +%s)
         if [ "$now" -ge "$next_kill" ]; then
-            set -- $NODES; shift $(( RANDOM % 4 )); victim=$1
+            set -- $NODES; shift $(( RANDOM % $(echo $NODES | wc -w) )); victim=$1
             pid=$(bench_pid "$victim")
             if [ -n "$pid" ]; then
                 ssh root@"$victim" "kill -9 $pid"; down=$(( 90 + RANDOM % 90 ))

@@ -28,12 +28,14 @@
 # BENCH_CLIENT_EXTRA_ENV="K=V ..." adds environment for the client (e.g. DFS_CHAIN_WRITES=1).
 # BENCH_SERVER_BIN_DIR / BENCH_CLIENT_BIN deploy other binaries (e.g. production's own, copied
 # read-only, for a prod-vs-new comparison). A redeploy over a running bench needs teardown first.
+# BENCH_NODES="server2 server3 ..." / BENCH_DIR=/mnt/dfsbench/srv run the servers on other hosts and
+# disks (the first node seeds the rest); BENCH_CLIENT_HOST picks the client. Default: gluster2-5.
 set -e
-NODES="gluster2 gluster3 gluster4 gluster5"   # not gluster1: production leader, least free memory
+NODES=${BENCH_NODES:-"gluster2 gluster3 gluster4 gluster5"}   # not gluster1: production leader, least free memory
 CLIENT=${BENCH_CLIENT_HOST:-server4}   # server4: x86_64 client from dist/bench-x86_64 (build-x86.sh);
                                        # rock5b (aarch64, 1 GbE): BENCH_CLIENT_BIN=target/release/dfs-client
 PORT=8950
-DIR=/mnt/gluster/dfs-bench            # on each storage node (persistent disk, not /tmp = RAM)
+DIR=${BENCH_DIR:-/mnt/gluster/dfs-bench}   # on each storage node (persistent disk, not /tmp = RAM)
 CDIR=/root/dfs-bench                  # on the client
 MNT=/mnt/dfs-bench
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,7 +46,8 @@ MIN_FREE_MB=3000
 SERVER_ENV="DFS_CHUNK_RING_CAPACITY=8 DFS_DELTA_RING_CAPACITY=8 DFS_MAX_CACHE_CHUNKS=8 DFS_LEASE_CLUSTER_SIZE=4 DFS_SLOT_ISR_SEED_SECS=3"
 
 ip_of() { getent hosts "$1" | awk '{print $1; exit}'; }
-SEED="$(ip_of gluster2):$PORT"
+SEED_NODE=${NODES%% *}   # the first node seeds the others
+SEED="$(ip_of "$SEED_NODE"):$PORT"
 
 # Stop only processes whose executable IS the bench binary. Never pkill -f: the pattern would
 # also match the ssh shell running it, and a loose pattern could reach production.
@@ -74,15 +77,15 @@ start_client() {  # $1 = DFS_ORDERED_WRITES
 case "$1" in
 check)
     for n in $NODES; do
-        echo "$n: $(ssh root@"$n" "df -Pm /mnt/gluster | awk 'NR==2{print \$4\" MB free on /mnt/gluster\"}'; awk '/MemAvailable/{print int(\$2/1024)\" MB mem avail\"}' /proc/meminfo; uname -m" | tr '\n' ' ')"
+        echo "$n: $(ssh root@"$n" "df -Pm $(dirname $DIR) | awk 'NR==2{print \$4\" MB free on $(dirname $DIR)\"}'; awk '/MemAvailable/{print int(\$2/1024)\" MB mem avail\"}' /proc/meminfo; uname -m" | tr '\n' ' ')"
     done
     echo "$CLIENT: $(ssh root@"$CLIENT" "which fio || echo NO-FIO; uname -m; df -Pm /root | awk 'NR==2{print \$4\" MB free\"}'" | tr '\n' ' ')"
     ;;
 deploy)
     ORDERED=${2:-0}
     for n in $NODES; do
-        free=$(ssh root@"$n" "df -Pm /mnt/gluster | awk 'NR==2{print \$4}'")
-        [ "$free" -ge "$MIN_FREE_MB" ] || { echo "$n: only ${free}MB free on /mnt/gluster (< ${MIN_FREE_MB}) — aborting"; exit 1; }
+        free=$(ssh root@"$n" "df -Pm $(dirname $DIR) | awk 'NR==2{print \$4}'")
+        [ "$free" -ge "$MIN_FREE_MB" ] || { echo "$n: only ${free}MB free on $(dirname $DIR) (< ${MIN_FREE_MB}) — aborting"; exit 1; }
     done
     for n in $NODES; do
         ip=$(ip_of "$n")
@@ -90,7 +93,7 @@ deploy)
         scp -q "$BIN/dfs-server" "$BIN/dfs-admin" root@"$n":$DIR/bin/
         ssh root@"$n" "cd $DIR && [ -f config/config.toml ] || $DIR/bin/dfs-server init --data-dir $DIR/data --meta-dir $DIR/metadata --config $DIR/config/config.toml >/dev/null 2>&1
             sed -i 's|^listen_addr = .*|listen_addr = \"$ip:$PORT\"|' $DIR/config/config.toml
-            if [ $n != gluster2 ]; then sed -i 's|^seed_nodes = .*|seed_nodes = [\"$SEED\"]|' $DIR/config/config.toml; fi
+            if [ $n != $SEED_NODE ]; then sed -i 's|^seed_nodes = .*|seed_nodes = [\"$SEED\"]|' $DIR/config/config.toml; fi
             grep -E '^(listen_addr|seed_nodes)' $DIR/config/config.toml"
     done
     ssh root@"$CLIENT" "mkdir -p $CDIR"

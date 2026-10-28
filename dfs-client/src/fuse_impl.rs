@@ -8984,6 +8984,22 @@ impl Filesystem for DfsFilesystem {
             // two metadata entries for the same path after rename.
             if let Some(new_ino_val) = new_ino {
                 if let Some(existing_meta) = metadata_cache.get(&new_ino_val).map(|m| m.clone()) {
+                    // The destination is the source file itself: an earlier attempt of this
+                    // rename already moved it, and the caller is retrying (mv did, after a
+                    // slow leader made the first attempt report EIO; suite T110). Deleting
+                    // the "existing destination" deleted the renamed file. POSIX makes a
+                    // rename onto the same file a no-op that succeeds.
+                    if new_ino_val == old_ino || metadata_cache.get(&old_ino).map(|m| m.id) == Some(existing_meta.id) {
+                        info!("rename: {} is already {} (file_id {}); nothing to do", old_path, new_path, existing_meta.id);
+                        if new_ino_val != old_ino {
+                            path_to_inode.write().unwrap().remove(&old_path);
+                        }
+                        let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                        let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
+                        DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, old_parent);
+                        reply.ok();
+                        return;
+                    }
                     if let Err(e) = client.delete_file(&existing_meta.path).await {
                         warn!("rename: failed to delete destination {}: {}", existing_meta.path, e);
                         // Non-fatal: proceed with rename

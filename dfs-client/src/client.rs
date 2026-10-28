@@ -8559,6 +8559,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                         debug!("ReplaceIsrMember for file {} chunk {}: primary {} not expired by a majority yet; asking again in {:?}",
                             tag.file_id, tag.chunk_idx, failed, TAKEOVER_POLL);
                         tokio::time::sleep(TAKEOVER_POLL).await;
+                        // "Not expired" also means the primary may be back: a majority voted out
+                        // the incarnation that refused us, it rejoined at the next one, and that
+                        // one holds its lease and takes writes. The secondary never calls it
+                        // expired, so asking only the secondary waited out the whole budget
+                        // while the primary was fine (suite T108 1027b: 19s; T111). Resend the
+                        // write: a primary that answered refuses again at once if it is still
+                        // without its lease; one we couldn't reach costs a transport timeout, so
+                        // that is retried only every RESEND_UNREACHABLE.
+                        const RESEND_UNREACHABLE: std::time::Duration = std::time::Duration::from_secs(2);
+                        if !transport_failed(tag.primary) || iteration_start.elapsed() >= RESEND_UNREACHABLE {
+                            continue 'retry;
+                        }
                         continue;
                     }
                     info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",

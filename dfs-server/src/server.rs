@@ -291,6 +291,13 @@ pub struct Server {
     /// resolved, without polling.
     rename_progress: Arc<tokio::sync::Notify>,
 
+    /// Renames this node has started, by (old path, new path): the file they move and when
+    /// they started. A client that times out waiting for a slow rename sends it again; by
+    /// then the first has moved the file, and the repeat answered "File not found" (EIO to
+    /// rsync on staging, 2026-10-26; suite T110). A repeat waits for the first and answers
+    /// as it did. Entries go after RECENT_RENAME_TTL.
+    recent_renames: Arc<DashMap<(String, String), (FileId, std::time::Instant)>>,
+
     /// Per-chunk serialization locks for MultiPatch.
     /// Serializes all patches to the same (FileId, chunk_idx) pair so that two
     /// concurrent patches (A→B and B→C) cannot race in spawn_blocking: without
@@ -713,6 +720,10 @@ impl Drop for PendingRenameGuard {
         self.rename_progress.notify_waiters();
     }
 }
+
+/// How long a rename stays recognisable as one a repeat of it can wait for: past any client's
+/// retry ladder for one request (send_to_leader_with_retry gives up after 15s).
+const RECENT_RENAME_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn fold_metadata_batch(items: Vec<FileMetadata>) -> Vec<FileMetadata> {
     let mut order: Vec<FileId> = Vec::new();
@@ -1317,6 +1328,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectIgnoreMetadataVersions { .. }
         | Request::InjectChunkLocation { .. }
         | Request::InjectSlowFoldAdopts { .. }
+        | Request::InjectLeaseLapse { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
 }
@@ -6113,6 +6125,7 @@ impl Server {
             sled_write_progress,
             pending_renames,
             rename_progress,
+            recent_renames: Arc::new(DashMap::new()),
         };
 
         server
@@ -8552,6 +8565,18 @@ impl Server {
                 warn!("FAULT INJECTION: the next {} peer fold result(s) wait {}ms before this node records them", count, millis);
                 crate::write_order::INJECTED_SLOW_FOLD_ADOPT_MS.store(millis, std::sync::atomic::Ordering::SeqCst);
                 crate::write_order::INJECTED_SLOW_FOLD_ADOPTS.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
+            Request::InjectLeaseLapse { millis } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: acting as if this node's lease had lapsed for {}ms", millis);
+                let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 + millis;
+                crate::lease::INJECTED_LAPSE_UNTIL_MS.store(until, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
             Request::SlotIsrPrepare { items } => self.slot_isr.handle_prepare(items).await,
@@ -18213,9 +18238,17 @@ impl Server {
     /// Hold the real chunk `id` locally, pulling it from `from` (verified by its content hash)
     /// if we don't.
     async fn ensure_anchor_local(&self, file_id: FileId, chunk_idx: u64, id: ChunkId, from: NodeId) -> bool {
+        // Bounded like resync_from_primary's request, for the same reason: callers hold the
+        // slot's order lock. A primary that folded during a cut names a real base the
+        // secondary lacks, and the pull, lost to the dead link, held every later write to the
+        // chunk for the default 30s RPC timeout, long after the heal (suite T91, 1026b ON).
+        // A healthy pair moves one chunk in milliseconds; giving up lets the resync that
+        // follows, or the next write, go through once the link is back.
+        const ANCHOR_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let held = self.storage.has_chunk(&id)
-            || pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, id, &[from], file_id, chunk_idx * (4 * 1024 * 1024))
-                .await.is_some();
+            || tokio::time::timeout(ANCHOR_PULL_TIMEOUT,
+                pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, id, &[from], file_id, chunk_idx * (4 * 1024 * 1024)))
+                .await.ok().flatten().is_some();
         held && self.register_anchor_location(file_id, chunk_idx, id).await
     }
 
@@ -22093,6 +22126,9 @@ impl Server {
         let file_id = match self.metadata.get_file_by_path_async(old_path.clone()).await {
             Ok(Some(m)) => m.id,
             Ok(None) => {
+                if self.rename_already_done(&old_path, &new_path).await {
+                    return Response::Ok { data: None };
+                }
                 return Response::Error {
                     message: format!("File not found: {}", old_path),
                     code: ErrorCode::NotFound,
@@ -22113,6 +22149,7 @@ impl Server {
         // a "no mismatch yet" false negative in handle_put_file_metadata's
         // snap-to-canonical-path check while this rename is still committing.
         let _rename_guard = PendingRenameGuard::new(self.pending_renames.clone(), self.rename_progress.clone(), file_id);
+        self.record_rename(&old_path, &new_path, file_id);
         self.wait_for_pending_metadata_write(file_id).await;
 
         // Get existing metadata
@@ -22253,6 +22290,8 @@ impl Server {
                     }
                 }
             }
+            // Gone since the lookup above: a concurrent repeat of this rename may have moved it.
+            Ok(None) if self.rename_already_done(&old_path, &new_path).await => Response::Ok { data: None },
             Ok(None) => Response::Error {
                 message: format!("File not found: {}", old_path),
                 code: ErrorCode::NotFound,
@@ -22264,6 +22303,30 @@ impl Server {
                     code: ErrorCode::InternalError,
                 }
             }
+        }
+    }
+
+    /// Note a rename as started, for rename_already_done. Expired entries are dropped here.
+    fn record_rename(&self, old_path: &str, new_path: &str, file_id: FileId) {
+        if self.recent_renames.len() >= 256 {
+            self.recent_renames.retain(|_, (_, at)| at.elapsed() < RECENT_RENAME_TTL);
+        }
+        self.recent_renames.insert((old_path.to_string(), new_path.to_string()), (file_id, std::time::Instant::now()));
+    }
+
+    /// Whether `old_path` is missing because a rename of it to `new_path`, started on this node
+    /// within RECENT_RENAME_TTL, moved it: waits for that rename to finish, then checks that
+    /// `new_path` holds the file it moved. A failed or overtaken first attempt answers false.
+    async fn rename_already_done(&self, old_path: &str, new_path: &str) -> bool {
+        let Some(file_id) = self.recent_renames.get(&(old_path.to_string(), new_path.to_string()))
+            .filter(|e| e.1.elapsed() < RECENT_RENAME_TTL).map(|e| e.0) else { return false };
+        self.wait_for_pending_rename(file_id).await;
+        match self.metadata.get_file_by_path_async(new_path.to_string()).await {
+            Ok(Some(m)) if m.id == file_id => {
+                info!("Rename {} -> {} repeated: already done (file_id: {})", old_path, new_path, file_id);
+                true
+            }
+            _ => false,
         }
     }
 

@@ -3098,6 +3098,281 @@ check "T107b a file emptied (: >) right after appends, then appended to, holds o
 check "T107c a fresh client reads only the new content of both" "$([ "$T107_FRESH_BAD" = 0 ] && echo PASS || echo FAIL)"
 fi # should_run T107
 
+# ── T108: T91 with a fold on the primary inside the cut (gate G2) ──
+# A primary that folds while its secondary is cut off names the fold result as the next
+# version's base. The secondary lacks it and pulled it from the primary under the slot's order
+# lock; lost to the blackhole, that pull waited out the default 30s RPC timeout, long after the
+# heal, and the writer stalled 34s (1026b ON T91, where the client's ForceFold landed in the
+# cut). Same cut as T91, timed around the primary's own idle fold (held open by slow-fold).
+snapshot_log T108
+if should_run T108 && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+echo "=== T108: a primary that folds during the cut doesn't stall the slot behind the secondary's lost base pull: writes resume after the heal, none fails ==="
+T108_FILE=t108.bin
+T108_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$MOUNT/$T108_FILE" bs=4M count=2 status=none
+dfs_sync
+T108_ISR=""
+for _ in $(seq 1 30); do
+    T108_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T108_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+    [ -n "$T108_ISR" ] && break
+    sleep 1
+done
+T108_MAP=$("$BIN/dfs-admin" --cluster "$T108_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+read -r T108_PN T108_SN <<< "$T108_ISR"
+T108_P=$(echo "$T108_MAP" | awk -v n="$T108_PN" '$1==n{print $2}')
+T108_S=$(echo "$T108_MAP" | awk -v n="$T108_SN" '$1==n{print $2}')
+if [ -z "$T108_P" ] || [ -z "$T108_S" ]; then
+    check "T108 setup: chunk 1's ISR found ($T108_P,$T108_S)" FAIL
+else
+    echo "  T108: ISR primary=$T108_P secondary=$T108_S"
+    # Lines since the start, by timestamp: a count of the concatenated logs shifts as any of them grows.
+    T108_T0=$(date -u +%Y-%m-%dT%H:%M:%S)
+    t108_since() { cat "$LOG"/server*.log | sed 's/\x1b\[[0-9;]*m//g' | awk -v t0="$T108_T0" '$1 >= t0'; }
+    T108_N=$(( ${T108_P##*:} - 8900 + 1 ))
+    T108_PMARK=$(wc -l < "$LOG/server${T108_N}.log")
+    # A few fsynced 4 KiB patches leave chunk 1 dirty; the writer then waits. Once the stream has
+    # been quiet the primary's owner folds it, held 3s by slow-fold: the cut goes up while it's
+    # held, so the fold's result never reaches the secondary. The primary's side heals ~0.5s after
+    # the fold and the writer starts: the next WriteOrder names the fold result as its base, which
+    # the secondary has to pull through the blackhole. Times are from the go signal; the
+    # secondary's side heals at ~5.5s.
+    rm -f "$T/t108.ready" "$T/t108.go"
+    python3 - "$MOUNT/$T108_FILE" 30 "$T/t108.ready" "$T/t108.go" > "$LOG/t108_w.out" 2>>"$LOG/t108.err" <<'PY' &
+import json, os, sys, time
+path, secs, ready, go = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+fd = os.open(path, os.O_RDWR)
+for i in range(3):
+    os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + i * 4096); os.fsync(fd)
+open(ready, "w").close()
+while not os.path.exists(go): time.sleep(0.02)
+start = time.time(); acked = []; failed = []; worst = 0.0; i = 3
+while time.time() - start < secs:
+    t0 = time.time()
+    try:
+        os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + (i % 1024) * 4096); os.fsync(fd)
+        acked.append(round(time.time() - start, 2))
+    except OSError as e:
+        failed.append([i, round(time.time() - start, 2), str(e)]); time.sleep(0.2)
+    worst = max(worst, time.time() - t0); i += 1
+os.close(fd)
+print(json.dumps({"acked": len(acked), "last_s": acked[-1] if acked else -1, "after_heal": sum(1 for t in acked if 11.5 < t <= secs),
+                  "failed": failed, "worst_s": round(worst, 2), "secs": secs}))
+PY
+    T108_W=$!
+    for _ in $(seq 1 300); do [ -f "$T/t108.ready" ] && break; sleep 0.1; done
+    "$BIN/dfs-admin" --cluster "$T108_P" fault slow-fold --millis 3000 --count 1 >/dev/null 2>&1 || true
+    T108_HELD=0
+    for _ in $(seq 1 180); do
+        tail -n +"$((T108_PMARK + 1))" "$LOG/server${T108_N}.log" | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -a "FAULT INJECTION: background fold of file" | grep -q "chunk 1 " && { T108_HELD=1; break; }
+        sleep 0.25
+    done
+    "$BIN/dfs-admin" --cluster "$T108_P" fault set --drop-to "$T108_S" >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T108_S" fault set --drop-to "$T108_P" --black-hole >/dev/null 2>&1 || true
+    sleep 3.5
+    "$BIN/dfs-admin" --cluster "$T108_P" fault clear >/dev/null 2>&1 || true
+    touch "$T/t108.go"
+    sleep 5.5
+    "$BIN/dfs-admin" --cluster "$T108_S" fault clear >/dev/null 2>&1 || true
+    wait "$T108_W" 2>/dev/null || true
+    rm -f "$T/t108.ready" "$T/t108.go"
+    T108_OUT=$(tail -1 "$LOG/t108_w.out" 2>/dev/null)
+    # Reached: the primary's fold was held in the cut, and the secondary then needed its result.
+    T108_PULLS=$(t108_since \
+        | grep -a "never arrived; resyncing\|pull_chunk_from_peers" | grep -ac "" || true)
+    echo "  T108: owner fold held in the cut: $T108_HELD; secondary gap/pull lines: $T108_PULLS"
+    T108_SINCE=$(t108_since)
+    T108_GAPS=$(echo "$T108_SINCE" | grep -ac "never arrived; resyncing" || true)
+    T108_LOST=$(echo "$T108_SINCE" | grep -ac "resync: primary .* answered Err(Timeout" || true)
+    echo "  T108: writer $T108_OUT; gaps seen $T108_GAPS, resync requests timed out $T108_LOST $(head -c 200 "$LOG/t108.err" 2>/dev/null)"
+    T108_V=$(echo "$T108_OUT" | python3 -c "
+import json,sys
+try: r=json.loads(sys.stdin.read())
+except Exception: print('BAD'); sys.exit()
+print(len(r['failed']), r['after_heal'], r['worst_s'])" 2>/dev/null || echo BAD)
+    read -r T108_NFAIL T108_AFTER T108_WORST <<< "$T108_V"
+    [ "$T108_NFAIL" = 0 ] \
+        && check "T108a no write failed across the lost resync" PASS \
+        || check "T108a $T108_NFAIL write(s) failed (writer: $T108_OUT)" FAIL
+    [ "${T108_AFTER:-0}" -gt 0 ] 2>/dev/null \
+        && check "T108b the writer made progress after the heal ($T108_AFTER acked from 6s after the heal)" PASS \
+        || check "T108b no write acked from 6s after the heal to the end: the slot stayed stalled behind the lost resync" FAIL
+    # The client fails an ordered write its secondary hasn't applied within 20s (the outage
+    # budget): an op that long is an fsync EIO as soon as two writers share the slot (T74).
+    python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 20 else 1)" "${T108_WORST:-99}" 2>/dev/null \
+        && check "T108d the slowest write took ${T108_WORST}s, inside the client's 20s outage budget" PASS \
+        || check "T108d the slowest write took ${T108_WORST:-?}s, past the client's 20s outage budget" FAIL
+    # Informational: the case was reached (a gap, then a resync sent into the blackhole).
+    [ "$T108_HELD" = 1 ] || echo "  (T108 note: the primary's owner fold was never held; the case was not reached)"
+    T108_READ=$("$BIN/dfs-admin" --cluster "$T108_P,$T108_S" isr read --file "/$T108_FILE" --chunk 1 2>&1 | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T108_H1 T108_H2 <<< "$T108_READ"
+    [ -n "$T108_H1" ] && [ "$T108_H1" = "$T108_H2" ] && [ "$T108_H1" != ERR ] \
+        && check "T108c both ISR replicas hold identical bytes ($T108_H1)" PASS \
+        || check "T108c ISR replicas differ or unreadable: $T108_READ" FAIL
+fi
+for n in ${T108_ALL//,/ }; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
+rm -f "$MOUNT/$T108_FILE" "$LOG/t108.err"
+fi # should_run T108
+
+# ── T111: a primary that refuses for a moment, then holds its lease again ──
+# In 1027b's T108 the primary was fenced at incarnation 0 and rejoined as 1 within 30ms; one write
+# landed in between and was refused. The client asked the secondary to take over, and the
+# secondary rightly declined (incarnation 1 isn't expired, so a takeover would make two primaries).
+# The client only asked again, every 300ms, never resending the write to a primary that took
+# writes again: 19s stalled, the whole retry budget. lease-lapse gives the primary that moment of
+# refusal with no expiry vote.
+snapshot_log T111
+if should_run T111 && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+echo "=== T111: a write the primary refused while briefly without its lease lands once it holds the lease again, not after the client's whole retry budget ==="
+T111_FILE=t111.bin
+T111_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$MOUNT/$T111_FILE" bs=4M count=2 status=none
+dfs_sync
+T111_ISR=""
+for _ in $(seq 1 30); do
+    T111_ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T111_FILE" --chunks 2 2>/dev/null \
+        | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][1]; print(' '.join(r['members']) if r else '')" 2>/dev/null || true)
+    [ -n "$T111_ISR" ] && break
+    sleep 1
+done
+T111_MAP=$("$BIN/dfs-admin" --cluster "$T111_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+read -r T111_PN T111_SN <<< "$T111_ISR"
+T111_P=$(echo "$T111_MAP" | awk -v n="$T111_PN" '$1==n{print $2}')
+T111_S=$(echo "$T111_MAP" | awk -v n="$T111_SN" '$1==n{print $2}')
+if [ -z "$T111_P" ] || [ -z "$T111_S" ]; then
+    check "T111 setup: chunk 1's ISR found ($T111_P,$T111_S)" FAIL
+else
+    echo "  T111: ISR primary=$T111_P secondary=$T111_S"
+    T111_T0=$(date -u +%Y-%m-%dT%H:%M:%S)
+    rm -f "$T/t111.ready" "$T/t111.go"
+    python3 - "$MOUNT/$T111_FILE" 12 "$T/t111.ready" "$T/t111.go" > "$LOG/t111_w.out" 2>>"$LOG/t111.err" <<'PY' &
+import json, os, sys, time
+path, secs, ready, go = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+fd = os.open(path, os.O_RDWR)
+for i in range(3):
+    os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + i * 4096); os.fsync(fd)
+open(ready, "w").close()
+while not os.path.exists(go): time.sleep(0.02)
+start = time.time(); acked = 0; failed = []; worst = 0.0; i = 3
+while time.time() - start < secs:
+    t0 = time.time()
+    try:
+        os.pwrite(fd, os.urandom(4096), 4 * 1024 * 1024 + (i % 1024) * 4096); os.fsync(fd); acked += 1
+    except OSError as e:
+        failed.append([i, round(time.time() - start, 2), str(e)]); time.sleep(0.2)
+    worst = max(worst, time.time() - t0); i += 1
+os.close(fd)
+print(json.dumps({"acked": acked, "failed": failed, "worst_s": round(worst, 2), "secs": secs}))
+PY
+    T111_W=$!
+    for _ in $(seq 1 300); do [ -f "$T/t111.ready" ] && break; sleep 0.1; done
+    touch "$T/t111.go"
+    sleep 2
+    "$BIN/dfs-admin" --cluster "$T111_P" fault lease-lapse --millis 1500 >/dev/null 2>&1 || true
+    wait "$T111_W" 2>/dev/null || true
+    rm -f "$T/t111.ready" "$T/t111.go"
+    T111_OUT=$(tail -1 "$LOG/t111_w.out" 2>/dev/null)
+    # Reached: the primary refused a write as not holding its lease, and the client asked the
+    # secondary to take over.
+    T111_SINCE=$(cat "$LOG"/client*.log | sed 's/\x1b\[[0-9;]*m//g' | awk -v t0="$T111_T0" '$1 >= t0')
+    T111_REFUSED=$(echo "$T111_SINCE" | grep -a "Ordered: not the primary of file" | grep -ac "" || true)
+    T111_ASKED=$(echo "$T111_SINCE" | grep -a "Sending request to .*ReplaceIsrMember" | grep -ac "" || true)
+    echo "  T111: writer $T111_OUT; refusals seen $T111_REFUSED, takeover requests $T111_ASKED $(head -c 200 "$LOG/t111.err" 2>/dev/null)"
+    T111_V=$(echo "$T111_OUT" | python3 -c "
+import json,sys
+try: r=json.loads(sys.stdin.read())
+except Exception: print('BAD'); sys.exit()
+print(len(r['failed']), r['worst_s'])" 2>/dev/null || echo BAD)
+    read -r T111_NFAIL T111_WORST <<< "$T111_V"
+    [ "$T111_NFAIL" = 0 ] \
+        && check "T111a no write failed across the primary's lapse" PASS \
+        || check "T111a $T111_NFAIL write(s) failed (writer: $T111_OUT)" FAIL
+    # The lapse lasts 1.5s; a write refused in it lands within a few seconds of its end.
+    python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5 else 1)" "${T111_WORST:-99}" 2>/dev/null \
+        && check "T111b the slowest write took ${T111_WORST}s, across a 1.5s lapse" PASS \
+        || check "T111b the slowest write took ${T111_WORST:-?}s, for a 1.5s lapse: the client waited on a takeover that couldn't come" FAIL
+    [ "${T111_REFUSED:-0}" -gt 0 ] || echo "  (T111 note: no write was refused during the lapse; the case was not reached)"
+    T111_READ=$("$BIN/dfs-admin" --cluster "$T111_P,$T111_S" isr read --file "/$T111_FILE" --chunk 1 2>&1 | python3 -c "
+import json,sys
+hs=[]
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except Exception: continue
+    hs.append(r['blake3'][:16] if r.get('len') == 4194304 else 'ERR')
+print(' '.join(hs))" || true)
+    read -r T111_H1 T111_H2 <<< "$T111_READ"
+    [ -n "$T111_H1" ] && [ "$T111_H1" = "$T111_H2" ] && [ "$T111_H1" != ERR ] \
+        && check "T111c both ISR replicas hold identical bytes ($T111_H1)" PASS \
+        || check "T111c ISR replicas differ or unreadable: $T111_READ" FAIL
+fi
+for n in ${T111_ALL//,/ }; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
+rm -f "$MOUNT/$T111_FILE" "$LOG/t111.err"
+fi # should_run T111
+
+if should_run T110; then
+snapshot_log T110
+echo ""
+echo "=== T110: a rename the leader is slow to answer still succeeds (rsync's temp-file rename, staging 2026-10-26) ==="
+# Staging: under load the leader took 9s to answer an rsync rename. The client gives a reply 3s,
+# then sends the same request again on a fresh connection; by then the first had moved the file,
+# so the repeat answered "File not found" and rsync got EIO, although the rename had happened.
+# rsync then unlinks its temp name. Here a metadata-db stall on a follower holds the leader's
+# rename (it waits on each peer) past the client's 3s; the rename must succeed, and the file
+# must survive the cleanup.
+T110_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T110_LEADER_PREFIX=$("$BIN/dfs-admin" --cluster "$T110_ALL" cluster status 2>/dev/null | grep -oP 'Leader:\s+\K\S+' | head -1 || true)
+T110_LEADER=$("$BIN/dfs-admin" --cluster "$T110_ALL" lease status 2>/dev/null | python3 -c "
+import json,sys
+for l in sys.stdin:
+    x=json.loads(l)
+    if x['node'].startswith('$T110_LEADER_PREFIX'): print(x['addr'])" || true)
+[ -z "$T110_LEADER" ] && T110_LEADER=127.0.0.1:8900
+# A follower: the leader's rename waits on every peer in turn (ReplicateMetadata, DeletePathIndex).
+T110_PEER=127.0.0.1:8904; [ "$T110_LEADER" = "$T110_PEER" ] && T110_PEER=127.0.0.1:8903
+T110_D="$MOUNT/t110"; mkdir -p "$T110_D"
+T110_EIO=0; T110_LOST=0; T110_SAMPLE=""
+for r in 1 2 3; do
+    head -c 1048576 /dev/urandom > "$T110_D/.f$r.zip.tmp"
+    T110_SUM=$(md5sum < "$T110_D/.f$r.zip.tmp" | cut -c1-32)
+    dfs_sync
+    "$BIN/dfs-admin" --cluster "$T110_PEER" fault stall --target metadata-db --millis 5000 >/dev/null 2>&1 || true
+    sleep 0.2
+    # One rename(2), as rsync does; after a failure, a retry (as mv did) and rsync's unlink of its
+    # temp name.
+    T110_RES=$(python3 - "$T110_D/.f$r.zip.tmp" "$T110_D/f$r.zip" <<'PY'
+import os, sys, time
+a, b = sys.argv[1], sys.argv[2]
+t = time.time()
+try:
+    os.rename(a, b); print("ok")
+except OSError as e:
+    print("failed after %.2fs: %s" % (time.time() - t, e))
+    try: os.rename(a, b)
+    except OSError: pass
+    try: os.unlink(a)
+    except OSError: pass
+PY
+)
+    [ "$T110_RES" = ok ] || { T110_EIO=$((T110_EIO+1)); T110_SAMPLE="round $r: $T110_RES"; }
+    sleep 6
+    [ "$(md5sum < "$T110_D/f$r.zip" 2>/dev/null | cut -c1-32)" = "$T110_SUM" ] && [ ! -e "$T110_D/.f$r.zip.tmp" ] \
+        || { T110_LOST=$((T110_LOST+1)); T110_SAMPLE="${T110_SAMPLE:+$T110_SAMPLE; }round $r: $(ls -a "$T110_D" | tr '\n' ' ')"; }
+done
+echo "  T110: leader $T110_LEADER, stalled follower $T110_PEER; renames that failed: $T110_EIO/3; files not intact at the new name: $T110_LOST/3 ${T110_SAMPLE:+(e.g. $T110_SAMPLE)}"
+check "T110a a rename the leader answers after the client's 3s reply timeout succeeds the first time" "$([ "$T110_EIO" = 0 ] && echo PASS || echo FAIL)"
+check "T110b the renamed file is intact at its new name, after a retried rename and the temp name's cleanup" "$([ "$T110_LOST" = 0 ] && echo PASS || echo FAIL)"
+fi # should_run T110
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then
@@ -8360,14 +8635,16 @@ for n in 127.0.0.1:8900 127.0.0.1:8901 127.0.0.1:8902 127.0.0.1:8903; do "$BIN/d
 for c in 0 1 2 3; do
     "$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr propose --file "$T63_FILE" --chunk "$c" --members "${T63_ID[1]},${T63_ID[2]}" >/dev/null 2>&1 || true
 done
-for n in "${T63_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
+# Sample node 5 while it is still cut off: its 3s catch-up timer can fire within ms of the heal
+# (1027d ON: 13ms), so a sample after healing can find it caught up already.
 T63_BEHIND=$(t63_node5_matches)
+for n in "${T63_NODES[@]}"; do "$BIN/dfs-admin" --cluster "$n" fault clear >/dev/null 2>&1 || true; done
 T63_CAUGHT=NO
 for _ in $(seq 1 15); do T63_CAUGHT=$(t63_node5_matches); [ "$T63_CAUGHT" = YES ] && break; sleep 1; done
-echo "  T63: right after healing node 5 matches the others: $T63_BEHIND; within 15s: $T63_CAUGHT"
+echo "  T63: while cut off node 5 matches the others: $T63_BEHIND; within 15s of healing: $T63_CAUGHT"
 [ "$T63_BEHIND" = NO ] \
     && check "T63 precondition: the partitioned node really missed the new epochs" PASS \
-    || check "T63 precondition: node 5 already matched right after healing (test is vacuous)" FAIL
+    || check "T63 precondition: node 5 already matched while cut off (test is vacuous)" FAIL
 if [ "$T63_CAUGHT" != YES ]; then
     echo "  T63 diagnostics: each node's epochs per chunk"
     t63_views | python3 -c "

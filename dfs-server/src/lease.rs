@@ -33,6 +33,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectLeaseLapse`): until this time (ms since
+/// UNIX epoch), `holds_own_lease` answers false, with no expiry vote.
+pub static INJECTED_LAPSE_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseConfig {
     pub lease: Duration,
@@ -577,7 +581,9 @@ impl LeaseRuntime {
 
     /// Whether this node holds its own lease right now.
     pub fn holds_own_lease(&self) -> bool {
-        self.holder.lock().unwrap().holds_lease(Instant::now())
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let lapsed = now_ms < INJECTED_LAPSE_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst);
+        !lapsed && self.holder.lock().unwrap().holds_lease(Instant::now())
     }
 
     /// Whether `node` is known here to have been voted expired by a majority at its

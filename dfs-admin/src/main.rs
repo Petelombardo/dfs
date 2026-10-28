@@ -184,6 +184,12 @@ enum FaultCommands {
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
+    /// Test-only: for `millis` the node acts as if its own lease had lapsed (a primary refuses
+    /// ordered writes), with no expiry vote.
+    LeaseLapse {
+        #[arg(long)]
+        millis: u64,
+    },
     /// Test-only: fail every chunk-location registration this node receives for `millis`
     /// (0 clears it).
     FailLocations {
@@ -1905,6 +1911,16 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::LeaseLapse { millis } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectLeaseLapse { millis: *millis }).await? {
+                Response::Ok { .. } => println!("{}: lease lapsed for {}ms", addr, millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::FailLocations { millis } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectChunkLocationFailures { millis: *millis }).await? {
@@ -1970,7 +1986,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
-        | FaultCommands::SlowFoldAdopt { .. }
+        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::LeaseLapse { .. }
         | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. }
         | FaultCommands::PlantLocation { .. } => unreachable!("handled above"),
     };

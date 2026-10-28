@@ -1348,6 +1348,14 @@ pub enum Request {
         millis: u64,
         count: u32,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): for `millis` this node acts as if its own lease had
+    /// lapsed (a primary refuses ordered writes), with no expiry vote: what a primary that was
+    /// fenced and rejoined at its next incarnation shows for a moment (suite T111). APPENDED
+    /// at end to preserve wire compatibility.
+    InjectLeaseLapse {
+        millis: u64,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

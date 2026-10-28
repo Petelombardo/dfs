@@ -364,16 +364,27 @@ async fn unmount_filesystem(mountpoint: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Parse node address, adding default port 8900 if not specified
+/// Parse a seed node: an IP or a hostname, with an optional port (default 8900). A hostname
+/// is resolved once, here; the rest of the cluster is discovered from the seed by address.
 fn parse_node_address(node_str: &str) -> Result<SocketAddr> {
-    // If it already has a port, parse directly
-    if node_str.contains(':') {
-        return node_str.parse().context("Invalid address format");
+    use std::net::{IpAddr, ToSocketAddrs};
+    if let Ok(addr) = node_str.parse::<SocketAddr>() {
+        return Ok(addr);
     }
-
-    // Otherwise, add default port 8900
-    let with_port = format!("{}:8900", node_str);
-    with_port.parse().context("Invalid IP address")
+    // A bare IP, v4 or v6 (an IPv6 literal has colons but no port)
+    if let Ok(ip) = node_str.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 8900));
+    }
+    let host_port = match node_str.rsplit_once(':') {
+        Some((_, port)) if port.parse::<u16>().is_ok() => node_str.to_string(),
+        _ => format!("{}:8900", node_str),
+    };
+    let addrs: Vec<SocketAddr> = host_port.to_socket_addrs()
+        .with_context(|| format!("Could not resolve {}", host_port))?
+        .collect();
+    // Prefer IPv4: the servers advertise and listen on their IPv4 addresses.
+    addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied()
+        .with_context(|| format!("{} resolved to no addresses", host_port))
 }
 
 /// Discover all cluster nodes by querying GetClusterStatus from a seed node
@@ -701,4 +712,18 @@ fn systemd_uninstall(service_name: &str) -> Result<()> {
     info!("Systemd service uninstalled: {}", service_name);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_seed_node_may_be_a_hostname_with_or_without_a_port() {
+        assert_eq!(parse_node_address("localhost:8901").unwrap().port(), 8901);
+        let a = parse_node_address("localhost").unwrap();
+        assert!(a.ip().is_loopback() && a.port() == 8900, "got {}", a);
+        assert_eq!(parse_node_address("10.25.1.60").unwrap(), "10.25.1.60:8900".parse().unwrap());
+        assert!(parse_node_address("no-such-host.invalid").is_err());
+    }
 }

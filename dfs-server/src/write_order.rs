@@ -350,6 +350,29 @@ impl SlotOrder {
         let mut g = self.inner.lock().unwrap();
         g.decided.remove(&write_id);
         g.decide(write_id, Decision::Ordered { version, response: Some(response.clone()) });
+        drop(g);
+        self.changed.notify_waiters();
+    }
+
+    /// What was decided for `write_id`, waiting up to `timeout` for a write still being applied
+    /// to finish. A resent copy arrives because the first copy's reply timed out: on a node
+    /// whose disk takes seconds per commit the write is usually nearly done, and answering
+    /// "still being applied" failed a write the primary was about to ack (G8 1028 fix7: server2
+    /// as primary, an fsync EIO 6s in). Returns the in-progress decision if it outlasts `timeout`.
+    pub async fn await_decided(&self, write_id: u128, timeout: std::time::Duration) -> Option<Decision> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let d = self.decided(write_id);
+            if !matches!(d, Some(Decision::Ordered { response: None, .. })) {
+                return d;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.decided(write_id);
+            }
+        }
     }
 
     /// Secondary: the primary (boot nonce `stream`) says `write_id` is `version`, applied onto

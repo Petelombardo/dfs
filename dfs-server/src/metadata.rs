@@ -355,6 +355,10 @@ thread_local! {
     /// Test hook: runs once, right after a compaction catch-up pass opens its read snapshot,
     /// so a test can commit a write exactly in the window between snapshot and diff.
     static AFTER_CATCHUP_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    /// Test hook: runs at the start of EVERY catch-up pass, before it takes its dirty keys
+    /// and snapshot, so each pass sees the hook's writes and a test can keep the live db
+    /// changing for as long as compaction keeps catching up.
+    static BEFORE_EVERY_CATCHUP_PASS: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -362,6 +366,15 @@ fn after_catchup_snapshot() {
     if let Some(f) = AFTER_CATCHUP_SNAPSHOT.with(|h| h.borrow_mut().take()) {
         f();
     }
+}
+
+#[cfg(test)]
+fn before_catchup_pass() {
+    BEFORE_EVERY_CATCHUP_PASS.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
 }
 
 /// Value type of a metadata table, for compaction's generic copy (see live_tables).
@@ -5542,6 +5555,8 @@ impl MetadataStore {
         let catchup_deadline = std::time::Instant::now() + catchup_budget;
         let mut converged = false;
         loop {
+            #[cfg(test)]
+            before_catchup_pass();
             let live = self.db.read();
             let dirty = self.take_dirty_keys();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase2 begin_read: {}", e))?;
@@ -7712,7 +7727,13 @@ mod tests {
         // real defaults needs a huge dataset and several seconds of sustained writes to
         // reliably outrun them, which is correct for production but far too slow for a
         // unit test. A 5ms budget and a threshold of 1 row exercises the exact same
-        // code path deterministically and fast.
+        // code path fast.
+        //
+        // The churn is two writes before every catch-up pass (BEFORE_EVERY_CATCHUP_PASS), so
+        // every pass diffs 2 rows, over the threshold of 1, and none can converge. It used to
+        // be a writer thread racing the passes: on server6's 16 cores the passes sometimes
+        // caught it, compaction converged and returned Ok, and the test failed 10 of 20 runs
+        // (10-29) with nothing wrong in compaction.
         let temp_dir = TempDir::new().unwrap();
         let store = std::sync::Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
 
@@ -7723,22 +7744,19 @@ mod tests {
             store.put_file(&m).unwrap();
         }
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let store2 = std::sync::Arc::clone(&store);
-        let stop2 = std::sync::Arc::clone(&stop);
-        let storm = std::thread::spawn(move || {
-            let mut i = 0u64;
-            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut i = 0u64;
+        BEFORE_EVERY_CATCHUP_PASS.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+            for _ in 0..2 {
                 let mut m = FileMetadata::new(format!("/storm_{}", i), FileType::RegularFile);
                 m.size = i;
                 store2.put_file(&m).unwrap();
                 i += 1;
             }
-        });
+        })));
 
         let result = store.compact_db_with_budget(std::time::Duration::from_secs(30), std::time::Duration::from_millis(5), 1);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        storm.join().unwrap();
+        BEFORE_EVERY_CATCHUP_PASS.with(|h| *h.borrow_mut() = None);
 
         assert!(result.is_err(), "compact_db() should defer (Err) under sustained churn, not block on a large Phase 3 diff");
         let msg = result.unwrap_err().to_string();

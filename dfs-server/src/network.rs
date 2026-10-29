@@ -255,11 +255,23 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
 
+        // A failed accept() leaves the pending connection queued, so retrying at once fails
+        // again at once: out of file descriptors (EMFILE) the loop spun and logged 3 GB in
+        // 3.5 h on the G8 bench (1028; suite T112). Back off, doubling up to 1s, and log a
+        // summary at most every 10s.
+        const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(5);
+        const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+        const ACCEPT_ERROR_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut accept_backoff = ACCEPT_BACKOFF_MIN;
+        let mut accept_errors_unlogged: u64 = 0;
+        let mut accept_error_logged_at: Option<std::time::Instant> = None;
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((mut stream, peer_addr)) => {
+                            accept_backoff = ACCEPT_BACKOFF_MIN;
                             debug!("Accepted connection from {}", peer_addr);
                             let _ = stream.set_nodelay(true);
                             // Enable TCP keepalive so the kernel detects dead peers
@@ -329,7 +341,15 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                             }
                         }
                         Err(e) => {
-                            error!("Failed to accept connection: {}", e);
+                            accept_errors_unlogged += 1;
+                            if accept_error_logged_at.map_or(true, |t| t.elapsed() >= ACCEPT_ERROR_LOG_EVERY) {
+                                error!("Failed to accept connection on {}: {} ({} accept failure(s) since the last report; backing off {:?})",
+                                    self.listen_addr, e, accept_errors_unlogged, accept_backoff);
+                                accept_errors_unlogged = 0;
+                                accept_error_logged_at = Some(std::time::Instant::now());
+                            }
+                            tokio::time::sleep(accept_backoff).await;
+                            accept_backoff = (accept_backoff * 2).min(ACCEPT_BACKOFF_MAX);
                         }
                     }
                 }
@@ -359,7 +379,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
 }
 
 /// Handle a single TCP connection
-async fn handle_connection<H: MessageHandler>(
+async fn handle_connection<H: MessageHandler + 'static>(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     handler: Arc<H>,
@@ -449,19 +469,44 @@ async fn handle_connection<H: MessageHandler>(
                 }
                 let dispatch_start = std::time::Instant::now();
                 let forward = chain.forward.take();
-                let dispatch = async {
+                let dispatch_handler = handler.clone();
+                let mut dispatch = Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, async move {
                     match forward {
-                        Some(fwd) => chained_dispatch(envelope, fwd, handler.clone()).await,
-                        None => (process_message(envelope, handler.clone()).await, None),
+                        Some(fwd) => chained_dispatch(envelope, fwd, dispatch_handler).await,
+                        None => (process_message(envelope, dispatch_handler).await, None),
+                    }
+                }));
+                // A caller that gave up (its reply timeout) closes its end, and its retry comes on
+                // a new connection. Holding this socket until the handler finishes kept one
+                // CLOSE-WAIT descriptor per abandoned request: G8 1028, server2 slow to fsync had
+                // 931 of its 1024 descriptors in CLOSE-WAIT. Once the caller is gone, close the
+                // socket and let the handler run to completion on its own (cancelling it midway
+                // isn't safe for metadata writes); its reply has no one to go to. peek never
+                // consumes, so a caller that sends more meanwhile just stops the watch.
+                let mut peek_buf = [0u8; 1];
+                let mut watch_hangup = true;
+                let finished = loop {
+                    tokio::select! {
+                        r = &mut dispatch => break Some(r),
+                        p = stream.peek(&mut peek_buf), if watch_hangup => match p {
+                            Ok(0) | Err(_) => break None,
+                            Ok(_) => watch_hangup = false,
+                        },
                     }
                 };
-                let response = match tokio::time::timeout(HANDLER_TIMEOUT, dispatch).await {
-                    Ok((r, idle)) => {
+                let response = match finished {
+                    Some(Ok((r, idle))) => {
                         if idle.is_some() { chain.idle = idle; }
                         r
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         warn!("Handler timed out (>120s) for request from {}, closing connection", peer_addr);
+                        break;
+                    }
+                    None => {
+                        debug!("{} hung up {:?} into its request ({:?}); closing, the handler finishes on its own",
+                            peer_addr, dispatch_start.elapsed(), req_class);
+                        tokio::spawn(async move { let _ = dispatch.await; });
                         break;
                     }
                 };
@@ -898,6 +943,16 @@ async fn process_message<H: MessageHandler>(
     MessageEnvelope::new(envelope.request_id, response)
 }
 
+/// Most requests one NetworkClient keeps in flight to one target (DFS_PEER_MAX_IN_FLIGHT, default
+/// 64). Normal traffic stays well under it (a 5-node suite peaks near 30 to a node that commits
+/// 1.5s late). Each node has two peer clients (Server.client, ClusterManager.client), so a node
+/// takes at most 2 x 64 from each peer: 4 peers' 512 fit its 1024 peer budget (RESERVED_PEER_CONNECTIONS).
+fn peer_max_in_flight() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("DFS_PEER_MAX_IN_FLIGHT").ok()
+        .and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(64))
+}
+
 /// Network client for sending requests to other nodes
 /// Maintains a per-peer connection pool to avoid opening a new TCP connection
 /// for every request (which exhausts file descriptors under heavy healing/replication load).
@@ -919,6 +974,13 @@ pub struct NetworkClient {
     /// `entry.lock().await` under it; Arc-ing the inner Mutex closes both paths.)
     pool: Arc<DashMap<SocketAddr, Arc<Mutex<VecDeque<TcpStream>>>>>,
 
+    /// Requests in flight per target, at most peer_max_in_flight(). Each one holds its own
+    /// connection until the reply, so without a bound a peer that answers slowly collects
+    /// connections at (request rate x reply time): G8 1028, server2 (31ms per fsync, 3-6s per
+    /// request) had 944 open within 2 minutes and ran out of descriptors. Bounded, senders
+    /// queue here instead and a slow peer holds at most this many connections from each node.
+    in_flight: Arc<DashMap<SocketAddr, Arc<tokio::sync::Semaphore>>>,
+
     /// When true, every dial in send_message_inner targets peer_port_addr(target)
     /// instead of target directly — set only for the 2 production instances that
     /// exist purely for inter-node RPC (Server.client, ClusterManager.client; see
@@ -937,6 +999,7 @@ impl NetworkClient {
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
             pool: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
             apply_peer_offset: false,
         }
     }
@@ -950,6 +1013,7 @@ impl NetworkClient {
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
             pool: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
             apply_peer_offset: true,
         }
     }
@@ -991,6 +1055,16 @@ impl NetworkClient {
             }
             None => {}
         }
+        // Wait for an in-flight slot to this target within the caller's own deadline; the permit
+        // is held until this request's reply (or failure) and released on return.
+        let slots = self.in_flight.entry(target)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(peer_max_in_flight())))
+            .value().clone();
+        let _in_flight = match tokio::time::timeout(response_timeout, slots.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            _ => anyhow::bail!("{} requests already in flight to {} for {:?}: the peer isn't keeping up",
+                peer_max_in_flight(), target, response_timeout),
+        };
         let request_id = self.next_request_id();
         let envelope = MessageEnvelope::new(request_id, message);
 

@@ -212,6 +212,7 @@ fn init_node(data_dir: PathBuf, meta_dir: PathBuf, config_path: PathBuf) -> Resu
 /// Start the DFS server
 async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("Starting DFS server...");
+    raise_nofile_limit();
 
     // Load configuration (mutable so we can write node_id back if needed)
     let mut config = Config::from_file(&config_path)?;
@@ -1128,6 +1129,35 @@ async fn send_join_request(
 }
 
 /// Start background task to periodically retry joining cluster
+/// Raise the soft NOFILE limit to the hard one. Every open connection holds a descriptor for its
+/// whole life (network::MAX_CONNECTIONS + RESERVED_PEER_CONNECTIONS = 1536 by default, plus outgoing
+/// connections, chunk files and the database), and a server started from a shell inherits a soft
+/// limit of 1024: the G8 bench servers did, and one ran out (1028; suite T112). The systemd unit
+/// grants 65536 itself.
+fn raise_nofile_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        warn!("NOFILE: getrlimit failed: {}", std::io::Error::last_os_error());
+        return;
+    }
+    const WANT: libc::rlim_t = 65536;
+    let budget = (network::MAX_CONNECTIONS + network::RESERVED_PEER_CONNECTIONS) as libc::rlim_t * 2;
+    let target = WANT.max(lim.rlim_cur).min(lim.rlim_max);
+    if target > lim.rlim_cur {
+        let raised = libc::rlimit { rlim_cur: target, rlim_max: lim.rlim_max };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            info!("NOFILE: raised the soft limit from {} to {}", lim.rlim_cur, target);
+            lim.rlim_cur = target;
+        } else {
+            warn!("NOFILE: could not raise the soft limit from {} to {}: {}", lim.rlim_cur, target, std::io::Error::last_os_error());
+        }
+    }
+    if lim.rlim_cur < budget {
+        warn!("NOFILE: the limit is {} (hard {}), below the {} descriptors this server's connection budget can use: \
+               raise it (e.g. LimitNOFILE=65536) or the server may run out of descriptors under load", lim.rlim_cur, lim.rlim_max, budget);
+    }
+}
+
 async fn start_periodic_rejoin(
     server: std::sync::Arc<server::Server>,
     join_targets: Vec<std::net::SocketAddr>,

@@ -58,6 +58,11 @@ pub struct Server {
     /// Per-slot write versions for `Request::Ordered` (SLOT-OWNERSHIP-PLAN 3c).
     write_ordering: Arc<crate::write_order::WriteOrdering>,
 
+    /// As a slot's primary: since when clients have reported its secondary failing writes
+    /// while it still answers our pings, and when they last did, by (file, chunk, epoch).
+    /// See `replace_isr_member`.
+    lagging_secondaries: Arc<DashMap<(FileId, u64, u64), (std::time::Instant, std::time::Instant)>>,
+
     /// Replication factor. `Arc<AtomicUsize>` — the same instance is handed to
     /// `HealingManager` at construction (see `replication_factor_handle()`), so a live
     /// `dfs-admin cluster set --replication-factor` change or rejoin reconciliation is
@@ -132,6 +137,12 @@ pub struct Server {
     /// client_write_seq (i.e. most reads of a file the client has written this session),
     /// scaling with total cluster chunks rather than the single chunk being read.
     chunk_to_file: Arc<DashMap<ChunkId, FileId>>,
+    /// Per file, the newest truncate-to-zero this node applied: its write_seq and the chunks
+    /// it removed. A location report older than it describes the file before the truncate and
+    /// must not refill the emptied map (see `truncate_outranks`): one queued behind a slow
+    /// leader put the old chunk 0 back after `: > app.log`, the next append's open fetched
+    /// it, and the appends went after the old bytes (G8 1029, b1029a).
+    truncate_floors: Arc<DashMap<FileId, (u64, std::collections::HashSet<ChunkId>)>>,
 
     /// Permanently-missing chunk blocklist.
     /// Chunks that recently failed reads from all online nodes. Prevents connection
@@ -724,6 +735,10 @@ impl Drop for PendingRenameGuard {
 /// How long a rename stays recognisable as one a repeat of it can wait for: past any client's
 /// retry ladder for one request (send_to_leader_with_retry gives up after 15s).
 const RECENT_RENAME_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a primary holds a resent copy of an ordered write that is still being applied
+/// (`SlotOrder::await_decided`): under the client's 3s read timeout, so the answer gets back.
+const ORDERED_RESEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn fold_metadata_batch(items: Vec<FileMetadata>) -> Vec<FileMetadata> {
     let mut order: Vec<FileId> = Vec::new();
@@ -1969,6 +1984,9 @@ pub(crate) enum SlotMergeOutcome {
     /// The file was just deleted here; a location still in flight for it must not
     /// re-create its chunk_map entry (see Server::file_recently_deleted).
     FileDeleted,
+    /// The location is from before the file's latest truncate-to-zero (see
+    /// Server::truncate_outranks): it must not refill the emptied map.
+    PreTruncate,
 }
 
 impl SlotMergeOutcome {
@@ -1981,7 +1999,7 @@ impl SlotMergeOutcome {
         match self {
             SlotMergeOutcome::Applied { current } => Some(*current),
             SlotMergeOutcome::Rejected { current, .. } => Some(*current),
-            SlotMergeOutcome::Unplaceable | SlotMergeOutcome::FileDeleted => None,
+            SlotMergeOutcome::Unplaceable | SlotMergeOutcome::FileDeleted | SlotMergeOutcome::PreTruncate => None,
         }
     }
 }
@@ -5973,6 +5991,7 @@ impl Server {
             lease,
             slot_isr,
             write_ordering: Arc::new(crate::write_order::WriteOrdering::default()),
+            lagging_secondaries: Arc::new(DashMap::new()),
             replication_factor,
             metadata_dir,
             config_path,
@@ -5993,6 +6012,7 @@ impl Server {
             write_semaphore: Arc::new(tokio::sync::Semaphore::new(48)),
             chunk_map: Arc::new(DashMap::new()),
             chunk_to_file: Arc::new(DashMap::new()),
+            truncate_floors: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             healing: Arc::new(RwLock::new(None)),
             offline_compaction_tx: Arc::new(RwLock::new(None)),
@@ -6888,6 +6908,8 @@ impl Server {
                 // never moves that head: left set, a fresh reader got the old content back
                 // (T107c, ordering on).
                 self.write_ordering.clear_file_heads(metadata.id);
+                self.truncate_floors.insert(metadata.id,
+                    (metadata.write_seq, old_locs.iter().map(|l| l.chunk_id).collect()));
                 self.chunk_map.insert(metadata.id, (vec![], metadata.write_seq));
             }
         }
@@ -6937,6 +6959,11 @@ impl Server {
         if self.file_recently_deleted(file_id) {
             debug!("[CHUNK_MAP] file={} deleted — dropping in-flight location {}", file_id, location.chunk_id);
             return SlotMergeOutcome::FileDeleted;
+        }
+        if self.truncate_outranks(file_id, location) {
+            info!("[CHUNK_MAP] file={} dropping location {} (seq {:?}) from before its truncate",
+                file_id, location.chunk_id, location.client_write_seq);
+            return SlotMergeOutcome::PreTruncate;
         }
         // Backfill the slot's CURRENT occupant's generation before arbitrating, if this
         // node never directly recorded it. chunk_generations is in-memory, per-chunk_id,
@@ -7188,6 +7215,7 @@ impl Server {
 
     /// Remove a file from the chunk map (on deletion).
     async fn chunk_map_remove(&self, file_id: &FileId) {
+        self.truncate_floors.remove(file_id);
         if let Some((_, (locs, _))) = self.chunk_map.remove(file_id) {
             for loc in locs.iter() {
                 self.chunk_to_file.remove(&loc.chunk_id);
@@ -11413,6 +11441,14 @@ impl Server {
             if loc.nodes.is_empty() || self.file_recently_deleted(fid) || self.is_superseded_token_location(&loc).await {
                 continue;
             }
+            // A head from before the file's truncate-to-zero must not refill the emptied map:
+            // with no occupant left to arbitrate against it went straight in, and the next
+            // append's open fetched the old chunk back (suite T117, G8 1029 DVR app.log).
+            if self.truncate_outranks(fid, &loc) {
+                info!("[CHUNK_MAP] file={} dropping ISR head {} (seq {:?}, generation {}) from before its truncate",
+                    fid, loc.chunk_id, loc.client_write_seq, head.generation);
+                continue;
+            }
             let names_head = |isr: &dfs_common::protocol::SlotIsr| {
                 isr.epoch == head.isr_epoch && loc.nodes.iter().all(|n| isr.members.contains(n))
             };
@@ -11490,8 +11526,8 @@ impl Server {
                 }
             }
             self.chunk_to_file.insert(merged.chunk_id, fid);
-            debug!("ISR head installed: file {} chunk {} -> {} (generation {}, was {:?} at {:?}; nodes {:?})",
-                fid, idx, merged.chunk_id, head.generation, occupant, occupant_gen, merged.nodes);
+            debug!("ISR head installed: file {} chunk {} -> {} (generation {}, seq {:?}, was {:?} at {:?}; nodes {:?})",
+                fid, idx, merged.chunk_id, head.generation, merged.client_write_seq, occupant, occupant_gen, merged.nodes);
             installed += 1;
         }
         debug!("handle_replicate_isr_heads: installed {}", installed);
@@ -12471,7 +12507,30 @@ impl Server {
                     Ok(Ok(env)) if matches!(env.message, Message::Response(Response::Pong))),
                 None => false,
             };
-            if reachable {
+            // Answering a ping isn't keeping up, though. A secondary whose disk takes seconds
+            // per commit (G8 1028: server2, ~31ms per fsync, commits up to 7.7s) answers every
+            // ping and times out every write: refused 44 times, it held the slot until the
+            // client's 20s outage budget ran out and failed the fsync (suite T114). So, as an
+            // ISR does, drop a secondary that has kept failing writes for LAGGING_SECONDARY_MAX
+            // even though it answers. Safe for the same reason as dropping an unreachable one:
+            // we, the primary, hold every acked write, and the replacement resyncs from us.
+            const LAGGING_SECONDARY_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+            // Reports further apart than this are separate episodes: the secondary kept up between.
+            const LAGGING_EPISODE_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+            let now = std::time::Instant::now();
+            let lagging_for = {
+                let mut e = self.lagging_secondaries.entry((file_id, chunk_idx, cur.epoch)).or_insert((now, now));
+                if now.duration_since(e.1) > LAGGING_EPISODE_GAP {
+                    *e = (now, now);
+                } else {
+                    e.1 = now;
+                }
+                now.duration_since(e.0)
+            };
+            if self.lagging_secondaries.len() > 4096 {
+                self.lagging_secondaries.retain(|_, (_, last)| now.duration_since(*last) <= LAGGING_EPISODE_GAP);
+            }
+            if reachable && lagging_for < LAGGING_SECONDARY_MAX {
                 // Reachable but it failed a write: it may have missed versions (their
                 // WriteOrders dropped). Have it resync from us now rather than stay stale
                 // inside the ISR until some later write reaches it.
@@ -12480,7 +12539,12 @@ impl Server {
                     let client = self.client.clone();
                     tokio::spawn(async move { let _ = client.send_message(addr, Message::Request(req)).await; });
                 }
-                return refuse(format!("secondary {} answers here; not excluding it (asked it to resync)", failed));
+                return refuse(format!("secondary {} answers here; not excluding it yet, failing writes for {:?} (asked it to resync)",
+                    failed, lagging_for));
+            }
+            if reachable {
+                warn!("[ISR] file {} chunk {}: secondary {} answers pings but has failed writes for {:?}; replacing it",
+                    file_id, chunk_idx, failed, lagging_for);
             }
         } else if !self.lease.is_expired(failed) {
             // Secondary taking over: only from a primary a majority voted expired, or two
@@ -12539,6 +12603,7 @@ impl Server {
             Err(_) => return refuse("the epoch change didn't commit in time".into()),
         };
         if records.first().cloned().flatten().as_ref() == Some(&next) {
+            self.lagging_secondaries.remove(&(file_id, chunk_idx, cur.epoch));
             info!("[ISR] file {} chunk {}: {} replaced {}{} -- epoch {} -> {}, members {:?}",
                 file_id, chunk_idx, me, failed, if resigned { " (its storage failed)" } else { "" },
                 cur.epoch, next.epoch, next.members);
@@ -15440,14 +15505,31 @@ impl Server {
         if need == 0 {
             return Ok(());
         }
+        // Every known member, whatever its status here: membership marks a peer Online only
+        // once it has heartbeated, so right after a restart every follower was up and able to
+        // commit but none counted, and every create failed with "0 online follower(s)" for
+        // ~6s (G8 1028 fix7, suite T116). A down one just fails its send; the ack goes out as
+        // soon as enough have committed, so it doesn't wait on that one.
+        // A brand-new cluster's leader can know none of them yet (G8 1028 fix8: "0 known
+        // follower(s)" for ~6s after the bench deploy): wait briefly for membership to fill in,
+        // under the client's 3s read timeout. Past that the put fails, and the client retries
+        // it (send_to_leader_with_retry), so a slow start costs time, not an EIO.
+        const MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
         let local_id = self.cluster.local_node_id();
-        let followers: Vec<SocketAddr> = self.cluster.get_all_nodes().await.into_iter()
-            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
-            .map(|n| n.addr)
-            .collect();
-        if followers.len() < need {
-            return Err(format!("{} online follower(s), {} needed", followers.len(), need));
-        }
+        let waited = std::time::Instant::now();
+        let followers: Vec<SocketAddr> = loop {
+            let followers: Vec<SocketAddr> = self.cluster.get_all_nodes().await.into_iter()
+                .filter(|n| n.id != local_id && n.status != dfs_common::NodeStatus::Leaving)
+                .map(|n| n.addr)
+                .collect();
+            if followers.len() >= need {
+                break followers;
+            }
+            if waited.elapsed() >= MEMBERSHIP_WAIT {
+                return Err(format!("{} known follower(s), {} needed", followers.len(), need));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
         let items = vec![metadata];
         let mut sends: futures::stream::FuturesUnordered<_> = followers.into_iter().map(|addr| {
             let req = Request::ReplicateMetadataBatch { items: items.clone() };
@@ -17704,7 +17786,7 @@ impl Server {
         // routinely a step behind each other) nor the leader's chunk_map (which can name a token
         // only the other replica holds) is this replica's state.
         if me == tag.primary {
-            if let Some(prev) = slot.decided(tag.write_id) {
+            if let Some(prev) = slot.await_decided(tag.write_id, ORDERED_RESEND_WAIT).await {
                 return Self::ordered_resend_response(tag.write_id, prev);
             }
             let current = self.slot_isr.get(tag.file_id, tag.chunk_idx);
@@ -17943,7 +18025,7 @@ impl Server {
             });
         };
         if me == tag.primary {
-            if let Some(prev) = slot.decided(tag.write_id) {
+            if let Some(prev) = slot.await_decided(tag.write_id, ORDERED_RESEND_WAIT).await {
                 return Self::ordered_resend_response(tag.write_id, prev);
             }
             let still_primary = self.slot_isr.get(file_id, chunk_idx).is_some_and(|isr| {
@@ -18033,6 +18115,8 @@ impl Server {
     }
 
     /// The answer to a resent copy of an ordered write: whatever this replica already decided.
+    /// A copy that arrives while the first is still being applied waits up to
+    /// ORDERED_RESEND_WAIT for it (see `SlotOrder::await_decided`).
     fn ordered_resend_response(write_id: u128, prev: crate::write_order::Decision) -> Response {
         match prev {
             crate::write_order::Decision::Ordered { response: Some(r), .. } => r,
@@ -19432,7 +19516,25 @@ impl Server {
     /// for good (a durable tombstone, mirrored in memory). The 30s window alone let a write
     /// still being retried after it reopen the file: the fresh accumulator's fold re-created
     /// the deleted file's chunk map (suite T72b), and after a restart the window is empty.
-    fn file_recently_deleted(&self, file_id: FileId) -> bool {
+/// Whether `location` describes `file_id` before its latest truncate-to-zero (see
+    /// `truncate_floors`). Writes after a truncate report at least its write_seq: the client
+    /// stamps the truncate with the next seq and later fresh writes with the current one. A
+    /// report without a seq is judged by its chunk: only one the truncate removed is dropped,
+    /// so a rewrite of the same bytes after the truncate, which carries a seq, still lands.
+    fn truncate_outranks(&self, file_id: FileId, location: &ChunkLocation) -> bool {
+        match self.truncate_floors.get(&file_id) {
+            Some(floor) => {
+                let (seq, removed) = floor.value();
+                match location.client_write_seq {
+                    Some(s) => s < *seq,
+                    None => removed.contains(&location.chunk_id),
+                }
+            }
+            None => false,
+        }
+    }
+
+        fn file_recently_deleted(&self, file_id: FileId) -> bool {
         self.delete_tombstones.get(&file_id)
             .is_some_and(|t| t.value().elapsed() < std::time::Duration::from_secs(30))
             || self.metadata.is_file_tombstoned(&file_id)
@@ -20906,27 +21008,116 @@ impl Server {
         if guard_losers.is_empty() {
             return Ok(locations);
         }
-        let holders = self.nodes_that_resolve(guard_losers.iter().map(|l| l.chunk_id).collect()).await;
-        for mut row in guard_losers {
-            let Some(real) = holders.get(&row.chunk_id).filter(|h| h.len() >= floor) else { continue };
-            let listed = row.nodes.len();
-            row.nodes = real.clone();
-            let idx = row.file_offset.map(|o| o / CHUNK_SIZE);
-            let Some(pos) = locations.iter().position(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == idx) else { continue };
-            let fold = |id: &ChunkId| self.fold_result_chunk_ids.contains(id);
-            if !Self::location_supersedes(&row, &locations[pos], fold(&row.chunk_id), fold(&locations[pos].chunk_id), None, None, floor) {
-                continue;
-            }
+        let slot_of = |l: &ChunkLocation| l.file_offset.map(|o| o / CHUNK_SIZE);
+        let mut by_slot: std::collections::HashMap<Option<u64>, Vec<ChunkLocation>> = std::collections::HashMap::new();
+        for row in guard_losers {
+            by_slot.entry(slot_of(&row)).or_default().push(row);
+        }
+        let holders = self.nodes_that_resolve(by_slot.values().flatten().map(|l| l.chunk_id).collect()).await;
+        // Those slots' winners that every holder their record lists says it can't serve.
+        let winners: Vec<ChunkLocation> = locations.iter().filter(|l| by_slot.contains_key(&slot_of(l))).cloned().collect();
+        let gone = self.listed_holders_all_deny(&winners).await;
+        let fold = |id: &ChunkId| self.fold_result_chunk_ids.contains(id);
+        for (idx, losers) in by_slot {
+            let Some(pos) = locations.iter().position(|l| slot_of(l) == idx) else { continue };
+            let current_gone = gone.contains(&locations[pos].chunk_id);
+            let Some(row) = Self::rebuild_slot_choice(&locations[pos], &losers, &holders, current_gone, floor, &fold) else { continue };
+            let listed = losers.iter().find(|l| l.chunk_id == row.chunk_id).map_or(0, |l| l.nodes.len());
             info!("Slot rebuild: file {} chunk_idx {:?}: {} (seq {:?}) is held by {} node(s), not the {} its record listed; \
-                   it wins over the older {} (seq {:?}) and its record is corrected",
-                file_id, idx, row.chunk_id, row.client_write_seq, real.len(), listed, locations[pos].chunk_id,
-                locations[pos].client_write_seq);
+                   it wins over the older {} (seq {:?}{}) and its record is corrected",
+                file_id, idx, row.chunk_id, row.client_write_seq, row.nodes.len(), listed, locations[pos].chunk_id,
+                locations[pos].client_write_seq, if current_gone { ", which no holder its record lists can serve" } else { "" });
             if let Err(e) = self.metadata.put_chunk_location_async(row.clone()).await {
                 warn!("Slot rebuild: failed to correct the record of {}: {}", row.chunk_id, e);
             }
             locations[pos] = row;
         }
         Ok(locations)
+    }
+
+    /// The row a slot rebuild serves in place of `current` (the slot's winner by the records),
+    /// if any: one of `losers`, the newer rows that lost only to the replica-count guard, with
+    /// its record corrected to the nodes `holders` says can really serve it. One held by
+    /// `floor` nodes takes the slot on merit.
+    ///
+    /// And when `current` is gone (every holder its record lists answered that it can't serve
+    /// it; see `listed_holders_all_deny`), the newest loser any node can serve takes it:
+    /// the guard exists to keep a readable, well-replicated version from losing to a write
+    /// that reached one node, and with nothing readable left to keep, it only kept a slot on
+    /// bytes that were gone. G8 1029 (b1029l) q.qcow2 chunk 33: the newest version (a fold
+    /// result, its record down to one holder after a phantom was pruned from it) lost to a
+    /// patch token its own fold had retired, and the next rebuild, finding that token
+    /// dangling, went back to the base before all of them: acked writes lost, while the newer
+    /// version sat intact on server3 and the leader healed it to a second node minutes later.
+    /// Served from one node, it is healed back up to RF like any under-replicated chunk.
+    fn rebuild_slot_choice(
+        current: &ChunkLocation,
+        losers: &[ChunkLocation],
+        holders: &std::collections::HashMap<ChunkId, Vec<NodeId>>,
+        current_gone: bool,
+        floor: usize,
+        is_fold: &dyn Fn(&ChunkId) -> bool,
+    ) -> Option<ChunkLocation> {
+        let mut best: Option<ChunkLocation> = None;
+        for row in losers {
+            let Some(real) = holders.get(&row.chunk_id).filter(|h| h.len() >= floor) else { continue };
+            let row = ChunkLocation { nodes: real.clone(), ..row.clone() };
+            let cur = best.as_ref().unwrap_or(current);
+            if Self::location_supersedes(&row, cur, is_fold(&row.chunk_id), is_fold(&cur.chunk_id), None, None, floor) {
+                best = Some(row);
+            }
+        }
+        if best.is_some() || !current_gone {
+            return best;
+        }
+        for row in losers {
+            let Some(real) = holders.get(&row.chunk_id).filter(|h| !h.is_empty()) else { continue };
+            let row = ChunkLocation { nodes: real.clone(), ..row.clone() };
+            if best.as_ref().is_none_or(|b| Self::location_supersedes(&row, b, is_fold(&row.chunk_id), is_fold(&b.chunk_id), None, None, 0)) {
+                best = Some(row);
+            }
+        }
+        best
+    }
+
+    /// Of `rows`, the ones every holder its record lists has answered it can't serve
+    /// (HasChunks, this node included when listed). A listed holder that doesn't answer, or a
+    /// record listing none, leaves the row alone: silence isn't absence, and a rebuild that
+    /// took it for absence would hand a slot to a one-copy write during a partition (the
+    /// guard rebuild_slot_choice keeps, unit test slot_rebuild_still_rejects_a_newer_record_only_one_node_holds).
+    async fn listed_holders_all_deny(&self, rows: &[ChunkLocation]) -> std::collections::HashSet<ChunkId> {
+        const HAS_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let local_id = self.cluster.local_node_id();
+        let mut asks: std::collections::HashMap<NodeId, Vec<ChunkId>> = std::collections::HashMap::new();
+        for row in rows {
+            for n in &row.nodes {
+                asks.entry(*n).or_default().push(row.chunk_id);
+            }
+        }
+        let mut answers: std::collections::HashMap<(NodeId, ChunkId), bool> = std::collections::HashMap::new();
+        for (node, ids) in asks {
+            let answer = if node == local_id {
+                self.handle_has_chunks(ids.clone()).await
+            } else {
+                let Some(addr) = self.cluster.get_node(&node).await.map(|n| n.addr) else { continue };
+                match tokio::time::timeout(HAS_CHUNK_TIMEOUT,
+                    self.client.send_message(addr, Message::Request(Request::HasChunks { chunk_ids: ids.clone() }))).await {
+                    Ok(Ok(dfs_common::MessageEnvelope { message: Message::Response(r), .. })) => r,
+                    _ => continue,
+                }
+            };
+            let Response::BoolVec { values } = answer else { continue };
+            if values.len() != ids.len() {
+                continue;
+            }
+            for (id, present) in ids.into_iter().zip(values) {
+                answers.insert((node, id), present);
+            }
+        }
+        rows.iter()
+            .filter(|r| !r.nodes.is_empty() && r.nodes.iter().all(|n| answers.get(&(*n, r.chunk_id)) == Some(&false)))
+            .map(|r| r.chunk_id)
+            .collect()
     }
 
     /// For each of `ids`, the nodes that say they can serve it (HasChunks: file presence for
@@ -23365,6 +23556,66 @@ mod tests {
         let loc_b = ChunkLocation { chunk_id: ChunkId::from_hash(hash_b), written_at: Some(50), ..loc_a.clone() };
         assert!(Server::location_supersedes(&loc_a, &loc_b, false, false, None, None, dfs_common::types::write_quorum(3)),
             "with neither side in fold_result_chunk_ids, ordering must fall back to plain written_at comparison");
+    }
+
+    /// A slot as the G8 1029 (b1029l) leader saw q.qcow2 chunk 33 at 11:12: the newest version
+    /// (a ForceFold result, seq 15185) had one real holder, and its record listed one after a
+    /// phantom holder was pruned from it; the older version (a patch token, seq 14732) had a
+    /// two-holder record and no bytes left anywhere, its fold having retired them.
+    fn rebuild_slot_fixture() -> (ChunkLocation, ChunkLocation, dfs_common::NodeId, Vec<dfs_common::NodeId>) {
+        let (old_hash, new_hash) = (compute_chunk_hash(b"rebuild-old-token"), compute_chunk_hash(b"rebuild-new-fold"));
+        let old_holders = vec![dfs_common::NodeId::new(), dfs_common::NodeId::new()];
+        let survivor = dfs_common::NodeId::new();
+        let older = ChunkLocation {
+            chunk_id: ChunkId::from_hash(old_hash), nodes: old_holders.clone(), size: 4 * 1024 * 1024,
+            checksum: old_hash, file_offset: Some(33 * 4 * 1024 * 1024),
+            written_at: Some(100), client_write_seq: Some(14732), file_id: None,
+        };
+        let newer = ChunkLocation {
+            chunk_id: ChunkId::from_hash(new_hash), nodes: vec![survivor], checksum: new_hash,
+            written_at: Some(200), client_write_seq: Some(15185), ..older.clone()
+        };
+        (older, newer, survivor, old_holders)
+    }
+
+    /// The bench's revert: the rebuild kept the older version, which none of its holders could
+    /// serve, over the newer one a node did hold, and the slot's acked writes were lost.
+    #[test]
+    fn rebuild_serves_the_newest_readable_version_when_the_winner_is_unreadable() {
+        let (older, newer, survivor, _) = rebuild_slot_fixture();
+        let holders: std::collections::HashMap<ChunkId, Vec<dfs_common::NodeId>> =
+            [(newer.chunk_id, vec![survivor])].into_iter().collect();
+        let floor = dfs_common::types::write_quorum(3);
+        let chosen = Server::rebuild_slot_choice(&older, &[newer.clone()], &holders, true, floor, &|_| false);
+        assert_eq!(chosen.as_ref().map(|c| c.chunk_id), Some(newer.chunk_id),
+            "no node can serve the older version, so the newer one a node holds must take the slot");
+        assert_eq!(chosen.unwrap().nodes, vec![survivor]);
+    }
+
+    /// The replica-count guard still holds while the older version is readable: a newer write
+    /// that reached one node only doesn't displace it (2026-07-27 VM-111).
+    #[test]
+    fn rebuild_keeps_a_readable_winner_over_a_newer_one_copy_write() {
+        let (older, newer, survivor, old_holders) = rebuild_slot_fixture();
+        let holders: std::collections::HashMap<ChunkId, Vec<dfs_common::NodeId>> =
+            [(newer.chunk_id, vec![survivor]), (older.chunk_id, old_holders)].into_iter().collect();
+        let floor = dfs_common::types::write_quorum(3);
+        assert!(Server::rebuild_slot_choice(&older, &[newer.clone()], &holders, false, floor, &|_| false).is_none());
+        // Nor while it is merely unconfirmed: a holder that didn't answer isn't a "no".
+        assert!(Server::rebuild_slot_choice(&older, &[newer], &[].into_iter().collect(), false, floor, &|_| false).is_none());
+    }
+
+    /// A newer version its record understated takes the slot once enough nodes really hold it
+    /// (10-20 staging, Legata ac7a02f0).
+    #[test]
+    fn rebuild_lets_an_understated_newer_version_win_on_its_real_holders() {
+        let (older, newer, survivor, old_holders) = rebuild_slot_fixture();
+        let other = dfs_common::NodeId::new();
+        let holders: std::collections::HashMap<ChunkId, Vec<dfs_common::NodeId>> =
+            [(newer.chunk_id, vec![survivor, other]), (older.chunk_id, old_holders)].into_iter().collect();
+        let floor = dfs_common::types::write_quorum(3);
+        let chosen = Server::rebuild_slot_choice(&older, &[newer.clone()], &holders, false, floor, &|_| false);
+        assert_eq!(chosen.map(|c| c.nodes), Some(vec![survivor, other]));
     }
 
     /// REPRO (2026-07-24 VM-108 dangling-pointer / fold-generation reorder).
@@ -26136,6 +26387,46 @@ mod tests {
         assert_eq!(locs[0].chunk_id, old, "a newer record held by one node must not win the rebuild");
         assert_eq!(metadata.get_chunk_location(&newer).unwrap().map(|l| l.nodes.len()), Some(1),
             "its record must not be rewritten either");
+    }
+
+    /// The rebuild end to end, as G8 1029 (b1029l) q.qcow2 chunk 33: the older record names
+    /// this node, which no longer has it; the newer version is on this node but its record
+    /// lists no holder. The newer one must take the slot, its record corrected.
+    #[tokio::test]
+    async fn slot_rebuild_serves_the_newer_version_when_the_older_ones_holders_lost_it() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+        let file_id = dfs_common::FileId::new();
+        let content = vec![9u8; 64];
+        let mut old_hash = [0u8; 32];
+        old_hash[0] = 0x01;
+        let old = ChunkId::from_hash(old_hash);
+        let mut new_hash = [0u8; 32];
+        new_hash[0] = 0x02;
+        let newer = ChunkId::from_hash(new_hash);
+        storage.write_chunk(&newer, &content).unwrap();
+        let row = |id: ChunkId, nodes: Vec<NodeId>, seq: u64| ChunkLocation {
+            chunk_id: id, nodes, size: content.len(), checksum: id.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: Some(seq), file_id: Some(file_id),
+        };
+        metadata.put_chunk_location(&row(old, vec![node_id], 1)).unwrap();
+        metadata.put_chunk_location(&row(newer, vec![], 2)).unwrap();
+
+        let locs = server.chunk_locations_verified_async(file_id).await.unwrap();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].chunk_id, newer, "the older version's only holder lost it; the newer one this node holds must win");
+        assert_eq!(metadata.get_chunk_location(&newer).unwrap().map(|l| l.nodes), Some(vec![node_id]),
+            "its record must name the node that really holds it");
     }
 
     /// A patch moves its slot's chunk_map entry from the base to the token, and every later
@@ -30336,6 +30627,48 @@ mod tests {
             h.server.chunk_map_update(&mk(191)).await;
             let n = h.server.chunk_map.get(&file_id).map(|e| e.value().0.len()).unwrap_or(99);
             assert_eq!(n, 0, "a newer truncate-to-zero must still clear the chunk map");
+        }
+
+        /// G8 1029 (b1029a, DVR app.log): `: > app.log` cleared the leader's map, then a
+        /// location report for the pre-truncate chunk 0, queued behind the slow leader
+        /// since the previous round, arrived and was inserted into the now-empty slot. The
+        /// next append's open fetched the old 2591-byte chunk back from the leader and the
+        /// appends went after it. A truncate must outrank every report of what it removed;
+        /// a write made after it must still land.
+        #[tokio::test]
+        async fn late_location_report_does_not_undo_a_truncate() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let loc = |byte: u8, cws: Option<u64>| {
+                let hash = compute_chunk_hash(&vec![byte; 64]);
+                ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash), nodes: vec![], size: 2591,
+                    checksum: hash, file_offset: Some(0),
+                    written_at: Some(1000), client_write_seq: cws, file_id: Some(file_id),
+                }
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc(1, Some(1040))], 1044));
+            let mut m = dfs_common::FileMetadata::new("/dvr/app.log".to_string(), dfs_common::FileType::RegularFile);
+            m.id = file_id;
+            m.size = 0;
+            m.write_seq = 1045;
+            h.server.chunk_map_update(&m).await;
+            let n = h.server.chunk_map.get(&file_id).map(|e| e.value().0.len()).unwrap_or(99);
+            assert_eq!(n, 0, "the truncate must clear the map");
+
+            // The old chunk's report, with its write seq and without one.
+            h.server.chunk_map_update_location_for_file(file_id, &loc(1, Some(1040))).await;
+            h.server.chunk_map_update_location_for_file(file_id, &loc(1, None)).await;
+            let left: Vec<ChunkId> = h.server.chunk_map.get(&file_id)
+                .map(|e| e.value().0.iter().map(|l| l.chunk_id).collect()).unwrap_or_default();
+            assert!(left.is_empty(), "a late report of a pre-truncate chunk came back after the truncate: {:?}", left);
+
+            // The first append after the truncate.
+            let fresh = loc(2, Some(1047));
+            h.server.chunk_map_update_location_for_file(file_id, &fresh).await;
+            let left: Vec<ChunkId> = h.server.chunk_map.get(&file_id)
+                .map(|e| e.value().0.iter().map(|l| l.chunk_id).collect()).unwrap_or_default();
+            assert_eq!(left, vec![fresh.chunk_id], "a write made after the truncate must land");
         }
 
         /// Same class as the test above: a record naming only SOME of a file's chunks

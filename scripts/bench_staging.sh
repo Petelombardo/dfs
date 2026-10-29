@@ -26,6 +26,9 @@
 # BENCH_JOBS="seq1m_fsync ..." runs only those fio jobs (default: all).
 # BENCH_SERVER_EXTRA_ENV="K=V ..." adds environment for the servers (e.g. DFS_APTIMING_INFO_MS=0).
 # BENCH_CLIENT_EXTRA_ENV="K=V ..." adds environment for the client (e.g. DFS_CHAIN_WRITES=1).
+# BENCH_LEADER_ORDER="server5 server4 ..." gives those nodes fixed node ids in that order, lowest
+#   first: the lowest-id fit node leads, so this picks the leader and who follows it (a slow disk
+#   as leader made every metadata commit wait on it, G8 1029). Unlisted nodes keep random ids.
 # BENCH_SERVER_BIN_DIR / BENCH_CLIENT_BIN deploy other binaries (e.g. production's own, copied
 # read-only, for a prod-vs-new comparison). A redeploy over a running bench needs teardown first.
 # BENCH_NODES="server2 server3 ..." / BENCH_DIR=/mnt/dfsbench/srv run the servers on other hosts and
@@ -95,6 +98,12 @@ deploy)
             sed -i 's|^listen_addr = .*|listen_addr = \"$ip:$PORT\"|' $DIR/config/config.toml
             if [ $n != $SEED_NODE ]; then sed -i 's|^seed_nodes = .*|seed_nodes = [\"$SEED\"]|' $DIR/config/config.toml; fi
             grep -E '^(listen_addr|seed_nodes)' $DIR/config/config.toml"
+        rank=0; k=0
+        for m in ${BENCH_LEADER_ORDER:-}; do k=$((k + 1)); [ "$m" = "$n" ] && rank=$k; done
+        if [ "$rank" != 0 ]; then
+            id=$(printf '00000000-0000-4000-8000-%012d' "$rank")
+            ssh root@"$n" "f=$DIR/config/config.toml; if grep -q '^node_id' \$f; then sed -i 's|^node_id = .*|node_id = \"$id\"|' \$f; else sed -i '/^\[node\]/a node_id = \"$id\"' \$f; fi; grep '^node_id' \$f"
+        fi
     done
     ssh root@"$CLIENT" "mkdir -p $CDIR"
     scp -q "$CLIENT_BIN" root@"$CLIENT":$CDIR/dfs-client

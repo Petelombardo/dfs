@@ -579,6 +579,24 @@ fn get_sqlite_consistency_window_ms() -> u64 {
 ///
 /// Back-pressure: if the oldest item is >10s old (leader unreachable), new async
 /// pushes block until the front clears.
+/// Test-only (DFS_FAULT_INJECTION=1 and DFS_FAULT_SLOW_LOCATION_REPORTS_MS=N): every batched
+/// chunk-location report waits N ms before it goes to the leader, as reports queued behind a
+/// saturated leader do, so one can land after a later truncate (suite T117).
+async fn fault_slow_location_report() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        let on = std::env::var("DFS_FAULT_INJECTION").map(|v| v == "1").unwrap_or(false);
+        if on {
+            std::env::var("DFS_FAULT_SLOW_LOCATION_REPORTS_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        } else {
+            0
+        }
+    });
+    if ms > 0 {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
 pub struct MetadataQueue {
     /// Queue entries. Oldest at front; deduped by file_id.
     inner: Mutex<VecDeque<MetadataEntry>>,
@@ -1778,6 +1796,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // Leader unknown — fall through to backoff + retry.
                     *self.leader_addr.write().await = None;
                 }
+                // The leader can't reach a majority yet: right after the cluster starts it
+                // knows none of its followers for a few seconds (G8 1028 fix7/fix8, suite
+                // T116). That ends, like an election: back off and send it again. A put is
+                // idempotent, so resending one the leader already committed is harmless.
+                Ok(Response::Error { ref message, .. }) if message.contains("not committed on a majority") => {}
                 Ok(resp) => return Ok(resp), // success or server-side error
                 Err(e) => {
                     // Network / connection error — transient.
@@ -6809,6 +6832,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         if locations.is_empty() {
             return Ok(());
         }
+        fault_slow_location_report().await;
         // Prefer the receipt-bearing variant so a declined registration is visible
         // instead of being reported as success — see
         // Request::ReplicateChunkLocationsWithReceipts' doc comment. Falls back to the
@@ -8806,6 +8830,21 @@ leader_addr: Arc::new(RwLock::new(None)),
         // which has the write.)
         if let Some(tag) = order_tags.values().next() {
             if !patched_node_ids.contains(&tag.primary) {
+                // A primary that is only slow (its reply timed out, or a resend found the
+                // write still being applied) will apply it: send it again within the outage
+                // budget, as for a secondary below. Handing it back cost the flush path's one
+                // retry, and a primary whose commits took seconds failed the fsync 6s in
+                // (G8 1028 fix7: server2).
+                let primary_slow = replica_results.iter().any(|(a, r)| {
+                    addr_to_node_id_snap.get(a) == Some(&tag.primary)
+                        && matches!(r, Err(e) if { let e = e.to_string(); is_transient_write_failure(&e) || e.contains("is still being applied") })
+                });
+                if primary_slow && retry_started.elapsed() < CONNECT_RETRY_BUDGET {
+                    debug!("MultiPatch: ordered write to file {} chunk {}: primary {} is slow; sending it again",
+                        tag.file_id, tag.chunk_idx, tag.primary);
+                    tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                    continue 'retry;
+                }
                 warn!("MultiPatch: ordered write to file {} chunk {} wasn't applied by its primary {} — retrying it, not backfilling",
                     tag.file_id, tag.chunk_idx, tag.primary);
                 return Err(anyhow::anyhow!(

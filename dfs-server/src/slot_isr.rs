@@ -352,9 +352,18 @@ impl SlotIsrService {
         }
     }
 
-    /// Send `req` to every peer; collect (peer, response) for those that answered.
-    async fn ask_peers(&self, req: Request) -> Vec<(NodeId, Response)> {
-        let calls = self.lease.peers().into_iter().map(|(id, addr)| {
+    /// Ask every peer, and return as soon as `need` of them have given a reply `counts`
+    /// accepts (the calls still out are dropped), or once every call has answered or failed.
+    /// A phase needs a majority, not everyone: waiting for all of them let one slow node (its
+    /// disk taking seconds per commit, so it answers late) hold every ISR change up to
+    /// RPC_TIMEOUT per phase. That was longer than the 3s a primary gives an epoch change, so a
+    /// primary could never replace that very node (suite T114, G8 1028). Only real replies
+    /// count: a node whose disk is full fails to persist its promise and answers an error at
+    /// once, and counted, it ended the wait before the healthy peers' promises arrived, so
+    /// the full node could never resign its ISRs (suite T79e).
+    async fn ask_peers(&self, req: Request, need: usize, counts: fn(&Response) -> bool) -> Vec<(NodeId, Response)> {
+        use futures::stream::StreamExt;
+        let mut calls: futures::stream::FuturesUnordered<_> = self.lease.peers().into_iter().map(|(id, addr)| {
             let client = self.client.clone();
             let req = req.clone();
             async move {
@@ -369,8 +378,17 @@ impl SlotIsrService {
                     }
                 }
             }
-        });
-        futures::future::join_all(calls).await.into_iter().flatten().collect()
+        }).collect();
+        let mut out = Vec::new();
+        while out.len() < need {
+            match calls.next().await {
+                Some(Some((id, r))) if counts(&r) => out.push((id, r)),
+                Some(Some((id, r))) => debug!("SLOT ISR: {} answered {:?}", id, dfs_common::debug_truncated(&r, 200)),
+                Some(None) => {}
+                None => break,
+            }
+        }
+        out
     }
 
     /// Choose each slot's next ISR by Paxos. `wanted` holds each slot's proposed value
@@ -403,7 +421,9 @@ impl SlotIsrService {
                 }
                 other => { warn!("SLOT ISR: local prepare failed: {:?}", other); return result; }
             }
-            for (peer, resp) in self.ask_peers(Request::SlotIsrPrepare { items }).await {
+            // This node's own promise counts toward the majority.
+            for (peer, resp) in self.ask_peers(Request::SlotIsrPrepare { items }, majority.saturating_sub(1),
+                |r| matches!(r, Response::SlotIsrPrepareReplies { .. })).await {
                 if let Response::SlotIsrPrepareReplies { replies } = resp {
                     if replies.len() == pending.len() {
                         for (k, r) in replies.into_iter().enumerate() { promises[k].push((peer, r)); }
@@ -437,7 +457,8 @@ impl SlotIsrService {
                 if let Response::SlotIsrAcceptReplies { replies } = self.handle_accept(items.clone()).await {
                     for (k, r) in replies.into_iter().enumerate() { accepts[k].push((self.me, r)); }
                 }
-                for (peer, resp) in self.ask_peers(Request::SlotIsrAccept { items }).await {
+                for (peer, resp) in self.ask_peers(Request::SlotIsrAccept { items }, majority.saturating_sub(1),
+                    |r| matches!(r, Response::SlotIsrAcceptReplies { .. })).await {
                     if let Response::SlotIsrAcceptReplies { replies } = resp {
                         if replies.len() == to_accept.len() {
                             for (k, r) in replies.into_iter().enumerate() { accepts[k].push((peer, r)); }
@@ -458,7 +479,19 @@ impl SlotIsrService {
             all.extend(learned);
             if !all.is_empty() {
                 let _ = self.handle_commit(all.clone()).await;
-                let _ = self.ask_peers(Request::SlotIsrCommit { items: all.clone() }).await;
+                // Every node should learn it, the new members first of all, before the caller
+                // sends them writes in the new epoch. Healthy peers answer within milliseconds;
+                // a slow one isn't waited for past COMMIT_WAIT, and keeps being sent it in the
+                // background (or learns it on its catch-up pass).
+                const COMMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+                let (client, peers, req) = (self.client.clone(), self.lease.peers(), Request::SlotIsrCommit { items: all.clone() });
+                let broadcast = tokio::spawn(async move {
+                    futures::future::join_all(peers.into_iter().map(|(_, addr)| {
+                        let (client, req) = (client.clone(), req.clone());
+                        async move { let _ = client.send_message_timeout(addr, Message::Request(req), RPC_TIMEOUT).await; }
+                    })).await;
+                });
+                let _ = tokio::time::timeout(COMMIT_WAIT, broadcast).await;
                 for (f, i, v) in &all {
                     info!("SLOT ISR: file {} chunk {} epoch {} = {:?}", f, i, v.epoch, v.members);
                 }

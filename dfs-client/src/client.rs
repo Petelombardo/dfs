@@ -8198,9 +8198,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Mutable: time spent waiting on a busy primary is added back (see the busy retry below).
         let mut retry_started = std::time::Instant::now();
         // Backoff between sends of an ordered write a replica answered busy, and the write's
-        // tags to send it again with.
+        // tags and client_write_seq to send it again with.
         let mut busy_backoff = BUSY_RETRY_BACKOFF_MIN;
-        let mut busy_tags: Option<HashMap<SocketAddr, dfs_common::WriteOrderTag>> = None;
+        let mut busy_tags: Option<(HashMap<SocketAddr, dfs_common::WriteOrderTag>, Option<u64>)> = None;
         // The slot generation the ordered primary stamped on the write that finally landed
         // (the slot reports itself through its primary; see the enqueue below).
         let mut ordered_generation: Option<u64> = None;
@@ -8306,14 +8306,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             replica_addrs.clone()
         };
 
-        let order_tags = match chunk_idx {
+        let (order_tags, resent_seq) = match chunk_idx {
             // Sent again after a busy answer: the same write, so a primary that already applied
             // it answers as before and a secondary still applying it waits on that same apply.
-            _ if busy_tags.as_ref().is_some_and(|t| t.keys().all(|a| patch_addrs.contains(a))) =>
-                busy_tags.take().unwrap_or_default(),
+            _ if busy_tags.as_ref().is_some_and(|(t, _)| t.keys().all(|a| patch_addrs.contains(a))) =>
+                busy_tags.take().map(|(t, seq)| (t, Some(seq))).unwrap_or_default(),
             Some(cidx) if Self::ordered_writes_enabled() =>
-                self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await,
-            _ => HashMap::new(),
+                (self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await, None),
+            _ => (HashMap::new(), None),
         };
         busy_tags = None;
         if let (Some(cidx), true) = (chunk_idx, Self::ordered_writes_enabled()) {
@@ -8334,7 +8334,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         // (`inc >= ext`) accepts whichever RCL physically arrives last — which can be an
         // intermediate rotation, not the final one — leaving chunk_map pointing at stale
         // chunk data that a later full-chunk read serves to the application.
-        let patch_client_write_seq = Some(self.next_write_seq(file_id));
+        // A resend of the same ordered write keeps its first send's seq: the seq is part of the
+        // delta record a replica stores, so a primary that applied the first send and a secondary
+        // that applies the resend would otherwise hold different chunk ids for the same bytes and
+        // disagree on every later write to the slot (G8 soak 10-30, fsync EIO).
+        let patch_client_write_seq = match resent_seq {
+            Some(seq) => seq,
+            None => Some(self.next_write_seq(file_id)),
+        };
 
         // Split-frame MultiPatch: when total patch data is large enough that bincode
         // serialization overhead matters (>= 32KB), serialize the envelope once with
@@ -8464,7 +8471,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 tokio::time::sleep(wait).await;
                 retry_started += wait;
                 busy_backoff = (busy_backoff * 2).min(BUSY_RETRY_BACKOFF_MAX);
-                busy_tags = Some(order_tags.clone());
+                busy_tags = Some((order_tags.clone(), patch_client_write_seq));
                 continue 'retry;
             }
             // A replica that gave no reply in time may still be applying the write: whatever
@@ -8474,7 +8481,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let silent = results.iter().any(|(a, r)| order_tags.contains_key(a)
                 && matches!(r, Err(e) if is_transient_write_failure(&e.to_string())));
             if silent && !refused {
-                busy_tags = Some(order_tags.clone());
+                busy_tags = Some((order_tags.clone(), patch_client_write_seq));
             }
         }
         busy_backoff = BUSY_RETRY_BACKOFF_MIN;
@@ -11279,6 +11286,93 @@ mod tests {
         assert!(new_pair_writes.load(Ordering::SeqCst) >= 2, "both members of the new pair must have taken the write");
         assert!(started.elapsed() < std::time::Duration::from_secs(5),
             "BUG REPRODUCED: the write took {:?} to reach the new pair", started.elapsed());
+    }
+
+    /// G8 soak 10-30 (198fd5c): the secondary answered an ordered write busy, and the client sent
+    /// the same write (same tags) again with a fresh client_write_seq. The primary had applied
+    /// the first send and answered the resend with that result; the secondary applied the resend.
+    /// The seq is part of the stored delta record, so the two held different chunk ids for the
+    /// same bytes, every later write to the slot saw a replica disagreement, and fsync got EIO.
+    /// Every send of one write must carry the same seq. Needs DFS_ORDERED_WRITES=1.
+    #[tokio::test]
+    async fn a_resent_ordered_write_carries_the_seq_of_its_first_send() {
+        use tokio::io::AsyncReadExt;
+        if !DfsClient::ordered_writes_enabled() {
+            eprintln!("skipped: run with DFS_ORDERED_WRITES=1");
+            return;
+        }
+        let (a, b): (SocketAddr, SocketAddr) = ("127.0.0.1:19441".parse().unwrap(), "127.0.0.1:19442".parse().unwrap());
+        let (na, nb) = (NodeId::new(), NodeId::new());
+        let file_id = FileId::new();
+        let final_id = chunk_id_with_hash0(0x55);
+        let isr = dfs_common::SlotIsr { epoch: 1, members: vec![na, nb] };
+        // (server, write_id, client_write_seq) for every ordered MultiPatch received.
+        let sends: Arc<std::sync::Mutex<Vec<(SocketAddr, u128, Option<u64>)>>> = Arc::default();
+        for addr in [a, b] {
+            let (sends, isr) = (sends.clone(), isr.clone());
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { return };
+                    let (sends, isr) = (sends.clone(), isr.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let mut len_buf = [0u8; 4];
+                            if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                            let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                            if stream.read_exact(&mut buf).await.is_err() { return; }
+                            let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                            let request_id = envelope.request_id;
+                            let Message::Request(req) = envelope.message else { return };
+                            let resp = match req {
+                                Request::GetOrSeedSlotIsr { .. } => Response::SlotIsrRecords { records: vec![Some(isr.clone())] },
+                                Request::Ordered { tag, request } => {
+                                    let seq = match *request { Request::MultiPatch { client_write_seq, .. } => client_write_seq, _ => None };
+                                    let first_to_b = {
+                                        let mut s = sends.lock().unwrap();
+                                        s.push((addr, tag.write_id, seq));
+                                        addr == b && s.iter().filter(|(x, ..)| *x == b).count() == 1
+                                    };
+                                    // The secondary is busy the first time; the primary applies at once.
+                                    if first_to_b {
+                                        Response::Error { message: "busy".into(), code: ErrorCode::ServerBusy }
+                                    } else {
+                                        Response::MultiPatchResult { new_chunk_id: final_id, size: 4096, patch_ts: Some(1000), chunk_seq: Some(1) }
+                                    }
+                                }
+                                _ => Response::Error { message: "unhandled in mock".into(), code: ErrorCode::InternalError },
+                            };
+                            write_envelope(&mut stream, request_id, resp).await;
+                        }
+                    });
+                }
+            });
+        }
+
+        let client = DfsClient::new(vec![a, b]).unwrap();
+        *client.leader_addr.write().await = Some(a);
+        for (addr, id) in [(a, na), (b, nb)] {
+            client.addr_to_node_id.write().await.insert(addr, id);
+            client.cluster_nodes.write().await.push(addr);
+        }
+        client.slot_isr_cache.insert((file_id, 1), isr);
+        let old_location = loc_with_nodes(chunk_id_with_hash0(0x00), vec![na, nb]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.multi_patch_chunk_on_replicas_verified(
+                chunk_id_with_hash0(0x00), file_id, 1, 0,
+                vec![(0usize, vec![0xAB; 4])], &old_location, None, true,
+                Arc::new(HashMap::new()),
+            ),
+        ).await;
+        assert!(matches!(result, Ok(Ok(_))), "the write must succeed once the secondary takes it: {:?}", result.map(|r| r.map(|_| ())));
+        let sends = sends.lock().unwrap().clone();
+        assert!(sends.iter().filter(|(x, ..)| *x == b).count() >= 2, "the secondary must have been sent the write again: {:?}", sends);
+        for (_, id, seq) in &sends {
+            let first = sends.iter().find(|(_, i, _)| i == id).map(|s| s.2);
+            assert_eq!(Some(*seq), first,
+                "BUG REPRODUCED: write {:x} was sent again with another client_write_seq: {:?}", id, sends);
+        }
     }
 
     /// Regression test for the 2026-08-18 VM-108 dd-read EIO: a second concurrent

@@ -600,6 +600,46 @@ impl ChunkShardState {
     }
 }
 
+/// A flush's claim on its chunk: `slot.flushing` plus the waiter later flushes of the chunk
+/// queue behind. Every return path of flush_buffer_async_one releases it through
+/// notify_chunk_flush_complete; dropping this releases it if that never ran (a return path
+/// that skipped it, or the flush's task dropped mid-flight), so a waiter is never left behind
+/// a flush that no longer exists. Releases only its own waiter, never a later flush's.
+struct FlushClaim {
+    buf: Arc<InodeWriteBuffer>,
+    idx: u64,
+    waiter: Arc<tokio::sync::Notify>,
+}
+
+impl FlushClaim {
+    fn release(cs: &mut ChunkShardState, waiter: &Arc<tokio::sync::Notify>, idx: u64) -> bool {
+        if !cs.flush_waiter.as_ref().is_some_and(|w| Arc::ptr_eq(w, waiter)) {
+            return false;
+        }
+        warn!("flush claim on chunk {} ended without a completion notify; releasing it", idx);
+        cs.flush_waiter = None;
+        cs.slot.flushing = false;
+        true
+    }
+}
+
+impl Drop for FlushClaim {
+    fn drop(&mut self) {
+        let Some(shard) = self.buf.chunk_get(self.idx) else { return };
+        let (waiter, idx) = (self.waiter.clone(), self.idx);
+        if let Ok(mut cs) = shard.try_lock() {
+            if Self::release(&mut cs, &waiter, idx) { drop(cs); waiter.notify_waiters(); }
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let mut cs = shard.lock().await;
+                if Self::release(&mut cs, &waiter, idx) { drop(cs); waiter.notify_waiters(); }
+            });
+        }
+    }
+}
+
 /// Per-inode write buffer: `meta` for inode-wide session state, `chunks` for
 /// the sharded per-chunk_idx locks. Replaces the old single `Mutex<InodeWriteState>`
 /// per inode — see ChunkShardState's doc comment for why.
@@ -2176,7 +2216,7 @@ impl FlushHandle {
         // and finally (urgent=true only) to any non-empty slot.
         // Atomically set flushing=true while holding the mutex so no second concurrent
         // task can claim the same slot.
-        let (chunk_idx, mut slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap) = {
+        let (chunk_idx, mut slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap, _claim) = {
             let Some(buf) = self.write_buffers.get(&ino).map(|e| e.clone()) else { return Ok(()); };
 
             // Candidate selection: non-blocking scan across shards (see
@@ -2284,28 +2324,23 @@ impl FlushHandle {
             loop {
                 let waiter = cs.flush_waiter.clone();
                 if let Some(notify) = waiter {
-                    drop(cs); // Release this shard's lock while waiting
+                    // Listen BEFORE releasing the shard: the flush in progress takes its waiter
+                    // under this lock, so a listener registered here can't miss the wake-up.
+                    // (Listening after the drop could, and the next flush then sat out a whole
+                    // 30 s timeout behind a flush that had already finished.)
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(cs);
                     debug!("flush_one_chunk: ino={} chunk={} waiting for in-flight flush", ino, idx);
-
-                    // Wait for notification with a 30-second timeout. If the previous flush is stuck
-                    // (server hang, network timeout, slow patch), we must not wait forever or we'll
-                    // deadlock all writes to this chunk. On timeout, force-remove the stale waiter
-                    // and let this flush fail gracefully - the retry logic will handle it.
-                    match tokio::time::timeout(tokio::time::Duration::from_secs(30), notify.notified()).await {
-                        Ok(_) => {
-                            debug!("flush_one_chunk: ino={} chunk={} wait complete, re-checking", ino, idx);
-                            cs = shard.lock().await; // Re-acquire and loop to check again
-                        }
-                        Err(_) => {
-                            warn!("flush_one_chunk: ino={} chunk={} FIFO wait timeout after 30s - previous flush stuck", ino, idx);
-                            // Force-remove the stale waiter and fail this flush
-                            let mut cs = shard.lock().await;
-                            cs.flush_waiter = None;
-                            // Also clear the flushing flag so the next attempt can proceed
-                            cs.slot.flushing = false;
-                            return Err(anyhow::anyhow!("FIFO wait timeout - previous flush stuck for >30s"));
-                        }
-                    }
+                    // No timeout of its own: this waits exactly as long as the flush in progress
+                    // lives. That flush gives up by its own outage budget, and its FlushClaim
+                    // releases this wait however it ends. A fixed 30 s here failed live writes
+                    // (EIO) behind a loaded-but-progressing primary (T119 1029z: fsyncs of 130 s,
+                    // nothing stuck).
+                    notified.await;
+                    debug!("flush_one_chunk: ino={} chunk={} wait complete, re-checking", ino, idx);
+                    cs = shard.lock().await; // Re-acquire and loop to check again
                 } else {
                     // No waiter → we can proceed
                     break;
@@ -2323,7 +2358,9 @@ impl FlushHandle {
             }
 
             // Create a new notifier for this flush so subsequent flushes will wait
-            cs.flush_waiter = Some(Arc::new(tokio::sync::Notify::new()));
+            let waiter = Arc::new(tokio::sync::Notify::new());
+            cs.flush_waiter = Some(waiter.clone());
+            let claim = FlushClaim { buf: buf.clone(), idx, waiter };
 
             // Now claim the slot
             cs.slot.flushing = true;
@@ -2335,7 +2372,7 @@ impl FlushHandle {
             let dirty_ranges = cs.slot.dirty_ranges.clone();
             let offset = idx * CHUNK_SIZE as u64;
             drop(cs);
-            (idx, data, offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap)
+            (idx, data, offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap, claim)
             // shard lock released here
         };
 
@@ -10414,6 +10451,124 @@ mod terminal_give_up_tests {
         assert!(result.unwrap().is_ok());
         assert!(waited >= std::time::Duration::from_millis(90),
             "BUG REPRODUCED: fsync's flush returned after {:?} with the chunk still being written by the background flusher", waited);
+    }
+
+    fn flush_handle_for_test(client: Arc<DfsClient>, write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>>,
+                             write_tasks_in_flight: Arc<DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>>) -> FlushHandle {
+        FlushHandle {
+            client,
+            write_buffers,
+            metadata_cache: Arc::new(DashMap::new()),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path: Arc::new(RwLock::new(HashMap::new())),
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(4096)),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight,
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        }
+    }
+
+    /// T119 1029z (primary at 15% CPU, 10 write IOPS): a chunk's flush queues behind the one
+    /// in progress, and that one was alive, just slow under the load (fsyncs ran 130 s).
+    /// The queued flush gave up after a fixed 30 s ("FIFO wait timeout") and its fsync
+    /// returned EIO. It must wait as long as the flush in progress lives.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_queued_behind_a_slow_flush_of_its_chunk_waits_it_out_instead_of_failing() {
+        let client = Arc::new(DfsClient::new(vec!["127.0.0.1:1".parse().unwrap()]).unwrap());
+        let write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>> = Arc::new(DashMap::new());
+        let ino = 44u64;
+        let buf = Arc::new(InodeWriteBuffer::new(false));
+        write_buffers.insert(ino, buf.clone());
+        // New bytes sit unclaimed while the earlier flush of the chunk is still committing.
+        let earlier = Arc::new(tokio::sync::Notify::new());
+        {
+            let shard = buf.chunk_entry(0);
+            let mut cs = shard.lock().await;
+            cs.slot.extents.push((0, vec![0xCDu8; 4096]));
+            cs.slot.span_end = 4096;
+            cs.slot.real_data_end = 4096;
+            cs.slot.dirty_ranges = vec![(0, 4096)];
+            cs.flush_waiter = Some(earlier.clone());
+            buf.active_chunks.insert(0);
+        }
+        let handle = flush_handle_for_test(client, write_buffers.clone(), Arc::new(DashMap::new()));
+        // It finishes 40 s later, and its flush took the new bytes too.
+        let bg_buf = buf.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+            let shard = bg_buf.chunk_get(0).unwrap();
+            let waiter = {
+                let mut cs = shard.lock().await;
+                cs.slot = ChunkSlot::new();
+                bg_buf.active_chunks.remove(&0);
+                cs.flush_waiter.take()
+            };
+            if let Some(w) = waiter { w.notify_waiters(); }
+        });
+        let started = tokio::time::Instant::now();
+        let result = handle.flush_one_chunk(ino, true).await;
+        let waited = started.elapsed();
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+        assert!(result.is_ok(), "BUG REPRODUCED: the queued flush failed after {:?} behind a flush that was still alive: {:#}",
+            waited, result.unwrap_err());
+        assert!(waited >= std::time::Duration::from_secs(40), "returned after {:?}, before the earlier flush finished", waited);
+    }
+
+    /// The other half of the same change: with no timer, a flush's claim must not outlive the
+    /// flush. A flush task dropped mid-flight (here aborted while it waits for the chunk's
+    /// write() tasks) has to release `flushing` and its waiter, or the chunk's next flush
+    /// waits forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_dropped_mid_flight_releases_its_claim_on_the_chunk() {
+        let client = Arc::new(DfsClient::new(vec!["127.0.0.1:1".parse().unwrap()]).unwrap());
+        let write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>> = Arc::new(DashMap::new());
+        let ino = 45u64;
+        let buf = Arc::new(InodeWriteBuffer::new(false));
+        write_buffers.insert(ino, buf.clone());
+        {
+            let shard = buf.chunk_entry(0);
+            let mut cs = shard.lock().await;
+            cs.slot.extents.push((4096, vec![0xCDu8; 4096]));
+            cs.slot.span_end = 8192;
+            cs.slot.real_data_end = 8192;
+            cs.slot.gap_filled_prefix = 4096; // the flush waits for the chunk's write() tasks
+            cs.slot.dirty_ranges = vec![(4096, 8192)];
+            buf.active_chunks.insert(0);
+        }
+        let tasks: Arc<DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
+        tasks.insert((ino, 0), Arc::new(std::sync::atomic::AtomicUsize::new(1)));
+        let handle = Arc::new(flush_handle_for_test(client, write_buffers.clone(), tasks));
+        let h = handle.clone();
+        let flush = tokio::spawn(async move { h.flush_one_chunk(ino, true).await });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let shard = buf.chunk_get(0).unwrap();
+        {
+            let cs = shard.lock().await;
+            assert!(cs.slot.flushing && cs.flush_waiter.is_some(), "setup: the flush should hold its claim while it waits");
+        }
+        flush.abort();
+        let _ = flush.await;
+        tokio::task::yield_now().await;
+        let cs = shard.lock().await;
+        let (flushing, waiter) = (cs.slot.flushing, cs.flush_waiter.is_some());
+        drop(cs);
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+        assert!(!flushing && !waiter,
+            "BUG REPRODUCED: the dropped flush left its claim (flushing={}, waiter={}); the chunk's next flush waits on it forever",
+            flushing, waiter);
     }
 
     /// Suite 1016m OFF, T66[leader]: the background flusher's attempt on a chunk was refused

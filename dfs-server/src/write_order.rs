@@ -38,6 +38,11 @@ type SlotKey = (FileId, u64, u64); // file, chunk_idx, isr_epoch
 /// The version a primary announces for a write it refused to order. Real versions start at 1.
 pub const REFUSED: u64 = 0;
 
+/// The version a primary announces for a write it turned away as busy (`Admission`): nothing is
+/// decided for it, and a resend of the same write may still be ordered. The secondary answers
+/// its copy busy too, so the client's pair retry stays in step.
+pub const BUSY: u64 = u64::MAX;
+
 /// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectOrderedApplyFailures`): the primary
 /// fails its own apply of this many upcoming ordered writes, after announcing them.
 pub static INJECTED_APPLY_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -47,6 +52,28 @@ pub fn take_injected_apply_failure() -> bool {
     INJECTED_APPLY_FAILURES
         .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
+}
+
+/// Test-only (DFS_FAULT_INJECTION=1 and DFS_FAULT_SECONDARY_EXIT="before:N" or "after:N"): this
+/// node exits, as a crash would, on its Nth ordered write as a secondary, before applying it or
+/// after applying it but before answering (suite T120).
+pub fn secondary_exit_point() -> Option<(bool, u64)> {
+    static AT: std::sync::OnceLock<Option<(bool, u64)>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        if std::env::var("DFS_FAULT_INJECTION").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let v = std::env::var("DFS_FAULT_SECONDARY_EXIT").ok()?;
+        let (when, n) = v.split_once(':')?;
+        Some((when == "after", n.parse().ok()?))
+    })
+}
+
+/// Count one ordered write as a secondary; whether it is the one `secondary_exit_point` names.
+pub fn secondary_exit_now() -> Option<bool> {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (after, n) = secondary_exit_point()?;
+    (SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == n).then_some(after)
 }
 
 /// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectSlowBackgroundFolds`): the next
@@ -103,7 +130,14 @@ pub fn now_ms() -> u64 {
 }
 
 /// How many decided writes each slot remembers, so a resent copy of a write gets the same answer.
+/// A decision younger than DECIDED_MIN_AGE is kept past this: a client resends a write for as
+/// long as its secondary answers busy, and a primary that forgot the write ordered the resend
+/// as a new version, applying its old bytes again over newer writes (suite T66[secondary],
+/// 1030b: forgotten after 621 writes in 2 s, re-ordered as v622, and the pair split).
 const DECIDED_CAP: usize = 1024;
+const DECIDED_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(120);
+/// The bound on memory whatever the decisions' age.
+const DECIDED_HARD_CAP: usize = 65536;
 
 /// What a replica decided for one write. Each write is decided exactly once: the client's
 /// transport resends a request whose reply timed out (a stalled node), and a primary that
@@ -126,13 +160,15 @@ pub struct WriteOrdering {
     /// Highest ISR epoch at which this node caught up as the slot's secondary (the durable
     /// copy is the metadata store's SLOT_SYNCED_TABLE; this saves a write per ordered write).
     synced: DashMap<(FileId, u64), u64>,
+    /// The ordered write work this node has on hand (see Admission).
+    pub admission: Arc<Admission>,
 }
 
 impl Default for WriteOrdering {
     fn default() -> Self {
         WriteOrdering {
             boot: uuid::Uuid::new_v4().as_u64_pair().0, slots: DashMap::new(), latest_epoch: DashMap::new(),
-            synced: DashMap::new(),
+            synced: DashMap::new(), admission: Arc::new(Admission::from_env()),
         }
     }
 }
@@ -279,7 +315,10 @@ struct Inner {
     /// Secondary: the primary's boot nonce for the stream being followed.
     stream: Option<u64>,
     decided: HashMap<u128, Decision>,
-    decided_order: VecDeque<u128>,
+    decided_order: VecDeque<(u128, std::time::Instant)>,
+    /// Primary: the base each recent version was ordered on (oldest first, DECIDED_CAP of
+    /// them), so a resent write's WriteOrder can be announced again exactly.
+    bases: VecDeque<(u64, ChunkId)>,
     /// When this replica last applied (or anchored) a version of the stream.
     last_active: Option<std::time::Instant>,
 }
@@ -287,11 +326,15 @@ struct Inner {
 impl Inner {
     fn decide(&mut self, write_id: u128, d: Decision) {
         if self.decided.insert(write_id, d).is_none() {
-            self.decided_order.push_back(write_id);
+            let now = std::time::Instant::now();
+            self.decided_order.push_back((write_id, now));
             while self.decided_order.len() > DECIDED_CAP {
-                if let Some(old) = self.decided_order.pop_front() {
-                    self.decided.remove(&old);
+                let Some(&(old, at)) = self.decided_order.front() else { break };
+                if self.decided_order.len() <= DECIDED_HARD_CAP && now.duration_since(at) < DECIDED_MIN_AGE {
+                    break;
                 }
+                self.decided_order.pop_front();
+                self.decided.remove(&old);
             }
         }
     }
@@ -304,6 +347,9 @@ pub enum TurnError {
     /// The primary refused to order this write (not the primary, no lease, stale ISR):
     /// it announced version `REFUSED`, so the secondary fails it at once.
     Refused,
+    /// The primary turned this copy of the write away as busy (version `BUSY`); a resend may
+    /// still be ordered.
+    Busy,
     /// This write is version `version` on `base`, but versions after `applied` and before it
     /// never arrived.
     Gap { version: u64, base: ChunkId, applied: u64 },
@@ -348,8 +394,12 @@ impl SlotOrder {
     /// Either side: `write_id` (version `version`) is applied here and answered `response`.
     pub fn finish(&self, write_id: u128, version: u64, response: &Response) {
         let mut g = self.inner.lock().unwrap();
-        g.decided.remove(&write_id);
-        g.decide(write_id, Decision::Ordered { version, response: Some(response.clone()) });
+        // In place: removing it first queued the write a second time in decided_order, so the
+        // cap held half as many writes, and the stale entry's eviction dropped the live one.
+        match g.decided.get_mut(&write_id) {
+            Some(d) => *d = Decision::Ordered { version, response: Some(response.clone()) },
+            None => g.decide(write_id, Decision::Ordered { version, response: Some(response.clone()) }),
+        }
         drop(g);
         self.changed.notify_waiters();
     }
@@ -389,7 +439,11 @@ impl SlotOrder {
         if g.decided.contains_key(&write_id) {
             return;
         }
-        g.orders.entry(write_id).or_insert((version, base));
+        // A real order replaces a busy one: the primary admitted a resend, and the two
+        // WriteOrders can arrive in either order.
+        if g.orders.get(&write_id).is_none_or(|&(v, _)| v == BUSY) {
+            g.orders.insert(write_id, (version, base));
+        }
         drop(g);
         self.changed.notify_waiters();
     }
@@ -402,6 +456,20 @@ impl SlotOrder {
     /// The version this replica's head reflects, if the head can be continued.
     pub fn head_version(&self) -> Option<u64> {
         self.inner.lock().unwrap().head_version
+    }
+
+    /// Primary: version `version` was ordered on `base`.
+    pub fn note_base(&self, version: u64, base: ChunkId) {
+        let mut g = self.inner.lock().unwrap();
+        g.bases.push_back((version, base));
+        while g.bases.len() > DECIDED_CAP {
+            g.bases.pop_front();
+        }
+    }
+
+    /// Primary: the base version `version` was ordered on, if it is recent.
+    pub fn base_of(&self, version: u64) -> Option<ChunkId> {
+        self.inner.lock().unwrap().bases.iter().rev().find(|(v, _)| *v == version).map(|(_, b)| *b)
     }
 
     /// Primary: the last version handed out.
@@ -417,7 +485,7 @@ impl SlotOrder {
         g.head = Some(id);
         g.head_version = Some(version);
         g.applied = g.applied.max(version);
-        g.orders.retain(|_, (v, _)| *v > version);
+        g.orders.retain(|_, (v, _)| *v > version && *v != BUSY);
         drop(g);
         self.changed.notify_waiters();
     }
@@ -433,10 +501,10 @@ impl SlotOrder {
             {
                 let g = self.inner.lock().unwrap();
                 if let Some(&(v, base)) = g.orders.get(&write_id) {
-                    if v == REFUSED {
+                    if v == REFUSED || v == BUSY {
                         drop(g);
                         self.inner.lock().unwrap().orders.remove(&write_id);
-                        return Err(TurnError::Refused);
+                        return Err(if v == BUSY { TurnError::Busy } else { TurnError::Refused });
                     }
                     // Wait for every earlier version even when this replica's head can't be
                     // continued: at stream start that is the normal state, and v2 must not
@@ -470,6 +538,206 @@ impl SlotOrder {
         }
         drop(g);
         self.changed.notify_waiters();
+    }
+}
+
+/// How much ordered write work this node has on hand, and whether it takes another write as a
+/// primary. Every ordered write counts from the moment it arrives until it is done: a primary's
+/// write from admission (before it waits for the slot's order lock), and a secondary's copy from
+/// arrival, through waiting its turn and catching up, to its apply, even after its request was
+/// answered "still being applied" (see Server::handle_ordered_inner). Only the primary may turn a
+/// write away, before ordering it: after that both copies must apply it. So the primary admits a
+/// write only while three things hold:
+///
+/// - fewer writes are in progress here than the limit. The limit adapts the way TCP's window
+///   does: it halves (at most once per `target`) when a write takes longer than `target` plus its
+///   payload's transfer time, and grows by about one per window of writes that finish in time.
+///   A node that took every write it was sent worked on all of them at once when it fell behind,
+///   each took longer, the client's 3 s reply deadline passed, the client sent the write again,
+///   and the node did it twice (G8 1029 bafd835f: server2, a 2-core Celeron on a SATA SSD).
+/// - the oldest write in progress here has waited less than `STALL_TARGETS` targets: a count
+///   alone misreads 64 small writes on a fast node and 4 large ones on a slow one alike.
+/// - the slot's secondary last reported (in its reply to a WriteOrder) its own oldest write
+///   younger than that. A slow secondary is never dropped (its storage is the cluster's), so
+///   the primary slows the writes it orders to the secondary's pace instead (suite T119: a
+///   loaded secondary fell 30 s behind while its primary kept ordering).
+///
+/// A write turned away is answered busy at once, with no work done and nothing decided for it,
+/// and the client sends it again shortly; it waits, it doesn't fail. With nothing in progress a
+/// write is always admitted, so a node makes progress however slow it is.
+pub struct Admission {
+    target: std::time::Duration,
+    max: f64,
+    st: std::sync::Mutex<AdmissionState>,
+    /// Each peer's last report (see `report`).
+    peers: DashMap<dfs_common::NodeId, PeerLoad>,
+}
+
+/// What a peer last reported of its ordered write work.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerLoad {
+    /// How long its oldest write in progress had waited.
+    pub oldest: std::time::Duration,
+    /// How long it had gone without finishing any write while it had some in progress: slow
+    /// work finishes, a stuck node's doesn't. None from a peer that doesn't report it.
+    pub stalled: Option<std::time::Duration>,
+    /// When the report arrived.
+    pub at: std::time::Instant,
+}
+
+struct AdmissionState {
+    limit: f64,
+    next_id: u64,
+    /// Start of each write in progress, by permit id.
+    started: std::collections::BTreeMap<u64, std::time::Instant>,
+    /// When a write in progress here last finished.
+    last_done: Option<std::time::Instant>,
+    last_cut: Option<std::time::Instant>,
+}
+
+/// One write in progress; reports how long it took when dropped.
+pub struct AdmitPermit {
+    adm: Arc<Admission>,
+    id: u64,
+    allowance: std::time::Duration,
+}
+
+impl Drop for AdmitPermit {
+    fn drop(&mut self) {
+        self.adm.done(self.id, self.allowance);
+    }
+}
+
+/// Payload transfer time an admitted write is allowed beyond the target: a 4 MiB patch on a
+/// healthy node is not a sign of overload.
+const ADMISSION_BYTES_PER_SEC: f64 = 32.0 * 1024.0 * 1024.0;
+
+/// A write in progress this many targets old means work is piling up here.
+const STALL_TARGETS: u32 = 3;
+
+/// A node whose work in progress has finished nothing for this long is stuck, not slow: its
+/// slots' primaries replace it in their ISRs (Server::replace_isr_member).
+pub const STALLED_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A peer's report counts for this long.
+const PEER_REPORT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Admission {
+    pub fn new(target: std::time::Duration, max: usize) -> Self {
+        let max = max.max(1) as f64;
+        Admission {
+            target, max,
+            st: std::sync::Mutex::new(AdmissionState {
+                limit: max, next_id: 0, started: std::collections::BTreeMap::new(), last_done: None, last_cut: None,
+            }),
+            peers: DashMap::new(),
+        }
+    }
+
+    /// From DFS_WRITE_ADMISSION_TARGET_MS (default 1000, under the client's 3 s reply
+    /// deadline) and DFS_WRITE_ADMISSION_MAX (default 64, the client's flush concurrency).
+    pub fn from_env() -> Self {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+        Self::new(std::time::Duration::from_millis(env("DFS_WRITE_ADMISSION_TARGET_MS", 1000)), env("DFS_WRITE_ADMISSION_MAX", 64) as usize)
+    }
+
+    fn permit(self: &Arc<Self>, g: &mut AdmissionState, payload: usize) -> AdmitPermit {
+        g.next_id += 1;
+        g.started.insert(g.next_id, std::time::Instant::now());
+        AdmitPermit {
+            adm: self.clone(),
+            id: g.next_id,
+            allowance: std::time::Duration::from_secs_f64(payload as f64 / ADMISSION_BYTES_PER_SEC),
+        }
+    }
+
+    /// Work this node must do whatever its load (a secondary's copy of an ordered write).
+    pub fn admit(self: &Arc<Self>, payload: usize) -> AdmitPermit {
+        let mut g = self.st.lock().unwrap();
+        self.permit(&mut g, payload)
+    }
+
+    /// Admit a primary write of `payload` bytes for a slot whose secondary is `secondary`, or
+    /// None (with why) if work is piling up here or there.
+    pub fn try_admit(self: &Arc<Self>, payload: usize, secondary: dfs_common::NodeId) -> Result<AdmitPermit, String> {
+        let stall = self.target * STALL_TARGETS;
+        let mut g = self.st.lock().unwrap();
+        if !g.started.is_empty() {
+            let limit = (g.limit as usize).max(1);
+            if g.started.len() >= limit {
+                return Err(format!("{} of its {} writes in progress", g.started.len(), limit));
+            }
+            let oldest = g.started.values().min().map(|t| t.elapsed()).unwrap_or_default();
+            if oldest > stall {
+                return Err(format!("its oldest write in progress is {:?} old", oldest));
+            }
+        }
+        if let Some(behind) = self.peer_backlog(secondary).filter(|b| *b > stall) {
+            return Err(format!("its secondary {} reports its oldest write in progress {:?} old", secondary, behind));
+        }
+        Ok(self.permit(&mut g, payload))
+    }
+
+    fn done(&self, id: u64, allowance: std::time::Duration) {
+        let mut g = self.st.lock().unwrap();
+        let Some(start) = g.started.remove(&id) else { return };
+        g.last_done = Some(std::time::Instant::now());
+        if start.elapsed() > self.target + allowance {
+            if g.last_cut.is_none_or(|t| t.elapsed() >= self.target) {
+                g.limit = (g.limit / 2.0).max(1.0);
+                g.last_cut = Some(std::time::Instant::now());
+            }
+        } else {
+            g.limit = (g.limit + 1.0 / g.limit).min(self.max);
+        }
+    }
+
+    /// How long this node has gone without finishing a write while it has some in progress
+    /// (counted from the oldest one's start if none finished since): zero when idle.
+    fn stalled(g: &AdmissionState) -> std::time::Duration {
+        let Some(oldest) = g.started.values().min() else { return std::time::Duration::ZERO };
+        g.last_done.map_or(*oldest, |d| d.max(*oldest)).elapsed()
+    }
+
+    /// This node's load for its WriteOrder replies, as 24 bytes (little-endian u64s): how many
+    /// writes are in progress, how long the oldest has waited (ms), and how long it has gone
+    /// without finishing one (ms; see `stalled`).
+    pub fn report(&self) -> Vec<u8> {
+        let g = self.st.lock().unwrap();
+        let oldest = g.started.values().min().map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+        let mut out = (g.started.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&oldest.to_le_bytes());
+        out.extend_from_slice(&(Self::stalled(&g).as_millis() as u64).to_le_bytes());
+        out
+    }
+
+    /// A peer's `report`, from its reply to a WriteOrder. Anything else (an older peer answers
+    /// with no data) is ignored.
+    pub fn note_peer(&self, peer: dfs_common::NodeId, report: &[u8]) {
+        let field = |i: usize| report.get(i * 8..i * 8 + 8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes);
+        if let Some(ms) = field(1) {
+            self.peers.insert(peer, PeerLoad {
+                oldest: std::time::Duration::from_millis(ms),
+                stalled: field(2).map(std::time::Duration::from_millis),
+                at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    /// The oldest write in progress `peer` last reported, if it reported recently.
+    pub fn peer_backlog(&self, peer: dfs_common::NodeId) -> Option<std::time::Duration> {
+        self.peers.get(&peer).filter(|e| e.at.elapsed() < PEER_REPORT_TTL).map(|e| e.oldest)
+    }
+
+    /// `peer`'s last report, however old.
+    pub fn peer_load(&self, peer: dfs_common::NodeId) -> Option<PeerLoad> {
+        self.peers.get(&peer).map(|e| *e)
+    }
+
+    /// The current limit and how many writes are in progress, for logs and tests.
+    pub fn state(&self) -> (usize, usize) {
+        let g = self.st.lock().unwrap();
+        (g.limit as usize, g.started.len())
     }
 }
 
@@ -576,6 +844,24 @@ mod tests {
         assert_eq!(r, Err(TurnError::Refused));
     }
 
+    /// Suite T66[secondary] (1030b): the primary forgot a write it had ordered as v2 after 621
+    /// more writes, and ordered the client's resend of it as v622. Every decided write must
+    /// still be remembered while it is recent, however many writes follow it.
+    #[test]
+    fn a_primary_remembers_a_recent_write_it_ordered_however_many_follow() {
+        let o = WriteOrdering::default();
+        let s = o.slot(FileId::new(), 1, 2);
+        for id in 1..=3000u128 {
+            let v = s.assign_once(id).unwrap();
+            s.finish(id, v, &Response::Ok { data: None });
+        }
+        for id in [1u128, 600, 1500] {
+            assert!(matches!(s.assign_once(id), Err(Decision::Ordered { .. })),
+                "BUG REPRODUCED: write {} was forgotten and its resend ordered again as a new version", id);
+        }
+        assert_eq!(s.inner.lock().unwrap().decided_order.len(), 3000, "each write is queued once");
+    }
+
     #[test]
     fn each_write_is_decided_once_whatever_copy_arrives_later() {
         let o = WriteOrdering::default();
@@ -630,5 +916,105 @@ mod tests {
         o.clear_file_heads(f);
         assert_eq!((o.latest_head(f, 0), o.latest_head(f, 3)), (None, None), "the truncated file's heads are gone");
         assert_eq!(o.latest_head(g, 0), Some(cid(3)), "another file's stream is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_busy_order_fails_the_turn_as_busy_and_a_real_order_for_the_resend_replaces_it() {
+        let s = SlotOrder::default();
+        s.record_order(1, BUSY, cid(0), 7);
+        assert_eq!(s.wait_turn(1, Duration::from_millis(50)).await, Err(TurnError::Busy));
+        assert_eq!(s.wait_turn(1, Duration::from_millis(50)).await, Err(TurnError::NoOrder), "busy is consumed, nothing decided");
+        // The resend's real order and the first copy's busy order can arrive either way round.
+        s.record_order(2, BUSY, cid(0), 7);
+        s.record_order(2, 1, cid(4), 7);
+        assert_eq!(s.wait_turn(2, Duration::from_millis(50)).await, Ok((1, cid(4))));
+        s.applied(2, 1, Some(cid(4)));
+        s.record_order(3, 2, cid(5), 7);
+        s.record_order(3, BUSY, cid(0), 7);
+        assert_eq!(s.wait_turn(3, Duration::from_millis(50)).await, Ok((2, cid(5))), "a late busy doesn't undo a real order");
+        s.record_order(4, BUSY, cid(0), 7);
+        s.set_anchor(cid(6), 3);
+        assert_eq!(s.wait_turn(4, Duration::from_millis(50)).await, Err(TurnError::NoOrder), "an anchor drops stale busy orders");
+    }
+
+    #[test]
+    fn admission_halves_on_slow_writes_grows_on_fast_ones_and_always_admits_one() {
+        let a = Arc::new(Admission::new(Duration::from_millis(20), 8));
+        let sec = dfs_common::NodeId::new();
+        let permits: Vec<_> = (0..8).map(|_| a.try_admit(0, sec).expect("starts at the max")).collect();
+        assert!(a.try_admit(0, sec).is_err(), "the ninth is turned away");
+        std::thread::sleep(Duration::from_millis(30));
+        drop(permits);
+        assert_eq!(a.state(), (4, 0), "slow writes halve the limit once per target");
+        std::thread::sleep(Duration::from_millis(25));
+        for _ in 0..3 {
+            let p = a.try_admit(0, sec).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            drop(p);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(a.state(), (1, 0), "it never goes below one");
+        let p = a.try_admit(0, sec).expect("with nothing in progress a write is always admitted");
+        assert!(a.try_admit(0, sec).is_err());
+        drop(p);
+        for _ in 0..40 {
+            drop(a.try_admit(0, sec).unwrap());
+        }
+        assert!(a.state().0 >= 4, "fast writes grow it back: {:?}", a.state());
+        let forced: Vec<_> = (0..a.state().0).map(|_| a.admit(0)).collect();
+        assert!(a.try_admit(0, sec).is_err(), "work this node must do counts toward the limit");
+        drop(forced);
+        let big = a.try_admit(4 << 20, sec).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let before = a.state().0;
+        drop(big);
+        assert!(a.state().0 >= before, "a 4 MiB write gets its transfer time on top of the target");
+    }
+
+    #[test]
+    fn admission_turns_writes_away_while_old_work_piles_up_here_or_on_the_secondary() {
+        let a = Arc::new(Admission::new(Duration::from_millis(10), 64));
+        let (sec, other) = (dfs_common::NodeId::new(), dfs_common::NodeId::new());
+        let stuck = a.admit(0);
+        assert!(a.try_admit(0, sec).is_ok(), "young work in progress doesn't block");
+        std::thread::sleep(Duration::from_millis(40));
+        let why = a.try_admit(0, sec).err().expect("a secondary copy waiting 4 targets blocks new primary writes");
+        assert!(why.contains("oldest write in progress"), "{}", why);
+        drop(stuck);
+        assert!(a.try_admit(0, sec).is_ok());
+        // The secondary's report, as its WriteOrder reply carries it.
+        let peer = Arc::new(Admission::new(Duration::from_millis(10), 64));
+        let held = peer.admit(0);
+        std::thread::sleep(Duration::from_millis(40));
+        a.note_peer(sec, &peer.report());
+        let why = a.try_admit(0, sec).err().expect("a secondary that's behind slows its primary");
+        assert!(why.contains("secondary"), "{}", why);
+        assert!(a.try_admit(0, other).is_ok(), "a slot with another secondary is unaffected");
+        drop(held);
+        a.note_peer(sec, &peer.report());
+        assert!(a.try_admit(0, sec).is_ok(), "it caught up");
+        a.note_peer(other, &[]);
+        assert_eq!(a.peer_backlog(other), None, "an older peer's empty reply is ignored");
+    }
+
+    #[test]
+    fn a_report_says_how_long_work_in_progress_has_finished_nothing() {
+        let a = Arc::new(Admission::new(Duration::from_millis(10), 64));
+        let peer = dfs_common::NodeId::new();
+        a.note_peer(peer, &a.report());
+        assert_eq!(a.peer_load(peer).unwrap().stalled, Some(Duration::ZERO), "idle is not stalled");
+        let stuck = a.admit(0);
+        std::thread::sleep(Duration::from_millis(30));
+        a.note_peer(peer, &a.report());
+        assert!(a.peer_load(peer).unwrap().stalled.unwrap() >= Duration::from_millis(30), "nothing finished since it started");
+        let quick = a.admit(0);
+        drop(quick);
+        a.note_peer(peer, &a.report());
+        assert!(a.peer_load(peer).unwrap().stalled.unwrap() < Duration::from_millis(10), "slow work that finishes is progress");
+        drop(stuck);
+        let mut old = a.report();
+        old.truncate(16);
+        a.note_peer(peer, &old);
+        assert_eq!(a.peer_load(peer).unwrap().stalled, None, "a 16-byte report from an older peer has no stall field");
     }
 }

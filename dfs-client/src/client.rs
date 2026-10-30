@@ -1499,6 +1499,20 @@ fn is_storage_full_refusal(err_msg: &str) -> bool {
         || err_msg.contains("storage failed, so it left the ISR")
 }
 
+/// Backoff between sends of an ordered write whose primary answered busy (doubling, jittered).
+const BUSY_RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(50);
+const BUSY_RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A replica answered busy: `ErrorCode::ServerBusy`, which send_request turns into an
+/// "ServerBusy" error.
+fn is_busy_result(r: &Result<Response>) -> bool {
+    match r {
+        Ok(Response::Error { code: dfs_common::ErrorCode::ServerBusy, .. }) => true,
+        Ok(_) => false,
+        Err(e) => e.to_string() == "ServerBusy",
+    }
+}
+
 fn is_transient_write_failure(err_msg: &str) -> bool {
     let s = err_msg.to_lowercase();
     // All distinctive client-side network-wrapper phrases (see send_request /
@@ -8181,7 +8195,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         // where this is consumed below for why re-sending unchanged would otherwise be
         // the only thing we could do.
         let mut self_referential_revalidate_done = false;
-        let retry_started = std::time::Instant::now();
+        // Mutable: time spent waiting on a busy primary is added back (see the busy retry below).
+        let mut retry_started = std::time::Instant::now();
+        // Backoff between sends of an ordered write a replica answered busy, and the write's
+        // tags to send it again with.
+        let mut busy_backoff = BUSY_RETRY_BACKOFF_MIN;
+        let mut busy_tags: Option<HashMap<SocketAddr, dfs_common::WriteOrderTag>> = None;
         // The slot generation the ordered primary stamped on the write that finally landed
         // (the slot reports itself through its primary; see the enqueue below).
         let mut ordered_generation: Option<u64> = None;
@@ -8288,10 +8307,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         let order_tags = match chunk_idx {
+            // Sent again after a busy answer: the same write, so a primary that already applied
+            // it answers as before and a secondary still applying it waits on that same apply.
+            _ if busy_tags.as_ref().is_some_and(|t| t.keys().all(|a| patch_addrs.contains(a))) =>
+                busy_tags.take().unwrap_or_default(),
             Some(cidx) if Self::ordered_writes_enabled() =>
                 self.ordered_write_tags(file_id, cidx, &patch_addrs, &addr_to_node_id_snap).await,
             _ => HashMap::new(),
         };
+        busy_tags = None;
         if let (Some(cidx), true) = (chunk_idx, Self::ordered_writes_enabled()) {
             if order_tags.is_empty() {
                 // Greppable: suite T61d counts these; an unordered write can diverge the pair.
@@ -8405,13 +8429,55 @@ leader_addr: Arc::new(RwLock::new(None)),
         if let Some(cidx) = chunk_idx {
             // A primary that no longer is one: forget the cached ISR so the next attempt
             // looks it up again.
-            let stale_isr = results.iter().any(|(_, r)| matches!(r,
+            let refusers: Vec<SocketAddr> = results.iter().filter(|(_, r)| matches!(r,
                 Ok(Response::Error { message, .. }) if message.starts_with("Ordered: not the primary")
-                    || message.starts_with("Ordered: stale ISR epoch")));
-            if stale_isr {
+                    || message.starts_with("Ordered: stale ISR epoch"))).map(|(a, _)| *a).collect();
+            if !refusers.is_empty() {
                 self.slot_isr_cache.remove(&(file_id, cidx));
+                // Ask the refusers first: they refused because they know a newer ISR. Left to
+                // slot_isr_for's holder order, the lookup could reach the replaced member
+                // first, which still answers with the epoch it was replaced out of, and the
+                // retry went to the old pair again (suite T114: the stuck secondary was also
+                // the metadata leader, and the client spent 30s on it).
+                self.slot_isr_for(file_id, cidx, &refusers).await;
             }
         }
+        // A replica of an ordered write answered busy: a primary over its admission limit did no
+        // work on the write and decided nothing for it (server write_order::Admission), or a
+        // secondary is still applying it. Send the same write again after a short backoff. The
+        // replica is answering, so this is not an outage: the wait doesn't spend the outage
+        // budget. Meanwhile the flush holds its data, the write buffer fills, and write() slows
+        // the application to what the slower replica can take (fuse_impl's buffer back-pressure).
+        if let Some(tag) = order_tags.values().next().copied() {
+            // A refusal ("not the primary", a stale epoch, ...) means the slot has moved on: these
+            // tags can never succeed, however busy the other replica is, so it beats a busy
+            // answer. Suite T114: the primary had replaced a stuck secondary that still answered
+            // busy, and the client kept resending the old epoch to the old pair.
+            let refused = results.iter().any(|(a, r)| order_tags.contains_key(a)
+                && matches!(r, Ok(Response::Error { code, .. }) if *code != dfs_common::ErrorCode::ServerBusy));
+            if let Some((busy_addr, _)) = results.iter()
+                .find(|(a, r)| !refused && order_tags.contains_key(a) && is_busy_result(r))
+            {
+                let wait = busy_backoff.mul_f64(0.5 + (uuid::Uuid::new_v4().as_u128() % 1000) as f64 / 2000.0);
+                debug!("MultiPatch: ordered write to file {} chunk {}: {} is busy; sending it again in {:?}",
+                    tag.file_id, tag.chunk_idx, busy_addr, wait);
+                tokio::time::sleep(wait).await;
+                retry_started += wait;
+                busy_backoff = (busy_backoff * 2).min(BUSY_RETRY_BACKOFF_MAX);
+                busy_tags = Some(order_tags.clone());
+                continue 'retry;
+            }
+            // A replica that gave no reply in time may still be applying the write: whatever
+            // the retries below decide, send the same write, so a late copy joins the apply
+            // already running instead of starting another on a node that is behind. Not after a
+            // refusal ("not the primary", a stale epoch, ...): that needs fresh tags.
+            let silent = results.iter().any(|(a, r)| order_tags.contains_key(a)
+                && matches!(r, Err(e) if is_transient_write_failure(&e.to_string())));
+            if silent && !refused {
+                busy_tags = Some(order_tags.clone());
+            }
+        }
+        busy_backoff = BUSY_RETRY_BACKOFF_MIN;
 
         // Collect per-replica results before any disagreement logic.
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
@@ -8597,6 +8663,20 @@ leader_addr: Arc::new(RwLock::new(None)),
                         }
                         continue;
                     }
+                    // A secondary the primary sees making progress is slow, not down: it is
+                    // never replaced (its storage is the cluster's), so the write waits for it,
+                    // without spending the outage budget, and goes as slow as it does.
+                    let progressing = failed == tag.secondary
+                        && matches!(&resp, Ok(Response::Error { message, .. }) if message.contains("is making progress"));
+                    if progressing {
+                        let wait = busy_backoff.mul_f64(0.5 + (uuid::Uuid::new_v4().as_u128() % 1000) as f64 / 2000.0);
+                        debug!("ReplaceIsrMember for file {} chunk {}: secondary {} is slow but making progress; sending the write again in {:?}",
+                            tag.file_id, tag.chunk_idx, failed, wait);
+                        tokio::time::sleep(wait).await;
+                        retry_started += wait;
+                        busy_backoff = (busy_backoff * 2).min(BUSY_RETRY_BACKOFF_MAX);
+                        continue 'retry;
+                    }
                     info!("ReplaceIsrMember for file {} chunk {} (failed member {}) declined: {}",
                         tag.file_id, tag.chunk_idx, failed, resp.map(|r| dfs_common::debug_truncated(&r, 200)).unwrap_or_else(|e| e.to_string()));
                     break;
@@ -8702,6 +8782,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                             .map(|e| {
                                 let e = e.to_string();
                                 is_transient_write_failure(&e) || (ordered && is_ordered_handover_failure(&e))
+                                    // A busy replica is alive: beside a handover refusal it
+                                    // is a wait for fresh tags, not a reason to drop to the
+                                    // leader-refresh ladder (suite T114).
+                                    || (ordered && e == "ServerBusy")
                             })
                             .unwrap_or(false)
                     });
@@ -11106,6 +11190,95 @@ mod tests {
         }
         assert!(attempt_count.load(Ordering::SeqCst) >= 3,
             "must have actually made a third attempt, not just gotten lucky on retry count");
+    }
+
+    /// Suite T114 (1030a, 2 of 5 runs): the primary replaced a stuck secondary that was also
+    /// the metadata leader. The primary refused the old epoch's tags, the stuck node answered
+    /// busy, and the client dropped to the leader-refresh ladder (6s timeouts on the stuck
+    /// leader), then looked the ISR up from the stuck node first (leader-first holder order)
+    /// and got the epoch it had been replaced out of: 32s writes. The refuser knows the new
+    /// ISR; the write must reach the new pair without asking the stuck node anything else.
+    /// Needs DFS_ORDERED_WRITES=1 (a process-wide switch), so it runs on its own with it set.
+    #[tokio::test]
+    async fn a_write_refused_for_a_stale_epoch_beside_a_busy_replica_goes_to_the_new_pair() {
+        use tokio::io::AsyncReadExt;
+        if !DfsClient::ordered_writes_enabled() {
+            eprintln!("skipped: run with DFS_ORDERED_WRITES=1");
+            return;
+        }
+        let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) =
+            ("127.0.0.1:19431".parse().unwrap(), "127.0.0.1:19432".parse().unwrap(), "127.0.0.1:19433".parse().unwrap());
+        let (na, nb, nc) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let file_id = FileId::new();
+        let final_id = chunk_id_with_hash0(0x44);
+        let old_isr = dfs_common::SlotIsr { epoch: 1, members: vec![na, nb] };
+        let new_isr = dfs_common::SlotIsr { epoch: 2, members: vec![na, nc] };
+        let new_pair_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // b is the replaced, stuck member: it still holds epoch 1, answers ordered writes busy,
+        // and is slow at everything else.
+        for (addr, isr, stuck) in [(a, new_isr.clone(), false), (b, old_isr.clone(), true), (c, new_isr.clone(), false)] {
+            let new_pair_writes = new_pair_writes.clone();
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { return };
+                    let (isr, new_pair_writes) = (isr.clone(), new_pair_writes.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let mut len_buf = [0u8; 4];
+                            if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                            let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                            if stream.read_exact(&mut buf).await.is_err() { return; }
+                            let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                            let request_id = envelope.request_id;
+                            let Message::Request(req) = envelope.message else { return };
+                            let resp = match req {
+                                Request::GetOrSeedSlotIsr { .. } => Response::SlotIsrRecords { records: vec![Some(isr.clone())] },
+                                Request::Ordered { .. } if stuck => Response::Error { message: "busy".into(), code: ErrorCode::ServerBusy },
+                                Request::Ordered { tag, .. } if tag.isr_epoch < isr.epoch => Response::Error {
+                                    message: format!("Ordered: stale ISR epoch {} for file {} chunk {} (current {} {:?})",
+                                        tag.isr_epoch, tag.file_id, tag.chunk_idx, isr.epoch, isr.members),
+                                    code: ErrorCode::InvalidRequest,
+                                },
+                                Request::Ordered { .. } => {
+                                    new_pair_writes.fetch_add(1, Ordering::SeqCst);
+                                    Response::MultiPatchResult { new_chunk_id: final_id, size: 4096, patch_ts: Some(1000), chunk_seq: Some(1) }
+                                }
+                                _ if stuck => { tokio::time::sleep(std::time::Duration::from_secs(60)).await; return }
+                                _ => Response::Error { message: "unhandled in mock".into(), code: ErrorCode::InternalError },
+                            };
+                            write_envelope(&mut stream, request_id, resp).await;
+                        }
+                    });
+                }
+            });
+        }
+
+        let client = DfsClient::new(vec![a, b, c]).unwrap();
+        *client.leader_addr.write().await = Some(b);
+        for (addr, id) in [(a, na), (b, nb), (c, nc)] {
+            client.addr_to_node_id.write().await.insert(addr, id);
+            client.cluster_nodes.write().await.push(addr);
+        }
+        client.slot_isr_cache.insert((file_id, 1), old_isr);
+        let old_location = loc_with_nodes(chunk_id_with_hash0(0x00), vec![na, nb, nc]);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.multi_patch_chunk_on_replicas_verified(
+                chunk_id_with_hash0(0x00), file_id, 1, 0,
+                vec![(0usize, vec![0xAB; 4])], &old_location, None, true,
+                Arc::new(HashMap::new()),
+            ),
+        ).await;
+        match result {
+            Err(_) => panic!("BUG REPRODUCED: the write was still going after 20s"),
+            Ok(Err(e)) => panic!("BUG REPRODUCED: the write failed instead of going to the new ISR pair: {}", e),
+            Ok(Ok(_)) => {}
+        }
+        assert!(new_pair_writes.load(Ordering::SeqCst) >= 2, "both members of the new pair must have taken the write");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5),
+            "BUG REPRODUCED: the write took {:?} to reach the new pair", started.elapsed());
     }
 
     /// Regression test for the 2026-08-18 VM-108 dd-read EIO: a second concurrent

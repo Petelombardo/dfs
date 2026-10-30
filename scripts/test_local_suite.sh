@@ -3935,6 +3935,298 @@ fi
 rm -f "$MOUNT/$T118_FILE"
 fi # should_run T118
 
+# ── T119: fsync'd writes keep succeeding while their slots' primary is CPU-starved (G8 1029 bafd835f) ──
+# G8 1029 (bafd835f): server2, a 2-core Celeron, was the slot primary for many of the VM image's
+# chunks. Its own fold and metadata work ate its CPU (a 7-op metadata commit took 26.8 s, folds
+# waited 18-38 s for a permit) while it kept accepting the client's writes; they timed out, the
+# secondaries had resynced past them and refused them, the client's outage budget ran out and
+# fio's fsync got EIO, twice in the hour with no node down. A loaded primary has to make its
+# clients wait, not fail them. Here the node that is primary for the most chunks of a 16-chunk
+# file (the leader excluded where it can be) is capped to a fraction of one core (cgroup v2
+# cpu.max) while 4 writers each fsync 16 x 4 KiB random writes per round across the file.
+# Every fsync must succeed and every acked block must read back.
+snapshot_log T119
+if should_run T119; then
+echo ""
+echo "=== T119: fsync'd writes keep succeeding while their slots' primary is CPU-starved ==="
+T119_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T119_FILE=t119_starved.bin
+T119_CG=/sys/fs/cgroup/dfs-t119
+t119_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T73)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+dd if=/dev/urandom of="$MOUNT/$T119_FILE" bs=4M count=16 status=none
+dfs_sync
+T119_LEADER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[0]['address'] if online else '')" 2>/dev/null || true)
+T119_MAP=$("$BIN/dfs-admin" --cluster "$T119_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+# "addr primaries": the node that is primary for the most chunks, not the leader if another has any.
+T119_PICK=""
+for _ in $(seq 1 30); do
+    T119_PICK=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T119_FILE" --chunks 16 2>/dev/null \
+        | python3 -c "
+import collections, json, sys
+addr = dict(l.split() for l in '''$T119_MAP'''.strip().splitlines())
+isr = json.loads(sys.stdin.readline())['isr']
+n = collections.Counter(addr.get(r['members'][0], '') for r in isr if r and r['members'])
+n.pop('', None)
+picks = sorted(n.items(), key=lambda p: (p[0] == '$T119_LEADER', -p[1]))
+if picks: print(*picks[0])" 2>/dev/null || true)
+    [ -n "$T119_PICK" ] && break
+    sleep 1
+done
+read -r T119_P T119_NP <<< "$T119_PICK"
+if [ -z "$T119_P" ]; then
+    check "T119 setup: the file's slot primaries found" FAIL
+else
+    T119_N=$(( ${T119_P##*:} - 8900 + 1 ))
+    T119_PID=$(ps -eo pid,args | awk -v c="dfs-server start --config $BASE/node${T119_N}/config.toml" 'index($0, c) && !/awk/ {print $1; exit}')
+    t119_side() {  # secs: stream 1 MiB writes to another file, fsync every 8 MiB; prints MB/s
+        python3 - "$MOUNT/t119_side.bin" "$1" <<'PY' 2>&1
+import os, sys, time
+path, secs = sys.argv[1], float(sys.argv[2])
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+block, n, t0 = os.urandom(1 << 20), 0, time.time()
+try:
+    while time.time() - t0 < secs:
+        os.write(fd, block); n += 1
+        if n % 8 == 0:
+            os.fsync(fd)
+    os.fsync(fd)
+    print("%.1f" % (n / (time.time() - t0)))
+except OSError as e:
+    print("ERR %s" % e)
+os.close(fd)
+PY
+    }
+    # Writes that don't touch the loaded node should keep their pace (informational: the side
+    # file's chunks may still land on it).
+    T119_SIDE_BASE=$(t119_side 10)
+    T119_CLIENT_MARK=$(wc -l < "$LOG/client.log")
+    t119_side "${T119_SECS:-90}" > "$T/t119_side.out" &
+    T119_SIDE_PID=$!
+    mkdir -p "$T119_CG"
+    echo "${T119_CPU:-15000 100000}" > "$T119_CG/cpu.max"
+    # T119_IO (e.g. "wiops=40 wbps=4194304") also throttles the node's writes to its data disk:
+    # server2's 128 GB SATA SSD took 5-8 s for metadata commits with nothing queued.
+    [ -n "${T119_IO:-}" ] && echo "$(lsblk -dno MAJ:MIN "$(findmnt -no SOURCE --target "$BASE")" | tr -d ' ') $T119_IO" > "$T119_CG/io.max"
+    echo "$T119_PID" > "$T119_CG/cgroup.procs"
+    echo "  T119: node$T119_N ($T119_P, pid $T119_PID) is primary of $T119_NP of 16 chunks (leader $T119_LEADER); capped to cpu.max '$(cat "$T119_CG/cpu.max")' io.max '$(cat "$T119_CG/io.max" 2>/dev/null)' for ${T119_SECS:-90} s"
+    T119_OUT=$(python3 - "$MOUNT/$T119_FILE" "${T119_SECS:-90}" "${T119_WRITERS:-4}" "${T119_BATCH:-16}" <<'PY' 2>&1
+import os, random, sys, threading, time
+path, secs, nw, batch = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+per = 16 * 1024 // nw       # the 4 KiB blocks each writer owns
+end = time.time() + secs
+acked = {}                 # block offset -> the tag its last fsync'd write held
+lock = threading.Lock()
+stats = {"rounds": 0, "errs": [], "max_fsync": 0.0}
+def writer(w):
+    fd = os.open(path, os.O_RDWR)
+    r = 0
+    while time.time() < end:
+        r += 1
+        pending = {}
+        try:
+            for _ in range(batch):
+                off = (w * per + random.randrange(per)) * 4096   # each writer owns its own blocks
+                tag = ("w%d-r%d-" % (w, r)).encode()
+                os.pwrite(fd, (tag * 4096)[:4096], off)
+                pending[off] = tag
+            t0 = time.time()
+            os.fsync(fd)
+            dt = time.time() - t0
+        except OSError as e:
+            with lock:
+                stats["errs"].append("w%d r%d %s at %.0f s" % (w, r, e, secs - (end - time.time())))
+                for off in pending:   # an unacked write leaves its block unknown
+                    acked.pop(off, None)
+            continue
+        with lock:
+            stats["rounds"] += 1
+            stats["max_fsync"] = max(stats["max_fsync"], dt)
+            acked.update(pending)
+    os.close(fd)
+ts = [threading.Thread(target=writer, args=(w,)) for w in range(nw)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+fd = os.open(path, os.O_RDONLY)
+bad = []
+for off, tag in sorted(acked.items()):
+    b = os.pread(fd, 4096, off)
+    if b != (tag * 4096)[:4096]:
+        bad.append("%d holds %r, acked %r" % (off, b[:10], tag))
+os.close(fd)
+print("rounds %d, max fsync %.1f s, errors %d%s; acked blocks %d, wrong %d%s" % (
+    stats["rounds"], stats["max_fsync"], len(stats["errs"]),
+    (" (" + "; ".join(stats["errs"][:3]) + ")") if stats["errs"] else "",
+    len(acked), len(bad), (" (" + "; ".join(bad[:3]) + ")") if bad else ""))
+PY
+)
+    echo "$T119_PID" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+    rmdir "$T119_CG" 2>/dev/null || true
+    wait "$T119_SIDE_PID" 2>/dev/null || true
+    echo "  T119: $T119_OUT"
+    echo "  T119: side file stream: $T119_SIDE_BASE MB/s before the cap, $(cat "$T/t119_side.out") MB/s during it"
+    rm -f "$MOUNT/t119_side.bin"
+    # The client's write buffer must hold its cap while a replica is slow: the busy answers make
+    # the flush keep its data, and write() has to wait rather than buffer past the cap. One
+    # write() may land on top of a full buffer (it is checked before it is buffered).
+    T119_BUF=$(tail -n +"$((T119_CLIENT_MARK + 1))" "$LOG/client.log" | grep -a "WBSTATS" \
+        | sed -E 's/.*buffered=([0-9]+) cap=([0-9]+).*/\1 \2/' | awk '$1 > m {m = $1} {c = $2} END {print m + 0, c + 0}')
+    read -r T119_BUF_MAX T119_BUF_CAP <<< "$T119_BUF"
+    echo "  T119: client write buffer peaked at $T119_BUF_MAX of its $T119_BUF_CAP-byte cap"
+    T119_BUDGET=$(grep -ac 'for the whole outage budget' "$LOG/client.log" || true)
+    echo "  T119: node$T119_N during the cap: $(grep -ac 'slow commit' "$LOG/server${T119_N}.log" || true) slow commit(s) in its log; client: $T119_BUDGET outage-budget failure(s)"
+    echo "$T119_OUT" | grep -q "errors 0;" \
+        && t119_check "T119a every fsync succeeds while the slots' primary is CPU-starved" PASS \
+        || t119_check "T119a fsync failed while the slots' primary was CPU-starved: $(echo "$T119_OUT" | head -c 300)" FAIL
+    echo "$T119_OUT" | grep -q "wrong 0" \
+        && t119_check "T119b every acked block reads back" PASS \
+        || t119_check "T119b an acked block doesn't read back: $(echo "$T119_OUT" | head -c 300)" FAIL
+    # The bench's EIOs began as a write the client gave up on after its 20 s outage budget;
+    # here the flush path's retry can still save the fsync, so count the give-ups themselves.
+    [ "$T119_BUDGET" = 0 ] \
+        && t119_check "T119c no write ran out its outage budget against the loaded node" PASS \
+        || t119_check "T119c $T119_BUDGET write(s) ran out their outage budget against the loaded node" FAIL
+    [ "$T119_BUF_CAP" -gt 0 ] && [ "$T119_BUF_MAX" -le $((T119_BUF_CAP + 1048576)) ] \
+        && t119_check "T119d the client's write buffer held its cap (peak $T119_BUF_MAX of $T119_BUF_CAP bytes)" PASS \
+        || t119_check "T119d the client's write buffer went past its cap or wasn't sampled (peak $T119_BUF_MAX of $T119_BUF_CAP bytes)" FAIL
+fi
+rm -f "$MOUNT/$T119_FILE"
+fi # should_run T119
+
+# ── T120: a slot's secondary crashes mid-write: every fsync still succeeds, nothing acked is lost ──
+# An ordered write is acked only once both copies hold it. Here the secondary of a chunk being
+# written dies (exit, as a crash) on its 3rd copy of a write: (a) after applying it but before
+# answering, (b) before applying it, both back 5 s later; (c) after applying, down 40 s, past
+# the client's 20 s outage budget, so the slot's ISR replaces it. The writer fsyncs a 4 KiB
+# round every second throughout; every fsync must succeed (slower is fine) and every acked
+# round must read back through a fresh client. Two things must hold for it: a resent copy of a
+# write the primary already applied re-announces its WriteOrder (the restarted secondary lost
+# it), and a copy resent after silence is the same write, not a second one.
+snapshot_log T120
+if should_run T120; then
+echo ""
+echo "=== T120: a slot's secondary crashes mid-write: every fsync succeeds, nothing acked is lost ==="
+T120_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+t120_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T73)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t120_start() {   # node [env assignments...]
+    local n=$1; shift
+    env "$@" RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$n/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$n.log" 2>&1 &
+}
+t120_running() { pgrep -f "dfs-server start --config $BASE/node$1/config.toml" >/dev/null; }
+t120_case() {   # label exit-point down-secs
+    local label=$1 point=$2 down=$3 f="t120_$1.bin"
+    dd if=/dev/urandom of="$MOUNT/$f" bs=4M count=8 status=none
+    dfs_sync
+    local leader map pick c sec n
+    leader=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = sorted((n for n in d.get('nodes', []) if n.get('status') == 'Online'), key=lambda n: n['id'])
+print(online[0]['address'] if online else '')" 2>/dev/null || true)
+    map=$("$BIN/dfs-admin" --cluster "$T120_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    pick=""
+    for _ in $(seq 1 30); do
+        pick=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$f" --chunks 8 2>/dev/null | python3 -c "
+import json, sys
+addr = dict(l.split() for l in '''$map'''.strip().splitlines())
+isr = json.loads(sys.stdin.readline())['isr']
+picks = [(c, addr.get(r['members'][1], '')) for c, r in enumerate(isr)
+         if c >= 1 and r and len(r['members']) >= 2 and addr.get(r['members'][1]) not in ('', None, '$leader')]
+if picks: print(*picks[0])" 2>/dev/null || true)
+        [ -n "$pick" ] && break
+        sleep 1
+    done
+    read -r c sec <<< "$pick"
+    if [ -z "$sec" ]; then
+        t120_check "T120$label setup: a chunk whose secondary isn't the leader ($leader) found" FAIL
+        rm -f "$MOUNT/$f"; return
+    fi
+    n=$(( ${sec##*:} - 8900 + 1 ))
+    # Restart the secondary armed to exit on its 3rd ordered copy.
+    pkill -9 -f "dfs-server start --config $BASE/node$n/config.toml" 2>/dev/null || true
+    for _ in $(seq 1 50); do t120_running "$n" || break; sleep 0.1; done
+    t120_start "$n" DFS_FAULT_SECONDARY_EXIT="$point"
+    sleep 12
+    echo "  T120$label: chunk $c of $f, secondary node$n ($sec) exits at '$point', back after $down s"
+    rm -f "$T/t120.stop"
+    python3 - "$MOUNT/$f" "$((c * 4194304))" "$T/t120.stop" > "$T/t120_w.out" 2>&1 <<'PY' &
+import os, sys, time
+path, base, stop = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+fd = os.open(path, os.O_RDWR)
+acked, errs, worst, r = [], [], 0.0, 0
+while not os.path.exists(stop) and r < 200:
+    r += 1
+    tag = ("C%d-" % r).encode()
+    try:
+        os.pwrite(fd, (tag * 4096)[:4096], base + r * 4096)
+        t0 = time.time()
+        os.fsync(fd)
+        worst = max(worst, time.time() - t0)
+        acked.append(r)
+    except OSError as e:
+        errs.append("round %d: %s" % (r, e))
+    time.sleep(1)
+os.close(fd)
+print("rounds %d, acked %d, max fsync %.1f s, errors %d%s; acked: %s" % (
+    r, len(acked), worst, len(errs), (" (" + "; ".join(errs[:3]) + ")") if errs else "", ",".join(map(str, acked))))
+PY
+    local wpid=$! exited=no
+    for _ in $(seq 1 60); do t120_running "$n" || { exited=yes; break; }; sleep 0.5; done
+    if [ "$exited" = yes ]; then
+        sleep "$down"
+        t120_start "$n"
+    fi
+    sleep 20
+    touch "$T/t120.stop"; wait "$wpid" 2>/dev/null || true
+    local out; out=$(cat "$T/t120_w.out")
+    echo "  T120$label: $(echo "$out" | sed 's/; acked: .*//')"
+    # Every acked round, through a fresh client.
+    local m=/tmp/dfs-mount-fresh v
+    mkdir -p "$m"
+    RUST_LOG=info "$BIN/dfs-client" mount "$m" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t120_fresh.log" --allow-other --log-level debug &
+    local cpid=$!
+    for _ in $(seq 1 50); do mountpoint -q "$m" && break; sleep 0.1; done
+    v=$(python3 - "$m/$f" "$((c * 4194304))" "$(echo "$out" | sed -n 's/.*; acked: //p')" <<'PY' 2>&1 || true
+import sys
+path, base, acked = sys.argv[1], int(sys.argv[2]), [int(x) for x in sys.argv[3].split(",") if x]
+bad = []
+with open(path, "rb") as f:
+    for r in acked:
+        f.seek(base + r * 4096)
+        b = f.read(4096)
+        if b != (("C%d-" % r).encode() * 4096)[:4096]:
+            bad.append("round %d holds %r" % (r, b[:8]))
+print("OK %d" % len(acked) if not bad else "BAD " + "; ".join(bad[:3]))
+PY
+)
+    fusermount -u "$m" 2>/dev/null || true
+    kill_client_and_wait "$cpid"
+    t120_running "$n" || t120_start "$n"
+    [ "$exited" = yes ] || t120_check "T120$label setup: node$n exited at '$point' while the chunk was written" FAIL
+    echo "$out" | grep -q "errors 0;" && [ "${v%% *}" = OK ] \
+        && t120_check "T120$label every fsync succeeded and all acked rounds read back ($v)" PASS \
+        || t120_check "T120$label the secondary's crash at '$point' (down $down s) failed or lost a write: $(echo "$out" | sed 's/; acked: .*//' | head -c 200); read: $v" FAIL
+    rm -f "$MOUNT/$f"
+    sleep 5
+}
+t120_case a after:3 5
+t120_case b before:3 5
+t120_case c after:3 40
+fi # should_run T120
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

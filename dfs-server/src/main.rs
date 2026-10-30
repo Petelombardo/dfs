@@ -267,6 +267,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config_path.clone(),
         config.storage.metadata_batch_drain_enabled,
     ));
+    server.set_self_ref();
     info!("✓ Server instance created");
 
     // The persisted cluster size, before anything asks is_leader() (the background loops

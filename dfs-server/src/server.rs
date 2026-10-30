@@ -58,6 +58,18 @@ pub struct Server {
     /// Per-slot write versions for `Request::Ordered` (SLOT-OWNERSHIP-PLAN 3c).
     write_ordering: Arc<crate::write_order::WriteOrdering>,
 
+    /// This server, for work a request starts and outlives its reply (a secondary's ordered
+    /// apply; see ordered_secondary_job). Set by main once the server is in an Arc.
+    self_ref: std::sync::OnceLock<std::sync::Weak<Server>>,
+
+    /// A secondary's ordered applies in progress, by (file, chunk, epoch, write id): a resent
+    /// copy of the write waits on the one already running instead of starting another.
+    secondary_jobs: Arc<DashMap<(FileId, u64, u64, u128), tokio::sync::watch::Receiver<Option<Response>>>>,
+
+    /// As a slot's primary: when we last checked whether its secondary is stuck, by (file,
+    /// chunk, epoch), so a busy slot asks at most every few seconds.
+    stuck_secondary_checks: DashMap<(FileId, u64, u64), std::time::Instant>,
+
     /// As a slot's primary: since when clients have reported its secondary failing writes
     /// while it still answers our pings, and when they last did, by (file, chunk, epoch).
     /// See `replace_isr_member`.
@@ -5991,6 +6003,9 @@ impl Server {
             lease,
             slot_isr,
             write_ordering: Arc::new(crate::write_order::WriteOrdering::default()),
+            self_ref: std::sync::OnceLock::new(),
+            secondary_jobs: Arc::new(DashMap::new()),
+            stuck_secondary_checks: DashMap::new(),
             lagging_secondaries: Arc::new(DashMap::new()),
             replication_factor,
             metadata_dir,
@@ -8747,7 +8762,8 @@ impl Server {
             }
             Request::WriteOrder { file_id, chunk_idx, isr_epoch, write_id, version, base, stream } => {
                 self.write_ordering.slot(file_id, chunk_idx, isr_epoch).record_order(write_id, version, base, stream);
-                Response::Ok { data: None }
+                // This node's load, so the primary paces what it orders to it (Admission).
+                Response::Ok { data: Some(self.write_ordering.admission.report()) }
             }
             Request::ResyncSlot { file_id, chunk_idx, isr_epoch } => {
                 self.handle_resync_slot(file_id, chunk_idx, isr_epoch).await
@@ -12507,14 +12523,19 @@ impl Server {
                     Ok(Ok(env)) if matches!(env.message, Message::Response(Response::Pong))),
                 None => false,
             };
-            // Answering a ping isn't keeping up, though. A secondary whose disk takes seconds
-            // per commit (G8 1028: server2, ~31ms per fsync, commits up to 7.7s) answers every
-            // ping and times out every write: refused 44 times, it held the slot until the
-            // client's 20s outage budget ran out and failed the fsync (suite T114). So, as an
-            // ISR does, drop a secondary that has kept failing writes for LAGGING_SECONDARY_MAX
-            // even though it answers. Safe for the same reason as dropping an unreachable one:
-            // we, the primary, hold every acked write, and the replacement resyncs from us.
-            const LAGGING_SECONDARY_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+            // Answering a ping isn't keeping up, though, and slow isn't stuck. A slow secondary
+            // is never replaced: its storage is the cluster's, and replacing it on every slot
+            // it holds would retire it (Pete 10-29: "accept that writes to that storage are
+            // simply slower"); clients wait for it, the primary paces its writes to it
+            // (write_order::Admission). A stuck one, whose work in progress finishes nothing,
+            // is replaced as an unreachable one is (G8 1028: server2's commits up to 7.7s held
+            // the slot until the client's outage budget ran out; suite T114 holds the
+            // secondary's db for 30s). Stuck: its last report says it has finished nothing for
+            // STALLED_MAX with work in progress, or (no recent report: it doesn't even answer
+            // WriteOrders) clients have reported it failing writes for that long. Safe for the
+            // same reason as dropping an unreachable one: we, the primary, hold every acked
+            // write, and the replacement resyncs from us.
+            use crate::write_order::STALLED_MAX;
             // Reports further apart than this are separate episodes: the secondary kept up between.
             const LAGGING_EPISODE_GAP: std::time::Duration = std::time::Duration::from_secs(10);
             let now = std::time::Instant::now();
@@ -12530,21 +12551,26 @@ impl Server {
             if self.lagging_secondaries.len() > 4096 {
                 self.lagging_secondaries.retain(|_, (_, last)| now.duration_since(*last) <= LAGGING_EPISODE_GAP);
             }
-            if reachable && lagging_for < LAGGING_SECONDARY_MAX {
-                // Reachable but it failed a write: it may have missed versions (their
-                // WriteOrders dropped). Have it resync from us now rather than stay stale
-                // inside the ISR until some later write reaches it.
+            let load = self.write_ordering.admission.peer_load(failed);
+            let stalled = match load {
+                Some(l) if l.at.elapsed() < STALLED_MAX => l.stalled.unwrap_or(lagging_for),
+                _ => lagging_for,
+            };
+            if reachable && stalled < STALLED_MAX {
+                // Reachable and making progress, but it failed a write: it may have missed
+                // versions (their WriteOrders dropped). Have it resync from us now rather than
+                // stay stale inside the ISR until some later write reaches it.
                 if let Some(addr) = addr {
                     let req = Request::ResyncFromPrimary { file_id, chunk_idx, isr_epoch: cur.epoch };
                     let client = self.client.clone();
                     tokio::spawn(async move { let _ = client.send_message(addr, Message::Request(req)).await; });
                 }
-                return refuse(format!("secondary {} answers here; not excluding it yet, failing writes for {:?} (asked it to resync)",
-                    failed, lagging_for));
+                return refuse(format!("secondary {} answers here and is making progress (oldest write in progress {:?}, none finished for {:?}); not replacing it (asked it to resync)",
+                    failed, load.map(|l| l.oldest), stalled));
             }
             if reachable {
-                warn!("[ISR] file {} chunk {}: secondary {} answers pings but has failed writes for {:?}; replacing it",
-                    file_id, chunk_idx, failed, lagging_for);
+                warn!("[ISR] file {} chunk {}: secondary {} answers pings but has finished no write for {:?}; replacing it",
+                    file_id, chunk_idx, failed, stalled);
             }
         } else if !self.lease.is_expired(failed) {
             // Secondary taking over: only from a primary a majority voted expired, or two
@@ -17680,6 +17706,36 @@ impl Server {
     /// tells the secondary, and applies it holding the slot's order lock; the secondary
     /// applies it only in that order. Either way the patch itself goes through
     /// handle_multi_patch unchanged.
+    /// As `tag`'s primary: a secondary that reports it has finished nothing for STALLED_MAX with
+    /// work in progress is stuck, not slow. Its client only ever hears busy and waits, so it is
+    /// we who replace it in the slot's ISR (at most every 5 s per slot; replace_isr_member).
+    fn replace_stuck_secondary(&self, tag: &dfs_common::WriteOrderTag) {
+        let Some(l) = self.write_ordering.admission.peer_load(tag.secondary) else { return };
+        let key = (tag.file_id, tag.chunk_idx, tag.isr_epoch);
+        let due = self.stuck_secondary_checks.get(&key).is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+        if !due || l.at.elapsed() >= crate::write_order::STALLED_MAX
+            || !l.stalled.is_some_and(|st| st >= crate::write_order::STALLED_MAX)
+        {
+            return;
+        }
+        self.stuck_secondary_checks.insert(key, std::time::Instant::now());
+        if self.stuck_secondary_checks.len() > 4096 {
+            self.stuck_secondary_checks.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(60));
+        }
+        let Some(server) = self.self_ref.get().and_then(|w| w.upgrade()) else { return };
+        let failed = tag.secondary;
+        tokio::spawn(async move {
+            let r = server.replace_isr_member(key.0, key.1, key.2, failed, false).await;
+            info!("[ISR] file {} chunk {}: secondary {} reports it has finished nothing for {:?}: {}",
+                key.0, key.1, failed, l.stalled, dfs_common::debug_truncated(&r, 200));
+        });
+    }
+
+    /// Give the server a handle to itself, for work that outlives a request's reply.
+    pub fn set_self_ref(self: &Arc<Self>) {
+        let _ = self.self_ref.set(Arc::downgrade(self));
+    }
+
     async fn handle_ordered(&self, tag: dfs_common::WriteOrderTag, request: Request) -> Response {
         let resp = self.handle_ordered_inner(&tag, request).await;
         match resp {
@@ -17787,6 +17843,37 @@ impl Server {
         // only the other replica holds) is this replica's state.
         if me == tag.primary {
             if let Some(prev) = slot.await_decided(tag.write_id, ORDERED_RESEND_WAIT).await {
+                // A resent write may be a client's answer to a secondary that lost its copy and
+                // the WriteOrder with it (a crash and restart, suite T120): announce it again.
+                // A secondary ignores an order it already has.
+                if let crate::write_order::Decision::Ordered { version, response: Some(_) } = &prev {
+                    if let (Some(base), Some(addr)) = (slot.base_of(*version), self.cluster.get_node(&tag.secondary).await.map(|n| n.addr)) {
+                        let client = self.client.clone();
+                        let msg = Request::WriteOrder {
+                            file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
+                            write_id: tag.write_id, version: *version, base, stream: self.write_ordering.boot,
+                        };
+                        let admission = self.write_ordering.admission.clone();
+                        let secondary = tag.secondary;
+                        let server = self.self_ref.get().cloned();
+                        tokio::spawn(async move {
+                            // Its reply's load report keeps replace_stuck_secondary current while
+                            // a lone writer resends; act on it as it lands, not at the next
+                            // resend (one resend, ~3 s, later: suite T114).
+                            if let Ok(env) = client.send_message(addr, Message::Request(msg)).await {
+                                if let Message::Response(Response::Ok { data: Some(report) }) = env.message {
+                                    admission.note_peer(secondary, &report);
+                                    if let Some(server) = server.and_then(|w| w.upgrade()) {
+                                        server.replace_stuck_secondary(&tag);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                // The client resends a write whose secondary keeps answering busy; this is where
+                // a lone writer's resends reach us, so check for a stuck secondary here too.
+                self.replace_stuck_secondary(&tag);
                 return Self::ordered_resend_response(tag.write_id, prev);
             }
             let current = self.slot_isr.get(tag.file_id, tag.chunk_idx);
@@ -17816,6 +17903,30 @@ impl Server {
                     code: ErrorCode::InvalidRequest,
                 };
             }
+            // Over its admission limit the primary does no work on the write and decides
+            // nothing for it: it answers busy, tells the secondary to answer its copy busy too,
+            // and the client sends the write again shortly (see write_order::Admission).
+            let payload: usize = patches.iter().map(|(_, d)| d.len()).sum();
+            let _admitted = match self.write_ordering.admission.try_admit(payload, tag.secondary) {
+                Ok(permit) => permit,
+                Err(why) => {
+                self.replace_stuck_secondary(&tag);
+                if let Some(addr) = self.cluster.get_node(&tag.secondary).await.map(|n| n.addr) {
+                    let client = self.client.clone();
+                    let msg = Request::WriteOrder {
+                        file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
+                        write_id: tag.write_id, version: crate::write_order::BUSY, base: chunk_id,
+                        stream: self.write_ordering.boot,
+                    };
+                    tokio::spawn(async move { let _ = client.send_message(addr, Message::Request(msg)).await; });
+                }
+                debug!("[ORDER] primary: busy: file {} chunk {}: {}", tag.file_id, tag.chunk_idx, why);
+                return Response::Error {
+                    message: format!("Ordered: busy: this primary turned the write away ({}); send it again", why),
+                    code: ErrorCode::ServerBusy,
+                };
+                }
+            };
             let _order = slot.order_lock.lock().await;
             let version = match slot.assign_once(tag.write_id) {
                 Ok(v) => v,
@@ -17854,9 +17965,20 @@ impl Server {
                     file_id: tag.file_id, chunk_idx: tag.chunk_idx, isr_epoch: tag.isr_epoch,
                     write_id: tag.write_id, version, base, stream: self.write_ordering.boot,
                 };
+                slot.note_base(version, base);
+                let admission = self.write_ordering.admission.clone();
+                let secondary = tag.secondary;
+                let server = self.self_ref.get().cloned();
                 tokio::spawn(async move {
-                    if let Err(e) = client.send_message(addr, Message::Request(msg)).await {
-                        warn!("[ORDER] WriteOrder v{} to {} failed: {}", version, addr, e);
+                    match client.send_message(addr, Message::Request(msg)).await {
+                        // The secondary's reply carries its load (write_order::Admission::report).
+                        Ok(env) => if let Message::Response(Response::Ok { data: Some(report) }) = env.message {
+                            admission.note_peer(secondary, &report);
+                            if let Some(server) = server.and_then(|w| w.upgrade()) {
+                                server.replace_stuck_secondary(&tag);
+                            }
+                        },
+                        Err(e) => warn!("[ORDER] WriteOrder v{} to {} failed: {}", version, addr, e),
                     }
                 });
             }
@@ -17889,80 +18011,168 @@ impl Server {
                     code: ErrorCode::InvalidRequest,
                 };
             }
-            const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-            let (version, primary_base) = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
-                Ok(v) => v,
-                // An earlier version never arrived (the client wrote around us during a stall,
-                // or a WriteOrder was lost): the head can't continue; resync below.
-                Err(crate::write_order::TurnError::Gap { version, base, applied }) => {
-                    warn!("[ORDER] file {} chunk {} epoch {}: versions {}..{} never arrived; resyncing from the primary",
-                        tag.file_id, tag.chunk_idx, tag.isr_epoch, applied + 1, version - 1);
-                    (version, base)
-                }
-                Err(crate::write_order::TurnError::Refused) => {
-                    return Response::Error {
-                        message: format!("Ordered: the primary refused write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx),
-                        code: ErrorCode::InvalidRequest,
-                    };
-                }
-                Err(crate::write_order::TurnError::NoOrder) => {
-                    return Response::Error {
-                        message: format!("Ordered: primary never ordered write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx),
-                        code: ErrorCode::InvalidRequest,
-                    };
-                }
-            };
-            if version == 1 {
-                info!("[ORDER] secondary: following file {} chunk {} epoch {} (primary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.primary);
-            }
-            let _order = slot.order_lock.lock().await;
-            // A real base is the primary's exact state after version-1 (real ids are content
-            // hashes): adopt it, pulling it verified if we lack it. Token ids prove nothing
-            // either way (see write_order.rs), so they are never compared.
-            if !primary_base.looks_like_patch_token() && slot.head() != Some(primary_base)
-                && self.ensure_anchor_local(file_id, tag.chunk_idx, primary_base, tag.primary).await
-            {
-                slot.set_anchor(primary_base, version - 1);
-                self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
-            }
-            if slot.head_version() != Some(version - 1) {
-                let behind = slot.head_version().is_none_or(|hv| hv < version);
-                if behind {
-                    match self.resync_from_primary(&tag).await {
-                        Some((anchor, at)) => {
-                            info!("[ORDER] secondary: file {} chunk {}: resynced from the primary at v{} ({})",
-                                file_id, tag.chunk_idx, at, anchor);
-                            self.adopt_resync_anchor(file_id, tag.chunk_idx, tag.isr_epoch, &slot, anchor, at).await;
-                        }
-                        None => warn!("[ORDER] secondary: file {} chunk {} v{}: resync from the primary failed",
-                            file_id, tag.chunk_idx, version),
-                    }
-                }
-                if slot.head_version() != Some(version - 1) {
-                    // Either v is already in our state (a resync covered it) or we couldn't
-                    // resync. Refuse: the client backfills this write from the primary's copy.
-                    let resp = Response::Error {
-                        message: format!("Ordered: secondary can't apply v{} of file {} chunk {} here (head at {:?}); backfill it",
-                            version, file_id, tag.chunk_idx, slot.head_version()),
-                        code: ErrorCode::InvalidRequest,
-                    };
-                    slot.finish(tag.write_id, version, &resp);
-                    return resp;
-                }
-            }
-            let base = slot.head().unwrap_or(primary_base);
-            let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
-            if matches!(resp, Response::MultiPatchResult { .. }) {
-                // Applied onto our head at v-1, which this epoch's stream began from the
-                // primary's anchor or a resync: we hold everything the primary acked.
-                self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
-            }
-            slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
-            slot.finish(tag.write_id, version, &resp);
-            resp
+            let payload: usize = patches.iter().map(|(_, d)| d.len()).sum();
+            let req = Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq };
+            self.ordered_secondary_job(tag, slot, req, payload).await
         } else {
             Response::Error { message: "Ordered: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
         }
+    }
+
+    /// Secondary: run (or join) the apply of ordered write `tag`, and answer within
+    /// SECONDARY_REPLY_WITHIN either way. A loaded secondary used to hold the client's request for
+    /// the whole job (its turn, a resync, pulling an anchor, the apply): 30 s on a node whose disk
+    /// was throttled, until the client's read timed out and it counted the secondary as down for
+    /// the whole outage budget (suite T119). Now the job runs on, counted in this node's
+    /// admission, and the request is answered busy ("still being applied"); the client sends the
+    /// same write again and that copy waits on the same job. A slow secondary makes writes slower,
+    /// never failed.
+    async fn ordered_secondary_job(&self, tag: dfs_common::WriteOrderTag, slot: Arc<crate::write_order::SlotOrder>, req: Request, payload: usize) -> Response {
+        const SECONDARY_REPLY_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+        let key = (tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.write_id);
+        let started = match self.secondary_jobs.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(e) => Err(e.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                v.insert(rx.clone());
+                Ok((tx, rx))
+            }
+        };
+        let mut rx = match started {
+            Err(rx) => rx,
+            Ok((tx, rx)) => {
+                let permit = self.write_ordering.admission.admit(payload);
+                let jobs = self.secondary_jobs.clone();
+                match self.self_ref.get().and_then(|w| w.upgrade()) {
+                    Some(server) => {
+                        tokio::spawn(async move {
+                            let resp = server.ordered_secondary_apply(tag, slot, req).await;
+                            drop(permit);
+                            // A finished write's answer is in the slot's decisions for any later
+                            // copy; one that wasn't (busy, no order yet) is tried afresh.
+                            jobs.remove(&key);
+                            let _ = tx.send(Some(resp));
+                        });
+                    }
+                    // No Arc (unit-test servers): apply inline, as before.
+                    None => {
+                        let resp = self.ordered_secondary_apply(tag, slot, req).await;
+                        drop(permit);
+                        jobs.remove(&key);
+                        return resp;
+                    }
+                }
+                rx
+            }
+        };
+        let done = match tokio::time::timeout(SECONDARY_REPLY_WITHIN, rx.wait_for(|r| r.is_some())).await {
+            Ok(Ok(r)) => r.clone(),
+            _ => None,
+        };
+        match done {
+            Some(resp) => resp,
+            None => Response::Error {
+                message: format!("Ordered: busy: write {:x} for file {} chunk {} is still being applied on the secondary; send it again",
+                    tag.write_id, tag.file_id, tag.chunk_idx),
+                code: ErrorCode::ServerBusy,
+            },
+        }
+    }
+
+    /// Secondary: wait for ordered write `tag`'s turn, catch up if the stream can't continue
+    /// here, and apply it (see ordered_secondary_job).
+    async fn ordered_secondary_apply(&self, tag: dfs_common::WriteOrderTag, slot: Arc<crate::write_order::SlotOrder>, req: Request) -> Response {
+        let Request::MultiPatch { chunk_id: _, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq } = req else {
+            return Response::Error { message: "Ordered: only MultiPatch can be ordered".into(), code: ErrorCode::InvalidRequest };
+        };
+        let exit_after = crate::write_order::secondary_exit_now();
+        if exit_after == Some(false) {
+            warn!("FAULT INJECTION: secondary exiting before applying ordered write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx);
+            std::process::exit(137);
+        }
+        const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        let (version, primary_base) = match slot.wait_turn(tag.write_id, TURN_TIMEOUT).await {
+            Ok(v) => v,
+            // An earlier version never arrived (the client wrote around us during a stall,
+            // or a WriteOrder was lost): the head can't continue; resync below.
+            Err(crate::write_order::TurnError::Gap { version, base, applied }) => {
+                warn!("[ORDER] file {} chunk {} epoch {}: versions {}..{} never arrived; resyncing from the primary",
+                    tag.file_id, tag.chunk_idx, tag.isr_epoch, applied + 1, version - 1);
+                (version, base)
+            }
+            Err(crate::write_order::TurnError::Refused) => {
+                return Response::Error {
+                    message: format!("Ordered: the primary refused write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx),
+                    code: ErrorCode::InvalidRequest,
+                };
+            }
+            // Nothing is decided for a write the primary turned away as busy: the client
+            // sends both copies again.
+            Err(crate::write_order::TurnError::Busy) => {
+                return Response::Error {
+                    message: format!("Ordered: busy: the primary turned write {:x} for file {} chunk {} away; send it again", tag.write_id, tag.file_id, tag.chunk_idx),
+                    code: ErrorCode::ServerBusy,
+                };
+            }
+            Err(crate::write_order::TurnError::NoOrder) => {
+                return Response::Error {
+                    message: format!("Ordered: primary never ordered write {:x} for file {} chunk {}", tag.write_id, tag.file_id, tag.chunk_idx),
+                    code: ErrorCode::InvalidRequest,
+                };
+            }
+        };
+        if version == 1 {
+            info!("[ORDER] secondary: following file {} chunk {} epoch {} (primary {})", tag.file_id, tag.chunk_idx, tag.isr_epoch, tag.primary);
+        }
+        let _order = slot.order_lock.lock().await;
+        // A real base is the primary's exact state after version-1 (real ids are content
+        // hashes): adopt it, pulling it verified if we lack it. Token ids prove nothing
+        // either way (see write_order.rs), so they are never compared.
+        if !primary_base.looks_like_patch_token() && slot.head() != Some(primary_base)
+            && self.ensure_anchor_local(file_id, tag.chunk_idx, primary_base, tag.primary).await
+        {
+            slot.set_anchor(primary_base, version - 1);
+            self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
+        }
+        if slot.head_version() != Some(version - 1) {
+            let behind = slot.head_version().is_none_or(|hv| hv < version);
+            if behind {
+                match self.resync_from_primary(&tag).await {
+                    Some((anchor, at)) => {
+                        info!("[ORDER] secondary: file {} chunk {}: resynced from the primary at v{} ({})",
+                            file_id, tag.chunk_idx, at, anchor);
+                        self.adopt_resync_anchor(file_id, tag.chunk_idx, tag.isr_epoch, &slot, anchor, at).await;
+                    }
+                    None => warn!("[ORDER] secondary: file {} chunk {} v{}: resync from the primary failed",
+                        file_id, tag.chunk_idx, version),
+                }
+            }
+            if slot.head_version() != Some(version - 1) {
+                // Either v is already in our state (a resync covered it) or we couldn't
+                // resync. Refuse: the client backfills this write from the primary's copy.
+                let resp = Response::Error {
+                    message: format!("Ordered: secondary can't apply v{} of file {} chunk {} here (head at {:?}); backfill it",
+                        version, file_id, tag.chunk_idx, slot.head_version()),
+                    code: ErrorCode::InvalidRequest,
+                };
+                slot.finish(tag.write_id, version, &resp);
+                return resp;
+            }
+        }
+        let base = slot.head().unwrap_or(primary_base);
+        let resp = self.handle_multi_patch(base, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq, true).await;
+        if matches!(resp, Response::MultiPatchResult { .. }) {
+            // Applied onto our head at v-1, which this epoch's stream began from the
+            // primary's anchor or a resync: we hold everything the primary acked.
+            self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
+        }
+        slot.applied(tag.write_id, version, Self::multi_patch_result_id(&resp));
+        slot.finish(tag.write_id, version, &resp);
+        if exit_after == Some(true) {
+            warn!("FAULT INJECTION: secondary exiting after applying ordered write {:x} (v{}) for file {} chunk {}, before answering", tag.write_id, version, tag.file_id, tag.chunk_idx);
+            std::process::exit(137);
+        }
+        resp
     }
 
     /// The slot generation the primary stamps on ordered write `version` at `epoch`: the
@@ -18122,7 +18332,9 @@ impl Server {
             crate::write_order::Decision::Ordered { response: Some(r), .. } => r,
             crate::write_order::Decision::Ordered { version, response: None } => Response::Error {
                 message: format!("Ordered: write {:x} (v{}) is still being applied", write_id, version),
-                code: ErrorCode::InternalError,
+                // Busy: the replica is answering and the write will finish; the client sends the
+                // same write again and waits, without spending its outage budget.
+                code: ErrorCode::ServerBusy,
             },
             crate::write_order::Decision::Refused => Response::Error {
                 message: format!("Ordered: the primary refused write {:x}", write_id),

@@ -4952,9 +4952,24 @@ impl OverlayForkCtx {
             })
             .unwrap_or_default();
         holders.push(me); // a node with a dirty slot holds it, listed or not
+        let isr = self.slot_isr.get(file_id, chunk_idx);
+        // An ordered slot's versions have one authority, the primary its ISR names, and clients
+        // send every write there until an epoch bump names another. Its fold re-anchors the
+        // stream and the secondary adopts it; a secondary's fold reconciles with nothing. A
+        // secondary that skipped an expired primary or outwaited a slow one folded alone while
+        // writes still went to that primary: each patched a different accumulator, every write
+        // came back as two versions, and fsync failed (G8 soak 10-31, /vm/disk.raw chunk 432).
+        // A dead primary leaves through the ISR (replace_isr_member), and then this node owns.
+        if let Some(isr) = isr.as_ref().filter(|_| self.write_ordering.latest_slot(file_id, chunk_idx).is_some()) {
+            return match isr.members.first().copied() {
+                Some(p) if p == me && self.lease.holds_own_lease() => FoldRole::Owner,
+                Some(p) if p == me => FoldRole::Wait(None),
+                primary => FoldRole::Wait(primary),
+            };
+        }
         // The stored ISR (Phase 3a) is the same on every node that knows it, whatever each
         // one's holder list says; without one, fall back to rendezvous over the holders.
-        let order = match self.slot_isr.get(file_id, chunk_idx) {
+        let order = match isr {
             Some(isr) => isr.members,
             None => fold_owner_order(file_id, chunk_idx, &holders),
         };
@@ -32844,6 +32859,37 @@ mod tests {
 
             h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 1, members: vec![peer, me] });
             assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Wait(Some(peer)), "the stored ISR names the peer primary");
+        }
+
+        /// G8 soak 10-31 (/vm/disk.raw chunk 432): a majority expired the slow primary's
+        /// lease, the secondary's fold role skipped it and folded the ordered slot alone, and
+        /// the ISR still named that primary, so clients kept writing to it. Each replica then
+        /// patched a different accumulator, every write returned two versions, and fsync
+        /// failed after the outage budget. Only the ISR's primary folds an ordered slot; a
+        /// dead primary leaves through the ISR (an epoch bump), not through the fold role.
+        #[tokio::test]
+        async fn an_ordered_slots_secondary_never_folds_it_while_the_isr_names_another_primary() {
+            let h = make_overlay_test_harness();
+            h.server.lease.grant_own_lease_for_test();
+            let ctx = h.server.overlay_ctx();
+            let me = h.server.cluster().local_node_id();
+            let file_id = FileId::new();
+            let peer = phase2_peer(file_id, 0, me, false);
+            phase2_holders(&h, file_id, peer, 19368, ChunkId::from_hash(compute_chunk_hash(b"ordered-secondary"))).await;
+            h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 1, members: vec![peer, me] });
+            let _ = h.server.write_ordering.slot(file_id, 0, 1);
+            let quiet = std::time::Duration::from_secs(1);
+
+            assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Wait(Some(peer)));
+            assert_eq!(ctx.fold_role(file_id, 0, FOLD_OWNER_PATIENCE), FoldRole::Wait(Some(peer)),
+                "past the patience window the secondary still leaves an ordered slot to its primary");
+            h.server.lease.declare_expired_for_test(peer);
+            assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Wait(Some(peer)),
+                "an expired primary the ISR still names keeps the slot's folds");
+
+            h.server.slot_isr.set_committed_for_test(file_id, 0, crate::slot_isr::SlotIsr { epoch: 2, members: vec![me, peer] });
+            let _ = h.server.write_ordering.slot(file_id, 0, 2);
+            assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Owner, "after the ISR names this node primary, it folds");
         }
 
         /// Before Phase 2, a non-owner proposed, found the peer unreachable, and folded

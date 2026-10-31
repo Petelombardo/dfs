@@ -17,13 +17,20 @@ CDIR=/root/dfs-bench
 SOAK=$CDIR/soak
 mkdir -p "$SOAK"
 log() { echo "$(date '+%F %T') $*" >> "$SOAK/$1.log"; }
-stopping() { [ -f "$SOAK/stop" ]; }
+# A worker also stops when the bench mount is gone: after the client died (G8 10-31, a stack
+# overflow) the workers kept writing into the bare directory on server4's root disk (13 GB).
+stopping() {
+    [ -f "$SOAK/stop" ] && return 0
+    mountpoint -q "$MNT" && return 1
+    log "$1" "FAIL $MNT is not mounted (the client is gone); stopping"
+    return 0
+}
 
 case "$1" in
 vm)
     mkdir -p "$MNT/vm"
     i=0
-    while ! stopping; do
+    while ! stopping vm; do
         i=$((i+1))
         out=$(cd "$MNT/vm" && fio --name=vm --filename=disk.raw --size=2g --rw=randwrite \
             --bsrange=4k-64k --ioengine=psync --fsync=8 --verify=crc32c --verify_backlog=64 \
@@ -39,7 +46,7 @@ qcow2)
     Q=$MNT/vm/q.qcow2
     [ -f "$Q" ] || qemu-img create -q -f qcow2 "$Q" 4G
     i=0
-    while ! stopping; do
+    while ! stopping qcow2; do
         i=$((i+1)); p=$(( i % 250 + 1 ))
         # 200 random 64 KiB clusters, written with pattern p and flushed, then read back by a
         # separate qemu-io process (the image is closed and reopened in between).
@@ -58,7 +65,7 @@ qcow2)
 dvr)
     mkdir -p "$MNT/dvr"
     i=$(ls "$SOAK"/rec_*.md5 2>/dev/null | wc -l)
-    while ! stopping; do
+    while ! stopping dvr; do
         i=$((i+1)); f=$MNT/dvr/rec_$i.ts
         # ~8 MB/s in 188-byte-aligned blocks, fsync about every 5 s, md5 of exactly what was written.
         res=$(python3 - "$f" <<'PY'

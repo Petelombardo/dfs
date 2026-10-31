@@ -2247,6 +2247,7 @@ for T99_TRY in 1 2 3 4 5 6; do
         sleep 1
     done
     pair=$(for n in $isr; do echo "$T99_MAP" | awk -v n="$n" '$1==n{print $2}'; done | tr '\n' ' ')
+    echo "  T99 try $T99_TRY: chunk 1 isr=[${isr:-none}] pair=[${pair}] leader=$T99_LADDR"
     if [ -n "$isr" ] && ! echo " $pair" | grep -q " $T99_LADDR "; then T99_FILE=$f; break; fi
     rm -f "$MOUNT/$f"
 done

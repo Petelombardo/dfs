@@ -2402,14 +2402,35 @@ impl HealingManager {
     /// deleted only if EVERY node, all online and settled, names the same other version N
     /// as the slot's current one, at least RF of them hold N, and none still needs this
     /// chunk (a pending patch's base or delta, a token, an ordered head). Plus: older than
-    /// DFS_SUPERSEDED_GRACE_SECS (6 h), seen on two consecutive passes, and deleted in two
+    /// the grace (superseded_grace_secs: 6 h, 10 min short of space), seen on two consecutive passes, and deleted in two
     /// steps (moved aside, then gone a pass later unless the slot names it again).
+    /// How old a superseded copy must be before cleanup considers it (see
+    /// process_superseded_candidates): DFS_SUPERSEDED_GRACE_SECS (6 h), or, with under 10% of
+    /// this node's disk available, DFS_SUPERSEDED_PRESSURE_GRACE_SECS (10 min). A rewritten
+    /// VM disk leaves one old version per fold, and on a node short of space six hours of
+    /// them filled it (G8 soak 10-31: ~8 GB per 12 GB node in 70 minutes, then ENOSPC on
+    /// every write). Out of space is the worse failure; the grace is the extra margin on top
+    /// of every node agreeing, two sightings and the two-step delete, which all still apply.
+    fn superseded_grace_secs(&self) -> u64 {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+        Self::superseded_grace_for(env("DFS_SUPERSEDED_GRACE_SECS", 6 * 3600),
+            env("DFS_SUPERSEDED_PRESSURE_GRACE_SECS", 600), self.storage.get_filesystem_stats().ok())
+    }
+
+    fn superseded_grace_for(grace: u64, pressure_grace: u64, fs_stats: Option<(u64, u64, u64)>) -> u64 {
+        const PRESSURE_AVAILABLE_PCT: u64 = 10;
+        match fs_stats {
+            Some((total, _, available)) if total > 0 && available * 100 < total * PRESSURE_AVAILABLE_PCT => grace.min(pressure_grace),
+            _ => grace,
+        }
+    }
+
     async fn process_superseded_candidates(&self, row_only: Vec<ChunkId>) {
         if row_only.is_empty() || std::env::var("DFS_SUPERSEDED_CLEANUP").is_ok_and(|v| v == "0") {
             return;
         }
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-        let grace = std::env::var("DFS_SUPERSEDED_GRACE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(6 * 3600);
+        let grace = self.superseded_grace_secs();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let rows = match self.metadata.get_chunk_locations_batch_async(row_only).await {
             Ok(r) => r,
@@ -2441,7 +2462,7 @@ impl HealingManager {
         }
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let Some(leader) = self.cluster.get_leader_addr().await else { return };
-        let grace = std::env::var("DFS_SUPERSEDED_GRACE_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(6 * 3600);
+        let grace = self.superseded_grace_secs();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut items = Vec::new();
         for chunk in chunks {
@@ -8974,6 +8995,25 @@ mod tests {
         healing.drain_superseded_trash().await;
         assert_eq!(storage.read_chunk(&result).unwrap(), b"live",
             "BUG: deleted the fold result of the token its slot names — the slot's only content");
+    }
+
+    /// G8 soak 10-31: fio rewrote a 2 GB VM disk with fsyncs, every fold left a 4 MB old
+    /// version, and the 6 h grace kept them all: ~8 GB per 12 GB node in 70 minutes, then
+    /// every write failed ENOSPC while the disks held mostly reclaimable copies. Short on
+    /// space, the grace shrinks; every other check (all nodes agree, two sightings, two-step
+    /// delete) still applies.
+    #[test]
+    fn superseded_grace_shrinks_when_the_disk_runs_short() {
+        let gb = 1u64 << 30;
+        let grace = |avail_gb: u64| HealingManager::superseded_grace_for(6 * 3600, 600, Some((100 * gb, avail_gb * gb, avail_gb * gb)));
+        assert_eq!(grace(50), 6 * 3600, "plenty of space: the normal grace");
+        assert_eq!(grace(10), 6 * 3600, "at the threshold: still the normal grace");
+        assert_eq!(grace(9), 600, "under 10% available: the pressure grace");
+        assert_eq!(grace(0), 600);
+        assert_eq!(HealingManager::superseded_grace_for(300, 600, Some((100 * gb, gb, gb))), 300,
+            "the pressure grace never lengthens a shorter configured grace");
+        assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, None), 6 * 3600, "unknown space: the normal grace");
+        assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, Some((0, 0, 0))), 6 * 3600);
     }
 
     /// Superseded-version cleanup (10-13): a copy is deletable only when every node names

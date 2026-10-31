@@ -73,7 +73,7 @@ start_servers() {  # $1 = DFS_ORDERED_WRITES; DFS_METADATA_DURABLE from the call
 start_client() {  # $1 = DFS_ORDERED_WRITES
     local cluster
     cluster=$(for n in $NODES; do printf '%s:%s,' "$(ip_of "$n")" "$PORT"; done); cluster=${cluster%,}
-    ssh root@"$CLIENT" "mkdir -p $MNT || exit 1; $BENCH_CLIENT_EXTRA_ENV DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $CDIR/dfs-client mount $MNT --cluster $cluster --log-file $CDIR/client.log --allow-other > $CDIR/client.out 2>&1 < /dev/null & sleep 3; mountpoint -q $MNT && echo mounted || echo MOUNT-FAILED"
+    ssh root@"$CLIENT" "mkdir -p $MNT || exit 1; cd $CDIR && ulimit -c unlimited; $BENCH_CLIENT_EXTRA_ENV DFS_ORDERED_WRITES=$1 RUST_LOG=info nohup setsid $CDIR/dfs-client mount $MNT --cluster $cluster --log-file $CDIR/client.log --allow-other > $CDIR/client.out 2>&1 < /dev/null & sleep 3; mountpoint -q $MNT && echo mounted || echo MOUNT-FAILED"
     sleep 10   # leases, ISR seeding (default 30s cadence: the first writes may go unordered)
 }
 

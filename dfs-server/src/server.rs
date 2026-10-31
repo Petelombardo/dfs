@@ -273,6 +273,11 @@ pub struct Server {
     /// Notified by the sled-write worker when it has drained all pending items
     /// and exited (after the sender is dropped). Used by drain_sled_writes().
     sled_write_done: Arc<tokio::sync::Notify>,
+    /// Workers spawned / exited. notify_waiters() wakes only tasks already waiting, so a
+    /// worker that exits before drain_sled_writes() starts waiting leaves no signal; the
+    /// drain checks these counts instead of trusting it saw the wakeup.
+    sled_workers_spawned: Arc<std::sync::atomic::AtomicU64>,
+    sled_workers_exited: Arc<std::sync::atomic::AtomicU64>,
 
     /// FileIds with a metadata write currently sitting in the sled_write_tx
     /// channel, not yet committed to redb. handle_put_file_metadata's write path
@@ -5836,12 +5841,14 @@ impl Server {
         meta_bg: Arc<MetadataStore>,
         tombstones_for_worker: Arc<DashMap<FileId, std::time::Instant>>,
         done_notify: Arc<tokio::sync::Notify>,
+        (spawned, exited): (Arc<std::sync::atomic::AtomicU64>, Arc<std::sync::atomic::AtomicU64>),
         backlog_for_worker: Arc<std::sync::atomic::AtomicUsize>,
         pending_for_worker: Arc<PendingWrites>,
         progress_for_worker: Arc<tokio::sync::Notify>,
         metadata_batch_drain_enabled: bool,
     ) -> tokio::sync::mpsc::UnboundedSender<SledWrite> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SledWrite>();
+        spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
                 // Batch/fold pending writes into one redb transaction per drain cycle
                 // instead of one begin_write() per item — the measured bottleneck
@@ -5941,6 +5948,7 @@ impl Server {
                     }
                 }
                 // All pending items have been committed — signal drain_sled_writes().
+                exited.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 done_notify.notify_waiters();
             });
         tx
@@ -5967,6 +5975,8 @@ impl Server {
         // thread captures the correct Arc clones (struct fields can't cross-reference
         // each other within a single literal).
         let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let sled_workers_spawned = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sled_workers_exited = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_metadata_writes: Arc<PendingWrites> = Arc::new(PendingWrites::default());
         let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
@@ -5977,6 +5987,7 @@ impl Server {
                 metadata.clone(),
                 tombstones_for_worker,
                 sled_write_done.clone(),
+                (sled_workers_spawned.clone(), sled_workers_exited.clone()),
                 sled_write_backlog.clone(),
                 pending_metadata_writes.clone(),
                 sled_write_progress.clone(),
@@ -6154,6 +6165,8 @@ impl Server {
             dirty_heads: Arc::new(DashMap::new()),
             fold_announce_inflight: Arc::new(FoldAnnounceInflight::default()),
             sled_write_done,
+            sled_workers_spawned,
+            sled_workers_exited,
             sled_write_backlog,
             sled_write_tx,
             pending_metadata_writes,
@@ -6195,6 +6208,7 @@ impl Server {
             self.metadata.clone(),
             self.delete_tombstones.clone(),
             self.sled_write_done.clone(),
+            (self.sled_workers_spawned.clone(), self.sled_workers_exited.clone()),
             self.sled_write_backlog.clone(),
             self.pending_metadata_writes.clone(),
             self.sled_write_progress.clone(),
@@ -6207,10 +6221,23 @@ impl Server {
     /// pending metadata writes before returning. Called during graceful shutdown so
     /// no queued PutFileMetadata writes are lost when the process exits.
     pub async fn drain_sled_writes(&self) {
+        // Register for the worker's exit signal BEFORE closing its channel, and wait on
+        // the exit count, not on having seen the signal: the worker uses notify_waiters(),
+        // which wakes only tasks already waiting, so a worker that finished between the
+        // close and the wait used to leave this waiting forever (main.rs bounds it at 5 s,
+        // and then skipped flush_durable below).
+        let notified = self.sled_write_done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         // Drop the sender — this closes the channel and signals the worker to drain.
         self.sled_write_tx.lock().unwrap().take();
         // Wait for the worker thread to finish committing all remaining items.
-        self.sled_write_done.notified().await;
+        use std::sync::atomic::Ordering::SeqCst;
+        while self.sled_workers_exited.load(SeqCst) < self.sled_workers_spawned.load(SeqCst) {
+            notified.as_mut().await;
+            notified.set(self.sled_write_done.notified());
+            notified.as_mut().enable();
+        }
         // All items are now committed with Durability::None (in OS page cache).
         // One empty Durability::Immediate commit promotes the entire accumulated list
         // to physical disk via fdatasync — same trick used by compact_db().
@@ -6751,6 +6778,14 @@ impl Server {
             // incoming lookups, each an existing binary search) instead of O(M) is
             // the same complexity chunk_map_update already had before either fix.
             let mut superseded_chunk_ids: Vec<ChunkId> = Vec::new();
+            // Folded tokens in this record, looked up before taking the map entry (no await
+            // under it): a folded token never takes its slot back from its own fold result.
+            let mut folded_into: HashMap<ChunkId, ChunkId> = HashMap::new();
+            for loc in metadata.chunk_locations.iter() {
+                if let Some(result) = self.folded_token_result(&loc.chunk_id).await {
+                    folded_into.insert(loc.chunk_id, result);
+                }
+            }
             let new_locs: Vec<ChunkLocation> = if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
                 let (existing_locs, _) = existing_entry.value();
                 const CHUNK_SIZE_4M: u64 = 4 * 1024 * 1024;
@@ -6766,6 +6801,10 @@ impl Server {
                         Self::chunk_map_find_by_idx(existing_locs, cidx).map(|i| &existing_locs[i])
                     }) {
                         if old_loc.chunk_id == loc.chunk_id { continue; }
+                        if folded_into.get(&loc.chunk_id) == Some(&old_loc.chunk_id) {
+                            *loc = old_loc.clone();
+                            continue;
+                        }
                         // The slot generation, when both sides have one, is the authoritative
                         // order, as in location_supersedes: client_write_seq is one client's
                         // per-file counter, meaningless across two writers' clients. A client
@@ -10278,7 +10317,8 @@ impl Server {
     ///                                    node that hasn't seen its Pending row yet would
     ///                                    otherwise be wrongly declined)
     ///   - seq missing on either side  -> accept
-    /// Only a strictly OLDER seq against a different current token is declined.
+    /// Only a strictly OLDER seq against a different current token is declined, and a
+    /// token this node has recorded as folded while the slot names its fold result.
     async fn is_superseded_token_location(&self, location: &ChunkLocation) -> bool {
         if !location.chunk_id.looks_like_patch_token() {
             return false;
@@ -10286,10 +10326,18 @@ impl Server {
         let (Some(file_id), Some(offset)) = (location.file_id, location.file_offset) else {
             return false;
         };
+        let chunk_idx = offset / self.chunker.chunk_size() as u64;
+        if let Some(result) = self.folded_token_result(&location.chunk_id).await {
+            if self.chunk_map_current(file_id, chunk_idx) == Some(result) {
+                debug!("Declining ChunkLocation for folded patch token {} (file {} chunk_idx {}): \
+                        the slot already names its fold result {}",
+                    location.chunk_id, file_id, chunk_idx, result);
+                return true;
+            }
+        }
         let Some(incoming_seq) = location.client_write_seq else {
             return false;
         };
-        let chunk_idx = offset / self.chunker.chunk_size() as u64;
         let slot = match self.metadata.get_patch_state_for_slot_async(file_id, chunk_idx).await {
             Ok(Some(s)) => s,
             _ => return false,
@@ -10310,6 +10358,27 @@ impl Server {
                never revisit — an orphan identity that outlives its bytes.",
             location.chunk_id, file_id, chunk_idx, incoming_seq, current_token, current_seq);
         true
+    }
+
+    /// The fold result this node has recorded for patch token `token`, if it was folded.
+    /// A token is unique to one write (its id includes the write's seq), so once folded it
+    /// can never legitimately name its slot again: the fold result carries the same
+    /// client_write_seq, and seq arbitration alone would hand the slot to whichever of the
+    /// two arrived last (G8 soak 2026-10-30).
+    async fn folded_token_result(&self, token: &ChunkId) -> Option<ChunkId> {
+        if !token.looks_like_patch_token() {
+            return None;
+        }
+        match self.metadata.get_patch_state_async(*token).await {
+            Ok(Some(PatchState::Folded(result))) if result != *token => Some(result),
+            _ => None,
+        }
+    }
+
+    fn chunk_map_current(&self, file_id: FileId, chunk_idx: u64) -> Option<ChunkId> {
+        let entry = self.chunk_map.get(&file_id)?;
+        let (locs, _) = entry.value();
+        Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
     }
 
     fn merge_replicated_chunk_location(
@@ -29265,6 +29334,132 @@ mod tests {
             matches!(server.metadata.get_chunk_location(&real_chunk), Ok(Some(_))),
             "a content-addressed chunk id must be unaffected by patch-token retirement"
         );
+    }
+
+    /// drain_sled_writes must return when the worker has already exited by the time it
+    /// starts waiting. The worker signals with notify_waiters(), which wakes only tasks
+    /// already waiting; found 2026-10-30 as a full parallel unit run hanging forever in
+    /// test_replicate_chunk_locations_batch_updates_chunk_map_and_file_record. This sets up
+    /// the state that race leaves (worker gone, signal spent) directly.
+    #[tokio::test]
+    async fn draining_after_the_metadata_worker_already_exited_returns() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        // Close the worker's channel and give it time to finish and fire its signal with
+        // nobody waiting — what happens when it wins the race against the drain's wait.
+        server.sled_write_tx.lock().unwrap().take();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(3), server.drain_sled_writes()).await;
+        assert!(drained.is_ok(),
+            "BUG REPRODUCED: drain_sled_writes waited forever for a worker that had already \
+             exited (its notify_waiters() fired before anyone was waiting)");
+
+        // And a restarted worker is drained normally.
+        server.restart_sled_writes();
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(3), server.drain_sled_writes()).await;
+        assert!(drained.is_ok(), "a running worker must drain");
+    }
+
+    /// A late message for a patch token that has already been folded must not take the
+    /// slot back from the token's own fold result.
+    ///
+    /// Root-caused 2026-10-30 in the G8 bench soak (/vm/q.qcow2 chunk 38, token df7c99f0
+    /// folded into 6a37fdc3, both at client_write_seq 37261). A fold result keeps its
+    /// token's seq, so neither the seq nor (when only one side has one) the generation
+    /// can order the pair, and the slot went to whichever message arrived last. A late
+    /// location for the token put it back; its holders then dropped the folded token and
+    /// the slot named an id nobody held: every write needing that base failed with EIO.
+    #[tokio::test]
+    async fn a_late_message_for_a_folded_token_does_not_take_the_slot_from_its_fold_result() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const CHUNK_IDX: u64 = 38;
+        const SLOT: u64 = CHUNK_IDX * 4 * 1024 * 1024;
+        const SEQ: u64 = 37261;
+        const GEN: u64 = 1099511627846;
+        let now_ms = dfs_common::types::current_timestamp_ms();
+
+        let base = ChunkId::from_hash(compute_chunk_hash(b"38-base"));
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"38-delta"));
+        let token = ChunkId::patch_token_identity(delta);
+        let folded = ChunkId::from_hash(compute_chunk_hash(b"38-folded"));
+        server.metadata.put_patch_state_pending(
+            file_id, CHUNK_IDX, &token, base, delta, 4194304, now_ms, Some(SEQ),
+        ).unwrap();
+
+        let holders = vec![NodeId::new(), NodeId::new()];
+        let mk = |chunk_id: ChunkId, seq: u64, at: u64| ChunkLocation {
+            chunk_id,
+            nodes: holders.clone(),
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(SLOT),
+            written_at: Some(at),
+            client_write_seq: Some(seq),
+            file_id: Some(file_id),
+        };
+        let current = || {
+            let map = server.chunk_map_ref();
+            let entry = map.get(&file_id)?;
+            let (locs, _) = entry.value();
+            Server::chunk_map_find_by_idx(locs, CHUNK_IDX).map(|i| locs[i].chunk_id)
+        };
+
+        server.handle_replicate_chunk_location(mk(token, SEQ, now_ms), Some(file_id), Some(GEN)).await;
+        server.handle_replicate_patch_fold(
+            token, folded, file_id, CHUNK_IDX, Some(mk(folded, SEQ, now_ms + 1)),
+        ).await;
+        assert_eq!(current(), Some(folded), "setup: the fold must move the slot to its result");
+
+        // The late location for the token, as the soak's leader received it.
+        server.handle_replicate_chunk_location(mk(token, SEQ, now_ms + 2), Some(file_id), Some(GEN)).await;
+        assert_eq!(current(), Some(folded),
+            "BUG REPRODUCED: a late location for folded token {} took the slot back from its \
+             fold result {}; the token's holders drop it once folded, so the slot would name \
+             an id nobody holds", token, folded);
+
+        // The same late token arriving in a metadata push.
+        let mut md = dfs_common::FileMetadata::new(
+            "/vm/q.qcow2".to_string(), dfs_common::FileType::RegularFile);
+        md.id = file_id;
+        md.size = SLOT + 4194304;
+        md.write_seq = 1;
+        md.chunk_locations = std::sync::Arc::new(vec![mk(token, SEQ, now_ms + 3)]);
+        server.chunk_map_update(&md).await;
+        assert_eq!(current(), Some(folded),
+            "BUG REPRODUCED: a metadata push naming folded token {} took the slot back from \
+             its fold result {}", token, folded);
+
+        // Control: a newer write's token still replaces the fold result.
+        let newer = ChunkId::patch_token_identity(ChunkId::from_hash(compute_chunk_hash(b"38-delta-2")));
+        server.handle_replicate_chunk_location(mk(newer, SEQ + 1, now_ms + 4), Some(file_id), None).await;
+        assert_eq!(current(), Some(newer), "a newer write must still take the slot");
     }
 
     /// The backstop: rows proven unresolvable get physically retired, so a leak by ANY

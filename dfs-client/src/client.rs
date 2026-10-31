@@ -10376,8 +10376,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         self.last_resync_sent_at.remove(&file_id);
     }
 
-    /// Delete file
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
+    /// Delete file. `file_id` names the file meant: a node whose path already names a newer
+    /// file leaves it alone (Request::DeleteFileById). None (a directory) deletes by path.
+    pub async fn delete_file(&self, path: &str, file_id: Option<dfs_common::FileId>) -> Result<()> {
         // Fan out to quorum (leader + 2 other online nodes) simultaneously.
         // Each recipient enqueues the deletion durably to sled and wipes local
         // metadata before acking — so the file disappears from the namespace
@@ -10386,7 +10387,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         //
         // If the leader is down, pick any 3 online nodes. The new leader will
         // poll all nodes for their delete queues on election and resume the drain.
-        let request = Request::DeleteFile { path: path.to_string() };
+        let legacy = Request::DeleteFile { path: path.to_string() };
+        let request = match file_id {
+            Some(file_id) => Request::DeleteFileById { path: path.to_string(), file_id },
+            None => legacy.clone(),
+        };
 
         // The fan-out must include the real leader: every recipient accepts a delete, so one
         // sent to a former leader isn't redirected, and the leader keeps the file. A later create
@@ -10439,12 +10444,17 @@ leader_addr: Arc::new(RwLock::new(None)),
         let leader_addr = quorum[0];
         let mut handles: Vec<_> = quorum.iter().map(|&addr| {
             let req = request.clone();
+            let legacy = legacy.clone();
             let this = self.clone();
             tokio::spawn(async move {
-                (addr, tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
-                    this.send_request(addr, req),
-                ).await)
+                let timeout = tokio::time::Duration::from_secs(10);
+                let mut result = tokio::time::timeout(timeout, this.send_request(addr, req.clone())).await;
+                // A server predating DeleteFileById can't decode it and drops the connection;
+                // send it the path-only request it knows (its old behavior, no worse).
+                if matches!(req, Request::DeleteFileById { .. }) && matches!(result, Ok(Err(_))) {
+                    result = tokio::time::timeout(timeout, this.send_request(addr, legacy)).await;
+                }
+                (addr, result)
             })
         }).collect();
 

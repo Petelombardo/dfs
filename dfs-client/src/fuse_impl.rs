@@ -8039,7 +8039,7 @@ impl Filesystem for DfsFilesystem {
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
                     // Clean up remaining local state that was preserved for open fds.
-                    def_metadata_cache.remove(&ino);
+                    let def_file_id = def_metadata_cache.remove(&ino).map(|(_, m)| m.id);
                     def_write_counters.write().unwrap().remove(&ino);
                     def_last_warm_offset.remove(&ino);
                     def_chunk_offset_cache.remove(&ino);
@@ -8052,7 +8052,7 @@ impl Filesystem for DfsFilesystem {
                         def_path_to_inode.write().unwrap()
                             .remove_entry(&unlinked_path);
                         def_inode_to_path.write().unwrap().remove(&ino);
-                        match def_client.delete_file(&unlinked_path).await {
+                        match def_client.delete_file(&unlinked_path, def_file_id).await {
                             Ok(_) => info!("deferred unlink: deleted {} (ino={})", unlinked_path, ino),
                             Err(e) => error!("deferred unlink: delete_file failed for {}: {}", unlinked_path, e),
                         }
@@ -8864,7 +8864,7 @@ impl Filesystem for DfsFilesystem {
                 client.cancel_metadata(file_id).await;
             }
 
-            match client.delete_file(&path).await {
+            match client.delete_file(&path, file_id_opt).await {
                 Ok(_) => {
                     pending_deletes.remove(&path);
                     reply.ok();
@@ -8904,7 +8904,7 @@ impl Filesystem for DfsFilesystem {
                         reply.error(libc::ENOTEMPTY);
                         return;
                     }
-                    match client.delete_file(&path).await {
+                    match client.delete_file(&path, None).await {
                         Ok(_) => {
                             if let Some(&ino) = path_to_inode.read().unwrap().get(&path) {
                                 metadata_cache.remove(&ino);
@@ -9037,7 +9037,7 @@ impl Filesystem for DfsFilesystem {
                         reply.ok();
                         return;
                     }
-                    if let Err(e) = client.delete_file(&existing_meta.path).await {
+                    if let Err(e) = client.delete_file(&existing_meta.path, Some(existing_meta.id)).await {
                         warn!("rename: failed to delete destination {}: {}", existing_meta.path, e);
                         // Non-fatal: proceed with rename
                     }

@@ -1318,6 +1318,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::PutFileMetadata { .. }
         | Request::ListDirectory { .. }
         | Request::DeleteFile { .. }
+        | Request::DeleteFileById { .. }
         | Request::RenameFile { .. }
         | Request::GetFileChunkMap { .. }
         | Request::RevalidateChunkSlot { .. }
@@ -8856,7 +8857,11 @@ impl Server {
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
-                self.handle_delete_file(path).await
+                self.handle_delete_file(path, None).await
+            }
+            Request::DeleteFileById { path, file_id } => {
+                self.ops_tracker.inc_meta();
+                self.handle_delete_file(path, Some(file_id)).await
             }
             Request::RenameFile { old_path, new_path } => {
                 self.ops_tracker.inc_meta();
@@ -18385,6 +18390,9 @@ impl Server {
             if let Some(sz) = size {
                 advance_chunk_map_for_ordered_write(&self.chunk_map, &self.chunk_to_file, file_id, chunk_idx, anchor, sz as usize, None);
             }
+            if let Some(start) = start {
+                self.record_ordered_fold(file_id, chunk_idx, start, anchor, true).await;
+            }
             send_order(version, anchor);
             let resp = fold_result(anchor, size);
             slot.finish(tag.write_id, version, &resp);
@@ -18404,10 +18412,11 @@ impl Server {
             let _order = slot.order_lock.lock().await;
             // Our own content at version-1, if our head is there, is the cheap way to C.
             let mut held = false;
+            let mut folded_head = None;
             if slot.head_version() == Some(version - 1) {
                 if let Some(head) = slot.head() {
                     match self.materialize_anchor(file_id, chunk_idx, head).await {
-                        Some(mine) if mine == anchor => held = true,
+                        Some(mine) if mine == anchor => { held = true; folded_head = Some(head); }
                         Some(mine) => warn!("[ORDER] secondary: file {} chunk {} fold v{}: our content {} differs from the primary's {} -- pulling the primary's",
                             file_id, chunk_idx, version, mine, anchor),
                         None => {}
@@ -18426,12 +18435,49 @@ impl Server {
             if let Some(sz) = size {
                 advance_chunk_map_for_ordered_write(&self.chunk_map, &self.chunk_to_file, file_id, chunk_idx, anchor, sz as usize, None);
             }
+            if let Some(head) = folded_head {
+                self.record_ordered_fold(file_id, chunk_idx, head, anchor, false).await;
+            }
             let resp = fold_result(anchor, size);
             slot.finish(tag.write_id, version, &resp);
             resp
         } else {
             Response::Error { message: "Ordered fold: this node is neither the primary nor the secondary".into(), code: ErrorCode::InvalidRequest }
         }
+    }
+
+    /// An ordered fold replaced the slot's head `token`, a pending patch, with `result`, the
+    /// same content materialized. Record it as a fold (PATCH_STATE Folded) the way a regular
+    /// fold does: left Pending, the background fold found the slot "superseded by a different
+    /// path" and deleted the token's row, the leader's map (which still named the token, never
+    /// told of the fold) purged it as DATA LOSS, and clients holding it were told their base
+    /// was stale until fsync failed (G8 soak 10-31, /vm/q.qcow2 chunk 67). The primary tells
+    /// the leader, after the reply: the pair's order lock is held here.
+    async fn record_ordered_fold(&self, file_id: FileId, chunk_idx: u64, token: ChunkId, result: ChunkId, tell_leader: bool) {
+        if !token.looks_like_patch_token() || token == result
+            || !matches!(self.metadata.get_patch_state_async(token).await, Ok(Some(PatchState::Pending { .. })))
+        {
+            return;
+        }
+        if let Err(e) = self.metadata.update_patch_state_folded_for_file_async(file_id, token, result).await {
+            warn!("[ORDER] file {} chunk {}: recording ordered fold {} -> {} failed: {}", file_id, chunk_idx, token, result, e);
+            return;
+        }
+        self.write_ordering.on_folded(file_id, chunk_idx, token, result);
+        self.dirty_patch_slots.remove_if(&(file_id, chunk_idx), |_, s| s.token == token);
+        if !tell_leader || self.cluster.is_leader().await {
+            return;
+        }
+        let Some(server) = self.self_ref.get().and_then(|w| w.upgrade()) else { return };
+        tokio::spawn(async move {
+            let Some(leader) = server.cluster.get_leader_addr().await else { return };
+            let req = Request::ReplicatePatchFold { public_token: token, real_chunk_id: result, file_id, chunk_idx, location: None };
+            match tokio::time::timeout(std::time::Duration::from_secs(2), server.client.send_message(leader, Message::Request(req))).await {
+                Ok(Ok(env)) if matches!(env.message, Message::Response(Response::FoldReceipt { applied: true, .. } | Response::Ok { .. })) => {}
+                other => debug!("[ORDER] file {} chunk {}: leader not told of ordered fold {} -> {}: {:?}",
+                    file_id, chunk_idx, token, result, other.map(|r| r.map(|e| format!("{:?}", e.message)))),
+            }
+        });
     }
 
     /// The answer to a resent copy of an ordered write: whatever this replica already decided.
@@ -19664,10 +19710,20 @@ impl Server {
     ///   5. Acks the client
     ///
     /// The leader's drain worker then handles all actual chunk deletion asynchronously.
-    async fn handle_delete_file(&self, path: String) -> Response {
+    async fn handle_delete_file(&self, path: String, file_id: Option<FileId>) -> Response {
         debug!("Handling delete file: {}", path);
 
         let metadata = match self.metadata.get_file_by_path_async(path.clone()).await {
+            // The path was created again since the client deleted the file it named (see
+            // Request::DeleteFileById): that file is someone's new one. The old one goes
+            // through the leader's drain by id.
+            Ok(Some(m)) if file_id.is_some_and(|want| want != m.id) => {
+                info!("DeleteFile: {} now names {}, not {}; leaving it", path, m.id, file_id.unwrap());
+                return Response::Error {
+                    message: "File not found".to_string(),
+                    code: ErrorCode::NotFound,
+                };
+            }
             Ok(Some(m)) => m,
             Ok(None) => {
                 return Response::Error {
@@ -25394,6 +25450,27 @@ mod tests {
         assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
     }
 
+    /// G8 soak 10-31: fio deleted and re-created /vm/disk.raw; the client's delete reached
+    /// server4 6 s late, by path, and deleted the NEW file there, which then refused every
+    /// write (fsync EIO). A delete naming the old file must leave the new one alone.
+    #[tokio::test]
+    async fn a_late_delete_of_a_replaced_file_leaves_the_new_file_at_its_path() {
+        let h = make_overlay_test_harness();
+        let path = "/vm/disk.raw".to_string();
+        let old = dfs_common::FileMetadata::new(path.clone(), dfs_common::types::FileType::RegularFile);
+        h.metadata.put_file(&old).unwrap();
+        let r = h.server.handle_request(Request::DeleteFileById { path: path.clone(), file_id: old.id }).await;
+        assert!(matches!(r, Response::Ok { .. }), "deleting the file the path names: {:?}", r);
+
+        let new = dfs_common::FileMetadata::new(path.clone(), dfs_common::types::FileType::RegularFile);
+        h.metadata.put_file(&new).unwrap();
+        let r = h.server.handle_request(Request::DeleteFileById { path: path.clone(), file_id: old.id }).await;
+        assert!(matches!(r, Response::Error { code: ErrorCode::NotFound, .. }), "a late delete of the old file: {:?}", r);
+        assert_eq!(h.metadata.get_file_by_path(&path).unwrap().map(|m| m.id), Some(new.id),
+            "BUG: a late delete of the replaced file deleted the new file at its path");
+        assert!(!h.server.file_recently_deleted(new.id), "BUG: the new file was tombstoned");
+    }
+
     /// Every metadata commit is durable (an fsync), so a delete must be one commit, not one
     /// for the record, one for the path index and one per chunk location: T21's 2101-file
     /// delete storm drained 3x slower (35s -> 108s), and the half-applied deletes it left
@@ -25935,6 +26012,60 @@ mod tests {
         let unknown = ChunkId::from_hash({ let mut x = current.hash; x[31] ^= 0xff; x });
         assert_eq!(h.server.materialize_anchor(file_id, chunk_idx, unknown).await, None,
             "an unreadable version must not be replaced by this node's own content for the slot");
+    }
+
+    /// G8 soak 10-31 (/vm/q.qcow2 chunk 67): the client's ordered ForceFold folded token
+    /// df7ce891 into fe7f8eaa, but the holders' PATCH_STATE for the token stayed Pending and
+    /// the leader never heard of the fold. The holders' background fold then found the slot
+    /// "superseded by a different path" and deleted the token's row, the leader (whose map
+    /// still named the token) purged it as DATA LOSS, and clients holding the token were told
+    /// their base was stale until fsync failed. An ordered fold records what it folded.
+    #[tokio::test]
+    async fn an_ordered_fold_records_the_token_it_folded() {
+        use dfs_common::NodeInfo;
+        let h = make_overlay_test_harness();
+        h.server.lease.grant_own_lease_for_test();
+        let me = h.server.cluster().local_node_id();
+        let secondary = NodeId::new(); // nothing listens: the order to it is fire-and-forget
+        h.server.cluster().add_node(NodeInfo::new(secondary, "127.0.0.1:19381".parse().unwrap(), None)).await.unwrap();
+        let file_meta = dfs_common::FileMetadata::new("/ordered-fold-record".to_string(), dfs_common::types::FileType::RegularFile);
+        let file_id = file_meta.id;
+        h.metadata.put_file(&file_meta).unwrap();
+        let (chunk_idx, off) = (0u64, 0u64);
+        let base = vec![0x31u8; 4096];
+        let base_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base, off, file_id));
+        h.storage.write_chunk(&base_id, &base).unwrap();
+        let loc = ChunkLocation {
+            chunk_id: base_id, nodes: vec![me], size: base.len(), checksum: base_id.hash,
+            file_offset: Some(off), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        h.server.chunk_map.insert(file_id, (vec![loc.clone()], 1));
+        h.metadata.put_chunk_location(&loc).unwrap();
+        let token = match h.server.handle_multi_patch(
+            base_id, file_id, Some(chunk_idx), off, vec![(10usize, vec![0x42u8; 8])], None, Some(2), None, Some(2), false,
+        ).await {
+            Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
+            other => panic!("setup: patch failed: {:?}", other),
+        };
+        assert!(token.looks_like_patch_token());
+        assert!(matches!(h.metadata.get_patch_state(&token).unwrap(), Some(PatchState::Pending { .. })));
+
+        h.server.slot_isr.set_committed_for_test(file_id, chunk_idx, crate::slot_isr::SlotIsr { epoch: 1, members: vec![me, secondary] });
+        let tag = dfs_common::WriteOrderTag { file_id, chunk_idx, isr_epoch: 1, primary: me, secondary, write_id: 7 };
+        let result = match h.server.handle_ordered(tag, Request::ForceFold { file_id, chunk_idx }).await {
+            Response::ForceFoldResult { real_chunk_id, .. } => real_chunk_id,
+            other => panic!("the ordered fold failed: {:?}", other),
+        };
+        assert!(!result.looks_like_patch_token());
+        let state = h.metadata.get_patch_state(&token).unwrap();
+        assert!(matches!(state, Some(PatchState::Folded(r)) if r == result),
+            "BUG: the ordered fold left its token {:?}, not Folded({}); the background fold will abandon it", state, result);
+
+        // The background fold that used to delete the token's row adopts instead.
+        let _ = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, false).await;
+        let state = h.metadata.get_patch_state(&token).unwrap();
+        assert!(matches!(state, Some(PatchState::Folded(r)) if r == result),
+            "a background fold after the ordered one must not drop the token's record: {:?}", state);
     }
 
     /// Suite T74a (10-13): a replacement secondary that never caught up took over from a dead

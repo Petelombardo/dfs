@@ -1356,6 +1356,19 @@ pub enum Request {
     InjectLeaseLapse {
         millis: u64,
     },
+
+    /// DeleteFile naming the file the client means. The client fans a delete out to the
+    /// leader and two other nodes and returns on the leader's ack; a follower's copy can
+    /// arrive after the path was created again, and DeleteFile resolved the path there and
+    /// deleted the NEW file (G8 soak 10-31: fio re-laid-out /vm/disk.raw, server4
+    /// tombstoned the new file 6 s later and refused its writes). A node whose path names
+    /// another file leaves it alone; the old file's own deletion reaches every node through
+    /// the leader's drain (DeleteChunksBatch, by id). APPENDED at end to preserve wire
+    /// compatibility; a server without it gets DeleteFile.
+    DeleteFileById {
+        path: String,
+        file_id: FileId,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

@@ -6665,6 +6665,9 @@ impl Server {
         // to skew/drift on the aarch64 fleet — are neither of them reliable causal
         // clocks across generations, so they are demoted to a SAME-generation /
         // unknown-generation fallback only.
+        if let Some(incoming_wins) = Self::token_vs_its_fold(incoming, existing) {
+            return incoming_wins;
+        }
         if let (Some(inc_gen), Some(ext_gen)) = (incoming_gen, existing_gen) {
             if inc_gen != ext_gen {
                 return inc_gen > ext_gen;
@@ -6678,6 +6681,26 @@ impl Server {
             (None, Some(_)) => false, // existing has a seq, incoming is legacy → keep
             // Both predate client_write_seq → origin, then written_at, same as above.
             (None, None) => Self::fold_then_written_at(incoming, existing, incoming_is_fold, existing_is_fold),
+        }
+    }
+
+    /// A patch token and a content id at the same client_write_seq in one slot are one
+    /// write: the content id is the token's fold result (a fold keeps the seq, and since
+    /// 2f6d278 a resend keeps it too). The fold result wins, before generations: a fold
+    /// result has its token's generation by definition, so a node that knows a different
+    /// one for it backfilled it from a lagging per-slot counter (G8 soak 2026-10-31: the
+    /// leader gave a fold result 840 against its own token's 841 and handed the slot back
+    /// to the token). `Some(incoming_wins)` for that pair, `None` for anything else.
+    fn token_vs_its_fold(incoming: &ChunkLocation, existing: &ChunkLocation) -> Option<bool> {
+        match (incoming.client_write_seq, existing.client_write_seq) {
+            (Some(inc), Some(ext)) if inc == ext => {
+                match (incoming.chunk_id.looks_like_patch_token(), existing.chunk_id.looks_like_patch_token()) {
+                    (false, true) => Some(true),
+                    (true, false) => Some(false),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -6801,7 +6824,9 @@ impl Server {
                         Self::chunk_map_find_by_idx(existing_locs, cidx).map(|i| &existing_locs[i])
                     }) {
                         if old_loc.chunk_id == loc.chunk_id { continue; }
-                        if folded_into.get(&loc.chunk_id) == Some(&old_loc.chunk_id) {
+                        if folded_into.get(&loc.chunk_id) == Some(&old_loc.chunk_id)
+                            || Self::token_vs_its_fold(loc, old_loc) == Some(false)
+                        {
                             *loc = old_loc.clone();
                             continue;
                         }
@@ -6825,7 +6850,8 @@ impl Server {
                                 metadata.path, loc.file_offset, loc.chunk_id, gen_of(&loc.chunk_id), old_loc.chunk_id, gen_of(&old_loc.chunk_id),
                                 loc.client_write_seq, old_loc.client_write_seq);
                         }
-                        let stale = if let Some(stale) = by_generation { stale } else { match (loc.client_write_seq, old_loc.client_write_seq) {
+                        let stale = if Self::token_vs_its_fold(loc, old_loc) == Some(true) { false }
+                            else if let Some(stale) = by_generation { stale } else { match (loc.client_write_seq, old_loc.client_write_seq) {
                             (Some(inc), Some(ext)) => inc < ext,
                             (Some(_), None)        => false, // incoming has seq → newer
                             (None, Some(_))        => true,  // existing has seq, incoming doesn't → stale
@@ -29334,6 +29360,83 @@ mod tests {
             matches!(server.metadata.get_chunk_location(&real_chunk), Ok(Some(_))),
             "a content-addressed chunk id must be unaffected by patch-token retirement"
         );
+    }
+
+    /// A fold result must keep its slot against a late report of its own token even when
+    /// the result's generation had to be backfilled from a lagging per-slot counter.
+    ///
+    /// G8 soak 2026-10-31 (/vm/q.qcow2 chunk 11, token df7c56c2 folded into 0548bdff by the
+    /// client's ordered ForceFold, both cws 3555). The leader held neither copy: it never
+    /// saw a Folded row, it knew the token at generation 841, and its CHUNK_SEQ_TABLE for the
+    /// slot still said 840. A holder's late location report for the token backfilled the
+    /// fold result to 840, the token won 841 > 840, and the client then patched on top of
+    /// the token.
+    #[tokio::test]
+    async fn a_fold_result_with_a_backfilled_generation_keeps_its_slot_against_its_token() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3,
+            temp_metadata_dir.path().to_path_buf(),
+            temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        const CHUNK_IDX: u64 = 11;
+        const SLOT: u64 = CHUNK_IDX * 4 * 1024 * 1024;
+        const SEQ: u64 = 3555;
+        let now_ms = dfs_common::types::current_timestamp_ms();
+        let token = ChunkId::patch_token_identity(ChunkId::from_hash(compute_chunk_hash(b"11-delta")));
+        let folded = ChunkId::from_hash(compute_chunk_hash(b"11-folded"));
+        let holders = vec![NodeId::new(), NodeId::new()];
+        let mk = |chunk_id: ChunkId, seq: u64, at: u64| ChunkLocation {
+            chunk_id, nodes: holders.clone(), size: 4194304, checksum: [0u8; 32],
+            file_offset: Some(SLOT), written_at: Some(at), client_write_seq: Some(seq),
+            file_id: Some(file_id),
+        };
+        let current = || {
+            let map = server.chunk_map_ref();
+            let entry = map.get(&file_id)?;
+            let (locs, _) = entry.value();
+            Server::chunk_map_find_by_idx(locs, CHUNK_IDX).map(|i| locs[i].chunk_id)
+        };
+        let push = |loc: ChunkLocation| {
+            let mut md = dfs_common::FileMetadata::new(
+                "/vm/q.qcow2".to_string(), dfs_common::FileType::RegularFile);
+            md.id = file_id;
+            md.size = SLOT + 4194304;
+            md.write_seq = 1;
+            md.chunk_locations = std::sync::Arc::new(vec![loc]);
+            md
+        };
+
+        server.metadata.put_chunk_seq(file_id, CHUNK_IDX, 840).unwrap();
+        server.handle_replicate_chunk_location(mk(token, SEQ, now_ms), Some(file_id), Some(841)).await;
+        assert_eq!(current(), Some(token), "setup: the token holds the slot");
+        // The client's ForceFold result arrives in a metadata push, with no generation.
+        server.chunk_map_update(&push(mk(folded, SEQ, now_ms + 1))).await;
+        assert_eq!(current(), Some(folded), "the fold result takes the slot from its token");
+
+        // A holder's late report of the token, without a generation, as in the soak.
+        server.handle_replicate_chunk_location(mk(token, SEQ, now_ms + 2), Some(file_id), None).await;
+        assert_eq!(current(), Some(folded),
+            "BUG REPRODUCED: a late report of token {} took the slot back from its fold \
+             result {} (the result's generation was backfilled from a lagging slot counter)",
+            token, folded);
+        // And the same token in a metadata push.
+        server.chunk_map_update(&push(mk(token, SEQ, now_ms + 3))).await;
+        assert_eq!(current(), Some(folded),
+            "BUG REPRODUCED: a metadata push naming token {} took the slot back from its fold \
+             result {}", token, folded);
+
+        // Control: a newer write still takes the slot.
+        let newer = ChunkId::patch_token_identity(ChunkId::from_hash(compute_chunk_hash(b"11-delta-2")));
+        server.handle_replicate_chunk_location(mk(newer, SEQ + 1, now_ms + 4), Some(file_id), Some(842)).await;
+        assert_eq!(current(), Some(newer), "a newer write must still take the slot");
     }
 
     /// drain_sled_writes must return when the worker has already exited by the time it

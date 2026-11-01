@@ -18608,8 +18608,9 @@ impl Server {
     /// token resolves through the read path) written under its content hash. The anchor of an
     /// ordered stream (see write_order.rs).
     async fn materialize_anchor(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> Option<ChunkId> {
+        let seq = self.version_write_seq(file_id, chunk_idx, id).await;
         if !id.looks_like_patch_token() && self.storage.has_chunk(&id) {
-            return self.register_anchor_location(file_id, chunk_idx, id).await.then_some(id);
+            return self.register_anchor_location(file_id, chunk_idx, id, seq).await.then_some(id);
         }
         // Exactly `id`, never a substitute: here, else from a peer holding it (at stream start
         // `id` can be the client's chunk id, which an earlier unordered phase or a missed
@@ -18635,7 +18636,25 @@ impl Server {
                 return None;
             }
         }
-        self.register_anchor_location(file_id, chunk_idx, anchor).await.then_some(anchor)
+        self.register_anchor_location(file_id, chunk_idx, anchor, seq).await.then_some(anchor)
+    }
+
+    /// The client_write_seq of version `id` of a slot, from this node's records: its pending
+    /// patch, its own location row, or the slot's chunk_map entry naming it.
+    async fn version_write_seq(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> Option<u64> {
+        if let Ok(Some(PatchState::Pending { client_write_seq: Some(seq), .. })) = self.metadata.get_patch_state_async(id).await {
+            return Some(seq);
+        }
+        if let Ok(Some(loc)) = self.metadata.get_chunk_location_async(id).await {
+            if loc.client_write_seq.is_some() {
+                return loc.client_write_seq;
+            }
+        }
+        self.chunk_map.get(&file_id).and_then(|e| {
+            let (locs, _) = e.value();
+            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| &locs[i])
+                .filter(|l| l.chunk_id == id).and_then(|l| l.client_write_seq)
+        })
     }
 
     fn chunk_data_bytes(resp: Response) -> Option<Vec<u8>> {
@@ -18701,14 +18720,19 @@ impl Server {
             || tokio::time::timeout(ANCHOR_PULL_TIMEOUT,
                 pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, id, &[from], file_id, chunk_idx * (4 * 1024 * 1024)))
                 .await.ok().flatten().is_some();
-        held && self.register_anchor_location(file_id, chunk_idx, id).await
+        held && self.register_anchor_location(file_id, chunk_idx, id, None).await
     }
 
     /// Register a local ChunkLocation for an anchor if it has none. A fresh accumulator on a
     /// real base requires its base's location (handle_multi_patch's "no registered location"
     /// guard), and an anchor written or pulled here has none: without this every ordered write
     /// onto a fresh anchor failed (suite T34 with DFS_ORDERED_WRITES=1).
-    async fn register_anchor_location(&self, file_id: FileId, chunk_idx: u64, id: ChunkId) -> bool {
+    /// `seq` is the client_write_seq of the version the anchor is the content of. Anchors were
+    /// registered with None, and a slot rebuilt or arbitrated from CHUNK_TABLE ranks a version
+    /// with no seq below any older one with a seq: after a primary's restart a slot fell back
+    /// from its newest anchor to a version 25,000 writes older and the next epoch anchored on
+    /// it, losing the acked writes between (G8 soak 11-01, /vm/q.qcow2 chunk 25).
+    async fn register_anchor_location(&self, file_id: FileId, chunk_idx: u64, id: ChunkId, seq: Option<u64>) -> bool {
         let me = self.cluster.local_node_id();
         let file_offset = chunk_idx * (4 * 1024 * 1024);
         if let Ok(Some(existing)) = self.metadata.get_chunk_location_async(id).await {
@@ -18716,7 +18740,9 @@ impl Server {
             // through handle_write_chunk, which registers a bare row (no file, no offset). A
             // leader that kept it mapped the chunk at idx 0 and its slot read as a hole
             // (suite T66[secondary], 1017a). Complete it rather than trust it.
-            if existing.file_offset.is_some() && existing.file_id.is_some() && existing.nodes.contains(&me) {
+            if existing.file_offset.is_some() && existing.file_id.is_some() && existing.nodes.contains(&me)
+                && (existing.client_write_seq.is_some() || seq.is_none())
+            {
                 return true;
             }
             let mut nodes = existing.nodes.clone();
@@ -18727,6 +18753,7 @@ impl Server {
                 nodes,
                 file_offset: existing.file_offset.or(Some(file_offset)),
                 file_id: existing.file_id.or(Some(file_id)),
+                client_write_seq: existing.client_write_seq.or(seq),
                 ..existing
             };
             return match self.metadata.put_chunk_location_async(completed).await {
@@ -18745,7 +18772,7 @@ impl Server {
             checksum: id.hash,
             file_offset: Some(chunk_idx * (4 * 1024 * 1024)),
             written_at: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64),
-            client_write_seq: None,
+            client_write_seq: seq,
             file_id: Some(file_id),
         };
         match self.metadata.put_chunk_location_async(loc).await {
@@ -26012,6 +26039,45 @@ mod tests {
         let unknown = ChunkId::from_hash({ let mut x = current.hash; x[31] ^= 0xff; x });
         assert_eq!(h.server.materialize_anchor(file_id, chunk_idx, unknown).await, None,
             "an unreadable version must not be replaced by this node's own content for the slot");
+    }
+
+    /// G8 soak 11-01 (/vm/q.qcow2 chunk 25): every ordered anchor was registered with
+    /// client_write_seq None, and a slot rebuilt or arbitrated from CHUNK_TABLE ranks a
+    /// version with no seq below any older one with a seq. After the primary's restart the
+    /// slot fell back from its newest anchor (dc443bdf, the content of seq 32362) to a version
+    /// of seq 6736, the next epoch anchored on it, and the acked writes between were lost. An
+    /// anchor is the content of the version it materializes, and carries that version's seq.
+    #[tokio::test]
+    async fn an_anchor_carries_the_write_seq_of_the_version_it_materializes() {
+        let h = make_overlay_test_harness();
+        let me = h.server.cluster().local_node_id();
+        let file_meta = dfs_common::FileMetadata::new("/anchor-seq".to_string(), dfs_common::types::FileType::RegularFile);
+        let file_id = file_meta.id;
+        h.metadata.put_file(&file_meta).unwrap();
+        let (chunk_idx, off) = (0u64, 0u64);
+        let base = vec![0x51u8; 4096];
+        let base_id = ChunkId::from_hash(dfs_common::compute_chunk_hash_at(&base, off, file_id));
+        h.storage.write_chunk(&base_id, &base).unwrap();
+        let loc = ChunkLocation {
+            chunk_id: base_id, nodes: vec![me], size: base.len(), checksum: base_id.hash,
+            file_offset: Some(off), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        h.server.chunk_map.insert(file_id, (vec![loc.clone()], 1));
+        h.metadata.put_chunk_location(&loc).unwrap();
+        let token = match h.server.handle_multi_patch(
+            base_id, file_id, Some(chunk_idx), off, vec![(10usize, vec![0x52u8; 8])], None, Some(2), None, Some(2), false,
+        ).await {
+            Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
+            other => panic!("setup: patch failed: {:?}", other),
+        };
+        let anchor = h.server.materialize_anchor(file_id, chunk_idx, token).await.expect("anchor");
+        assert_ne!(anchor, token);
+        let row = h.metadata.get_chunk_location(&anchor).unwrap().expect("the anchor has a location row");
+        assert_eq!(row.client_write_seq, Some(2),
+            "BUG: the anchor of write seq 2 is registered with {:?}; a rebuild ranks it below older versions", row.client_write_seq);
+        // A content version that is its own anchor keeps (and completes) its seq too.
+        assert_eq!(h.server.materialize_anchor(file_id, chunk_idx, anchor).await, Some(anchor));
+        assert_eq!(h.metadata.get_chunk_location(&anchor).unwrap().unwrap().client_write_seq, Some(2));
     }
 
     /// G8 soak 10-31 (/vm/q.qcow2 chunk 67): the client's ordered ForceFold folded token

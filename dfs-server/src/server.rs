@@ -20131,6 +20131,19 @@ impl Server {
             }
         }
 
+        // A node that is down never got the batch. Clearing the entry left it the file: the
+        // old leader, SIGKILLed during a delete, came back with the file in its FILE_TABLE,
+        // led again, and a deleted recording reappeared to clients with its chunks gone (G8
+        // soak 11-01, /dvr/rec_115.ts). Keep it queued until that node is back and has it.
+        let down: Vec<NodeId> = nodes.iter()
+            .filter(|n| n.id != local_id && matches!(n.status, dfs_common::NodeStatus::Suspected | dfs_common::NodeStatus::Failed))
+            .map(|n| n.id)
+            .collect();
+        if !down.is_empty() {
+            debug!("drain_one_delete: {} stays queued until {:?} (down) has it", entry.path, down);
+            return;
+        }
+
         if !all_acked {
             // Leave in queue — will retry on next drain cycle.
             info!("drain_one_delete: some nodes failed for {} — will retry", entry.path);
@@ -25475,6 +25488,27 @@ mod tests {
             "a deleted file must leave no dirty slot behind for the fold sweep to fold");
         assert!(!h.server.chunk_patch_locks.iter().any(|e| e.key().0 == dead));
         assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
+    }
+
+    /// G8 soak 11-01 (soak #8): /dvr/rec_115.ts was deleted while the leader was SIGKILLed.
+    /// The interim leader drained the delete to the online nodes only and cleared the queue;
+    /// the old leader came back with the file in its FILE_TABLE, led again, and the deleted
+    /// recording reappeared to clients (512 MB, its chunks gone). A delete stays queued until
+    /// every known node has it; a node that is down gets it when it is back.
+    #[tokio::test]
+    async fn a_delete_stays_queued_while_a_known_node_is_down() {
+        use dfs_common::NodeInfo;
+        let h = make_overlay_test_harness();
+        let mut down = NodeInfo::new(NodeId::new(), "127.0.0.1:19471".parse().unwrap(), None);
+        down.status = dfs_common::NodeStatus::Failed;
+        h.server.cluster().add_node(down).await.unwrap();
+        let file_meta = dfs_common::FileMetadata::new("/dvr/rec_115.ts".to_string(), dfs_common::types::FileType::RegularFile);
+        h.metadata.put_file(&file_meta).unwrap();
+        let entry = dfs_common::DeleteQueueEntry { file_id: file_meta.id, path: file_meta.path.clone(), chunk_ids: vec![] };
+        h.metadata.enqueue_delete(&entry).unwrap();
+        h.server.drain_one_delete(entry).await;
+        assert!(h.metadata.get_all_pending_deletes().unwrap().iter().any(|e| e.file_id == file_meta.id),
+            "BUG: the delete was cleared from the queue while a known node that never got it was down");
     }
 
     /// G8 soak 10-31: fio deleted and re-created /vm/disk.raw; the client's delete reached

@@ -89,6 +89,14 @@ PY
         # Keep the newest 8 recordings (4 GiB): delete older ones and their md5s.
         for old in $(ls "$SOAK"/rec_*.md5 2>/dev/null | sed 's/.*rec_\([0-9]*\).md5/\1/' | sort -n | head -n -8); do
             rm -f "$MNT/dvr/rec_$old.ts" "$SOAK/rec_$old.md5"
+            echo "$old" >> "$SOAK/deleted.list"
+        done
+        # A deleted recording must stay deleted (G8 11-01: a leader SIGKILLed during the delete
+        # came back with the file and rec_115 etc. reappeared). Report each one once.
+        for d in $(sort -un "$SOAK/deleted.list" 2>/dev/null); do
+            if [ -e "$MNT/dvr/rec_$d.ts" ] && ! grep -qx "$d" "$SOAK/resurrected.list" 2>/dev/null; then
+                echo "$d" >> "$SOAK/resurrected.list"; log dvr "FAIL rec_$d was deleted and is back"
+            fi
         done
         # The DVR startup-log pattern (Legata 1e111d42): 40 shell appends, then read back.
         : > "$MNT/dvr/app.log"; : > "$SOAK/app.exp"

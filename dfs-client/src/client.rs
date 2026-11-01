@@ -10446,12 +10446,16 @@ leader_addr: Arc::new(RwLock::new(None)),
             let req = request.clone();
             let legacy = legacy.clone();
             let this = self.clone();
+            let is_leader = addr == leader_addr;
             tokio::spawn(async move {
                 let timeout = tokio::time::Duration::from_secs(10);
                 let mut result = tokio::time::timeout(timeout, this.send_request(addr, req.clone())).await;
-                // A server predating DeleteFileById can't decode it and drops the connection;
-                // send it the path-only request it knows (its old behavior, no worse).
-                if matches!(req, Request::DeleteFileById { .. }) && matches!(result, Ok(Err(_))) {
+                // A leader predating DeleteFileById can't decode it and drops the connection;
+                // send it the path-only request it knows (its old behavior, no worse). Only the
+                // leader, whose answer this waits for: a follower's failure can be a busy node,
+                // and a path-only copy that lands after the path was re-created deletes the new
+                // file there (G8 soak 10-31). Followers get the delete by id from the drain.
+                if is_leader && matches!(req, Request::DeleteFileById { .. }) && matches!(result, Ok(Err(_))) {
                     result = tokio::time::timeout(timeout, this.send_request(addr, legacy)).await;
                 }
                 (addr, result)
@@ -10898,6 +10902,71 @@ mod tests {
             }
         });
         revalidate_calls
+    }
+
+    /// A mock node for delete_file's fan-out. Answers DeleteFileById with Ok, or (with
+    /// `drop_by_id`) drops the connection the way a busy or pre-DeleteFileById server's
+    /// failure looks to the client; counts the path-only DeleteFile requests it receives.
+    fn spawn_mock_delete_node(addr: SocketAddr, drop_by_id: bool) -> Arc<std::sync::atomic::AtomicUsize> {
+        use tokio::io::AsyncReadExt;
+        let legacy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = legacy.clone();
+        tokio::spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::bind(addr).await else { return };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let count = count.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let Message::Request(req) = envelope.message else { return };
+                        match req {
+                            Request::DeleteFileById { .. } if drop_by_id => return,
+                            Request::DeleteFile { .. } => { count.fetch_add(1, Ordering::SeqCst); }
+                            _ => {}
+                        }
+                        write_envelope(&mut stream, envelope.request_id, Response::Ok { data: None }).await;
+                    }
+                });
+            }
+        });
+        legacy
+    }
+
+    /// G8 soak 10-31 (soak #6, 19:19): DeleteFileById to a busy follower failed at the
+    /// transport, the client resent it the path-only DeleteFile, and that copy landed after
+    /// fio re-created /vm/disk.raw: the follower deleted the NEW file and refused its writes
+    /// (fsync EIO). Followers' copies are redundancy (the leader's drain reaches every node
+    /// by id), so only the leader, whose answer the client waits for, gets the fallback.
+    #[tokio::test]
+    async fn a_failed_delete_by_id_is_never_resent_by_path_to_a_follower() {
+        let leader: SocketAddr = "127.0.0.1:19461".parse().unwrap();
+        let follower: SocketAddr = "127.0.0.1:19462".parse().unwrap();
+        let leader_legacy = spawn_mock_delete_node(leader, false);
+        let follower_legacy = spawn_mock_delete_node(follower, true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = DfsClient::new(vec![leader, follower]).unwrap();
+        *client.leader_addr.write().await = Some(leader);
+        *client.leader_view_at.lock().unwrap() = Some(std::time::Instant::now() + Duration::from_secs(3600));
+        client.delete_file("/vm/disk.raw", Some(dfs_common::FileId::new())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(leader_legacy.load(Ordering::SeqCst), 0, "the leader took DeleteFileById");
+        assert_eq!(follower_legacy.load(Ordering::SeqCst), 0,
+            "BUG: a follower whose DeleteFileById failed was sent the path-only DeleteFile");
+
+        // A leader that can't take DeleteFileById (pre-upgrade) still gets the delete.
+        let old_leader: SocketAddr = "127.0.0.1:19463".parse().unwrap();
+        let old_leader_legacy = spawn_mock_delete_node(old_leader, true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = DfsClient::new(vec![old_leader]).unwrap();
+        *client.leader_addr.write().await = Some(old_leader);
+        *client.leader_view_at.lock().unwrap() = Some(std::time::Instant::now() + Duration::from_secs(3600));
+        client.delete_file("/vm/disk.raw", Some(dfs_common::FileId::new())).await.unwrap();
+        assert!(old_leader_legacy.load(Ordering::SeqCst) >= 1, "a leader that can't take DeleteFileById gets DeleteFile");
     }
 
     /// Regression test for the 2026-08-10 RevalidateChunkSlot fix (real ~13min

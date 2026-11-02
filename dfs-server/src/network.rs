@@ -1251,6 +1251,54 @@ impl Default for NetworkClient {
     }
 }
 
+/// Control-plane traffic (leases, heartbeats) to a peer's control port, or to its peer port
+/// when it has no control listener (a binary predating it): one that refused the control
+/// port is sent to the peer port, and retried on the control port after a minute.
+pub struct ControlPlaneClient {
+    control: Arc<NetworkClient>,
+    fallback: Arc<NetworkClient>,
+    control_down: std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>,
+}
+
+impl ControlPlaneClient {
+    const CONTROL_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new(control: Arc<NetworkClient>, fallback: Arc<NetworkClient>) -> Self {
+        Self { control, fallback, control_down: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// Production: the control port, falling back to the peer port.
+    pub fn for_peers() -> Self {
+        Self::new(Arc::new(NetworkClient::new_for_control()), Arc::new(NetworkClient::new_for_peers()))
+    }
+
+    /// Both attempts within `timeout`: a dead host's connect timeout (5 s) must not hold a
+    /// lease round or a heartbeat past it.
+    pub async fn send(&self, addr: SocketAddr, message: Message, timeout: std::time::Duration) -> Result<MessageEnvelope> {
+        let via_control = self.control_down.lock().unwrap().get(&addr).is_none_or(|t| t.elapsed() >= Self::CONTROL_RETRY);
+        let sent = tokio::time::timeout(timeout, async {
+            if !via_control {
+                return (self.fallback.send_message_timeout(addr, message, timeout).await, false);
+            }
+            match self.control.send_message_timeout(addr, message.clone(), timeout).await {
+                // A peer without a control listener (older binary) refuses the connection.
+                Err(e) if format!("{:#}", e).contains("onnect") =>
+                    (self.fallback.send_message_timeout(addr, message, timeout).await, true),
+                other => (other, false),
+            }
+        }).await;
+        match sent {
+            Ok((sent, control_refused)) => {
+                if control_refused { self.control_down.lock().unwrap().insert(addr, std::time::Instant::now()); }
+                sent
+            }
+            // Not remembered: a slow node's control port answering late is still its fastest
+            // path, and a dead one fails either way.
+            Err(_) => Err(anyhow::anyhow!("no reply within {:?}", timeout)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

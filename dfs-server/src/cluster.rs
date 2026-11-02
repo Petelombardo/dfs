@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::network::NetworkClient;
+use crate::network::ControlPlaneClient;
 use dfs_common::{ConsistentHashRing, NodeId, NodeInfo, NodeStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,9 +50,16 @@ pub struct ClusterManager {
     /// Node failure timeout in seconds
     failure_timeout: u64,
 
-    /// Shared connection pool for heartbeat messages — reuses persistent
-    /// inter-node TCP connections instead of opening a new one per heartbeat.
-    client: Arc<NetworkClient>,
+    /// Heartbeats go to peers' control ports (ControlPlaneClient): on the peer port they
+    /// queued behind data RPCs on a busy node. Persistent connections, not one per heartbeat.
+    client: Arc<ControlPlaneClient>,
+
+    /// The control-plane runtime (main.rs) the heartbeat sender and failure detector run on:
+    /// on the main runtime of a slow node (G8 soak 11-01, server2: 2 cores, 70% iowait)
+    /// they ran seconds late, and so did the receipt of peers' heartbeats, so the node and
+    /// its peers flapped each other Suspected (a 15 s leader blip failed a create). Unset
+    /// (tests) they run on the caller's runtime.
+    control_rt: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
 
     /// Fired whenever any peer node transitions to Online (recovered or newly joined).
     /// Listeners use this to trigger proactive sync without polling.
@@ -231,7 +238,8 @@ impl ClusterManager {
             became_leader_drain_notify: Arc::new(Notify::new()),
             held_locations_synced: Arc::new(std::sync::Mutex::new(None)),
             holder_locations_ready: Arc::new(tokio::sync::watch::channel(u64::MAX).0),
-            client: Arc::new(NetworkClient::new_for_peers()),
+            client: Arc::new(ControlPlaneClient::for_peers()),
+            control_rt: Arc::new(std::sync::OnceLock::new()),
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compaction_intents: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1161,12 +1169,26 @@ impl ClusterManager {
         );
     }
 
+    /// Run the heartbeat sender and failure detector on `rt` (the control plane); call before
+    /// starting them.
+    pub fn set_control_runtime(&self, rt: tokio::runtime::Handle) {
+        let _ = self.control_rt.set(rt);
+    }
+
+    fn spawn_control<F: std::future::Future<Output = ()> + Send + 'static>(&self, f: F) {
+        match self.control_rt.get() {
+            Some(rt) => { rt.spawn(f); }
+            None => { tokio::spawn(f); }
+        }
+    }
+
     /// Start background task to check for failed nodes
     pub async fn start_failure_detector(self: Arc<Self>) {
-        let mut check_interval = interval(Duration::from_secs(self.heartbeat_interval));
-        let mut cleanup_counter = 0;
-
-        tokio::spawn(async move {
+        // Each timer is made inside its task: a timer belongs to the runtime it is created on,
+        // and fires only while that runtime's workers do.
+        self.clone().spawn_control(async move {
+            let mut check_interval = interval(Duration::from_secs(self.heartbeat_interval));
+            let mut cleanup_counter = 0;
             loop {
                 check_interval.tick().await;
 
@@ -1188,10 +1210,9 @@ impl ClusterManager {
 
     /// Start background task to send heartbeats to all nodes
     pub async fn start_heartbeat_sender(self: Arc<Self>) {
-        let mut heartbeat_interval = interval(Duration::from_secs(self.heartbeat_interval));
-        let mut probe_counter = 0u32;
-
-        tokio::spawn(async move {
+        self.clone().spawn_control(async move {
+            let mut heartbeat_interval = interval(Duration::from_secs(self.heartbeat_interval));
+            let mut probe_counter = 0u32;
             let rtt_window = std::time::Duration::from_secs(
                 std::env::var("DFS_PEER_RTT_LOG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
             );
@@ -1334,11 +1355,8 @@ impl ClusterManager {
             tokio::spawn(async move {
                 let _in_flight = in_flight;
                 let started = std::time::Instant::now();
-                let result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    client.send_message(target_addr, heartbeat),
-                ).await;
-                let failed = matches!(result, Err(_) | Ok(Err(_)));
+                let result = client.send(target_addr, heartbeat, Duration::from_secs(5)).await;
+                let failed = result.is_err();
                 if !is_probe {
                     let mut rtt = peer_rtt.lock().unwrap();
                     let r = rtt.entry(target_addr).or_default();
@@ -1350,11 +1368,7 @@ impl ClusterManager {
                     }
                 }
                 if failed {
-                    let reason = match &result {
-                        Err(_) => "timeout".to_string(),
-                        Ok(Err(e)) => e.to_string(),
-                        Ok(Ok(_)) => unreachable!(),
-                    };
+                    let reason = result.err().map(|e| e.to_string()).unwrap_or_default();
                     if is_probe {
                         debug!("Recovery probe to failed node {} unreachable: {}", target_addr, reason);
                     } else {

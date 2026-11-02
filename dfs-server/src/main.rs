@@ -300,6 +300,19 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.rebuild_chunk_map_from_metadata();
     info!("✓ Chunk map rebuild started (background)");
 
+    // Leases, heartbeats and the failure detector on their own runtime and port
+    // (network::CONTROL_PORT_OFFSET): on a slow node the main runtime stalled for seconds and
+    // the 3 s leases lapsed with it, and peers' heartbeats went unrecorded (G8 soak 11-01).
+    // It stays up through a planned compaction (only the client and peer listeners close).
+    // Leaked: a runtime dropped inside this async main would panic.
+    let control_runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("dfs-ctl")
+        .enable_all()
+        .build()?));
+    lease::install_control_runtime(control_runtime.handle().clone());
+    server.cluster().set_control_runtime(control_runtime.handle().clone());
+
     // Start failure detector
     server.cluster().start_failure_detector().await;
     info!("✓ Failure detector started");
@@ -437,18 +450,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ).peer_listener();
     server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
 
-    // Leases on their own runtime and port (network::CONTROL_PORT_OFFSET): on a slow node the
-    // main runtime stalled for seconds and the 3 s leases lapsed with it (G8 soak 11-01). It
-    // stays up through a planned compaction (only the client and peer listeners close).
-    // Leaked: a runtime dropped inside this async main would panic.
-    let control_runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("dfs-ctl")
-        .enable_all()
-        .build()?));
-    lease::install_control_runtime(control_runtime.handle().clone());
+    // The control listener (leases, heartbeats; see the control runtime above).
     let mut control_net_server = network::NetworkServer::new(
-        network::control_port_addr(config.node.listen_addr), std::sync::Arc::new(server::ControlHandler(server.clone())), 64,
+        network::control_port_addr(config.node.listen_addr), std::sync::Arc::new(server::ControlHandler::new(server.clone(), tokio::runtime::Handle::current())), 64,
     ).peer_listener();
     control_runtime.spawn(async move {
         if let Err(e) = control_net_server.start().await {

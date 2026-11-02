@@ -25517,7 +25517,8 @@ mod tests {
         let s = server.clone();
         main_rt.spawn(async move { NetworkServer::new(peer_addr, s, 16).start().await.ok(); });
         let s = server.clone();
-        ctl_rt.spawn(async move { NetworkServer::new(ctl_addr, Arc::new(ControlHandler(s)), 16).start().await.ok(); });
+        let main = main_rt.handle().clone();
+        ctl_rt.spawn(async move { NetworkServer::new(ctl_addr, Arc::new(ControlHandler::new(s, main)), 16).start().await.ok(); });
         std::thread::sleep(std::time::Duration::from_millis(300));
         let renew = |addr: SocketAddr| client_rt.block_on(async move {
             let started = std::time::Instant::now();
@@ -25540,6 +25541,98 @@ mod tests {
         assert!(peer_took >= std::time::Duration::from_millis(1500),
             "precondition: the same renewal through the stalled main runtime waits ({:?})", peer_took);
         main_rt.block_on(async move { drop(server) });
+    }
+
+    /// G8 soak 11-01 (soak #9): on the slow server2, peers' heartbeats waited behind its stalled
+    /// main runtime (round trips up to 5.8 s), so it saw them go silent and flapped them
+    /// Suspected, and they saw its own heartbeats arrive late (a 15 s leader blip failed a
+    /// create). The control listener records a heartbeat whatever the main runtime is doing.
+    #[test]
+    fn a_heartbeat_is_recorded_while_the_main_runtime_is_stalled() {
+        use crate::network::NetworkServer;
+        let main_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let ctl_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let client_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let OverlayTestHarness { server, _temp_storage, _temp_metadata, _temp_metadata_dir, .. } =
+            main_rt.block_on(async { make_overlay_test_harness() });
+        let server = Arc::new(server);
+        let ctl_addr: SocketAddr = "127.0.0.1:19484".parse().unwrap();
+        let (s, main) = (server.clone(), main_rt.handle().clone());
+        ctl_rt.spawn(async move { NetworkServer::new(ctl_addr, Arc::new(ControlHandler::new(s, main)), 16).start().await.ok(); });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let peer = dfs_common::NodeInfo::new(NodeId::new(), "127.0.0.1:19485".parse().unwrap(), None);
+        let heartbeat = |peer: dfs_common::NodeInfo| client_rt.block_on(async move {
+            let started = std::time::Instant::now();
+            let r = NetworkClient::new().send_message_timeout(ctl_addr,
+                Message::Cluster(ClusterMessage::Heartbeat { node_info: peer, cluster_view: vec![], heal_bandwidth_target_mb: None }),
+                std::time::Duration::from_secs(10)).await;
+            (started.elapsed(), r.map(|env| matches!(env.message, Message::Response(Response::Ok { .. }))).unwrap_or(false))
+        });
+
+        // Every main-runtime worker blocked for 3 s, as a slow disk's synchronous I/O does.
+        for _ in 0..2 {
+            main_rt.spawn(async { std::thread::sleep(std::time::Duration::from_secs(3)); });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (took, ok) = heartbeat(peer.clone());
+        assert!(ok && took < std::time::Duration::from_millis(500),
+            "BUG: a heartbeat took {:?} (ok {}) while the main runtime was stalled", took, ok);
+        let seen = client_rt.block_on(server.cluster.get_node(&peer.id));
+        assert!(seen.is_some_and(|n| n.status == dfs_common::NodeStatus::Online),
+            "BUG: the heartbeat answered but its sender was not recorded Online");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        main_rt.block_on(async move { drop(server) });
+    }
+
+    /// The sending side of the same stall (soak #9): server2's heartbeat sender ran on its
+    /// main runtime, so its heartbeats went out seconds late and its peers suspected it. The
+    /// sender runs on the control runtime and keeps its interval through a main-runtime stall.
+    #[test]
+    fn heartbeats_keep_going_out_while_the_main_runtime_is_stalled() {
+        use crate::network::NetworkServer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        impl MessageHandler for Counting {
+            fn handle_request(&self, _r: Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async { Response::Pong })
+            }
+            fn handle_cluster_message(&self, m: ClusterMessage) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                if matches!(m, ClusterMessage::Heartbeat { .. }) { self.0.fetch_add(1, Ordering::SeqCst); }
+                Box::pin(async { Response::Ok { data: None } })
+            }
+        }
+        let main_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let ctl_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let peer_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:9486".parse().unwrap();
+        let got = Arc::new(AtomicUsize::new(0));
+        // The peer answers on both its control port and its peer port.
+        for addr in [crate::network::control_port_addr(peer_addr), crate::network::peer_port_addr(peer_addr)] {
+            let got = got.clone();
+            peer_rt.spawn(async move { NetworkServer::new(addr, Arc::new(Counting(got)), 16).start().await.ok(); });
+        }
+        let cluster = Arc::new(ClusterManager::new(NodeId::new(), "127.0.0.1:9487".parse().unwrap(), 1, 30));
+        cluster.set_control_runtime(ctl_rt.handle().clone());
+        main_rt.block_on(async {
+            cluster.add_node(dfs_common::NodeInfo::new(NodeId::new(), peer_addr, None)).await.unwrap();
+            cluster.clone().start_heartbeat_sender().await;
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(got.load(Ordering::SeqCst) > 0, "setup: the peer receives heartbeats");
+
+        for _ in 0..2 {
+            main_rt.spawn(async { std::thread::sleep(std::time::Duration::from_secs(4)); });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let before = got.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let during = got.load(Ordering::SeqCst) - before;
+        assert!(during >= 2,
+            "BUG: {} heartbeat(s) went out in 3.5 s of a main-runtime stall (interval 1 s)", during);
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
     /// G8 soak 11-02 (soak #10): the leader, SIGKILLed during a delete, came back and led
@@ -33459,10 +33552,29 @@ mod tests {
     }
 }
 
+/// What a heartbeat leaves for the main runtime once its liveness is recorded
+/// (Server::record_heartbeat): persisting a newly met peer, and the leader's heal rate.
+struct HeartbeatFollowUp {
+    sender_id: NodeId,
+    persist_peers: bool,
+    heal_bandwidth_target_mb: Option<usize>,
+}
+
 /// Implement MessageHandler trait for Server
 /// The control listener's handler (network::CONTROL_PORT_OFFSET): lease renewals and expiry
-/// votes go straight to the lease runtime, nothing else is served. Runs on the control runtime.
-pub struct ControlHandler(pub Arc<Server>);
+/// votes go straight to the lease runtime, and a heartbeat's liveness is recorded here; its
+/// follow-up (Server::apply_heartbeat_follow_up) is handed to `main`. Nothing else is served.
+/// Runs on the control runtime.
+pub struct ControlHandler {
+    server: Arc<Server>,
+    main: tokio::runtime::Handle,
+}
+
+impl ControlHandler {
+    pub fn new(server: Arc<Server>, main: tokio::runtime::Handle) -> Self {
+        Self { server, main }
+    }
+}
 
 impl MessageHandler for ControlHandler {
     fn handle_request(
@@ -33471,11 +33583,11 @@ impl MessageHandler for ControlHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
             match request {
-                Request::RenewNodeLease { node, incarnation } => self.0.lease.handle_renew(node, incarnation),
-                Request::VoteLeaseExpired { target, incarnation } => self.0.lease.handle_vote(target, incarnation).await,
+                Request::RenewNodeLease { node, incarnation } => self.server.lease.handle_renew(node, incarnation),
+                Request::VoteLeaseExpired { target, incarnation } => self.server.lease.handle_vote(target, incarnation).await,
                 Request::Ping => Response::Pong,
                 _ => Response::Error {
-                    message: "the control port serves lease requests only".into(),
+                    message: "the control port serves leases and heartbeats only".into(),
                     code: ErrorCode::InvalidRequest,
                 },
             }
@@ -33484,10 +33596,22 @@ impl MessageHandler for ControlHandler {
 
     fn handle_cluster_message(
         &self,
-        _message: ClusterMessage,
+        message: ClusterMessage,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
-            Response::Error { message: "the control port serves lease requests only".into(), code: ErrorCode::InvalidRequest }
+            match message {
+                ClusterMessage::Heartbeat { node_info, cluster_view, heal_bandwidth_target_mb } => {
+                    self.server.rpc_class_counts.record(crate::stats::RpcClass::PeerGossip);
+                    let follow_up = self.server.record_heartbeat(node_info, cluster_view, heal_bandwidth_target_mb).await;
+                    let server = self.server.clone();
+                    self.main.spawn(async move { server.apply_heartbeat_follow_up(follow_up).await });
+                    Response::Ok { data: None }
+                }
+                _ => Response::Error {
+                    message: "the control port serves leases and heartbeats only".into(),
+                    code: ErrorCode::InvalidRequest,
+                },
+            }
         })
     }
 }
@@ -33576,75 +33700,8 @@ impl MessageHandler for Server {
             // Handle cluster messages (heartbeat, join, leave, etc.)
             match message {
                 ClusterMessage::Heartbeat { node_info, cluster_view, heal_bandwidth_target_mb } => {
-                    let sender_id = node_info.id;
-                    debug!("Received heartbeat from {} with {} gossip entries",
-                           node_info.id, cluster_view.len());
-
-                    // Record the sender's self-reported disk capacity before add_node
-                    // consumes node_info. Guard on total_bytes > 0 — a peer that hasn't
-                    // completed its own first capacity refresh yet sends zeros, and
-                    // recording that would make get_nodes_with_capacity_awareness treat
-                    // it as 100% full (immediate veto) instead of falling through to the
-                    // "never seen" 1TB/2TB default it should keep getting until the peer
-                    // actually has a real number to report.
-                    if node_info.total_bytes > 0 {
-                        self.cluster.update_node_capacity(
-                            node_info.id, node_info.available_bytes, node_info.total_bytes,
-                        ).await;
-                    }
-
-                    // Re-add the sender unconditionally. This handles nodes that were
-                    // purged after a long failure — update_heartbeat silently no-ops when
-                    // the node isn't in the map, causing permanent split-brain.
-                    // add_node is idempotent: it updates existing entries and inserts new ones.
-                    let already_known = self.cluster.get_node(&sender_id).await.is_some();
-                    if let Err(e) = self.cluster.add_node(node_info).await {
-                        warn!("Failed to add/update heartbeat node: {}", e);
-                    }
-                    // A restarted node (empty peer memory, e.g. no seed_nodes/peers.json)
-                    // is often first re-discovered through a peer just resuming its normal
-                    // Heartbeat broadcast, not a fresh Join/JoinRequest — the sender never
-                    // stopped considering us known, so it never re-announces. Without this,
-                    // that first-contact-via-heartbeat case never gets persisted, and a node
-                    // that keeps losing its peers.json on every restart keeps starting from
-                    // zero every time even though its peers are right there heartbeating at it.
-                    if !already_known {
-                        self.persist_peer_list().await;
-                    }
-                    // add_node just wrote whatever last_heartbeat the sender's NodeInfo
-                    // carried, stamped by the sender's own clock — not ours. A heartbeat
-                    // literally just arrived, so re-stamp with our own clock: trusting a
-                    // remote clock for local liveness bookkeeping means a node with a
-                    // skewed clock (NTP broken, wrong hardware clock, etc.) looks
-                    // perpetually stale to everyone else no matter how often it actually
-                    // sends heartbeats — it oscillates Online/Suspected forever instead of
-                    // settling, and each false "recovery" fires node_recovered_notify,
-                    // triggering full inventory re-pushes and reconciliation cluster-wide.
-                    let _ = self.cluster.update_heartbeat(&sender_id).await;
-
-                    // Merge cluster view gossip if present
-                    if !cluster_view.is_empty() {
-                        if let Err(e) = self.cluster.merge_cluster_gossip(cluster_view).await {
-                            warn!("Failed to merge cluster gossip: {}", e);
-                        }
-                    }
-
-                    // Apply the sender's heal bandwidth target if they're the leader —
-                    // our own pending_healing is always empty unless we're leader, so
-                    // this is the only accurate queue-depth-driven signal we can get.
-                    if let Some(target_mb) = heal_bandwidth_target_mb {
-                        let sender_is_leader = self.cluster.is_leader_id(sender_id).await;
-                        debug!(
-                            "heartbeat from {} carried heal_bandwidth_target_mb={} sender_is_leader={}",
-                            sender_id, target_mb, sender_is_leader
-                        );
-                        if sender_is_leader {
-                            if let Some(healing) = self.healing.read().await.as_ref() {
-                                healing.apply_external_bandwidth_target(target_mb).await;
-                            }
-                        }
-                    }
-
+                    let follow_up = self.record_heartbeat(node_info, cluster_view, heal_bandwidth_target_mb).await;
+                    self.apply_heartbeat_follow_up(follow_up).await;
                     Response::Ok { data: None }
                 }
                 ClusterMessage::Join { node_info } => {
@@ -33809,7 +33866,92 @@ fn count_close_wait_connections(port: u16) -> usize {
     count
 }
 
+
 impl Server {
+    /// The liveness half of a peer's heartbeat, all in memory: served on the control plane
+    /// (ControlHandler) so a stalled main runtime neither delays the reply nor leaves the
+    /// sender looking silent. What touches disk or the healer comes back as a follow-up.
+    async fn record_heartbeat(
+        &self,
+        node_info: dfs_common::NodeInfo,
+        cluster_view: Vec<dfs_common::NodeHealthGossip>,
+        heal_bandwidth_target_mb: Option<usize>,
+    ) -> HeartbeatFollowUp {
+        let sender_id = node_info.id;
+        debug!("Received heartbeat from {} with {} gossip entries",
+               node_info.id, cluster_view.len());
+
+        // Record the sender's self-reported disk capacity before add_node
+        // consumes node_info. Guard on total_bytes > 0 — a peer that hasn't
+        // completed its own first capacity refresh yet sends zeros, and
+        // recording that would make get_nodes_with_capacity_awareness treat
+        // it as 100% full (immediate veto) instead of falling through to the
+        // "never seen" 1TB/2TB default it should keep getting until the peer
+        // actually has a real number to report.
+        if node_info.total_bytes > 0 {
+            self.cluster.update_node_capacity(
+                node_info.id, node_info.available_bytes, node_info.total_bytes,
+            ).await;
+        }
+
+        // Re-add the sender unconditionally. This handles nodes that were
+        // purged after a long failure — update_heartbeat silently no-ops when
+        // the node isn't in the map, causing permanent split-brain.
+        // add_node is idempotent: it updates existing entries and inserts new ones.
+        let already_known = self.cluster.get_node(&sender_id).await.is_some();
+        if let Err(e) = self.cluster.add_node(node_info).await {
+            warn!("Failed to add/update heartbeat node: {}", e);
+        }
+        // add_node just wrote whatever last_heartbeat the sender's NodeInfo
+        // carried, stamped by the sender's own clock — not ours. A heartbeat
+        // literally just arrived, so re-stamp with our own clock: trusting a
+        // remote clock for local liveness bookkeeping means a node with a
+        // skewed clock (NTP broken, wrong hardware clock, etc.) looks
+        // perpetually stale to everyone else no matter how often it actually
+        // sends heartbeats — it oscillates Online/Suspected forever instead of
+        // settling, and each false "recovery" fires node_recovered_notify,
+        // triggering full inventory re-pushes and reconciliation cluster-wide.
+        let _ = self.cluster.update_heartbeat(&sender_id).await;
+
+        // Merge cluster view gossip if present
+        if !cluster_view.is_empty() {
+            if let Err(e) = self.cluster.merge_cluster_gossip(cluster_view).await {
+                warn!("Failed to merge cluster gossip: {}", e);
+            }
+        }
+
+        HeartbeatFollowUp { sender_id, persist_peers: !already_known, heal_bandwidth_target_mb }
+    }
+
+    async fn apply_heartbeat_follow_up(&self, f: HeartbeatFollowUp) {
+        let HeartbeatFollowUp { sender_id, persist_peers, heal_bandwidth_target_mb } = f;
+        // A restarted node (empty peer memory, e.g. no seed_nodes/peers.json)
+        // is often first re-discovered through a peer just resuming its normal
+        // Heartbeat broadcast, not a fresh Join/JoinRequest — the sender never
+        // stopped considering us known, so it never re-announces. Without this,
+        // that first-contact-via-heartbeat case never gets persisted, and a node
+        // that keeps losing its peers.json on every restart keeps starting from
+        // zero every time even though its peers are right there heartbeating at it.
+        if persist_peers {
+            self.persist_peer_list().await;
+        }
+        // Apply the sender's heal bandwidth target if they're the leader —
+        // our own pending_healing is always empty unless we're leader, so
+        // this is the only accurate queue-depth-driven signal we can get.
+        if let Some(target_mb) = heal_bandwidth_target_mb {
+            let sender_is_leader = self.cluster.is_leader_id(sender_id).await;
+            debug!(
+                "heartbeat from {} carried heal_bandwidth_target_mb={} sender_is_leader={}",
+                sender_id, target_mb, sender_is_leader
+            );
+            if sender_is_leader {
+                if let Some(healing) = self.healing.read().await.as_ref() {
+                    healing.apply_external_bandwidth_target(target_mb).await;
+                }
+            }
+        }
+    }
+
     /// Persist the current peer set to disk. Lives next to config.toml, not under
     /// metadata_dir, so a data/metadata format/reset doesn't also erase this node's
     /// memory of the cluster it belongs to.

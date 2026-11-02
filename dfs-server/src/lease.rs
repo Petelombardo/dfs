@@ -313,7 +313,7 @@ impl MembershipFile {
 // ---------------------------------------------------------------------------
 
 use crate::cluster::ClusterManager;
-use crate::network::NetworkClient;
+use crate::network::{ControlPlaneClient, NetworkClient};
 use dfs_common::{LeaseStatusReport, Message, Request, Response};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -327,11 +327,8 @@ pub struct LeaseRuntime {
     cfg: LeaseConfig,
     me: NodeId,
     cluster: Arc<ClusterManager>,
-    client: Arc<NetworkClient>,
-    /// Peer-port client for a node with no control listener (a binary predating it): one that
-    /// refused the control port is sent here, and retried on it after a minute.
-    fallback: Arc<NetworkClient>,
-    control_down: Mutex<HashMap<std::net::SocketAddr, Instant>>,
+    /// The control port, or the peer port of a node without one (see ControlPlaneClient).
+    client: ControlPlaneClient,
     state_file: LeaseStateFile,
     membership_file: MembershipFile,
     holder: Mutex<HolderState>,
@@ -391,9 +388,7 @@ impl LeaseRuntime {
             cfg: LeaseConfig::from_env(),
             me,
             cluster,
-            client,
-            fallback: Arc::new(NetworkClient::new_for_peers()),
-            control_down: Mutex::new(HashMap::new()),
+            client: ControlPlaneClient::new(client, Arc::new(NetworkClient::new_for_peers())),
             state_file,
             membership_file,
             holder: Mutex::new(HolderState::new(durable.incarnation)),
@@ -481,36 +476,11 @@ impl LeaseRuntime {
 
     async fn ask_all(&self, peers: &[(NodeId, std::net::SocketAddr)], req: Request) -> Vec<(NodeId, Response)> {
         let timeout = self.cfg.renew_every();
-        const CONTROL_RETRY: Duration = Duration::from_secs(60);
         let calls = peers.iter().map(|(id, addr)| {
-            let client = self.client.clone();
-            let fallback = self.fallback.clone();
             let req = req.clone();
             let (id, addr) = (*id, *addr);
-            let via_control = self.control_down.lock().unwrap().get(&addr).is_none_or(|t| t.elapsed() >= CONTROL_RETRY);
             async move {
-                // Both attempts within the round's own timeout: a dead host's connect timeout
-                // (5 s) must not hold the round past the lease.
-                let sent = tokio::time::timeout(timeout, async {
-                    if !via_control {
-                        return (fallback.send_message_timeout(addr, Message::Request(req), timeout).await, false);
-                    }
-                    match client.send_message_timeout(addr, Message::Request(req.clone()), timeout).await {
-                        // A peer without a control listener (older binary) refuses the connection.
-                        Err(e) if format!("{:#}", e).contains("onnect") =>
-                            (fallback.send_message_timeout(addr, Message::Request(req), timeout).await, true),
-                        other => (other, false),
-                    }
-                }).await;
-                let sent = match sent {
-                    Ok((sent, control_refused)) => {
-                        if control_refused { self.control_down.lock().unwrap().insert(addr, Instant::now()); }
-                        sent
-                    }
-                    // Not remembered: a slow node's control port answering late is still its
-                    // fastest path, and a dead one fails either way.
-                    Err(_) => Err(anyhow::anyhow!("no reply within {:?}", timeout)),
-                };
+                let sent = self.client.send(addr, Message::Request(req), timeout).await;
                 match sent {
                     Ok(env) => match env.message {
                         Message::Response(r) => Some((id, r)),

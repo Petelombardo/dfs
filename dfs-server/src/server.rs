@@ -20135,8 +20135,11 @@ impl Server {
         // old leader, SIGKILLed during a delete, came back with the file in its FILE_TABLE,
         // led again, and a deleted recording reappeared to clients with its chunks gone (G8
         // soak 11-01, /dvr/rec_115.ts). Keep it queued until that node is back and has it.
+        // Leaving counts too: a node steps aside for a planned compaction and comes back (G8
+        // soak 11-01: rec_492 drained by the 1.3 s interim leader while the leader compacted).
+        // One that leaves for good is removed (RemoveNode) and no longer listed.
         let down: Vec<NodeId> = nodes.iter()
-            .filter(|n| n.id != local_id && matches!(n.status, dfs_common::NodeStatus::Suspected | dfs_common::NodeStatus::Failed))
+            .filter(|n| n.id != local_id && n.status != dfs_common::NodeStatus::Online)
             .map(|n| n.id)
             .collect();
         if !down.is_empty() {
@@ -25509,6 +25512,20 @@ mod tests {
         h.server.drain_one_delete(entry).await;
         assert!(h.metadata.get_all_pending_deletes().unwrap().iter().any(|e| e.file_id == file_meta.id),
             "BUG: the delete was cleared from the queue while a known node that never got it was down");
+
+        // A node stepping aside for a planned compaction (Leaving) comes back the same way
+        // (soak #9: rec_492 came back after the leader's compaction step-aside).
+        let h = make_overlay_test_harness();
+        let mut compacting = NodeInfo::new(NodeId::new(), "127.0.0.1:19472".parse().unwrap(), None);
+        compacting.status = dfs_common::NodeStatus::Leaving;
+        h.server.cluster().add_node(compacting).await.unwrap();
+        let file_meta = dfs_common::FileMetadata::new("/dvr/rec_492.ts".to_string(), dfs_common::types::FileType::RegularFile);
+        h.metadata.put_file(&file_meta).unwrap();
+        let entry = dfs_common::DeleteQueueEntry { file_id: file_meta.id, path: file_meta.path.clone(), chunk_ids: vec![] };
+        h.metadata.enqueue_delete(&entry).unwrap();
+        h.server.drain_one_delete(entry).await;
+        assert!(h.metadata.get_all_pending_deletes().unwrap().iter().any(|e| e.file_id == file_meta.id),
+            "BUG: the delete was cleared while a node stepping aside for compaction never got it");
     }
 
     /// G8 soak 10-31: fio deleted and re-created /vm/disk.raw; the client's delete reached

@@ -6011,7 +6011,7 @@ impl Server {
             ))));
 
         let lease = Arc::new(crate::lease::LeaseRuntime::new(
-            cluster.local_node_id(), cluster.clone(), Arc::new(NetworkClient::new_for_peers()), &metadata_dir,
+            cluster.local_node_id(), cluster.clone(), Arc::new(NetworkClient::new_for_control()), &metadata_dir,
         ));
         // Leadership skips a peer a majority voted expired (see `lease_expired_probe`). Weak:
         // the lease runtime holds the cluster manager.
@@ -19991,10 +19991,14 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             let mut was_leader = false;
+            // A node that becomes leader merges the peers' queues at once: its own copy of a
+            // file deleted while it was down is served until it does (G8 soak 11-02: 18 s).
+            let became_leader = server.cluster.became_leader_drain_notify.clone();
             loop {
-                // Wait for a notify (new delete enqueued) or periodic poll.
+                // Wait for a notify (new delete enqueued, or leadership) or periodic poll.
                 tokio::select! {
                     _ = server.delete_drain_notify.notified() => {}
+                    _ = became_leader.notified() => {}
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {}
                 }
 
@@ -25491,6 +25495,75 @@ mod tests {
             "a deleted file must leave no dirty slot behind for the fold sweep to fold");
         assert!(!h.server.chunk_patch_locks.iter().any(|e| e.key().0 == dead));
         assert!(h.server.dirty_patch_slots.contains_key(&(other, 0)), "other files' slots are untouched");
+    }
+
+    /// G8 soak 11-01/02 (soak #9): on the slow 2-core server2 (70% iowait) the main runtime
+    /// stalled for seconds (heartbeat round trips up to 5.8 s), and lease renewals and votes,
+    /// served there, waited with it: its 3 s lease lapsed ~3,700 times, and while another node
+    /// was down the survivors needed its late acks and lost theirs (an ordered write then ran
+    /// out its outage budget: qcow2 EIO). The control listener answers lease requests on its
+    /// own runtime, whatever the main runtime is doing.
+    #[test]
+    fn lease_requests_are_answered_while_the_main_runtime_is_stalled() {
+        use crate::network::NetworkServer;
+        let main_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let ctl_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let client_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let OverlayTestHarness { server, _temp_storage, _temp_metadata, _temp_metadata_dir, .. } =
+            main_rt.block_on(async { make_overlay_test_harness() });
+        let server = Arc::new(server);
+        let peer_addr: SocketAddr = "127.0.0.1:19481".parse().unwrap();
+        let ctl_addr: SocketAddr = "127.0.0.1:19482".parse().unwrap();
+        let s = server.clone();
+        main_rt.spawn(async move { NetworkServer::new(peer_addr, s, 16).start().await.ok(); });
+        let s = server.clone();
+        ctl_rt.spawn(async move { NetworkServer::new(ctl_addr, Arc::new(ControlHandler(s)), 16).start().await.ok(); });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let renew = |addr: SocketAddr| client_rt.block_on(async move {
+            let started = std::time::Instant::now();
+            let r = NetworkClient::new().send_message_timeout(addr,
+                Message::Request(Request::RenewNodeLease { node: NodeId::new(), incarnation: 1 }),
+                std::time::Duration::from_secs(10)).await;
+            (started.elapsed(), r.map(|env| matches!(env.message, Message::Response(Response::LeaseAck { .. }))).unwrap_or(false))
+        });
+        assert!(renew(ctl_addr).1 && renew(peer_addr).1, "setup: both listeners answer a renewal");
+
+        // Every main-runtime worker blocked for 3 s, as a slow disk's synchronous I/O does.
+        for _ in 0..2 {
+            main_rt.spawn(async { std::thread::sleep(std::time::Duration::from_secs(3)); });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (took, acked) = renew(ctl_addr);
+        assert!(acked && took < std::time::Duration::from_millis(500),
+            "BUG: a lease renewal took {:?} (acked {}) while the main runtime was stalled", took, acked);
+        let (peer_took, _) = renew(peer_addr);
+        assert!(peer_took >= std::time::Duration::from_millis(1500),
+            "precondition: the same renewal through the stalled main runtime waits ({:?})", peer_took);
+        main_rt.block_on(async move { drop(server) });
+    }
+
+    /// G8 soak 11-02 (soak #10): the leader, SIGKILLed during a delete, came back and led
+    /// again at 15:59:41; its drain loop only woke on its 30 s tick, merged the peers' queued
+    /// delete at 15:59:59, and for those 18 s it served the deleted /dvr/rec_16.ts to clients.
+    /// A node that becomes leader merges and applies the queued deletes at once.
+    #[tokio::test]
+    async fn a_new_leader_applies_queued_deletes_at_once() {
+        let h = make_overlay_test_harness();
+        let server = Arc::new(h.server);
+        server.clone().start_delete_drain_loop();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let file_meta = dfs_common::FileMetadata::new("/dvr/rec_16.ts".to_string(), dfs_common::types::FileType::RegularFile);
+        h.metadata.put_file(&file_meta).unwrap();
+        h.metadata.enqueue_delete(&dfs_common::DeleteQueueEntry {
+            file_id: file_meta.id, path: file_meta.path.clone(), chunk_ids: vec![],
+        }).unwrap();
+        assert!(server.cluster.is_leader().await, "setup: a lone node leads");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while h.metadata.get_file_by_path(&file_meta.path).unwrap().is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(h.metadata.get_file_by_path(&file_meta.path).unwrap().is_none(),
+            "BUG: the new leader still serves a file whose delete was queued (it waits for its 30 s drain tick)");
     }
 
     /// G8 soak 11-01 (soak #8): /dvr/rec_115.ts was deleted while the leader was SIGKILLed.
@@ -33387,6 +33460,38 @@ mod tests {
 }
 
 /// Implement MessageHandler trait for Server
+/// The control listener's handler (network::CONTROL_PORT_OFFSET): lease renewals and expiry
+/// votes go straight to the lease runtime, nothing else is served. Runs on the control runtime.
+pub struct ControlHandler(pub Arc<Server>);
+
+impl MessageHandler for ControlHandler {
+    fn handle_request(
+        &self,
+        request: Request,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            match request {
+                Request::RenewNodeLease { node, incarnation } => self.0.lease.handle_renew(node, incarnation),
+                Request::VoteLeaseExpired { target, incarnation } => self.0.lease.handle_vote(target, incarnation).await,
+                Request::Ping => Response::Pong,
+                _ => Response::Error {
+                    message: "the control port serves lease requests only".into(),
+                    code: ErrorCode::InvalidRequest,
+                },
+            }
+        })
+    }
+
+    fn handle_cluster_message(
+        &self,
+        _message: ClusterMessage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            Response::Error { message: "the control port serves lease requests only".into(), code: ErrorCode::InvalidRequest }
+        })
+    }
+}
+
 impl MessageHandler for Server {
     fn handle_request(
         &self,

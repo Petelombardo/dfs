@@ -117,6 +117,8 @@ pub struct ClusterManager {
     /// (u64::MAX: never). Woken through `became_leader_notify`.
     leading_since: Arc<std::sync::atomic::AtomicU64>,
     pub became_leader_notify: Arc<Notify>,
+    /// Woken with `became_leader_notify`, for the delete drain (a Notify wakes one waiter).
+    pub became_leader_drain_notify: Arc<Notify>,
     /// The leader this node last pushed its held locations to on request
     /// (`Request::SyncHeldLocations`), and when: chunk_location_sync skips the same push.
     pub held_locations_synced: Arc<std::sync::Mutex<Option<(SocketAddr, std::time::Instant)>>>,
@@ -226,6 +228,7 @@ impl ClusterManager {
             leader_changed_notify: Arc::new(Notify::new()),
             leading_since: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             became_leader_notify: Arc::new(Notify::new()),
+            became_leader_drain_notify: Arc::new(Notify::new()),
             held_locations_synced: Arc::new(std::sync::Mutex::new(None)),
             holder_locations_ready: Arc::new(tokio::sync::watch::channel(u64::MAX).0),
             client: Arc::new(NetworkClient::new_for_peers()),
@@ -495,6 +498,7 @@ impl ClusterManager {
             if leader == Some(self.local_node_id) && !was_self {
                 self.leading_since.store(generation, std::sync::atomic::Ordering::Relaxed);
                 self.became_leader_notify.notify_one();
+                self.became_leader_drain_notify.notify_one();
             }
             self.leader_changed_notify.notify_one();
         }

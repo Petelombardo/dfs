@@ -71,8 +71,9 @@ dvr)
         res=$(python3 - "$f" <<'PY'
 import hashlib, os, sys, time
 path = sys.argv[1]; h = hashlib.md5(); blk = 188 * 1024; total = 512 * 1024 * 1024
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644); n = 0; t0 = last = time.time()
+n = 0; t0 = last = time.time()
 try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     while n < total:
         b = os.urandom(min(blk, total - n)); os.write(fd, b); h.update(b); n += len(b)
         if time.time() - last >= 5: os.fsync(fd); last = time.time()

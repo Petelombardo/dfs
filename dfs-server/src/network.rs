@@ -124,6 +124,24 @@ pub fn peer_port_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Lease traffic's own port: client port + 20,000 (28900s). Lease renewals and expiry votes
+/// sat behind data RPCs, on the same in-flight slots and the same runtime: on a slow 2-core
+/// node (G8 soak 11-01, server2: 70% iowait, heartbeat round trips up to 5.8 s) the 3 s
+/// leases lapsed thousands of times, and with another node down the survivors couldn't keep
+/// theirs either. The control listener answers lease requests only, on its own runtime.
+pub const CONTROL_PORT_OFFSET: u16 = 20_000;
+
+/// A node's control-plane address (see CONTROL_PORT_OFFSET); refuses to wrap like peer_port_addr.
+pub fn control_port_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.port().checked_add(CONTROL_PORT_OFFSET) {
+        Some(port) => SocketAddr::new(addr.ip(), port),
+        None => {
+            error!("Client port {} + CONTROL_PORT_OFFSET ({}) overflows u16 — using the peer port", addr.port(), CONTROL_PORT_OFFSET);
+            peer_port_addr(addr)
+        }
+    }
+}
+
 /// Network server for handling node-to-node communication
 /// Optimized for SBC environments (connection reuse, async I/O)
 ///
@@ -981,16 +999,15 @@ pub struct NetworkClient {
     /// queue here instead and a slow peer holds at most this many connections from each node.
     in_flight: Arc<DashMap<SocketAddr, Arc<tokio::sync::Semaphore>>>,
 
-    /// When true, every dial in send_message_inner targets peer_port_addr(target)
-    /// instead of target directly — set only for the 2 production instances that
-    /// exist purely for inter-node RPC (Server.client, ClusterManager.client; see
-    /// PEER_PORT_OFFSET's doc comment). The connection pool itself stays keyed by
-    /// the original, un-offset target — only the actual TcpStream::connect call
-    /// is redirected — so callers, logs, and existing "this is peer X's address"
-    /// reasoning are all unaffected. Plain new() (tests, any future non-peer use)
-    /// leaves this false, so test_message_framing/test_client_server need no
-    /// changes.
-    apply_peer_offset: bool,
+    /// Where every dial in send_message_inner goes for `target`: peer_port_addr for the 2
+    /// production instances that exist purely for inter-node RPC (Server.client,
+    /// ClusterManager.client; see PEER_PORT_OFFSET's doc comment), control_port_addr for the
+    /// lease client (CONTROL_PORT_OFFSET). The connection pool itself stays keyed by the
+    /// original, un-offset target — only the actual TcpStream::connect call is redirected —
+    /// so callers, logs, and existing "this is peer X's address" reasoning are all
+    /// unaffected. Plain new() (tests, any future non-peer use) dials the target itself, so
+    /// test_message_framing/test_client_server need no changes.
+    dial: fn(SocketAddr) -> SocketAddr,
 }
 
 impl NetworkClient {
@@ -1000,7 +1017,7 @@ impl NetworkClient {
             next_request_id: Arc::new(AtomicU64::new(1)),
             pool: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            apply_peer_offset: false,
+            dial: |a| a,
         }
     }
 
@@ -1014,7 +1031,18 @@ impl NetworkClient {
             next_request_id: Arc::new(AtomicU64::new(1)),
             pool: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            apply_peer_offset: true,
+            dial: peer_port_addr,
+        }
+    }
+
+    /// A client for lease traffic only, dialing peers' control port (CONTROL_PORT_OFFSET),
+    /// with its own pool and in-flight slots: a renewal never waits behind data RPCs.
+    pub fn new_for_control() -> Self {
+        Self {
+            next_request_id: Arc::new(AtomicU64::new(1)),
+            pool: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+            dial: control_port_addr,
         }
     }
 
@@ -1072,8 +1100,8 @@ impl NetworkClient {
         // pool itself stays keyed by target (the original, un-offset address) so
         // callers/logs keep reasoning about "peer X's address" unchanged; only the
         // real wire connection is redirected to the peer port for the 2 production
-        // instances built via new_for_peers() (see apply_peer_offset's doc comment).
-        let dial_addr = if self.apply_peer_offset { peer_port_addr(target) } else { target };
+        // instances built via new_for_peers() (see the `dial` field's doc comment).
+        let dial_addr = (self.dial)(target);
 
         // Try a pooled connection first; fall back to a fresh one if the pool is empty
         // or the connection has gone stale (detected by write/read failure).

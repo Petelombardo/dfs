@@ -437,6 +437,25 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ).peer_listener();
     server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
 
+    // Leases on their own runtime and port (network::CONTROL_PORT_OFFSET): on a slow node the
+    // main runtime stalled for seconds and the 3 s leases lapsed with it (G8 soak 11-01). It
+    // stays up through a planned compaction (only the client and peer listeners close).
+    // Leaked: a runtime dropped inside this async main would panic.
+    let control_runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("dfs-ctl")
+        .enable_all()
+        .build()?));
+    lease::install_control_runtime(control_runtime.handle().clone());
+    let mut control_net_server = network::NetworkServer::new(
+        network::control_port_addr(config.node.listen_addr), std::sync::Arc::new(server::ControlHandler(server.clone())), 64,
+    ).peer_listener();
+    control_runtime.spawn(async move {
+        if let Err(e) = control_net_server.start().await {
+            tracing::error!("Control listener error: {}", e);
+        }
+    });
+
     server.clone().start_conn_pressure_watchdog();
     server.clone().start_slot_audit();
     server.start_leases();

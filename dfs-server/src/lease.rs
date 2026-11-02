@@ -328,6 +328,10 @@ pub struct LeaseRuntime {
     me: NodeId,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
+    /// Peer-port client for a node with no control listener (a binary predating it): one that
+    /// refused the control port is sent here, and retried on it after a minute.
+    fallback: Arc<NetworkClient>,
+    control_down: Mutex<HashMap<std::net::SocketAddr, Instant>>,
     state_file: LeaseStateFile,
     membership_file: MembershipFile,
     holder: Mutex<HolderState>,
@@ -347,6 +351,17 @@ pub struct LeaseRuntime {
     /// votes shared the temp file: a rename found it gone and refused a grantable vote, and
     /// an older snapshot could land after a newer one, losing a granted fence (suite 1019b).
     persist_lock: tokio::sync::Mutex<()>,
+}
+
+/// The control-plane runtime the lease loop runs on, installed once at startup (main.rs). On
+/// the main runtime the loop and the lease RPCs stalled with everything else on a slow node
+/// (G8 soak 11-01, server2: 2 cores, 70% iowait, heartbeat round trips up to 5.8 s): its 3 s
+/// lease lapsed ~3,700 times, and while another node was down the survivors needed its late
+/// acks and lost theirs. Without one (tests) the loop runs wherever it is started.
+static CONTROL_RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+pub fn install_control_runtime(handle: tokio::runtime::Handle) {
+    let _ = CONTROL_RUNTIME.set(handle);
 }
 
 fn lease_trace() -> bool {
@@ -377,6 +392,8 @@ impl LeaseRuntime {
             me,
             cluster,
             client,
+            fallback: Arc::new(NetworkClient::new_for_peers()),
+            control_down: Mutex::new(HashMap::new()),
             state_file,
             membership_file,
             holder: Mutex::new(HolderState::new(durable.incarnation)),
@@ -392,9 +409,10 @@ impl LeaseRuntime {
     }
 
     pub fn start(self: Arc<Self>) {
-        info!("LEASE: started (lease {:?}, margin {:?}, majority of {})",
-            self.cfg.lease, self.cfg.margin, self.cluster_size.load(Ordering::Relaxed));
-        tokio::spawn(async move {
+        info!("LEASE: started (lease {:?}, margin {:?}, majority of {}, {})",
+            self.cfg.lease, self.cfg.margin, self.cluster_size.load(Ordering::Relaxed),
+            if CONTROL_RUNTIME.get().is_some() { "on the control runtime" } else { "on the caller's runtime" });
+        let run = async move {
             let mut tick = tokio::time::interval(self.cfg.renew_every());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -403,7 +421,11 @@ impl LeaseRuntime {
                 self.renew_round(&peers).await;
                 self.expire_silent_peers(&peers).await;
             }
-        });
+        };
+        match CONTROL_RUNTIME.get() {
+            Some(rt) => { rt.spawn(run); }
+            None => { tokio::spawn(run); }
+        }
     }
 
     /// Majority of the persisted membership high-water mark (see MembershipFile). Other
@@ -459,12 +481,37 @@ impl LeaseRuntime {
 
     async fn ask_all(&self, peers: &[(NodeId, std::net::SocketAddr)], req: Request) -> Vec<(NodeId, Response)> {
         let timeout = self.cfg.renew_every();
+        const CONTROL_RETRY: Duration = Duration::from_secs(60);
         let calls = peers.iter().map(|(id, addr)| {
             let client = self.client.clone();
+            let fallback = self.fallback.clone();
             let req = req.clone();
             let (id, addr) = (*id, *addr);
+            let via_control = self.control_down.lock().unwrap().get(&addr).is_none_or(|t| t.elapsed() >= CONTROL_RETRY);
             async move {
-                match client.send_message_timeout(addr, Message::Request(req), timeout).await {
+                // Both attempts within the round's own timeout: a dead host's connect timeout
+                // (5 s) must not hold the round past the lease.
+                let sent = tokio::time::timeout(timeout, async {
+                    if !via_control {
+                        return (fallback.send_message_timeout(addr, Message::Request(req), timeout).await, false);
+                    }
+                    match client.send_message_timeout(addr, Message::Request(req.clone()), timeout).await {
+                        // A peer without a control listener (older binary) refuses the connection.
+                        Err(e) if format!("{:#}", e).contains("onnect") =>
+                            (fallback.send_message_timeout(addr, Message::Request(req), timeout).await, true),
+                        other => (other, false),
+                    }
+                }).await;
+                let sent = match sent {
+                    Ok((sent, control_refused)) => {
+                        if control_refused { self.control_down.lock().unwrap().insert(addr, Instant::now()); }
+                        sent
+                    }
+                    // Not remembered: a slow node's control port answering late is still its
+                    // fastest path, and a dead one fails either way.
+                    Err(_) => Err(anyhow::anyhow!("no reply within {:?}", timeout)),
+                };
+                match sent {
                     Ok(env) => match env.message {
                         Message::Response(r) => Some((id, r)),
                         _ => None,

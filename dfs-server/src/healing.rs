@@ -3781,6 +3781,20 @@ impl HealingManager {
             for node_info in &online_nodes {
                 node_assigned.insert(node_info.id, every.clone());
             }
+            // A marker-shaped id is not asked of every node, but always of the holders its
+            // record lists, as on the fast pass. A real content hash starts with the marker
+            // 1 time in 65,536: G8 soak 11-02, chunk 30 of /dvr/rec_190.ts was such a fresh
+            // write, no node was asked about it, and the leader declared it DATA LOSS
+            // (0 replicas, both holders reachable) and purged its location.
+            for loc in &chunks_to_check {
+                if loc.chunk_id.looks_like_patch_token() && !slot_loser_set.contains(&loc.chunk_id) {
+                    for node_id in &loc.nodes {
+                        if all_known_node_ids.contains(node_id) {
+                            node_assigned.entry(*node_id).or_default().push(loc.chunk_id);
+                        }
+                    }
+                }
+            }
         } else {
             for loc in &chunks_to_check {
                 for node_id in &loc.nodes {
@@ -8581,6 +8595,86 @@ mod tests {
         file_meta.chunk_locations = Arc::new(vec![location.clone()]);
         metadata.put_file(&file_meta).unwrap();
         location
+    }
+
+    /// G8 soak 11-02 (soak #11): chunk 30 of /dvr/rec_190.ts was a fresh 4 MiB write whose
+    /// content hash happened to start with the patch-token marker (1 in 65,536). The deep
+    /// discovery pass asks every node about every chunk except marker-shaped ids, so no
+    /// node was asked about it at all: 0 replicas, both holders "reachable and empty", and
+    /// since it was no pending token the leader logged DATA LOSS and purged its location.
+    /// A marker-shaped id is still asked of the holders its record lists.
+    #[tokio::test]
+    async fn a_real_chunk_shaped_like_a_patch_token_is_counted_on_a_deep_pass() {
+        use crate::network::{MessageHandler, NetworkServer};
+        use dfs_common::protocol::{ClusterMessage, Request, Response};
+        /// A peer that holds every chunk it is asked about and has no pending tokens.
+        struct Holder;
+        impl MessageHandler for Holder {
+            fn handle_request(&self, r: Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move {
+                    match r {
+                        Request::HasChunks { chunk_ids } => Response::BoolVec { values: vec![true; chunk_ids.len()] },
+                        Request::GetPatchTokenIds => Response::PatchTokenIds { ids: vec![] },
+                        _ => Response::Ok { data: None },
+                    }
+                })
+            }
+            fn handle_cluster_message(&self, _m: ClusterMessage) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async { Response::Ok { data: None } })
+            }
+        }
+        let node_id = NodeId(uuid::Uuid::from_u128(1)); // the lowest id leads
+        let addr: SocketAddr = "127.0.0.1:19491".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        healing.healing_delay_secs.store(0, Ordering::Relaxed);
+        let peer = dfs_common::NodeInfo::new(NodeId(uuid::Uuid::from_u128(2)), "127.0.0.1:19492".parse().unwrap(), None);
+        let peer_addr = peer.addr;
+        tokio::spawn(async move { NetworkServer::new(peer_addr, Arc::new(Holder), 16).start().await.ok(); });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        healing.cluster.add_node(peer.clone()).await.unwrap();
+        assert!(healing.cluster.is_leader().await, "setup: this node leads");
+
+        let mut hash = compute_chunk_hash(b"a content hash that starts with df7c");
+        hash[0] = dfs_common::PATCH_TOKEN_MARKER[0];
+        hash[1] = dfs_common::PATCH_TOKEN_MARKER[1];
+        let chunk_id = ChunkId::from_hash(hash);
+        assert!(chunk_id.looks_like_patch_token(), "setup: the id is marker-shaped");
+        // Held by the peer only, as rec_190's chunk 30 was held by two non-leaders.
+        let mut file_meta = FileMetadata::new("/dvr/rec_190.ts".to_string(), FileType::RegularFile);
+        file_meta.size = 20;
+        let location = ChunkLocation {
+            chunk_id, nodes: vec![peer.id], size: 20, checksum: chunk_id.hash, file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp().saturating_sub(600) * 1000),
+            client_write_seq: None, file_id: Some(file_meta.id),
+        };
+        metadata.put_chunk_location(&location).unwrap();
+        file_meta.chunk_locations = Arc::new(vec![location.clone()]);
+        metadata.put_file(&file_meta).unwrap();
+        healing.chunk_map.insert(file_meta.id, (vec![location], 1));
+        let _ = &storage;
+        // The client's location batch queues a fresh chunk for healing at once
+        // (handle_replicate_chunk_locations), as it did rec_190's.
+        healing.queue_chunks_immediate(vec![chunk_id]).await;
+        // The holder also holds ordinary chunks, so it is asked and answers (it counts as
+        // reachable); only the marker-shaped id is left out of what it is asked.
+        let mut other_file = FileMetadata::new("/dvr/rec_189.ts".to_string(), FileType::RegularFile);
+        other_file.size = 20;
+        let other = ChunkLocation {
+            chunk_id: ChunkId::from_hash(compute_chunk_hash(b"an ordinary chunk on the holder")),
+            nodes: vec![peer.id], size: 20, checksum: [0; 32], file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp().saturating_sub(600) * 1000),
+            client_write_seq: None, file_id: Some(other_file.id),
+        };
+        metadata.put_chunk_location(&other).unwrap();
+        other_file.chunk_locations = Arc::new(vec![other.clone()]);
+        metadata.put_file(&other_file).unwrap();
+        healing.chunk_map.insert(other_file.id, (vec![other], 1));
+
+        for _ in 0..3 {
+            healing.run_discovery_pass(true).await.unwrap();
+        }
+        assert!(metadata.get_chunk_location(&chunk_id).unwrap().is_some(),
+            "BUG: the deep pass never asked the holder about a real marker-shaped chunk and purged its location as DATA LOSS");
     }
 
     /// Suite T78b, 2026-10-08: a corrupt copy was quarantined after the healer had

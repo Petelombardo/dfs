@@ -1387,6 +1387,23 @@ pub(crate) fn classify_cluster_message(_msg: &ClusterMessage) -> crate::stats::R
 /// chunk_prefetch fast path) — only meaningful for a single-call apply, so folds
 /// (which always need the fully-composed base freshly assembled from the chain) pass
 /// None.
+/// A foreground chunk write, off the async workers. ChunkStorage::write_chunk is synchronous
+/// (mkdir, write, fsync, rename): run inside a plain tokio::spawn it held a worker for the
+/// whole fsync. On the 2-core server2 (G8 soak 11-02: slow SSD, 70% iowait) WriteFileLocalOnly's
+/// per-chunk writes held both main-runtime workers in fsync, and every other request on the
+/// node waited seconds for them. Bounded by write_semaphore, as every foreground write is.
+async fn write_chunk_blocking(
+    storage: Arc<ChunkStorage>,
+    write_semaphore: Arc<tokio::sync::Semaphore>,
+    chunk_id: ChunkId,
+    data: Vec<u8>,
+) -> Result<()> {
+    let _permit = write_semaphore.acquire_owned().await.ok();
+    tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
+}
+
 async fn full_rewrite_chunk(
     storage: Arc<ChunkStorage>,
     metadata: Arc<MetadataStore>,
@@ -9747,11 +9764,7 @@ impl Server {
             // See write_semaphore's doc comment: bounds concurrent foreground
             // writes so an unthrottled burst can't pile up spawn_blocking
             // threads and buffered chunk payloads without limit.
-            let _permit = self.write_semaphore.acquire().await.ok();
-            let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
+            write_chunk_blocking(self.storage.clone(), self.write_semaphore.clone(), chunk_id, data).await
         };
 
         if let Err(e) = write_result {
@@ -12200,6 +12213,16 @@ impl Server {
                     Ok(tokens) => disk_present.extend(tokens),
                     Err(e) => warn!("handle_has_chunks: patch-state batch check failed: {}", e),
                 }
+                // A marker-shaped id with no patch state may be a real chunk: a content hash
+                // starts with the marker 1 time in 65,536 (G8 soak 11-02, chunk 30 of
+                // /dvr/rec_190.ts was answered "not here" from the disk that held it, and the
+                // leader declared it DATA LOSS). A real token has no file, so this only costs
+                // it a stat.
+                let unresolved: Vec<ChunkId> = token_misses.into_iter().filter(|id| !disk_present.contains(id)).collect();
+                if !unresolved.is_empty() {
+                    let raw = storage.chunks_present_batch(&unresolved).unwrap_or_else(|_| vec![false; unresolved.len()]);
+                    disk_present.extend(unresolved.into_iter().zip(raw).filter_map(|(id, has)| has.then_some(id)));
+                }
             }
             disk_present
         }).await.unwrap_or_else(|e| {
@@ -12960,6 +12983,7 @@ impl Server {
         for (chunk_id, chunk_data, chunk_file_offset) in chunks {
             let cluster = self.cluster.clone();
             let storage = self.storage.clone();
+            let write_semaphore = self.write_semaphore.clone();
             let metadata = self.metadata.clone();
             let client = self.client.clone();
             let replication_factor = self.replication_factor.load(Ordering::Relaxed);
@@ -13012,8 +13036,9 @@ impl Server {
                     if node_id == cluster.local_node_id() {
                         // Local write
                         let storage = storage.clone();
+                        let write_semaphore = write_semaphore.clone();
                         let task = tokio::spawn(async move {
-                            storage.write_chunk(&chunk_id, &chunk_data).is_ok()
+                            write_chunk_blocking(storage, write_semaphore, chunk_id, chunk_data).await.is_ok()
                         });
 
                         if is_quorum_node {
@@ -13216,6 +13241,7 @@ impl Server {
 
         for (chunk_id, chunk_data, chunk_file_offset) in chunks {
             let storage = self.storage.clone();
+            let write_semaphore = self.write_semaphore.clone();
             let metadata = self.metadata.clone();
             let cluster = self.cluster.clone();
             let client = self.client.clone();
@@ -13223,14 +13249,15 @@ impl Server {
 
             let task = tokio::spawn(async move {
                 // Write chunk locally
-                storage.write_chunk(&chunk_id, &chunk_data)
+                let chunk_len = chunk_data.len();
+                write_chunk_blocking(storage, write_semaphore, chunk_id, chunk_data).await
                     .context(format!("Failed to write chunk {} locally", chunk_id))?;
 
                 // Store chunk location metadata (with only local node)
                 let location = ChunkLocation {
                     chunk_id,
                     nodes: vec![local_node_id],  // Only local node
-                    size: chunk_data.len(),
+                    size: chunk_len,
                     checksum: chunk_id.hash,
                     // See chunk_data_at's doc comment / write_data's identical
                     // fix — file_offset was None here despite the chunker
@@ -13253,7 +13280,7 @@ impl Server {
                 // and causes the healer to see under-replicated chunks before the client has
                 // finished, triggering premature healing and resulting in 5× over-replication.
 
-                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
+                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_len as u64))
             });
 
             chunk_tasks.push(task);
@@ -13289,16 +13316,18 @@ impl Server {
 
         for (chunk_id, chunk_data, chunk_file_offset) in chunks {
             let storage = self.storage.clone();
+            let write_semaphore = self.write_semaphore.clone();
             let metadata = self.metadata.clone();
 
             let task = tokio::spawn(async move {
-                storage.write_chunk(&chunk_id, &chunk_data)
+                let chunk_len = chunk_data.len();
+                write_chunk_blocking(storage, write_semaphore, chunk_id, chunk_data).await
                     .context(format!("Failed to write chunk {} locally", chunk_id))?;
 
                 let location = ChunkLocation {
                     chunk_id,
                     nodes: vec![local_node_id],
-                    size: chunk_data.len(),
+                    size: chunk_len,
                     checksum: chunk_id.hash,
                     // Confirmed root cause of the VM-108 qcow2 corruption: this was
                     // None despite chunk_data_at always computing the real offset,
@@ -13314,7 +13343,7 @@ impl Server {
                 metadata.put_chunk_location_async(location).await
                     .context("Failed to store chunk location")?;
 
-                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
+                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_len as u64))
             });
 
             chunk_tasks.push(task);
@@ -16179,13 +16208,14 @@ impl Server {
                 let chunk_id = *chunk_id;
                 let chunk_data = chunk_data.clone();
                 let storage = self.storage.clone();
+                let write_semaphore = self.write_semaphore.clone();
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
                 let local_id = self.cluster.local_node_id();
 
                 write_tasks.push(tokio::spawn(async move {
                     if node_id == local_id {
-                        let ok = storage.write_chunk(&chunk_id, &chunk_data).is_ok();
+                        let ok = write_chunk_blocking(storage, write_semaphore, chunk_id, chunk_data).await.is_ok();
                         (node_id, ok)
                     } else {
                         let ok = match cluster.get_node(&node_id).await {
@@ -25540,6 +25570,56 @@ mod tests {
         let (peer_took, _) = renew(peer_addr);
         assert!(peer_took >= std::time::Duration::from_millis(1500),
             "precondition: the same renewal through the stalled main runtime waits ({:?})", peer_took);
+        main_rt.block_on(async move { drop(server) });
+    }
+
+    /// G8 soak 11-02 (soak #11): chunk 30 of /dvr/rec_190.ts was a fresh write whose content
+    /// hash starts with the patch-token marker (1 in 65,536). HasChunks sent marker-shaped
+    /// ids to the patch-state table only, so a holder with the chunk on disk answered "not
+    /// here", and the leader declared DATA LOSS and purged its location.
+    #[tokio::test]
+    async fn has_chunks_finds_a_real_chunk_shaped_like_a_patch_token() {
+        let h = make_overlay_test_harness();
+        let mut hash = *blake3::hash(b"fresh recording bytes").as_bytes();
+        hash[0] = dfs_common::PATCH_TOKEN_MARKER[0];
+        hash[1] = dfs_common::PATCH_TOKEN_MARKER[1];
+        let chunk_id = ChunkId::from_hash(hash);
+        assert!(chunk_id.looks_like_patch_token(), "setup: the id is marker-shaped");
+        h.storage.write_chunk(&chunk_id, b"fresh recording bytes").unwrap();
+        let r = h.server.handle_request(Request::HasChunks { chunk_ids: vec![chunk_id] }).await;
+        assert!(matches!(&r, Response::BoolVec { values } if values == &vec![true]),
+            "BUG: a node holding a marker-shaped real chunk on disk said it doesn't: {:?}", r);
+    }
+
+    /// G8 soak 11-02 (soak #11): server2's two main-runtime workers sat in fsync on chunk .tmp
+    /// files nearly all the time. WriteFileLocalOnly (14.5k of them, the client's fresh-data
+    /// path) wrote and fsynced each chunk inside a plain tokio::spawn, so two slow syncs held
+    /// both workers and every other request on the node waited. Chunk writes run on the
+    /// blocking pool; the runtime stays free while they sync.
+    #[test]
+    fn a_slow_chunk_sync_does_not_hold_a_runtime_worker() {
+        let main_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let OverlayTestHarness { server, _temp_storage, _temp_metadata, _temp_metadata_dir, .. } =
+            main_rt.block_on(async { make_overlay_test_harness() });
+        let server = Arc::new(server);
+        let dir = _temp_storage.path().to_path_buf();
+        crate::storage::SLOW_WRITES_FOR_TESTS.lock().unwrap().push((dir.clone(), std::time::Duration::from_secs(2)));
+        let s = server.clone();
+        let write = main_rt.spawn(async move {
+            s.handle_request(Request::WriteFileLocalOnly {
+                data: vec![7u8; 4096], file_offset: 0, file_id: dfs_common::FileId::new(),
+            }).await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // A request arriving mid-write: it needs a worker for a moment.
+        let started = std::time::Instant::now();
+        main_rt.block_on(async { main_rt.spawn(async {}).await.unwrap() });
+        let waited = started.elapsed();
+        let r = main_rt.block_on(write).unwrap();
+        crate::storage::SLOW_WRITES_FOR_TESTS.lock().unwrap().retain(|(d, _)| *d != dir);
+        assert!(matches!(r, Response::ChunkIds { .. }), "setup: the write succeeds: {:?}", r);
+        assert!(waited < std::time::Duration::from_millis(500),
+            "BUG: a task waited {:?} for the runtime's only worker while a chunk write synced", waited);
         main_rt.block_on(async move { drop(server) });
     }
 

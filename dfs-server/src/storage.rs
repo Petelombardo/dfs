@@ -17,6 +17,11 @@ use tracing::{debug, info, warn};
 /// two concurrent writes target the same chunk on the same node.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Tests: chunk writes under these data dirs take this long before their sync, as a slow
+/// disk's fsync does (server2, G8 soak 11-02). Per dir, so parallel tests are unaffected.
+#[cfg(test)]
+pub(crate) static SLOW_WRITES_FOR_TESTS: std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>> = std::sync::Mutex::new(Vec::new());
+
 /// Increment and return the global write counter — used by callers (e.g. PatchChunk handler)
 /// that need a unique temp file name in the same directory as a chunk.
 pub fn next_write_seq() -> u64 {
@@ -472,6 +477,10 @@ impl ChunkStorage {
 
         file.write_all(data)
             .context("Failed to write chunk data")?;
+        #[cfg(test)]
+        if let Some(d) = SLOW_WRITES_FOR_TESTS.lock().unwrap().iter().find(|(dir, _)| *dir == self.data_dir).map(|(_, d)| *d) {
+            std::thread::sleep(d);
+        }
 
         let sync_start = std::time::Instant::now();
         let (sync_time, rename_time) = match &self.coalescer {

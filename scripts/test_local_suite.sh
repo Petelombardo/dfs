@@ -324,10 +324,16 @@ T79_E_FULL=$(tail -n +"$((T79_E_MARK + 1))" "$LOG/server${T79_N}.log" | grep -ci
 T79_E_RESIGNED=$(tail -n +"$((T79_E_MARK + 1))" "$LOG/server${T79_N}.log" | grep -c "left the ISR of" || true)
 echo "  T79e: patched t79_pre.bin's 4 chunks: rc=$T79_E_RC, node$T79_N hit ENOSPC $T79_E_FULL time(s), left $T79_E_RESIGNED ISR(s)"
 # T79a is graded here: placement prefers nodes with free space, so new files often skip the
-# full node entirely; T79e's patches reach it for certain with ordering on.
+# full node entirely; T79e's patches reach it for certain with ordering on. Without ordering
+# nothing puts the full node in t79_pre.bin's pairs: it holds none of the 4 chunks about 13%
+# of the time (0.6^4; chain 1102f OFF), and then nothing was asked of it to grade.
+if [ "${DFS_ORDERED_WRITES:-0}" != 1 ] && [ "$T79_MOUNTED" = 1 ] && [ "$T79_RC" = 0 ] && [ "$((T79_FULL_ERRS + T79_E_FULL))" = 0 ]; then
+    echo "  (informational without DFS_ORDERED_WRITES) T79a not exercised: node$T79_N held none of t79_pre.bin's chunks and placement skipped it for new files"
+else
 [ "$T79_MOUNTED" = 1 ] && [ "$T79_RC" = 0 ] && [ "$((T79_FULL_ERRS + T79_E_FULL))" -gt 0 ] \
     && check "T79a fsynced writes complete while one node's disk is full (it refused $T79_FULL_ERRS new-file and $T79_E_FULL patch write(s))" PASS \
     || check "T79a rc=$T79_RC after $T79_FILES file(s), node$T79_N refused $T79_FULL_ERRS + $T79_E_FULL (mounted=$T79_MOUNTED; 0 = the full node was never asked): $(head -c 200 "$LOG/t79_dd.err")" FAIL
+fi
 if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
 [ "$T79_MOUNTED" = 1 ] && [ "$T79_E_RC" = 0 ] && [ "$T79_E_RESIGNED" -gt 0 ] \
     && check "T79e fsynced patches succeed while an ISR member's disk is full (it left $T79_E_RESIGNED ISR(s); was in $T79_IN of 4)" PASS \

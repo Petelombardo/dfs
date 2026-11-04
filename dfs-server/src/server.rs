@@ -1361,6 +1361,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectIgnoreMetadataVersions { .. }
         | Request::InjectChunkLocation { .. }
         | Request::InjectSlowFoldAdopts { .. }
+        | Request::InjectSlowIsrVotes { .. }
         | Request::InjectLeaseLapse { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
@@ -8708,6 +8709,19 @@ impl Server {
                 crate::write_order::INJECTED_SLOW_FOLD_ADOPTS.store(count, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
+            Request::InjectSlowIsrVotes { delay_millis, for_millis } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: for {}ms this node's ISR votes wait {}ms each", for_millis, delay_millis);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                crate::write_order::INJECTED_SLOW_ISR_VOTE_MS.store(delay_millis, std::sync::atomic::Ordering::SeqCst);
+                crate::write_order::INJECTED_SLOW_ISR_VOTES_UNTIL_MS.store(now + for_millis, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
             Request::InjectLeaseLapse { millis } => {
                 if !crate::network::fault_injection_allowed() {
                     return Response::Error {
@@ -8720,8 +8734,14 @@ impl Server {
                 crate::lease::INJECTED_LAPSE_UNTIL_MS.store(until, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
-            Request::SlotIsrPrepare { items } => self.slot_isr.handle_prepare(items).await,
-            Request::SlotIsrAccept { items } => self.slot_isr.handle_accept(items).await,
+            Request::SlotIsrPrepare { items } => {
+                if let Some(d) = crate::write_order::injected_slow_isr_vote() { tokio::time::sleep(d).await; }
+                self.slot_isr.handle_prepare(items).await
+            }
+            Request::SlotIsrAccept { items } => {
+                if let Some(d) = crate::write_order::injected_slow_isr_vote() { tokio::time::sleep(d).await; }
+                self.slot_isr.handle_accept(items).await
+            }
             Request::SlotIsrCommit { items } => self.slot_isr.handle_commit(items).await,
             Request::GetSlotIsr { slots } => self.slot_isr.handle_get(slots),
             Request::GetOrSeedSlotIsr { file_id, chunk_idx } => self.handle_get_or_seed_slot_isr(file_id, chunk_idx).await,

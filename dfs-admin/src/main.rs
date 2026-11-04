@@ -184,6 +184,14 @@ enum FaultCommands {
         #[arg(long, default_value_t = 1)]
         count: u32,
     },
+    /// Test-only: for `for_millis` the node holds every ISR Paxos vote it answers `delay_millis`
+    /// first, as a saturated disk delays persisting it.
+    SlowIsrVotes {
+        #[arg(long)]
+        delay_millis: u64,
+        #[arg(long)]
+        for_millis: u64,
+    },
     /// Test-only: for `millis` the node acts as if its own lease had lapsed (a primary refuses
     /// ordered writes), with no expiry vote.
     LeaseLapse {
@@ -1911,6 +1919,16 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::SlowIsrVotes { delay_millis, for_millis } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectSlowIsrVotes { delay_millis: *delay_millis, for_millis: *for_millis }).await? {
+                Response::Ok { .. } => println!("{}: for {}ms its ISR votes wait {}ms each", addr, for_millis, delay_millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::LeaseLapse { millis } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectLeaseLapse { millis: *millis }).await? {
@@ -1986,7 +2004,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
-        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::LeaseLapse { .. }
+        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::SlowIsrVotes { .. } | FaultCommands::LeaseLapse { .. }
         | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. }
         | FaultCommands::PlantLocation { .. } => unreachable!("handled above"),
     };

@@ -8171,6 +8171,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // a transient one first).
         const CONNECT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
         const CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(750);
+        // The ceiling on waiting out a pending secondary replacement (see `replacement_pending`
+        // below), which doesn't spend CONNECT_RETRY_BUDGET: a write stalls at most this long.
+        const REPLACEMENT_PENDING_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+        let write_started = std::time::Instant::now();
         // Gap B (raised 2026-08-13, CT-119/VM-108 write-path EIO investigation):
         // was 1 (a single immediate retry, matching the original `0u8..2` loop
         // bound) — under real observed chunk_map churn (a hot slot rewriting
@@ -8681,6 +8685,31 @@ leader_addr: Arc::new(RwLock::new(None)),
                             tag.file_id, tag.chunk_idx, failed, wait);
                         tokio::time::sleep(wait).await;
                         retry_started += wait;
+                        busy_backoff = (busy_backoff * 2).min(BUSY_RETRY_BACKOFF_MAX);
+                        continue 'retry;
+                    }
+                    // The secondary is down, and the primary, which applied this write (so it
+                    // holds its lease: a majority is alive), couldn't commit its replacement
+                    // yet. With one node of four down an epoch change needs every survivor's
+                    // vote, and a survivor whose saturated disk took up to 70 s to persist one
+                    // held every change back (G8 soak #13, server2: q.qcow2 chunk 103 failed
+                    // its fsync at the 20 s budget). Slow storage means slower writes, not a
+                    // failure (Pete 11-04): resend without spending the budget, up to
+                    // REPLACEMENT_PENDING_MAX. Two nodes down and the primary loses its lease
+                    // and refuses: then the budget applies as before.
+                    let replacement_pending = failed == tag.secondary && primary_ok && match &resp {
+                        Err(e) => is_transient_write_failure(&e.to_string()),
+                        Ok(Response::Error { message, .. }) => message.contains("didn't commit in time"),
+                        _ => false,
+                    };
+                    if replacement_pending && write_started.elapsed() < REPLACEMENT_PENDING_MAX {
+                        let wait = busy_backoff.mul_f64(0.5 + (uuid::Uuid::new_v4().as_u128() % 1000) as f64 / 2000.0);
+                        info!("ReplaceIsrMember for file {} chunk {}: replacing secondary {} is still pending ({}); the write waits, {:?} in",
+                            tag.file_id, tag.chunk_idx, failed,
+                            resp.as_ref().map(|r| dfs_common::debug_truncated(r, 120)).unwrap_or_else(|e| e.to_string()),
+                            write_started.elapsed());
+                        tokio::time::sleep(wait).await;
+                        retry_started += iteration_start.elapsed();
                         busy_backoff = (busy_backoff * 2).min(BUSY_RETRY_BACKOFF_MAX);
                         continue 'retry;
                     }

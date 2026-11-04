@@ -112,7 +112,10 @@ deploy)
     ;;
 upgrade-node)  # upgrade-node <node> <bin dir> [0|1]: replace ONE node's server binary in place, keep its data
     n=$2; [ -n "$n" ] && [ -f "$3/dfs-server" ] || { echo "upgrade-node <node> <bin dir> [0|1]"; exit 1; }
-    ssh root@"$n" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && kill \$p; done; sleep 2; true"
+    # Wait for the old process to exit: on a slow disk it can take longer than 2 s, and the
+    # copy below then fails on the busy binary and leaves the node down (11-03, 11-04).
+    ssh root@"$n" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && kill \$p; done; \
+        for _ in \$(seq 1 60); do busy=0; for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && busy=1; done; [ \$busy = 0 ] && break; sleep 1; done; true"
     scp -q "$3/dfs-server" "$3/dfs-admin" root@"$n":$DIR/bin/
     ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV $BENCH_SERVER_EXTRA_ENV DFS_ORDERED_WRITES=${4:-0} DFS_METADATA_DURABLE=${DFS_METADATA_DURABLE:-1} RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started $n"
     ;;

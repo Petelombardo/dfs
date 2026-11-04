@@ -103,6 +103,19 @@ pub fn take_injected_slow_fold_adopt() -> Option<u64> {
         .map(|_| INJECTED_SLOW_FOLD_ADOPT_MS.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectSlowIsrVotes`): until this time (ms since
+/// UNIX epoch), every ISR Paxos prepare and accept this node answers waits
+/// INJECTED_SLOW_ISR_VOTE_MS first.
+pub static INJECTED_SLOW_ISR_VOTES_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INJECTED_SLOW_ISR_VOTE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The injected delay for an ISR vote answered now, if one is armed.
+pub fn injected_slow_isr_vote() -> Option<std::time::Duration> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    (now < INJECTED_SLOW_ISR_VOTES_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst))
+        .then(|| std::time::Duration::from_millis(INJECTED_SLOW_ISR_VOTE_MS.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
 /// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectChunkLocationFailures`): until this
 /// time (ms since UNIX epoch), chunk-location registrations fail as a failed commit would.
 /// Time-based, not a count: the ordered and batched senders retry at very different rates.

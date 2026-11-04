@@ -1369,6 +1369,16 @@ pub enum Request {
         path: String,
         file_id: FileId,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): for `for_millis`, this node holds every ISR Paxos
+    /// prepare and accept it answers `delay_millis` first, as a saturated disk delays
+    /// persisting the vote (G8 soak #13: server2's metadata commits took up to 70 s, so with
+    /// one node of four down no ISR change could commit). APPENDED at end to preserve wire
+    /// compatibility.
+    InjectSlowIsrVotes {
+        delay_millis: u64,
+        for_millis: u64,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

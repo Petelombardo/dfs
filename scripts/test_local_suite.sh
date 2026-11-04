@@ -4234,6 +4234,140 @@ t120_case b before:3 5
 t120_case c after:3 40
 fi # should_run T120
 
+# ── T121: a slot's secondary dies while the survivors' ISR votes are slow: fsync waits, no EIO ──
+# G8 soak #13 (11-04): with one node of four down, an ISR change needs every survivor's vote,
+# and server2's saturated disk took up to 70 s to persist one. The dead secondary of q.qcow2
+# chunk 103 couldn't be replaced inside the client's 20 s outage budget, and its fsync failed.
+# Pete 11-04: a replacement that is only slow means slower writes, not a failure. Here (a) the
+# secondary, (b) the primary (regression cover: a takeover with slow votes already rides it out) is
+# SIGKILLed and every other survivor but its pair partner holds its ISR votes 8 s each for
+# 50 s (dfs-admin fault slow-isr-votes), longer than the client's 20 s budget twice over (the
+# flush path's one retry gets a second budget; soak #13's stall lasted about a minute): every
+# fsync must succeed, every acked round must read back through a fresh client, and the longest
+# fsync (the cost) is reported.
+snapshot_log T121
+if should_run T121; then
+echo ""
+echo "=== T121: a slot's secondary dies while the survivors' ISR votes are slow: fsync waits, no EIO ==="
+T121_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+t121_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T120)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t121_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$1.log" 2>&1 &
+}
+t121_running() { pgrep -f "dfs-server start --config $BASE/node$1/config.toml" >/dev/null; }
+t121_case() {   # label role: role = the ISR member killed (secondary or primary)
+    local label=$1 role=$2 f="t121_$1.bin"
+    dd if=/dev/urandom of="$MOUNT/$f" bs=4M count=8 status=none
+    dfs_sync
+    local leader pick c p sec victim n slow keep
+    leader=$(settled_leader)
+    # A chunk (1..) neither of whose members leads, so no election confounds the result.
+    pick=""
+    for _ in $(seq 1 30); do
+        pick=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$f" --chunks 8 2>/dev/null | python3 -c "
+import json, sys
+addr = dict(l.split() for l in '''$T121_MAP'''.strip().splitlines())
+isr = json.loads(sys.stdin.readline())['isr']
+for c in range(1, len(isr)):
+    r = isr[c]
+    if r and len(r['members']) >= 2:
+        p, s = addr.get(r['members'][0], ''), addr.get(r['members'][1], '')
+        if p and s and '$leader' not in (p, s): print(c, p, s); break" 2>/dev/null || true)
+        [ -n "$pick" ] && break
+        sleep 1
+    done
+    read -r c p sec <<< "$pick"
+    if [ -z "$sec" ]; then
+        echo "  T121$label: $(echo "$T121_MAP" | grep -c .) node(s) mapped; ISR: $("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$f" --chunks 8 2>&1 | head -c 600)"
+        t121_check "T121$label setup: a chunk neither of whose ISR members is the leader ($leader) found" FAIL
+        rm -f "$MOUNT/$f"; return
+    fi
+    if [ "$role" = primary ]; then victim=$p; keep=$sec; else victim=$sec; keep=$p; fi
+    n=$(( ${victim##*:} - 8900 + 1 ))
+    # Every survivor but the member that must drive the change votes slowly.
+    slow=$(echo "$T121_ALL" | tr ',' '\n' | grep -v -x -e "$victim" -e "$keep" | paste -sd,)
+    echo "  T121$label: chunk $c of $f, primary $p, secondary $sec; the $role (node$n) killed; slow ISR votes on $slow"
+    rm -f "$T/t121.stop"
+    python3 - "$MOUNT/$f" "$((c * 4194304))" "$T/t121.stop" > "$T/t121_w.out" 2>&1 <<'PY' &
+import os, sys, time
+path, base, stop = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+fd = os.open(path, os.O_RDWR)
+acked, errs, worst, r = [], [], 0.0, 0
+while not os.path.exists(stop) and r < 300:
+    r += 1
+    tag = ("V%d-" % r).encode()
+    try:
+        os.pwrite(fd, (tag * 4096)[:4096], base + (r % 900) * 4096)
+        t0 = time.time()
+        os.fsync(fd)
+        worst = max(worst, time.time() - t0)
+        acked.append(r)
+    except OSError as e:
+        errs.append("round %d: %s" % (r, e))
+    time.sleep(1)
+os.close(fd)
+print("rounds %d, acked %d, max fsync %.1f s, errors %d%s; acked: %s" % (
+    r, len(acked), worst, len(errs), (" (" + "; ".join(errs[:3]) + ")") if errs else "", ",".join(map(str, acked))))
+PY
+    local wpid=$!
+    sleep 4
+    pkill -9 -f "dfs-server start --config $BASE/node${n}/config.toml" 2>/dev/null || true
+    "$BIN/dfs-admin" --cluster "$slow" fault slow-isr-votes --delay-millis 8000 --for-millis 50000 >> "$LOG/t121_fault.log" 2>&1 \
+        || echo "  T121$label: could not arm slow ISR votes: $(tail -1 "$LOG/t121_fault.log")"
+    sleep 65
+    touch "$T/t121.stop"; wait "$wpid" 2>/dev/null || true
+    t121_start "$n"
+    local out; out=$(cat "$T/t121_w.out")
+    echo "  T121$label: $(echo "$out" | sed 's/; acked: .*//')"
+    local m=/tmp/dfs-mount-fresh v cpid pending
+    mkdir -p "$m"
+    RUST_LOG=info "$BIN/dfs-client" mount "$m" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t121_fresh.log" --allow-other --log-level debug &
+    cpid=$!
+    for _ in $(seq 1 50); do mountpoint -q "$m" && break; sleep 0.1; done
+    # The newest acked round at each offset must read back (rounds past 900 reuse offsets).
+    v=$(python3 - "$m/$f" "$((c * 4194304))" "$(echo "$out" | sed -n 's/.*; acked: //p')" <<'PY' 2>&1 || true
+import sys
+path, base, acked = sys.argv[1], int(sys.argv[2]), [int(x) for x in sys.argv[3].split(",") if x]
+newest = {}
+for r in acked: newest[r % 900] = r
+bad = []
+with open(path, "rb") as f:
+    for slot, r in newest.items():
+        f.seek(base + slot * 4096)
+        b = f.read(4096)
+        if b != (("V%d-" % r).encode() * 4096)[:4096]:
+            bad.append("round %d holds %r" % (r, b[:8]))
+print("OK %d" % len(newest) if not bad else "BAD " + "; ".join(bad[:3]))
+PY
+)
+    fusermount -u "$m" 2>/dev/null || true
+    kill_client_and_wait "$cpid"
+    pending=$(grep -ac "replacing secondary .* is still pending" "$CURRENT_CLIENT_LOG" 2>/dev/null || true)
+    echo "  T121$label: the client has waited out a pending secondary replacement $pending time(s) so far"
+    echo "$out" | grep -q "errors 0;" && [ "${v%% *}" = OK ] \
+        && t121_check "T121$label every fsync succeeded and all acked rounds read back ($v; $(echo "$out" | grep -o 'max fsync [0-9.]* s'))" PASS \
+        || t121_check "T121$label a dead $role with slow ISR votes failed or lost a write: $(echo "$out" | sed 's/; acked: .*//' | head -c 200); read: $v" FAIL
+    t121_running "$n" || t121_start "$n"
+    rm -f "$MOUNT/$f"
+    sleep 10
+}
+# Every node's id -> address; on a fresh cluster (T121 run alone) the leases take a moment.
+T121_MAP=""
+for _ in $(seq 1 30); do
+    T121_MAP=$("$BIN/dfs-admin" --cluster "$T121_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    [ "$(echo "$T121_MAP" | grep -c .)" -ge 5 ] && break
+    sleep 1
+done
+t121_case a secondary
+t121_case b primary
+fi # should_run T121
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

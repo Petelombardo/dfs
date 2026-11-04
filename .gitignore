@@ -19,3 +19,4 @@ dist/
 
 # Local Claude Code settings/state (machine-specific, not shared)
 /.claude/
+epaper-readme.md

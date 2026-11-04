@@ -2572,12 +2572,41 @@ impl HealingManager {
             debug!("Superseded cleanup: deferring — not every node answered (or one is too fresh)");
             return None;
         };
+        let (no_current, split, split_none, is_current, few_holders, needed) = Self::superseded_vetoes(items, &answers, rf);
+        info!("Superseded cleanup vetoes: {} no current at node 0, {} nodes name different currents ({} with a node naming none), \
+               {} current is the item, {} current held by fewer than {} node(s), {} still needed",
+            no_current, split, split_none, is_current, few_holders, dfs_common::types::write_quorum(rf), needed);
         Some(Self::superseded_verdict(items, &answers, rf))
     }
 
+    /// Why superseded_verdict refused each item, first reason in its order (diagnostic).
+    #[allow(clippy::type_complexity)]
+    fn superseded_vetoes(
+        items: &[(ChunkId, FileId, u64)],
+        answers: &[(Vec<Option<ChunkId>>, Vec<bool>, Vec<bool>)],
+        rf: usize,
+    ) -> (usize, usize, usize, usize, usize, usize) {
+        let mut v = (0, 0, 0, 0, 0, 0);
+        for (i, item) in items.iter().enumerate() {
+            let Some(n) = answers.first().and_then(|a| a.0[i]) else { v.0 += 1; continue };
+            if !answers.iter().all(|(cur, _, _)| cur[i] == Some(n)) {
+                v.1 += 1;
+                if answers.iter().any(|(cur, _, _)| cur[i].is_none()) { v.2 += 1; }
+            }
+            else if n == item.0 { v.3 += 1; }
+            else if answers.iter().filter(|(_, held, _)| held[i]).count() < dfs_common::types::write_quorum(rf) { v.4 += 1; }
+            else if answers.iter().any(|(_, _, prot)| prot[i]) { v.5 += 1; }
+        }
+        v
+    }
+
     /// Which `items` every node's answer (current, holds, protected per item) shows to be
-    /// an old version: all name the same current chunk N, N isn't the item, at least `rf`
-    /// hold N, and none still needs the item. Any node without an entry vetoes.
+    /// an old version: all name the same current chunk N, N isn't the item, N is on its
+    /// write quorum (the two mandatory copies when rf >= 2), and none still needs the item.
+    /// Any node without an entry vetoes. Waiting for all `rf` copies of N kept every old
+    /// version of a constantly rewritten slot: its new version lives on the ISR pair and
+    /// the healer never caught up to a third copy, so G8 soak #12's disks filled (11-03).
+    /// The old copy holds older content, so it adds nothing to the new version's safety.
     #[allow(clippy::type_complexity)]
     fn superseded_verdict(
         items: &[(ChunkId, FileId, u64)],
@@ -2593,7 +2622,7 @@ impl HealingManager {
             let unanimous = answers.iter().all(|(cur, _, _)| cur[i] == Some(n));
             let holders = answers.iter().filter(|(_, held, _)| held[i]).count();
             let needed = answers.iter().any(|(_, _, prot)| prot[i]);
-            if unanimous && n != item.0 && holders >= rf && !needed {
+            if unanimous && n != item.0 && holders >= dfs_common::types::write_quorum(rf) && !needed {
                 ok.push(*item);
             }
         }
@@ -9111,7 +9140,7 @@ mod tests {
     }
 
     /// Superseded-version cleanup (10-13): a copy is deletable only when every node names
-    /// the same newer version for its slot, held by RF, and none still needs it.
+    /// the same newer version for its slot, held by its write quorum, and none still needs it.
     #[test]
     fn superseded_verdict_needs_every_node_to_name_the_same_newer_version() {
         let (f, idx) = (FileId::new(), 7u64);
@@ -9129,8 +9158,18 @@ mod tests {
             "a node with no entry for the slot must veto");
         assert!(!ok(vec![ans(Some(old), true, false), ans(Some(old), true, false), ans(Some(old), true, false)]),
             "the item is the slot's current version: never deletable");
-        assert!(!ok(vec![ans(Some(cur), true, false), ans(Some(cur), true, false), ans(Some(cur), false, false)]),
-            "the current version held by fewer than RF nodes: keep the old one");
+        // G8 soak #12 (11-03): an ordered slot's new version sits on its ISR pair, and with
+        // fio rewriting all day the healer never caught up to a third copy, so no old version
+        // was ever deleted and the disks filled (4,119 of 4,299 vetoed for this alone). Pete:
+        // the two mandatory copies are enough when RF >= 2 (write_quorum).
+        assert!(ok(vec![ans(Some(cur), true, false), ans(Some(cur), true, false), ans(Some(cur), false, false), ans(Some(cur), false, false)]),
+            "the current version on its two mandatory copies: the old one is deletable");
+        assert!(!ok(vec![ans(Some(cur), true, false), ans(Some(cur), false, false), ans(Some(cur), false, false)]),
+            "the current version on a single node: keep the old one");
+        assert!(HealingManager::superseded_verdict(&item, &[ans(Some(cur), false, false)], 1).is_empty(),
+            "RF 1, the current version on no node: keep");
+        assert!(!HealingManager::superseded_verdict(&item, &[ans(Some(cur), true, false)], 1).is_empty(),
+            "RF 1: its one copy is enough");
         assert!(!ok(vec![ans(Some(cur), true, false), ans(Some(cur), true, true), ans(Some(cur), true, false)]),
             "a node still needs it (pending patch base, token, ordered head): keep");
         assert!(HealingManager::superseded_verdict(&item, &[], 3).is_empty(), "no answers: nothing deletable");

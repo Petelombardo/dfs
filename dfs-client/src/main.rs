@@ -396,7 +396,8 @@ fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> 
 
     static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-    // Try each seed node until one responds
+    // Try each seed node until one names a leader (see discovered_view).
+    let mut leaderless: Vec<SocketAddr> = Vec::new();
     for seed_addr in seed_addrs {
         info!("Querying cluster status from {}", seed_addr);
 
@@ -428,7 +429,7 @@ fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> 
             let response_envelope = MessageEnvelope::from_bytes(&buf)?;
 
             match response_envelope.message {
-                Message::Response(Response::ClusterStatus { nodes, .. }) => {
+                Message::Response(Response::ClusterStatus { nodes, leader_node_id, .. }) => {
                     // Extract addresses from all online nodes
                     let addrs: Vec<SocketAddr> = nodes
                         .iter()
@@ -440,19 +441,47 @@ fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> 
                         anyhow::bail!("No online nodes in cluster");
                     }
 
-                    info!("Discovered {} online nodes from {}", addrs.len(), seed_addr);
-                    Ok(addrs)
+                    info!("Discovered {} online nodes from {}{}", addrs.len(), seed_addr,
+                        if leader_node_id.is_none() { " (it names no leader)" } else { "" });
+                    Ok((addrs, leader_node_id.is_some()))
                 }
                 _ => anyhow::bail!("Unexpected response to GetClusterStatus"),
             }
         });
 
-        if let Ok(addrs) = result {
-            return Ok(addrs);
+        if let Ok((addrs, names_leader)) = result {
+            if let Some(chosen) = discovered_view(seed_addrs, &addrs, names_leader) {
+                return Ok(chosen);
+            }
+            if addrs.len() > leaderless.len() {
+                leaderless = addrs;
+            }
         }
     }
 
-    anyhow::bail!("Failed to discover cluster: all seed nodes unreachable")
+    if leaderless.is_empty() {
+        anyhow::bail!("Failed to discover cluster: all seed nodes unreachable")
+    }
+    // Nobody named a leader (an election, or every node just restarted): keep every seed.
+    let mut all: Vec<SocketAddr> = seed_addrs.to_vec();
+    for a in leaderless {
+        if !all.contains(&a) { all.push(a); }
+    }
+    Ok(all)
+}
+
+/// A seed's view of the cluster, taken at mount if it names a leader. A node that names none
+/// can't see a majority: typically it has just restarted and sees only itself. Taking its
+/// view made the client run against that one restarted node alone, and a fresh client read a
+/// stale version of a chunk from its pre-restart map (suite T121, 11-04, chain 1104a: the
+/// restarted ex-secondary served chunk 4 as it was before its replacement). The refresh path
+/// already skipped such views (suite T38a); mount didn't. None: ask the next seed.
+fn discovered_view(seeds: &[SocketAddr], view: &[SocketAddr], names_leader: bool) -> Option<Vec<SocketAddr>> {
+    if names_leader || view.len() >= seeds.len() {
+        Some(view.to_vec())
+    } else {
+        None
+    }
 }
 
 /// Set up logging to file or console
@@ -725,5 +754,41 @@ mod tests {
         assert!(a.ip().is_loopback() && a.port() == 8900, "got {}", a);
         assert_eq!(parse_node_address("10.25.1.60").unwrap(), "10.25.1.60:8900".parse().unwrap());
         assert!(parse_node_address("no-such-host.invalid").is_err());
+    }
+
+    /// Suite T121 in chain 1104a (11-04): a fresh client mounted while the first seed had just
+    /// restarted and saw only itself. Mount took that one-node view, ran against the restarted
+    /// node alone, and read a chunk as it was before the node went down. A seed whose view
+    /// names no leader is passed over for the next one.
+    #[test]
+    fn mount_passes_over_a_seed_that_names_no_leader() {
+        use dfs_common::{MessageEnvelope, Message, NodeInfo, NodeId, Response};
+        use std::io::{Read, Write};
+        let seeds: Vec<SocketAddr> = (0..5).map(|i| format!("127.0.0.1:{}", 19601 + i).parse().unwrap()).collect();
+        let infos: Vec<NodeInfo> = seeds.iter().map(|a| NodeInfo::new(NodeId::new(), *a, None)).collect();
+        // Seed 0 just restarted: it sees itself only and names no leader. Seed 1 sees everyone.
+        for (i, &addr) in seeds.iter().take(2).enumerate() {
+            let listener = std::net::TcpListener::bind(addr).unwrap();
+            let (nodes, leader) = if i == 0 { (vec![infos[0].clone()], None) } else { (infos.clone(), Some(infos[1].id)) };
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut len = [0u8; 4];
+                    if stream.read_exact(&mut len).is_err() { continue; }
+                    let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+                    if stream.read_exact(&mut buf).is_err() { continue; }
+                    let req = MessageEnvelope::from_bytes(&buf).unwrap();
+                    let resp = MessageEnvelope::new(req.request_id, Message::Response(Response::ClusterStatus {
+                        nodes: nodes.clone(), total_nodes: nodes.len(), healthy_nodes: nodes.len(), chunk_size_mb: 4,
+                        leader_node_id: leader, replication_factor: 3, local_node_id: None,
+                    })).to_bytes().unwrap();
+                    let _ = stream.write_all(&(resp.len() as u32).to_be_bytes());
+                    let _ = stream.write_all(&resp);
+                }
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let found = discover_cluster_nodes(&seeds).unwrap();
+        assert_eq!(found.len(), 5, "BUG: mount adopted a restarted seed's one-node view: {:?}", found);
     }
 }

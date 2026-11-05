@@ -2606,8 +2606,23 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// send_split_frame_write_request without the penalty short-circuit; see
-    /// send_request_unpenalized.
+    /// send_request_unpenalized. A busy node is asked again every 100 ms, in a loop. The
+    /// retry used to call this function again, nesting one future per busy answer: a ~70 s
+    /// busy spell nested ~700 deep and overflowed the flush worker's stack (G8 soak #15
+    /// 11-05 and #4 10-31, "thread 'dfs-flush' has overflowed its stack").
     async fn send_split_frame_write_request_unpenalized(&self, addr: SocketAddr, encoded_envelope: &[u8], raw_data: &[u8]) -> Result<Response> {
+        loop {
+            let response = self.send_split_frame_write_once(addr, encoded_envelope, raw_data).await?;
+            if matches!(response, Response::Error { code: dfs_common::ErrorCode::ServerBusy, .. }) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            return Ok(response);
+        }
+    }
+
+    /// One attempt of send_split_frame_write_request_unpenalized; a busy answer is returned.
+    async fn send_split_frame_write_once(&self, addr: SocketAddr, encoded_envelope: &[u8], raw_data: &[u8]) -> Result<Response> {
 
         debug!("Sending split-frame write request to {} ({} bytes data)", addr, raw_data.len());
 
@@ -2847,10 +2862,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // ServerBusy on write path: retry with backoff rather than EIO.
+        // ServerBusy on write path: the caller retries with backoff rather than EIO.
         if let Response::Error { code: dfs_common::ErrorCode::ServerBusy, .. } = &response {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            return Box::pin(self.send_split_frame_write_request_unpenalized(addr, encoded_envelope, raw_data)).await;
+            return Ok(response);
         }
 
         self.node_health.record_success(addr).await;
@@ -11755,6 +11769,59 @@ mod tests {
             }
         });
         (addr, stored)
+    }
+
+    /// G8 soak #15 (11-05 06:50) and #4 (10-31): "thread 'dfs-flush' has overflowed its stack".
+    /// The core showed ~700 nested send_split_frame_write_request_unpenalized frames: each
+    /// ServerBusy answer was retried by the function calling itself again (100 ms apart), and
+    /// a busy spell of ~70 s nested one future per answer until the flush worker's 2 MiB stack
+    /// ran out. Here a node answers busy 64 times on a worker with a 96 KiB stack: the write
+    /// must still go through.
+    #[test]
+    fn a_long_busy_spell_does_not_grow_the_stack() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const BUSY: usize = 64;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_stack_size(96 * 1024)
+            .enable_all().build().unwrap();
+        let r = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut answered = 0usize;
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else { return };
+                    loop {
+                        let mut len = [0u8; 4];
+                        if s.read_exact(&mut len).await.is_err() { break; }
+                        let mut env = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut env).await.is_err() { break; }
+                        let Ok(env) = MessageEnvelope::from_bytes(&env) else { break };
+                        if s.read_exact(&mut len).await.is_err() { break; }
+                        let mut data = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut data).await.is_err() { break; }
+                        answered += 1;
+                        let reply = if answered <= BUSY {
+                            Response::Error { message: "busy".into(), code: dfs_common::ErrorCode::ServerBusy }
+                        } else {
+                            Response::ChunkIds { chunk_ids: vec![ChunkId::from_hash(*blake3::hash(&data).as_bytes())],
+                                chunk_sizes: vec![data.len() as u64], replica_nodes_per_chunk: vec![vec![]] }
+                        };
+                        let reply = MessageEnvelope::new(env.request_id, Message::Response(reply)).to_bytes().unwrap();
+                        let mut out = (reply.len() as u32).to_be_bytes().to_vec();
+                        out.extend_from_slice(&reply);
+                        if s.write_all(&out).await.is_err() { break; }
+                    }
+                }
+            });
+            let client = Arc::new(DfsClient::new(vec![addr]).unwrap());
+            let request = Request::WriteFileLocalOnly { data: Vec::new(), file_offset: 0, file_id: dfs_common::FileId::new() };
+            let encoded = MessageEnvelope::new(RequestId::new(1), Message::Request(request)).to_bytes().unwrap();
+            // On a worker (the 96 KiB stack), not the test thread.
+            tokio::spawn(async move {
+                client.send_split_frame_write_request_unpenalized(addr, &encoded, &[7u8; 4096]).await
+            }).await.unwrap()
+        });
+        assert!(matches!(r, Ok(Response::ChunkIds { .. })), "the write goes through after the busy spell: {:?}", r);
     }
 
     /// Chained writes are on by default, so a client newer than its servers (or one whose

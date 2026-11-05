@@ -43,12 +43,16 @@ CDIR=/root/dfs-bench                  # on the client
 MNT=/mnt/dfs-bench
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 BIN="${BENCH_SERVER_BIN_DIR:-$REPO/target/release}"           # dfs-server + dfs-admin (aarch64)
+# BENCH_SERVER_BIN_DIR_AARCH64: the binaries for nodes whose uname -m is aarch64, in a cluster
+# that mixes them with x86_64 ones (11-05: puck, an arm64 box, joins server2-5).
+bin_for() { if [ -n "${BENCH_SERVER_BIN_DIR_AARCH64:-}" ] && [ "$(ssh root@"$1" uname -m)" = aarch64 ]; then echo "$BENCH_SERVER_BIN_DIR_AARCH64"; else echo "$BIN"; fi; }
 CLIENT_BIN="${BENCH_CLIENT_BIN:-$REPO/dist/bench-x86_64/dfs-client}"  # x86_64
 MIN_FREE_MB=3000
 # Same per-process cache caps as the local suite: this runs next to production.
-SERVER_ENV="DFS_CHUNK_RING_CAPACITY=8 DFS_DELTA_RING_CAPACITY=8 DFS_MAX_CACHE_CHUNKS=8 DFS_LEASE_CLUSTER_SIZE=4 DFS_SLOT_ISR_SEED_SECS=3"
+SERVER_ENV="DFS_CHUNK_RING_CAPACITY=8 DFS_DELTA_RING_CAPACITY=8 DFS_MAX_CACHE_CHUNKS=8 DFS_LEASE_CLUSTER_SIZE=$(echo $NODES | wc -w) DFS_SLOT_ISR_SEED_SECS=3"
 
-ip_of() { getent hosts "$1" | awk '{print $1; exit}'; }
+# A node named by its IP is that IP: getent has no entry for an address (11-05: puck, 10.25.1.42).
+ip_of() { case "$1" in *[!0-9.]*) getent hosts "$1" | awk '{print $1; exit}' ;; *) echo "$1" ;; esac; }
 SEED_NODE=${NODES%% *}   # the first node seeds the others
 SEED="$(ip_of "$SEED_NODE"):$PORT"
 
@@ -93,7 +97,8 @@ deploy)
     for n in $NODES; do
         ip=$(ip_of "$n")
         ssh root@"$n" "mkdir -p $DIR/bin $DIR/data $DIR/metadata $DIR/config"
-        scp -q "$BIN/dfs-server" "$BIN/dfs-admin" root@"$n":$DIR/bin/
+        nbin=$(bin_for "$n")
+        scp -q "$nbin/dfs-server" "$nbin/dfs-admin" root@"$n":$DIR/bin/
         ssh root@"$n" "cd $DIR && [ -f config/config.toml ] || $DIR/bin/dfs-server init --data-dir $DIR/data --meta-dir $DIR/metadata --config $DIR/config/config.toml >/dev/null 2>&1
             sed -i 's|^listen_addr = .*|listen_addr = \"$ip:$PORT\"|' $DIR/config/config.toml
             if [ $n != $SEED_NODE ]; then sed -i 's|^seed_nodes = .*|seed_nodes = [\"$SEED\"]|' $DIR/config/config.toml; fi
@@ -116,7 +121,8 @@ upgrade-node)  # upgrade-node <node> <bin dir> [0|1]: replace ONE node's server 
     # copy below then fails on the busy binary and leaves the node down (11-03, 11-04).
     ssh root@"$n" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && kill \$p; done; \
         for _ in \$(seq 1 60); do busy=0; for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && busy=1; done; [ \$busy = 0 ] && break; sleep 1; done; true"
-    scp -q "$3/dfs-server" "$3/dfs-admin" root@"$n":$DIR/bin/
+    ubin=$3; [ -n "${BENCH_SERVER_BIN_DIR_AARCH64:-}" ] && [ "$(ssh root@"$n" uname -m)" = aarch64 ] && ubin=$BENCH_SERVER_BIN_DIR_AARCH64
+    scp -q "$ubin/dfs-server" "$ubin/dfs-admin" root@"$n":$DIR/bin/
     ssh root@"$n" "cd $DIR || exit 1; $SERVER_ENV $BENCH_SERVER_EXTRA_ENV DFS_ORDERED_WRITES=${4:-0} DFS_METADATA_DURABLE=${DFS_METADATA_DURABLE:-1} RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started $n"
     ;;
 swap-client)  # swap-client <dfs-client path> [0|1]: replace only the client binary, remount

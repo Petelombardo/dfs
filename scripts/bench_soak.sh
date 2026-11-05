@@ -20,10 +20,11 @@ DIR=${BENCH_DIR:-/mnt/gluster/dfs-bench}
 CDIR=/root/dfs-bench
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=/root/g8-soak
-SERVER_ENV="DFS_CHUNK_RING_CAPACITY=8 DFS_DELTA_RING_CAPACITY=8 DFS_MAX_CACHE_CHUNKS=8 DFS_LEASE_CLUSTER_SIZE=4 DFS_SLOT_ISR_SEED_SECS=3"
+SERVER_ENV="DFS_CHUNK_RING_CAPACITY=8 DFS_DELTA_RING_CAPACITY=8 DFS_MAX_CACHE_CHUNKS=8 DFS_LEASE_CLUSTER_SIZE=$(echo $NODES | wc -w) DFS_SLOT_ISR_SEED_SECS=3"
 mkdir -p "$OUT"
 say() { echo "$(date '+%F %T') $*" | tee -a "$OUT/summary.log"; }
-ip_of() { getent hosts "$1" | awk '{print $1; exit}'; }
+# A node named by its IP is that IP: getent has no entry for an address (11-05: puck, 10.25.1.42).
+ip_of() { case "$1" in *[!0-9.]*) getent hosts "$1" | awk '{print $1; exit}' ;; *) echo "$1" ;; esac; }
 bench_pid() { ssh -o BatchMode=yes root@"$1" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && echo \$p; done"; }
 start_node() {
     ssh -o BatchMode=yes root@"$1" "cd $DIR || exit 1; $SERVER_ENV DFS_ORDERED_WRITES=1 DFS_METADATA_DURABLE=1 RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"

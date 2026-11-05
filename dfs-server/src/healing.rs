@@ -2200,6 +2200,13 @@ impl HealingManager {
     /// apart from genuinely new work — see that loop's net-new tracking. The manual
     /// full-sweep entry point above ignores the result.
     async fn run_disk_orphan_sweep_over(&self, chunks: Vec<ChunkId>) -> Vec<ChunkId> {
+        self.run_disk_orphan_sweep_over_mode(chunks, false).await
+    }
+
+    /// `superseded_only`: only superseded-version cleanup (and its trash drain), not the
+    /// live-file orphan deletion, which trusts this node's own view. See
+    /// superseded_cleanup_may_bypass_restart_grace.
+    async fn run_disk_orphan_sweep_over_mode(&self, chunks: Vec<ChunkId>, superseded_only: bool) -> Vec<ChunkId> {
         // 2x the periodic full-reconciliation interval (server.rs RECONCILE_INTERVAL =
         // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
         // system, so doubling it bounds how stale this node's live_chunk_ids() view
@@ -2382,10 +2389,36 @@ impl HealingManager {
             debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
         }
 
-        self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
+        if !superseded_only {
+            self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
+        }
         self.drain_superseded_trash().await;
         self.process_superseded_candidates(row_only).await;
         candidate_ids
+    }
+
+    /// Whether superseded-version cleanup may run while the full sweep waits out this node's
+    /// restart grace: only with the disk under pressure (Self::disk_under_pressure), at most
+    /// one node down, and the leader-election grace over. G8 soak #13/#14 (11-04): after
+    /// each kill the restarted node reclaimed nothing for 20 minutes while writes continued;
+    /// server3 then server5 reached 100% and the full leader's flapping cost VM-disk EIOs.
+    /// The restart grace protects decisions taken from this node's own (possibly stale)
+    /// chunk map; a superseded copy is deleted only when every node names the same newer
+    /// version, held by its write quorum, so a stale map here can only veto (Pete 11-04).
+    async fn superseded_cleanup_may_bypass_restart_grace(&self) -> bool {
+        if !Self::disk_under_pressure(self.storage.get_filesystem_stats().ok()) {
+            return false;
+        }
+        let all_nodes = self.cluster.get_all_nodes().await;
+        let down = all_nodes.iter().filter(|n| n.status != dfs_common::NodeStatus::Online).count();
+        let leader_grace_over = self.cluster.time_since_became_leader().await
+            .map_or(true, |d| d.as_secs() >= destructive_grace_secs());
+        down <= 1 && leader_grace_over
+    }
+
+    /// Under 10% of the disk available (see superseded_grace_for).
+    fn disk_under_pressure(fs_stats: Option<(u64, u64, u64)>) -> bool {
+        Self::superseded_grace_for(u64::MAX, 0, fs_stats) == 0
     }
 
     /// Superseded-version cleanup (DFS_SUPERSEDED_CLEANUP, on by default). A file rewritten
@@ -2437,17 +2470,24 @@ impl HealingManager {
             Err(e) => { debug!("Superseded cleanup: chunk rows unreadable this pass: {}", e); return; }
         };
         let mut items: Vec<(ChunkId, FileId, u64)> = Vec::new();
+        let n_rows = rows.len();
+        let (mut no_slot, mut no_current, mut is_current, mut young) = (0usize, 0usize, 0usize, 0usize);
         for (chunk, loc) in rows {
-            let (Some(file_id), Some(off)) = (loc.file_id, loc.file_offset) else { continue };
+            let (Some(file_id), Some(off)) = (loc.file_id, loc.file_offset) else { no_slot += 1; continue };
             let idx = off / CHUNK_SIZE;
-            if !matches!(self.slot_current(file_id, idx), Some(cur) if cur != chunk) {
-                continue;
+            match self.slot_current(file_id, idx) {
+                Some(cur) if cur != chunk => {}
+                Some(_) => { is_current += 1; continue; }
+                None => { no_current += 1; continue; }
             }
             if self.storage.get_chunk_mtime(&chunk).is_none_or(|m| now.saturating_sub(m) < grace) {
+                young += 1;
                 continue;
             }
             items.push((chunk, file_id, idx));
         }
+        info!("Superseded candidates: {} row(s): {} without a slot, {} no current version in this node's chunk map, \
+               {} still current, {} younger than {}s, {} go on", n_rows, no_slot, no_current, is_current, young, grace, items.len());
         self.confirm_and_move_superseded(items).await;
     }
 
@@ -2853,10 +2893,11 @@ impl HealingManager {
         loop {
             let iter_start = Instant::now();
 
-            if !self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                || self.compaction_quiescing.load(std::sync::atomic::Ordering::Relaxed)
-                || !self.disk_orphan_sweep_cluster_gate_clear(true).await
-            {
+            let runnable = self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                && !self.compaction_quiescing.load(std::sync::atomic::Ordering::Relaxed);
+            let full = runnable && self.disk_orphan_sweep_cluster_gate_clear(true).await;
+            let superseded_only = runnable && !full && self.superseded_cleanup_may_bypass_restart_grace().await;
+            if !full && !superseded_only {
                 // Gated — don't advance the cursor, just wait and re-check. The
                 // individual gate methods already log their own reason. No reason
                 // to poll gate checks faster than the current backoff level.
@@ -2906,7 +2947,7 @@ impl HealingManager {
                 0
             } else {
                 cursor = page.last().copied();
-                let candidate_ids = self.run_disk_orphan_sweep_over(page).await;
+                let candidate_ids = self.run_disk_orphan_sweep_over_mode(page, superseded_only).await;
                 let net_new = candidate_ids.iter().filter(|id| !previous_cycle_candidates.contains(id)).count();
                 current_cycle_candidates.extend(candidate_ids);
                 net_new
@@ -9137,6 +9178,67 @@ mod tests {
             "the pressure grace never lengthens a shorter configured grace");
         assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, None), 6 * 3600, "unknown space: the normal grace");
         assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, Some((0, 0, 0))), 6 * 3600);
+    }
+
+    /// G8 soak #13/#14 (11-04): after each kill the restarted node reclaimed nothing for its
+    /// 20-minute restart grace while writes went on; server3 then server5 reached 100%. Under
+    /// pressure, superseded cleanup (every node must agree) runs through that grace; without
+    /// pressure, or with more than one node down, it waits like the rest of the sweep.
+    #[tokio::test]
+    async fn a_restarted_node_under_disk_pressure_still_cleans_superseded_versions() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, _metadata, healing, t1, _t2) = make_healing(node_id, addr);
+        let dir = t1.path().to_path_buf();
+        assert!(healing.local_started_at.elapsed().as_secs() < destructive_grace_secs(), "setup: just restarted");
+        assert!(!healing.disk_orphan_sweep_cluster_gate_clear(false).await, "setup: the full sweep waits out the restart grace");
+
+        crate::storage::FS_STATS_FOR_TESTS.lock().unwrap().push((dir.clone(), (16 * GB, GB, GB)));
+        let under_pressure = healing.superseded_cleanup_may_bypass_restart_grace().await;
+        crate::storage::FS_STATS_FOR_TESTS.lock().unwrap().retain(|(d, _)| *d != dir);
+        assert!(under_pressure, "BUG: a restarted node at 94% full may not clean superseded versions for 20 minutes");
+
+        crate::storage::FS_STATS_FOR_TESTS.lock().unwrap().push((dir.clone(), (16 * GB, 4 * GB, 4 * GB)));
+        let roomy = healing.superseded_cleanup_may_bypass_restart_grace().await;
+        assert!(!roomy, "with room to spare it waits like the rest of the sweep");
+        crate::storage::FS_STATS_FOR_TESTS.lock().unwrap().retain(|(d, _)| *d != dir);
+
+        crate::storage::FS_STATS_FOR_TESTS.lock().unwrap().push((dir.clone(), (16 * GB, GB, GB)));
+        for i in 0..2 {
+            let mut down = dfs_common::NodeInfo::new(NodeId::new(), format!("127.0.0.1:{}", 19700 + i).parse().unwrap(), None);
+            down.status = dfs_common::NodeStatus::Failed;
+            healing.cluster.add_node(down).await.unwrap();
+        }
+        let two_down = healing.superseded_cleanup_may_bypass_restart_grace().await;
+        crate::storage::FS_STATS_FOR_TESTS.lock().unwrap().retain(|(d, _)| *d != dir);
+        assert!(!two_down, "with two nodes down nothing destructive runs");
+    }
+
+    /// The superseded-only pass must not run the live-file orphan deletion, which trusts this
+    /// node's own (possibly stale, just restarted) view.
+    #[tokio::test]
+    async fn a_superseded_only_pass_never_evicts_a_live_file_orphan() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, mut healing, _t1, _t2) = make_healing(node_id, addr);
+        healing.local_started_at = Instant::now() - Duration::from_secs(SELF_RESTART_GRACE_SECS + 1);
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"superseded-only-pass-orphan"));
+        storage.write_chunk(&chunk_id, b"some data").unwrap();
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&chunk_id, old_ts);
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id, nodes: vec![node_id], size: 9, checksum: chunk_id.hash, file_offset: Some(0),
+            written_at: Some(old_ts * 1000), client_write_seq: None, file_id: None,
+        }).unwrap();
+        for _ in 0..3 {
+            healing.run_disk_orphan_sweep_over_mode(vec![chunk_id], true).await;
+        }
+        assert!(storage.get_chunk_path(&chunk_id).exists(), "BUG: a superseded-only pass evicted a live-file orphan");
+        for _ in 0..3 {
+            healing.run_disk_orphan_sweep_over_mode(vec![chunk_id], false).await;
+        }
+        assert!(!storage.get_chunk_path(&chunk_id).exists(), "setup: the full pass does evict it");
     }
 
     /// Superseded-version cleanup (10-13): a copy is deletable only when every node names

@@ -17,6 +17,10 @@ use tracing::{debug, info, warn};
 /// two concurrent writes target the same chunk on the same node.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Tests: (total, free, available) reported for these data dirs instead of the real ones.
+#[cfg(test)]
+pub(crate) static FS_STATS_FOR_TESTS: std::sync::Mutex<Vec<(PathBuf, (u64, u64, u64))>> = std::sync::Mutex::new(Vec::new());
+
 /// Tests: chunk writes under these data dirs take this long before their sync, as a slow
 /// disk's fsync does (server2, G8 soak 11-02). Per dir, so parallel tests are unaffected.
 #[cfg(test)]
@@ -1102,6 +1106,10 @@ impl ChunkStorage {
     /// Returns (total_space, free_space, available_space) in bytes
     pub fn get_filesystem_stats(&self) -> Result<(u64, u64, u64)> {
         use std::os::unix::fs::MetadataExt;
+        #[cfg(test)]
+        if let Some(stats) = FS_STATS_FOR_TESTS.lock().unwrap().iter().find(|(dir, _)| *dir == self.data_dir).map(|(_, s)| *s) {
+            return Ok(stats);
+        }
 
         // Get filesystem stats using statvfs
         let metadata = fs::metadata(&self.data_dir)?;

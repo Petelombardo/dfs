@@ -12914,6 +12914,17 @@ impl Server {
                     self.broadcast_leader_unfit(false).await;
                     continue;
                 }
+                // Working again isn't enough to lead again: the node must have real headroom.
+                // Back at 400 MB free, a full leader led again, refilled in 40 s and stepped
+                // down a second time; each switch stalled clients' metadata 35-50 s and the
+                // VM disk got EIO (G8 soak #14, 11-04 17:26-17:36, server5: 16 GB).
+                let headroom = self.storage.get_filesystem_stats().ok()
+                    .is_some_and(|(total, _, available)| Self::regained_headroom_to_lead(available, total));
+                if !headroom {
+                    self.cluster.set_leader_unfit(me, true);
+                    self.broadcast_leader_unfit(true).await;
+                    continue;
+                }
                 info!("[LEADER] this node's storage works again; catching up on metadata before it can lead again");
                 let catchup = tokio::time::timeout(std::time::Duration::from_secs(120), self.run_metadata_catchup());
                 tokio::pin!(catchup);
@@ -12946,6 +12957,14 @@ impl Server {
                 info!("[LEADER] caught up; this node can lead again");
             }
         });
+    }
+
+    /// Whether a node that stopped leading because its storage failed has room to lead again:
+    /// 5% of its disk free, and at least 1 GiB. Leading is metadata-heavy, so a node that is
+    /// merely just above the failing line (64 MiB) fills again at once.
+    fn regained_headroom_to_lead(available: u64, total: u64) -> bool {
+        const MIN_HEADROOM: u64 = 1024 * 1024 * 1024;
+        available >= (total / 20).max(MIN_HEADROOM)
     }
 
     async fn broadcast_leader_unfit(&self, unfit: bool) {
@@ -25591,6 +25610,22 @@ mod tests {
         assert!(peer_took >= std::time::Duration::from_millis(1500),
             "precondition: the same renewal through the stalled main runtime waits ({:?})", peer_took);
         main_rt.block_on(async move { drop(server) });
+    }
+
+    /// G8 soak #14 (11-04 17:26-17:36, server5: a 16 GB bench disk): the full leader stepped
+    /// down at 60 MB free, was "fit" again at 400 MB, led, refilled in 40 s and stepped down
+    /// again; each switch stalled clients' metadata 35-50 s and the VM disk got EIO. A node
+    /// leads again only with real headroom: 5% of its disk, and at least 1 GiB.
+    #[test]
+    fn a_full_leader_leads_again_only_with_real_headroom() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        const MB: u64 = 1024 * 1024;
+        assert!(!Server::regained_headroom_to_lead(400 * MB, 16 * GB), "BUG: 400 MB of 16 GB was enough to lead again");
+        assert!(!Server::regained_headroom_to_lead(64 * MB, 16 * GB), "just above the failing line");
+        assert!(Server::regained_headroom_to_lead(2 * GB, 16 * GB), "2 GB of 16 GB is room to lead");
+        assert!(!Server::regained_headroom_to_lead(GB + GB / 5, 32 * GB), "5% of 32 GB is 1.6 GB");
+        assert!(Server::regained_headroom_to_lead(2 * GB, 32 * GB));
+        assert!(!Server::regained_headroom_to_lead(900 * MB, 4 * GB), "at least 1 GiB, however small the disk");
     }
 
     /// G8 soak 11-02 (soak #11): chunk 30 of /dvr/rec_190.ts was a fresh write whose content

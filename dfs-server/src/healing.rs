@@ -2418,7 +2418,7 @@ impl HealingManager {
 
     /// Under 10% of the disk available (see superseded_grace_for).
     fn disk_under_pressure(fs_stats: Option<(u64, u64, u64)>) -> bool {
-        Self::superseded_grace_for(u64::MAX, 0, fs_stats) == 0
+        Self::superseded_grace_for(u64::MAX, 0, 0, fs_stats) == 0
     }
 
     /// Superseded-version cleanup (DFS_SUPERSEDED_CLEANUP, on by default). A file rewritten
@@ -2447,12 +2447,20 @@ impl HealingManager {
     fn superseded_grace_secs(&self) -> u64 {
         let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
         Self::superseded_grace_for(env("DFS_SUPERSEDED_GRACE_SECS", 6 * 3600),
-            env("DFS_SUPERSEDED_PRESSURE_GRACE_SECS", 600), self.storage.get_filesystem_stats().ok())
+            env("DFS_SUPERSEDED_PRESSURE_GRACE_SECS", 600), env("DFS_SUPERSEDED_EMERGENCY_GRACE_SECS", 60),
+            self.storage.get_filesystem_stats().ok())
     }
 
-    fn superseded_grace_for(grace: u64, pressure_grace: u64, fs_stats: Option<(u64, u64, u64)>) -> u64 {
+    /// Under 10% of the disk available the grace drops to `pressure_grace`, under 3% to
+    /// `emergency_grace` (G8 soak #15, 11-05: on a 16 GB node the 600 s pressure grace still
+    /// held more rewrite churn than the disk had room for, 233 of 240 old versions were too
+    /// young to go, and it reached 0 MB free; Pete chose the shorter emergency grace). Neither
+    /// lengthens a shorter configured grace.
+    fn superseded_grace_for(grace: u64, pressure_grace: u64, emergency_grace: u64, fs_stats: Option<(u64, u64, u64)>) -> u64 {
         const PRESSURE_AVAILABLE_PCT: u64 = 10;
+        const EMERGENCY_AVAILABLE_PCT: u64 = 3;
         match fs_stats {
+            Some((total, _, available)) if total > 0 && available * 100 < total * EMERGENCY_AVAILABLE_PCT => grace.min(emergency_grace),
             Some((total, _, available)) if total > 0 && available * 100 < total * PRESSURE_AVAILABLE_PCT => grace.min(pressure_grace),
             _ => grace,
         }
@@ -9169,15 +9177,23 @@ mod tests {
     #[test]
     fn superseded_grace_shrinks_when_the_disk_runs_short() {
         let gb = 1u64 << 30;
-        let grace = |avail_gb: u64| HealingManager::superseded_grace_for(6 * 3600, 600, Some((100 * gb, avail_gb * gb, avail_gb * gb)));
+        let grace = |avail_gb: u64| HealingManager::superseded_grace_for(6 * 3600, 600, 60, Some((100 * gb, avail_gb * gb, avail_gb * gb)));
         assert_eq!(grace(50), 6 * 3600, "plenty of space: the normal grace");
         assert_eq!(grace(10), 6 * 3600, "at the threshold: still the normal grace");
         assert_eq!(grace(9), 600, "under 10% available: the pressure grace");
-        assert_eq!(grace(0), 600);
-        assert_eq!(HealingManager::superseded_grace_for(300, 600, Some((100 * gb, gb, gb))), 300,
+        assert_eq!(grace(3), 600, "at 3%: still the pressure grace");
+        // G8 soak #15 (11-05, server5: 16 GB): under the 600 s pressure grace 233 of 240 old
+        // versions were too young to go and the disk reached 0 MB free (Pete: option C).
+        assert_eq!(grace(2), 60, "BUG: under 3% available the 600 s pressure grace still held a full disk's old versions");
+        assert_eq!(grace(0), 60);
+        assert_eq!(HealingManager::superseded_grace_for(300, 600, 60, Some((100 * gb, gb, gb))), 60,
+            "the emergency grace applies whatever the configured one");
+        assert_eq!(HealingManager::superseded_grace_for(30, 600, 60, Some((100 * gb, gb, gb))), 30,
+            "no grace ever lengthens a shorter configured one");
+        assert_eq!(HealingManager::superseded_grace_for(300, 600, 60, Some((100 * gb, 5 * gb, 5 * gb))), 300,
             "the pressure grace never lengthens a shorter configured grace");
-        assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, None), 6 * 3600, "unknown space: the normal grace");
-        assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, Some((0, 0, 0))), 6 * 3600);
+        assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, 60, None), 6 * 3600, "unknown space: the normal grace");
+        assert_eq!(HealingManager::superseded_grace_for(6 * 3600, 600, 60, Some((0, 0, 0))), 6 * 3600);
     }
 
     /// G8 soak #13/#14 (11-04): after each kill the restarted node reclaimed nothing for its

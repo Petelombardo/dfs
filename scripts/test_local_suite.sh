@@ -4493,6 +4493,97 @@ fi
 rm -f "$MOUNT/$T122_FILE" "$T/t122.bin"
 fi # should_run T122
 
+# ── T123: a node stopped cleanly (graceful leave) and kept down past the 60 s leaving grace ──
+# G8 soak #17 (11-06, puck1): a node that announced a graceful leave (here a planned compaction;
+# a systemctl stop or a reboot sends the same) and wasn't back within the 60 s grace was marked
+# Failed, then purged from the cluster as "failed for >24h" 10 s later: the leave had zeroed its
+# last heartbeat. Healing then pruned it from every chunk's holders as "not in cluster", purged
+# chunks left with none as DATA LOSS, and the client's writes failed with EIO for 10 hours. Here
+# a non-leader node is SIGTERMed and kept down 120 s while patches land; it must stay a member,
+# no chunk may lose it as a holder, nothing may be purged as lost, and every write must succeed.
+snapshot_log T123
+if should_run T123; then
+echo ""
+echo "=== T123: a node gracefully stopped for 120 s stays a member: no purge, no pruned holders, no EIO ==="
+T123_FILE=t123.bin
+t123_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$1.log" 2>&1 &
+}
+t123_patch() {   # t123_patch <offset>: 4 KiB at <offset>, fsynced, into the mount and the expected copy
+    python3 - "$MOUNT/$T123_FILE" "$T/t123.bin" "$1" <<'PY'
+import os, sys
+x = os.urandom(4096); off = int(sys.argv[3])
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    os.pwrite(fd, x, off); os.fsync(fd)
+except OSError as e:
+    print("ERR at %d: %s" % (off, e)); sys.exit(0)
+finally:
+    os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+print("OK")
+PY
+}
+dd if=/dev/urandom of="$T/t123.bin" bs=4M count=8 status=none
+cp "$T/t123.bin" "$MOUNT/$T123_FILE"
+dfs_sync
+T123_LEADER=$(settled_leader)
+# The highest-numbered node that isn't the leader: a plain member, as puck1 was.
+T123_N=""
+for n in 5 4 3 2; do [ "127.0.0.1:$((8899 + n))" != "$T123_LEADER" ] && { T123_N=$n; break; }; done
+declare -A T123_MARK
+for n in 1 2 3 4 5; do T123_MARK[$n]=$(stat -c %s "$LOG/server$n.log"); done
+echo "  T123: leader $T123_LEADER; stopping node$T123_N gracefully for 120 s"
+pkill -TERM -f "dfs-server start --config $BASE/node$T123_N/config.toml" 2>/dev/null || true
+for _ in $(seq 1 150); do pgrep -f "dfs-server start --config $BASE/node$T123_N/config.toml" >/dev/null || break; sleep 0.1; done
+pkill -9 -f "dfs-server start --config $BASE/node$T123_N/config.toml" 2>/dev/null || true
+T123_OUT=""
+for i in $(seq 1 12); do
+    sleep 10
+    T123_OUT="$T123_OUT $(t123_patch $(( (i % 8) * 4194304 + 4096 * i )))"
+done
+t123_start "$T123_N"
+for _ in $(seq 1 60); do "$BIN/dfs-admin" --cluster "127.0.0.1:$((8899 + T123_N))" cluster status >/dev/null 2>&1 && break; sleep 1; done
+sleep 20
+T123_LINES=""
+for n in 1 2 3 4 5; do
+    T123_LINES="$T123_LINES$(tail -c +"$((T123_MARK[$n] + 1))" "$LOG/server$n.log" | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep -aE "Purging [0-9]+ long-failed nodes|removed node\(s\) from metadata|DATA LOSS:" | sed "s/^/node$n: /")
+"
+done
+T123_PURGE=$(echo "$T123_LINES" | grep -c "long-failed nodes" || true)
+T123_PRUNE=$(echo "$T123_LINES" | grep -c "removed node(s)" || true)
+T123_LOSS=$(echo "$T123_LINES" | grep -c "DATA LOSS:" || true)
+T123_ERRS=$(echo "$T123_OUT" | grep -o "ERR" | grep -c "" || true)
+echo "  T123: patches:$T123_OUT"
+echo "  T123: node purges $T123_PURGE, holder prunes $T123_PRUNE, DATA LOSS $T123_LOSS"
+echo "$T123_LINES" | grep . | head -3 | cut -c1-200 | sed 's/^/    /'
+dfs_sync
+T123_M1=$(md5sum < "$T/t123.bin" | cut -d' ' -f1)
+T123_FM=/tmp/dfs-mount-t123
+mkdir -p "$T123_FM"
+RUST_LOG=info "$BIN/dfs-client" mount "$T123_FM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t123.log" --allow-other --log-level debug &
+T123_CPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T123_FM" && break; sleep 0.1; done
+T123_M2=$(timeout 60 md5sum < "$T123_FM/$T123_FILE" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T123_FM" 2>/dev/null || true
+kill_client_and_wait "$T123_CPID"
+[ "$T123_PURGE" = 0 ] && [ "$T123_PRUNE" = 0 ] \
+    && check "T123a node$T123_N stayed a cluster member and a holder of its chunks while down 120 s" PASS \
+    || check "T123a node$T123_N, gracefully stopped, was purged ($T123_PURGE) or pruned as a holder ($T123_PRUNE lines) within 120 s" FAIL
+[ "$T123_LOSS" = 0 ] \
+    && check "T123b nothing was purged as DATA LOSS" PASS \
+    || check "T123b $T123_LOSS chunk(s) purged as DATA LOSS while their holder was only stopped" FAIL
+[ "$T123_ERRS" = 0 ] && [ "$T123_M1" = "$T123_M2" ] \
+    && check "T123c every write while it was down fsynced and a fresh client reads the file back" PASS \
+    || check "T123c $T123_ERRS write(s) failed; fresh read ${T123_M2:-unreadable} vs expected $T123_M1" FAIL
+pgrep -f "dfs-server start --config $BASE/node$T123_N/config.toml" >/dev/null || t123_start "$T123_N"
+rm -f "$MOUNT/$T123_FILE" "$T/t123.bin"
+sleep 5
+fi # should_run T123
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

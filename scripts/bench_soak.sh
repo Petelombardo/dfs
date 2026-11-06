@@ -72,6 +72,18 @@ start)
             [ -n "$(bench_pid "$victim")" ] && say "RESTARTED $victim" || say "FAIL $victim did not restart"
             next_kill=$(( $(date +%s) + 1800 + RANDOM % 1800 ))
         fi
+        # A server that exited on its own (a crash, a watchdog exit) comes back as systemd brings
+        # it back on staging: soak #17's puck1 exited at 01:19 and stayed down 10 h, until the
+        # next random kill happened to pick it. Every node is meant to be up here: the kill
+        # above sleeps out its own victim's downtime.
+        for n in $NODES; do
+            if [ -z "$(bench_pid "$n")" ]; then
+                say "EXITED $n: its bench server stopped on its own; restarting it (as systemd would)"
+                start_node "$n" > /dev/null
+                sleep 10
+                [ -n "$(bench_pid "$n")" ] && say "RESTARTED $n" || say "FAIL $n did not restart"
+            fi
+        done
         if [ "$now" -ge "$next_verify" ]; then
             ssh root@"$CLIENT" "bash $CDIR/bench_soak_workers.sh verify" < /dev/null
             next_verify=$(( $(date +%s) + 3600 ))

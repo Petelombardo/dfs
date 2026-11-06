@@ -808,7 +808,7 @@ async fn run_planned_offline_compaction(
     // machinery with the async path that failed; see watchdog.rs for the full
     // post-mortem. Armed slightly wider than the async timeout so that when the
     // runtime IS healthy the existing, cleaner path still wins.
-    let _compact_watchdog = crate::watchdog::HardDeadline::arm(
+    let compact_watchdog = crate::watchdog::HardDeadline::arm(
         "planned offline compaction", std::time::Duration::from_secs(90));
     let compact_task = tokio::task::spawn_blocking(move || metadata.compact_db_blocking());
     let compact_result = match tokio::time::timeout(std::time::Duration::from_secs(60), compact_task).await {
@@ -822,6 +822,10 @@ async fn run_planned_offline_compaction(
             std::process::exit(1);
         }
     };
+    // The deadline guards the compaction alone. Held to the end of this function, it also
+    // timed the rejoin below (catch-up, heartbeats), and a catch-up that overran on a slow node
+    // got a healthy process killed 90 s after a 2 s compaction (G8 soak #17, 11-06, puck1).
+    drop(compact_watchdog);
     server.end_compaction_quiesce();
     let succeeded = match &compact_result {
         Ok(Ok((before, after))) => {

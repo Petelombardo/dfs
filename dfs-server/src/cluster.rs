@@ -729,11 +729,15 @@ impl ClusterManager {
             info.status = NodeStatus::Leaving;
             info.leaving_at = now;
             info.leave_reason = Some(reason);
-            // Set last_heartbeat to 0 so the failure detector's is_timed_out check
-            // is immediately true.  Without this, the stale fresh heartbeat timestamp
-            // triggers the "!is_timed_out → rejoined" branch on the very next tick,
-            // resetting the node back to Online before it's actually gone.
-            info.last_heartbeat = 0;
+            // last_heartbeat stays the time of the node's last real heartbeat: the failure
+            // detector tells a return by a heartbeat newer than `leaving_at` (see its
+            // NodeStatus::Leaving branch). It was zeroed here once, so the stale fresh
+            // timestamp couldn't read as a return; but the same field times the purge of a
+            // node failed for >24h, and a node still away when the 60 s leaving grace ran
+            // out was purged from the cluster on the next tick. Healing then pruned it from
+            // every chunk's holders as "not in cluster", purged chunks left with none as
+            // DATA LOSS, and the client's writes failed for 10 hours (G8 soak #17, 11-06:
+            // puck1's planned compaction overran the grace; suite T123).
         }
         // Remove from hash ring so no new chunks are placed on a leaving node.
         let mut ring = self.hash_ring.write().await;
@@ -1459,17 +1463,20 @@ impl ClusterManager {
                     // Before that, the node may still come back (rolling restart / recovery).
                     let grace_expired = node_info.leaving_at > 0
                         && now.saturating_sub(node_info.leaving_at) > Self::LEAVING_GRACE_SECS;
-                    if grace_expired {
-                        warn!("Node {} leaving grace period expired — treating as Failed", node_id);
-                        node_info.status = NodeStatus::Failed;
-                        failed_nodes.push(*node_id);
-                    } else if !is_timed_out {
+                    // Back only on a heartbeat after the leave: the one before it is still
+                    // fresh for a while.
+                    let came_back = node_info.last_heartbeat > node_info.leaving_at && !is_timed_out;
+                    if came_back {
                         // Node sent a heartbeat — it came back before grace expired.
                         info!("Node {} rejoined after graceful leave", node_id);
                         node_info.status = NodeStatus::Online;
                         node_info.leaving_at = 0;
                         node_info.leave_reason = None;
                         recovered_nodes.push(*node_id);
+                    } else if grace_expired {
+                        warn!("Node {} leaving grace period expired — treating as Failed", node_id);
+                        node_info.status = NodeStatus::Failed;
+                        failed_nodes.push(*node_id);
                     }
                 }
             }
@@ -1665,6 +1672,46 @@ mod tests {
     async fn five_node_cluster() -> (ClusterManager, Vec<NodeId>) {
         let ids = five_ids();
         (five_node_view(&ids, 3).await, ids)
+    }
+
+    /// G8 soak #17 (suite T123): a node that left gracefully and was still away when the 60 s
+    /// leaving grace ran out turned Failed, and on the next tick was purged from the cluster as
+    /// failed for >24h (its last heartbeat had been zeroed), so healing pruned it from every
+    /// chunk. It must stay a member: Failed, purgeable only a day after its last heartbeat.
+    #[tokio::test]
+    async fn a_node_away_past_its_leaving_grace_stays_a_member() {
+        let (manager, ids) = five_node_cluster().await;
+        let away = ids[4];
+        let now = dfs_common::types::current_timestamp();
+        manager.nodes.write().await.get_mut(&away).unwrap().last_heartbeat = now - 91;
+        manager.set_leaving(away, dfs_common::LeaveReason::PlannedCompaction).await;
+        manager.nodes.write().await.get_mut(&away).unwrap().leaving_at = now - 90;
+        manager.check_failed_nodes().await.unwrap();
+        assert_eq!(manager.nodes.read().await.get(&away).map(|n| n.status), Some(NodeStatus::Failed));
+        manager.check_failed_nodes().await.unwrap();
+        manager.check_failed_nodes().await.unwrap();
+        assert!(manager.nodes.read().await.contains_key(&away), "purged from the cluster 90 s after its last heartbeat");
+    }
+
+    /// A leaving node is back only on a heartbeat after its leave: the one it sent before
+    /// leaving is still fresh for a while and must not read as a return.
+    #[tokio::test]
+    async fn a_leaving_node_is_back_only_on_a_heartbeat_after_its_leave() {
+        let (manager, ids) = five_node_cluster().await;
+        let away = ids[4];
+        manager.set_leaving(away, dfs_common::LeaveReason::Shutdown).await;
+        let now = dfs_common::types::current_timestamp();
+        {
+            let mut nodes = manager.nodes.write().await;
+            let n = nodes.get_mut(&away).unwrap();
+            n.leaving_at = now - 5;
+            n.last_heartbeat = now - 6;
+        }
+        manager.check_failed_nodes().await.unwrap();
+        assert_eq!(manager.nodes.read().await.get(&away).map(|n| n.status), Some(NodeStatus::Leaving));
+        manager.nodes.write().await.get_mut(&away).unwrap().last_heartbeat = now;
+        manager.check_failed_nodes().await.unwrap();
+        assert_eq!(manager.nodes.read().await.get(&away).map(|n| n.status), Some(NodeStatus::Online));
     }
 
     /// Suite T82: a node elected after a restart held none of three files' chunks and served

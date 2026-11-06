@@ -192,6 +192,12 @@ enum FaultCommands {
         #[arg(long)]
         for_millis: u64,
     },
+    /// Test-only: for `for_millis` no whole chunk moves between the node and its peers: it
+    /// refuses every WriteChunk sent to it and every chunk it pulls from a peer fails.
+    FailChunkTransfers {
+        #[arg(long)]
+        for_millis: u64,
+    },
     /// Test-only: for `millis` the node acts as if its own lease had lapsed (a primary refuses
     /// ordered writes), with no expiry vote.
     LeaseLapse {
@@ -1929,6 +1935,16 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::FailChunkTransfers { for_millis } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectChunkTransferFailures { for_millis: *for_millis }).await? {
+                Response::Ok { .. } => println!("{}: for {}ms chunk copies to it and its chunk pulls fail", addr, for_millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::LeaseLapse { millis } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectLeaseLapse { millis: *millis }).await? {
@@ -2004,7 +2020,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
-        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::SlowIsrVotes { .. } | FaultCommands::LeaseLapse { .. }
+        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::SlowIsrVotes { .. } | FaultCommands::FailChunkTransfers { .. } | FaultCommands::LeaseLapse { .. }
         | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. }
         | FaultCommands::PlantLocation { .. } => unreachable!("handled above"),
     };

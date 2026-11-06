@@ -1379,6 +1379,15 @@ pub enum Request {
         delay_millis: u64,
         for_millis: u64,
     },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): for `for_millis`, no whole chunk moves between this node
+    /// and its peers: it refuses every WriteChunk sent to it and every chunk it pulls from a peer
+    /// fails (G8 soak #16: an ordered slot's secondary neither got the primary's fold result,
+    /// which went to a third replica, nor could pull it). APPENDED at end to preserve wire
+    /// compatibility.
+    InjectChunkTransferFailures {
+        for_millis: u64,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

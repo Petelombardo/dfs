@@ -116,6 +116,17 @@ pub fn injected_slow_isr_vote() -> Option<std::time::Duration> {
         .then(|| std::time::Duration::from_millis(INJECTED_SLOW_ISR_VOTE_MS.load(std::sync::atomic::Ordering::SeqCst)))
 }
 
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectChunkTransferFailures`): until this time
+/// (ms since UNIX epoch), this node refuses every WriteChunk sent to it and fails every chunk
+/// pull from a peer.
+pub static INJECTED_CHUNK_TRANSFER_FAILURES_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether whole-chunk transfers to and from this node fail now.
+pub fn chunk_transfers_failing() -> bool {
+    let until = INJECTED_CHUNK_TRANSFER_FAILURES_UNTIL_MS.load(std::sync::atomic::Ordering::SeqCst);
+    until != 0 && now_ms() < until
+}
+
 /// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectChunkLocationFailures`): until this
 /// time (ms since UNIX epoch), chunk-location registrations fail as a failed commit would.
 /// Time-based, not a count: the ordered and batched senders retry at very different rates.
@@ -501,6 +512,12 @@ impl SlotOrder {
         g.orders.retain(|_, (v, _)| *v > version && *v != BUSY);
         drop(g);
         self.changed.notify_waiters();
+    }
+
+    /// Secondary: this replica's head is not the state the primary continues from, though its
+    /// version says it is; the next write resyncs (or is refused) instead of applying onto it.
+    pub fn lose_head(&self) {
+        self.inner.lock().unwrap().head_version = None;
     }
 
     /// Secondary: wait until `write_id` has a version and every earlier version is applied.

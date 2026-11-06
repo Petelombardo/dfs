@@ -4368,6 +4368,131 @@ t121_case a secondary
 t121_case b primary
 fi # should_run T121
 
+# ── T122: the primary folds in the background and the secondary can't pull the result ──
+# G8 soak #16 (11-05, /vm/disk.raw chunk 322): the overloaded primary (puck1) folded its token in
+# the background 20 s after the last write; the fold result hadn't reached the secondary when the
+# next ordered write came 10 s later, and the secondary couldn't pull it either. It applied the
+# write onto its unfolded token, the primary onto the fold result: the same bytes under different
+# ids, and every later write to the chunk came back as two versions and failed fsync with EIO.
+# Here the secondary holds every peer fold result 60 s before recording it (slow-fold-adopt), and
+# refuses chunk copies and can't pull a chunk (fail-chunk-transfers), while the primary folds and
+# six fsynced patches land: every fsync must succeed, the pair must
+# agree, and a fresh client reads them all.
+snapshot_log T122
+if should_run T122; then
+echo ""
+echo "=== T122: the primary's background fold, then writes the secondary can't pull its base for: no split, no EIO ==="
+T122_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T122_FILE=t122.bin
+t122_check() {   # required with DFS_ORDERED_WRITES=1, informational without (as T120)
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+t122_patch() {   # t122_patch <offset>: 4 KiB at <offset>, fsynced, into the mount and the expected copy
+    python3 - "$MOUNT/$T122_FILE" "$T/t122.bin" "$1" <<'PY'
+import os, sys
+x = os.urandom(4096); off = int(sys.argv[3])
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    os.pwrite(fd, x, off); os.fsync(fd)
+except OSError as e:
+    print("ERR at %d: %s" % (off, e)); sys.exit(0)
+finally:
+    os.close(fd)
+with open(sys.argv[2], "r+b") as f: f.seek(off); f.write(x)
+print("OK")
+PY
+}
+T122_MAP=""
+for _ in $(seq 1 30); do
+    T122_MAP=$("$BIN/dfs-admin" --cluster "$T122_ALL" lease status 2>/dev/null \
+        | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+    [ "$(echo "$T122_MAP" | grep -c .)" -ge 5 ] && break
+    sleep 1
+done
+dd if=/dev/urandom of="$T/t122.bin" bs=4M count=8 status=none
+cp "$T/t122.bin" "$MOUNT/$T122_FILE"
+dfs_sync
+T122_FID=$(grep -h "\[META SERVER\] put path=/$T122_FILE id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+T122_PICK=""
+for _ in $(seq 1 30); do
+    T122_PICK=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T122_FILE" --chunks 8 2>/dev/null | python3 -c "
+import json, sys
+addr = dict(l.split() for l in '''$T122_MAP'''.strip().splitlines())
+isr = json.loads(sys.stdin.readline())['isr']
+for c in range(1, len(isr)):
+    r = isr[c]
+    if r and len(r['members']) >= 2:
+        p, s = addr.get(r['members'][0], ''), addr.get(r['members'][1], '')
+        if p and s: print(c, p, s); break" 2>/dev/null || true)
+    [ -n "$T122_PICK" ] && break
+    sleep 1
+done
+read -r T122_C T122_P T122_S <<< "$T122_PICK"
+if [ -z "$T122_S" ]; then
+    echo "  T122: $(echo "$T122_MAP" | grep -c .) node(s) mapped; ISR: $("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$T122_FILE" --chunks 8 2>&1 | head -c 600)"
+    t122_check "T122 setup: a chunk with a two-member ISR found" FAIL
+else
+    T122_PN=$(( ${T122_P##*:} - 8900 + 1 )); T122_SN=$(( ${T122_S##*:} - 8900 + 1 ))
+    echo "  T122: file ${T122_FID:-?} chunk $T122_C, primary $T122_P (node$T122_PN), secondary $T122_S (node$T122_SN)"
+    T122_PBYTES=$(stat -c %s "$LOG/server$T122_PN.log"); T122_SMARK=$(wc -l < "$LOG/server$T122_SN.log")
+    T122_CMARK=$(wc -l < "$CURRENT_CLIENT_LOG")
+    "$BIN/dfs-admin" --cluster "$T122_S" fault slow-fold-adopt --millis 60000 --count 1000 >/dev/null 2>&1 \
+        || echo "  T122: could not arm slow-fold-adopt on $T122_S"
+    T122_BASE=$((T122_C * 4194304))
+    T122_OUT="first: $(t122_patch $((T122_BASE + 8192)))"
+    # From here the fold that follows can't copy its result to the secondary (it goes to a third
+    # replica), and the secondary can't pull it.
+    "$BIN/dfs-admin" --cluster "$T122_S" fault fail-chunk-transfers --for-millis 90000 >/dev/null 2>&1 \
+        || echo "  T122: could not arm fail-chunk-transfers on $T122_S"
+    T122_FOLDED=""
+    # Polled from a byte offset: only the log's new part is read, so the patches go out at
+    # once (`tail -f | grep -m1` waits out tail's timeout; a full re-read lagged 25 s).
+    for _ in $(seq 1 300); do
+        tail -c +"$((T122_PBYTES + 1))" "$LOG/server$T122_PN.log" | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -aq "Fold committed: file $T122_FID chunk_idx $T122_C " && { T122_FOLDED=1; break; }
+        sleep 0.2
+    done
+    if [ -n "$T122_FOLDED" ]; then
+        for i in 1 2 3 4 5 6; do
+            T122_OUT="$T122_OUT; $(t122_patch $((T122_BASE + 65536 + i * 131072)))"
+            sleep 1
+        done
+    fi
+    "$BIN/dfs-admin" --cluster "$T122_S" fault fail-chunk-transfers --for-millis 0 >/dev/null 2>&1 || true
+    "$BIN/dfs-admin" --cluster "$T122_S" fault slow-fold-adopt --millis 0 --count 0 >/dev/null 2>&1 || true
+    T122_ERRS=$(echo "$T122_OUT" | grep -o "ERR" | grep -c "" || true)
+    T122_CL=$(tail -n +"$((T122_CMARK + 1))" "$CURRENT_CLIENT_LOG" | sed 's/\x1b\[[0-9;]*m//g')
+    T122_DIS=$(echo "$T122_CL" | grep -a "REPLICA DISAGREEMENT" | grep -a "$T122_FID" | grep -c "" || true)
+    T122_ADOPT=$(tail -n +"$((T122_SMARK + 1))" "$LOG/server$T122_SN.log" | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep -a "file $T122_FID chunk $T122_C " | grep -ac "folded it here too" || true)
+    echo "  T122: patches: $T122_OUT"
+    echo "  T122: client REPLICA DISAGREEMENT lines for the file $T122_DIS; secondary folded its own head $T122_ADOPT time(s)"
+    dfs_sync
+    sleep 5
+    T122_M1=$(md5sum < "$T/t122.bin" | cut -d' ' -f1)
+    T122_FM=/tmp/dfs-mount-t122
+    mkdir -p "$T122_FM"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T122_FM" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t122.log" --allow-other --log-level debug &
+    T122_CPID=$!
+    for _ in $(seq 1 50); do mountpoint -q "$T122_FM" && break; sleep 0.1; done
+    T122_M2=$(timeout 60 md5sum < "$T122_FM/$T122_FILE" 2>/dev/null | cut -d' ' -f1)
+    fusermount -u "$T122_FM" 2>/dev/null || true
+    kill_client_and_wait "$T122_CPID"
+    [ -n "$T122_FOLDED" ] \
+        && t122_check "T122a the primary folded chunk $T122_C in the background while the secondary's adopt was held" PASS \
+        || t122_check "T122a the primary never folded chunk $T122_C within 60 s: the test didn't reach the case" FAIL
+    [ -n "$T122_FOLDED" ] && [ "$T122_ERRS" = 0 ] && [ "$T122_DIS" = 0 ] \
+        && t122_check "T122b every patch fsynced and the pair agreed on each" PASS \
+        || t122_check "T122b $T122_ERRS patch(es) failed, $T122_DIS disagreement(s): the pair split over the fold" FAIL
+    [ "$T122_M1" = "$T122_M2" ] \
+        && t122_check "T122c a fresh client reads every acked patch back" PASS \
+        || t122_check "T122c fresh read ${T122_M2:-unreadable} vs expected $T122_M1: an acked write was lost" FAIL
+fi
+rm -f "$MOUNT/$T122_FILE" "$T/t122.bin"
+fi # should_run T122
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

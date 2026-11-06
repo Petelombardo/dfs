@@ -1362,6 +1362,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectChunkLocation { .. }
         | Request::InjectSlowFoldAdopts { .. }
         | Request::InjectSlowIsrVotes { .. }
+        | Request::InjectChunkTransferFailures { .. }
         | Request::InjectLeaseLapse { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
@@ -2671,6 +2672,10 @@ async fn pull_chunk_from_peers_impl(
     file_id: FileId,
     file_offset: u64,
 ) -> Option<Arc<Vec<u8>>> {
+    if crate::write_order::chunk_transfers_failing() {
+        warn!("FAULT INJECTION: pull of chunk {} from peers failed", chunk_id);
+        return None;
+    }
     let local_id = cluster.local_node_id();
     let nodes = cluster.get_all_nodes().await;
     for &node_id in candidate_nodes {
@@ -3449,7 +3454,19 @@ impl OverlayForkCtx {
             // fold does not quietly migrate a chunk off the nodes that are
             // supposed to hold it; anything else online is a fallback for when
             // those are unreachable.
-            let prefer: Vec<NodeId> = peers.iter().map(|(nid, _)| *nid).collect();
+            // An ordered slot's ISR members come first, primary then secondary: the secondary
+            // continues the stream from this exact chunk, and when the copy went to a third
+            // replica instead the secondary had to fetch it before its next write could apply
+            // (G8 soak #16: it couldn't, and the pair split).
+            let me = self.cluster.local_node_id();
+            let mut prefer: Vec<NodeId> = self.slot_isr.get(file_id, chunk_idx)
+                .map(|isr| isr.members).unwrap_or_default()
+                .into_iter().filter(|n| *n != me).collect();
+            for (nid, _) in peers {
+                if !prefer.contains(nid) {
+                    prefer.push(*nid);
+                }
+            }
             match self.replicate_folded_bytes(folded_id, &buf, &holders, &prefer).await {
                 Some(node_id) => holders.push(node_id),
                 None => {
@@ -3766,8 +3783,9 @@ impl OverlayForkCtx {
                 && n.status == dfs_common::NodeStatus::Online
                 && !exclude.contains(&n.id))
             .collect();
-        // Slot's own replicas first; everything else is fallback placement.
-        candidates.sort_by_key(|n| !prefer.contains(&n.id));
+        // In `prefer`'s order (the slot's own replicas, ISR members first); everything else
+        // is fallback placement.
+        candidates.sort_by_key(|n| prefer.iter().position(|p| *p == n.id).unwrap_or(usize::MAX));
 
         for node in candidates {
             let req = Request::WriteChunk {
@@ -8568,6 +8586,10 @@ impl Server {
                 data,
                 checksum,
             } => {
+                if crate::write_order::chunk_transfers_failing() {
+                    warn!("FAULT INJECTION: refusing WriteChunk {}", chunk_id);
+                    return Response::Error { message: format!("write of {} refused (fault injection)", chunk_id), code: ErrorCode::InternalError };
+                }
                 self.ops_tracker.inc_write();
                 self.handle_write_chunk(chunk_id, data, checksum, false).await
             }
@@ -8720,6 +8742,18 @@ impl Server {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 crate::write_order::INJECTED_SLOW_ISR_VOTE_MS.store(delay_millis, std::sync::atomic::Ordering::SeqCst);
                 crate::write_order::INJECTED_SLOW_ISR_VOTES_UNTIL_MS.store(now + for_millis, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
+            Request::InjectChunkTransferFailures { for_millis } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: for {}ms this node refuses chunk copies and fails its chunk pulls", for_millis);
+                crate::write_order::INJECTED_CHUNK_TRANSFER_FAILURES_UNTIL_MS
+                    .store(crate::write_order::now_ms() + for_millis, std::sync::atomic::Ordering::SeqCst);
                 Response::Ok { data: None }
             }
             Request::InjectLeaseLapse { millis } => {
@@ -18312,11 +18346,22 @@ impl Server {
         // A real base is the primary's exact state after version-1 (real ids are content
         // hashes): adopt it, pulling it verified if we lack it. Token ids prove nothing
         // either way (see write_order.rs), so they are never compared.
-        if !primary_base.looks_like_patch_token() && slot.head() != Some(primary_base)
-            && self.ensure_anchor_local(file_id, tag.chunk_idx, primary_base, tag.primary).await
-        {
-            slot.set_anchor(primary_base, version - 1);
-            self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
+        if !primary_base.looks_like_patch_token() && slot.head() != Some(primary_base) {
+            if self.adopt_primary_base(file_id, tag.chunk_idx, &slot, version, primary_base, tag.primary).await {
+                slot.set_anchor(primary_base, version - 1);
+                self.note_synced_as_secondary(file_id, tag.chunk_idx, tag.isr_epoch).await;
+            } else if slot.head_version() == Some(version - 1) {
+                // Our head at v-1 is not the state the primary applies v onto. Continuing from
+                // it split the pair for good: the primary had folded its token in the
+                // background, this node couldn't pull the result, applied v onto its unfolded
+                // token instead, and from then on the two minted different ids for every write
+                // and every fsync of the chunk failed (G8 soak #16, 11-05, /vm/disk.raw chunk
+                // 322). Resync, or refuse and let the client backfill, as for any head that
+                // can't be continued.
+                warn!("[ORDER] secondary: file {} chunk {} v{}: can't adopt the primary's base {} (head {:?}); resyncing",
+                    file_id, tag.chunk_idx, version, primary_base, slot.head());
+                slot.lose_head();
+            }
         }
         if slot.head_version() != Some(version - 1) {
             let behind = slot.head_version().is_none_or(|hv| hv < version);
@@ -18777,6 +18822,55 @@ impl Server {
 
     /// Hold the real chunk `id` locally, pulling it from `from` (verified by its content hash)
     /// if we don't.
+    /// Secondary: make the primary's real base for `version` (its exact state after version-1)
+    /// this node's own, before applying `version` onto it. A primary's background fold is
+    /// what usually names one: it folded the token both replicas hold at version-1 into a real
+    /// chunk, and that chunk's bytes are this node's head's bytes, so folding the head here
+    /// yields the same content-addressed id with no network round trip. The fold result's
+    /// own announcement can arrive much later than the next write (an overloaded primary in
+    /// G8 soak #16 took 20 s per fold permit, the next write came 10 s after its fold). Else
+    /// the base is pulled, verified, from the primary.
+    async fn adopt_primary_base(&self, file_id: FileId, chunk_idx: u64, slot: &crate::write_order::SlotOrder,
+        version: u64, base: ChunkId, primary: NodeId) -> bool
+    {
+        if let (Some(head), Some(at)) = (slot.head(), slot.head_version()) {
+            if at + 1 == version && head.looks_like_patch_token() && self.fold_own_head_into(file_id, chunk_idx, head, base).await {
+                info!("[ORDER] secondary: file {} chunk {} v{}: the primary folded {} into {}; folded it here too",
+                    file_id, chunk_idx, version, head, base);
+                return true;
+            }
+        }
+        self.ensure_anchor_local(file_id, chunk_idx, base, primary).await
+    }
+
+    /// Fold this node's patch token `token` of slot (file, chunk_idx) into the real chunk
+    /// `expect` here, if `token`'s content is exactly `expect`'s: store it, register it as an
+    /// anchor, and record the fold as an ordered one (`record_ordered_fold`, which the client's
+    /// ordered ForceFold also takes). False, with nothing stored, if the content differs.
+    async fn fold_own_head_into(&self, file_id: FileId, chunk_idx: u64, token: ChunkId, expect: ChunkId) -> bool {
+        let Some(data) = Self::chunk_data_bytes(self.handle_read_chunk(token, None, None).await) else {
+            return false;
+        };
+        let id = ChunkId { hash: dfs_common::compute_chunk_hash_at(&data, chunk_idx * (4 * 1024 * 1024), file_id) };
+        if id != expect {
+            warn!("[ORDER] file {} chunk {}: this node's {} holds {}, not the primary's {}",
+                file_id, chunk_idx, token, id, expect);
+            return false;
+        }
+        if !self.storage.has_chunk(&id) {
+            if let Response::Error { message, .. } = self.handle_write_chunk(id, data, id.hash, false).await {
+                warn!("[ORDER] file {} chunk {}: storing {} (the fold of {}) failed: {}", file_id, chunk_idx, id, token, message);
+                return false;
+            }
+        }
+        let seq = self.version_write_seq(file_id, chunk_idx, token).await;
+        if !self.register_anchor_location(file_id, chunk_idx, id, seq).await {
+            return false;
+        }
+        self.record_ordered_fold(file_id, chunk_idx, token, id, false).await;
+        true
+    }
+
     async fn ensure_anchor_local(&self, file_id: FileId, chunk_idx: u64, id: ChunkId, from: NodeId) -> bool {
         // Bounded like resync_from_primary's request, for the same reason: callers hold the
         // slot's order lock. A primary that folded during a cut names a real base the
@@ -18789,6 +18883,9 @@ impl Server {
             || tokio::time::timeout(ANCHOR_PULL_TIMEOUT,
                 pull_chunk_from_peers_impl(&self.cluster, &self.client, &self.storage, id, &[from], file_id, chunk_idx * (4 * 1024 * 1024)))
                 .await.ok().flatten().is_some();
+        if !held {
+            warn!("[ORDER] file {} chunk {}: anchor {} isn't here and couldn't be pulled from {:?}", file_id, chunk_idx, id, from);
+        }
         held && self.register_anchor_location(file_id, chunk_idx, id, None).await
     }
 

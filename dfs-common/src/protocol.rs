@@ -1388,6 +1388,24 @@ pub enum Request {
     InjectChunkTransferFailures {
         for_millis: u64,
     },
+
+    /// Node -> every peer, repeated every couple of seconds while it holds: `node`'s metadata
+    /// commits are slow (`SlowJudge`), so it should lead only when no other fit node can: a
+    /// slow leader stalled clients' file records past their 60 s fsync budget (G8 soak #18).
+    /// A report expires unless repeated. Answered with Ok. APPENDED at end to preserve wire
+    /// compatibility; a node too old to know it ignores it (and keeps the old choice).
+    LeaderSlow {
+        node: NodeId,
+        slow: bool,
+    },
+
+    /// Test-only (DFS_FAULT_INJECTION=1): the next `count` metadata commits on this node each
+    /// take `millis` longer, as on a saturated disk. APPENDED at end to preserve wire
+    /// compatibility.
+    InjectSlowCommits {
+        millis: u64,
+        count: u32,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

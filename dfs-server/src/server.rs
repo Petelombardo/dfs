@@ -1295,6 +1295,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ReplaceIsrMember { .. }
         | Request::GetSlotHeads { .. } => ClientOther,
         Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. }
+        | Request::LeaderSlow { .. }
         | Request::SyncHeldLocations { .. } | Request::CheckSupersededChunks { .. }
         | Request::ReplicateIsrHeads { .. } => PeerOther,
         // A client's leader-directed read, relayed by the node the client asked.
@@ -1363,6 +1364,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::InjectSlowFoldAdopts { .. }
         | Request::InjectSlowIsrVotes { .. }
         | Request::InjectChunkTransferFailures { .. }
+        | Request::InjectSlowCommits { .. }
         | Request::InjectLeaseLapse { .. }
         | Request::ProposeSlotIsr { .. } => Admin,
     }
@@ -8789,6 +8791,24 @@ impl Server {
                 self.cluster.record_leader_report(node, unfit, led_term);
                 Response::Ok { data: None }
             }
+            Request::LeaderSlow { node, slow } => {
+                if node != self.cluster.local_node_id() {
+                    self.cluster.set_leader_slow(node, slow);
+                }
+                Response::Ok { data: None }
+            }
+            Request::InjectSlowCommits { millis, count } => {
+                if !crate::network::fault_injection_allowed() {
+                    return Response::Error {
+                        message: "fault injection is disabled on this node (start with DFS_FAULT_INJECTION=1)".into(),
+                        code: ErrorCode::PermissionDenied,
+                    };
+                }
+                warn!("FAULT INJECTION: the next {} metadata commit(s) each wait {}ms", count, millis);
+                crate::metadata::INJECTED_SLOW_COMMIT_MS.store(millis, std::sync::atomic::Ordering::SeqCst);
+                crate::metadata::INJECTED_SLOW_COMMITS.store(count, std::sync::atomic::Ordering::SeqCst);
+                Response::Ok { data: None }
+            }
             Request::ProposeSlotIsr { file_id, chunk_idx, members } => {
                 if !crate::network::fault_injection_allowed() {
                     Response::Error {
@@ -12931,8 +12951,20 @@ impl Server {
         tokio::spawn(async move {
             let me = self.cluster.local_node_id();
             let mut was_unfit = false;
+            let mut judge = crate::cluster::SlowJudge::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // Slow commits: a soft tier, judged and told apart from fitness (see SlowJudge).
+                let (slow_commits, in_flight) = self.metadata.commit_pace();
+                let was_slow = judge.tick(std::time::Instant::now(), slow_commits, in_flight);
+                if was_slow {
+                    if !self.cluster.self_is_slow() {
+                        warn!("[LEADER] this node's metadata commits are slow ({} over 1s in the last minute, one in flight for {:?}); \
+                               it leads only while no faster node can", slow_commits, in_flight);
+                        self.cluster.set_self_slow(true);
+                    }
+                    self.broadcast_leader_slow().await;
+                }
                 let unfit = self.own_storage_failing();
                 if unfit {
                     if !was_unfit {
@@ -12999,6 +13031,19 @@ impl Server {
     fn regained_headroom_to_lead(available: u64, total: u64) -> bool {
         const MIN_HEADROOM: u64 = 1024 * 1024 * 1024;
         available >= (total / 20).max(MIN_HEADROOM)
+    }
+
+    /// Tell every peer this node's metadata commits are slow (`Request::LeaderSlow`).
+    async fn broadcast_leader_slow(&self) {
+        let me = self.cluster.local_node_id();
+        for peer in self.cluster.get_all_nodes().await.into_iter().filter(|n| n.id != me) {
+            let client = self.client.clone();
+            let req = Request::LeaderSlow { node: me, slow: true };
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    client.send_message(peer.addr, Message::Request(req))).await;
+            });
+        }
     }
 
     async fn broadcast_leader_unfit(&self, unfit: bool) {

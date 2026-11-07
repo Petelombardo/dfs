@@ -560,6 +560,54 @@ impl PendingReply {
     }
 }
 
+/// How this node's metadata commits keep up: the commit in flight, if any, and when recent
+/// slow ones (over `SLOW_COMMIT`) finished. Leadership reads it: a node whose commits stay slow
+/// leads only when no faster node can (see `ClusterManager::leader_among`'s slow tier). A
+/// puck leading G8 soak #18 (11-06) took 1-4 s per commit, once 155 s, and clients' fsyncs
+/// failed waiting 60 s for their file records.
+#[derive(Debug, Default)]
+pub struct CommitPace {
+    in_flight_since: Option<std::time::Instant>,
+    slow_finished: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl CommitPace {
+    /// A commit at least this long counts as slow.
+    pub const SLOW_COMMIT: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Slow commits are counted over this window.
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn started(&mut self, at: std::time::Instant) {
+        self.in_flight_since = Some(at);
+    }
+
+    pub fn finished(&mut self, started: std::time::Instant, at: std::time::Instant) {
+        self.in_flight_since = None;
+        if at.saturating_duration_since(started) >= Self::SLOW_COMMIT {
+            self.slow_finished.push_back(at);
+        }
+        while self.slow_finished.front().is_some_and(|t| at.saturating_duration_since(*t) > Self::WINDOW) {
+            self.slow_finished.pop_front();
+        }
+    }
+
+    /// Slow commits that finished within `WINDOW` of `now`.
+    pub fn slow_in_window(&self, now: std::time::Instant) -> usize {
+        self.slow_finished.iter().filter(|t| now.saturating_duration_since(**t) <= Self::WINDOW).count()
+    }
+
+    /// How long the commit in flight has run, if one is.
+    pub fn in_flight_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.in_flight_since.map(|t| now.saturating_duration_since(t))
+    }
+}
+
+/// Test-only (DFS_FAULT_INJECTION=1, `Request::InjectSlowCommits`): the next
+/// `INJECTED_SLOW_COMMITS` metadata commits each take `INJECTED_SLOW_COMMIT_MS` longer, as on a
+/// saturated disk.
+pub static INJECTED_SLOW_COMMIT_MS: AtomicU64 = AtomicU64::new(0);
+pub static INJECTED_SLOW_COMMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Metadata storage using redb embedded database.
 /// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
@@ -614,6 +662,8 @@ pub struct MetadataStore {
     /// thread) had no visibility at all. This makes that visible directly instead
     /// of inferring it from client-side write timing.
     committer_stats: Mutex<CommitterStats>,
+    /// See CommitPace.
+    commit_pace: Mutex<CommitPace>,
     /// In-memory mirror of FILE_TOMBSTONE_TABLE's keys (file ids deleted for good, until
     /// pruned): loaded at open, added in the same call that writes a marker, trimmed by
     /// the prune. Lets the server refuse a write to a deleted file on its hot patch path
@@ -750,6 +800,7 @@ impl MetadataStore {
             txn_stats: Mutex::new(std::collections::HashMap::new()),
             committer: OnceLock::new(),
             committer_stats: Mutex::new(CommitterStats::default()),
+            commit_pace: Mutex::new(CommitPace::default()),
             tombstoned_files,
         })
     }
@@ -874,7 +925,14 @@ impl MetadataStore {
             let batch_size = ops.len();
             let Some(store) = store.upgrade() else { return };
             let commit_start = std::time::Instant::now();
+            store.commit_pace.lock().unwrap().started(commit_start);
+            if INJECTED_SLOW_COMMITS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                let ms = INJECTED_SLOW_COMMIT_MS.load(Ordering::SeqCst);
+                warn!("FAULT INJECTION: this metadata commit waits {}ms", ms);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             store.apply_ops_group(ops);
+            store.commit_pace.lock().unwrap().finished(commit_start, std::time::Instant::now());
             let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
             // Immediate outlier report (2026-08-08): the periodic [META COMMITTER]
             // summary already tracks max_commit_ms, but only as a number folded
@@ -901,6 +959,13 @@ impl MetadataStore {
     /// hundreds of batches/sec, and per-batch logging is exactly the "log file
     /// grew to 1GB in 3 hours" mistake this project already made once with
     /// per-op PUT logging). See committer_stats' doc comment for why this exists.
+    /// Slow commits within `CommitPace::WINDOW` and the age of the commit in flight, if any.
+    pub fn commit_pace(&self) -> (usize, Option<std::time::Duration>) {
+        let now = std::time::Instant::now();
+        let p = self.commit_pace.lock().unwrap();
+        (p.slow_in_window(now), p.in_flight_for(now))
+    }
+
     fn record_committer_stats(&self, batch_size: usize, queue_depth: usize, commit_ms: f64) {
         const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         let mut stats = self.committer_stats.lock().unwrap();
@@ -5753,6 +5818,25 @@ pub struct MetadataStats {
 mod tests {
     use super::*;
     use dfs_common::{ChunkId, FileType, NodeId};
+
+    #[test]
+    fn commit_pace_counts_slow_commits_in_the_last_minute_and_the_one_in_flight() {
+        let t0 = std::time::Instant::now();
+        let s = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let mut p = CommitPace::default();
+        p.started(s(0));
+        assert_eq!(p.in_flight_for(s(2_500)), Some(std::time::Duration::from_millis(2_500)));
+        p.finished(s(0), s(1_500));
+        assert_eq!(p.in_flight_for(s(2_000)), None);
+        p.started(s(2_000));
+        p.finished(s(2_000), s(2_100));
+        assert_eq!(p.slow_in_window(s(3_000)), 1, "a 100 ms commit isn't slow");
+        p.started(s(30_000));
+        p.finished(s(30_000), s(31_000));
+        assert_eq!(p.slow_in_window(s(32_000)), 2);
+        assert_eq!(p.slow_in_window(s(62_000)), 1, "the first fell out of the window");
+        assert_eq!(p.slow_in_window(s(92_000)), 0);
+    }
     use tempfile::TempDir;
 
     /// In-memory redb storage whose file can be made unable to grow, like a full disk.

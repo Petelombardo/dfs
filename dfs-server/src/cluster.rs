@@ -79,6 +79,13 @@ pub struct ClusterManager {
     /// (`Request::LeaderUnfit`), each until its report expires. Leadership skips them.
     leader_unfit: Arc<std::sync::Mutex<HashMap<NodeId, std::time::Instant>>>,
 
+    /// Nodes that reported their metadata commits are slow (`Request::LeaderSlow`), each until
+    /// its report expires, and whether this node judged itself so (`SlowJudge`). A soft tier:
+    /// leadership prefers a node not slow, but a slow one still leads when no other fit node
+    /// can (see `leader_among`).
+    leader_slow: Arc<std::sync::Mutex<HashMap<NodeId, std::time::Instant>>>,
+    self_slow: Arc<std::sync::atomic::AtomicBool>,
+
     /// Asked live whenever this node weighs itself as leader: true while its own storage is
     /// failing (`set_self_unfit_probe`). Its own `leader_unfit` entry comes from a 2 s tick,
     /// and a node whose disk had just filled elected itself 3 ms before that tick noticed,
@@ -225,6 +232,8 @@ impl ClusterManager {
             node_recovered_notify: Arc::new(Notify::new()),
             became_leader_at: Arc::new(RwLock::new(None)),
             leader_unfit: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            leader_slow: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            self_slow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             self_unfit_probe: Arc::new(std::sync::OnceLock::new()),
             lease_expired_probe: Arc::new(std::sync::OnceLock::new()),
             own_term: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -576,6 +585,30 @@ impl ClusterManager {
         self.leader_unfit.lock().unwrap().get(&node).is_some_and(|until| *until > now)
     }
 
+    /// Record that `node` reported its metadata commits are slow (`Request::LeaderSlow`); it
+    /// holds `LEADER_UNFIT_TTL` unless repeated. For this node, `set_self_slow`.
+    pub fn set_leader_slow(&self, node: NodeId, slow: bool) {
+        let mut m = self.leader_slow.lock().unwrap();
+        if slow {
+            m.insert(node, std::time::Instant::now() + Self::LEADER_UNFIT_TTL);
+        } else {
+            m.remove(&node);
+        }
+    }
+
+    /// Whether this node judged its own metadata commits slow.
+    pub fn self_is_slow(&self) -> bool {
+        self.self_slow.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// This node judged its own metadata commits slow (`SlowJudge`). It stays so for the life
+    /// of the process.
+    pub fn set_self_slow(&self, slow: bool) {
+        if self.self_slow.swap(slow, std::sync::atomic::Ordering::Relaxed) != slow {
+            self.leader_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Record a peer's `Request::LeaderUnfit` report: whether it can lead, and its term.
     pub fn record_leader_report(&self, node: NodeId, unfit: bool, led_term: u64) {
         if node != self.local_node_id {
@@ -612,7 +645,10 @@ impl ClusterManager {
         let _ = self.lease_expired_probe.set(Box::new(probe));
     }
 
-    /// The leader among `online`: the min id, skipping nodes that reported they can't lead.
+    /// The leader among `online`: the min id, skipping nodes that reported they can't lead,
+    /// and preferring nodes whose metadata commits aren't slow (`leader_slow`): a slow node
+    /// leads only when every fit node is slow. Leading, a puck's commits took 1-4 s, once 155 s,
+    /// and clients' fsyncs failed waiting for their file records (G8 soak #18, 11-06).
     /// A leader whose disk is full can't commit file records, so every client write failed
     /// for as long as it stayed full (suite T80c). This node judges itself live as well as
     /// by its own reports (`self_unfit_probe`).
@@ -637,12 +673,20 @@ impl ClusterManager {
         let now = std::time::Instant::now();
         let self_unfit = online.contains(&self.local_node_id)
             && self.self_unfit_probe.get().is_some_and(|probe| probe());
-        let fit_min = {
+        let fit: Vec<NodeId> = {
             let m = self.leader_unfit.lock().unwrap();
             online.iter().copied()
                 .filter(|id| !(*id == self.local_node_id && self_unfit))
                 .filter(|id| m.get(id).is_none_or(|until| *until <= now))
-                .min()
+                .collect()
+        };
+        // Among the fit, a node whose metadata commits are slow leads only if every fit node is.
+        let fit_min = {
+            let slow = self.leader_slow.lock().unwrap();
+            let self_slow = self.self_slow.load(std::sync::atomic::Ordering::Relaxed);
+            let is_slow = |id: &NodeId| if *id == self.local_node_id { self_slow }
+                else { slow.get(id).is_some_and(|until| *until > now) };
+            fit.iter().copied().filter(|id| !is_slow(id)).min().or_else(|| fit.iter().copied().min())
         };
         let terms = self.leader_terms.lock().unwrap();
         if fit_min.is_some() {
@@ -1646,6 +1690,42 @@ pub struct ClusterStats {
 }
 
 
+/// Judges, every few seconds, whether this node's metadata commits are slow enough that it
+/// shouldn't lead while a faster node can (`ClusterManager::set_self_slow`). Slow means, held for
+/// `SUSTAIN`: `SLOW_PER_WINDOW` commits over a second within the last minute, or one commit in
+/// flight for `STUCK`; a commit stuck that long is slow at once. Once slow, a node stays so for
+/// the life of the process: out of the lead its commits speed up, and coming back as fast it
+/// would retake the lead from a running faster node and stall the clients again, again and
+/// again (Pete 10-29: slowness only stops a node retaking the lead from a faster one; it still
+/// leads when no faster node is up).
+#[derive(Debug, Default)]
+pub struct SlowJudge {
+    slow_since: Option<std::time::Instant>,
+    slow: bool,
+}
+
+impl SlowJudge {
+    pub const SLOW_PER_WINDOW: usize = 5;
+    pub const STUCK: Duration = Duration::from_secs(20);
+    pub const SUSTAIN: Duration = Duration::from_secs(20);
+
+    /// One look at the committer (`MetadataStore::commit_pace`): slow commits in the last
+    /// minute, and how long the commit in flight has run. True once this node is slow.
+    pub fn tick(&mut self, now: std::time::Instant, slow_commits: usize, in_flight: Option<Duration>) -> bool {
+        if self.slow {
+            return true;
+        }
+        let stuck = in_flight.is_some_and(|d| d >= Self::STUCK);
+        if !stuck && slow_commits < Self::SLOW_PER_WINDOW {
+            self.slow_since = None;
+            return false;
+        }
+        let since = *self.slow_since.get_or_insert(now);
+        self.slow = stuck || now.saturating_duration_since(since) >= Self::SUSTAIN;
+        self.slow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1672,6 +1752,49 @@ mod tests {
     async fn five_node_cluster() -> (ClusterManager, Vec<NodeId>) {
         let ids = five_ids();
         (five_node_view(&ids, 3).await, ids)
+    }
+
+    /// G8 soak #18: a node whose commits are slow leads only when every fit node is slow, and
+    /// a fast node with a higher id leads in its place.
+    #[tokio::test]
+    async fn a_slow_node_leads_only_when_no_fit_node_is_fast() {
+        let ids = five_ids();
+        let manager = five_node_view(&ids, 3).await;
+        assert_eq!(manager.leader_among(ids.clone()), Some(ids[0]));
+        manager.set_leader_slow(ids[0], true);
+        assert_eq!(manager.leader_among(ids.clone()), Some(ids[1]), "the lowest-id fast node leads");
+        manager.set_leader_slow(ids[1], true);
+        manager.set_leader_slow(ids[2], true);
+        manager.set_leader_slow(ids[4], true);
+        manager.set_self_slow(true);
+        assert_eq!(manager.leader_among(ids.clone()), Some(ids[0]), "all slow: the lowest id leads anyway");
+        manager.set_self_slow(false);
+        assert_eq!(manager.leader_among(ids.clone()), Some(ids[3]), "this node, fast, leads over the slow");
+        // A fast node that is down: a slow one takes the lead, nobody is excluded.
+        let without_fast: Vec<NodeId> = ids.iter().copied().filter(|id| *id != ids[3]).collect();
+        assert_eq!(manager.leader_among(without_fast), Some(ids[0]));
+        // Unfit outranks slow: an unfit node never leads over a slow fit one.
+        manager.set_leader_unfit(ids[0], true);
+        let others: Vec<NodeId> = ids.iter().copied().filter(|id| *id != ids[3]).collect();
+        assert_eq!(manager.leader_among(others), Some(ids[1]));
+    }
+
+    #[test]
+    fn slow_judge_needs_sustained_slow_commits_or_one_stuck_commit_and_then_stays_slow() {
+        let t0 = std::time::Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut j = SlowJudge::default();
+        assert!(!j.tick(s(0), 4, None), "4 slow commits a minute is not slow");
+        assert!(!j.tick(s(2), 5, None), "slow, but not yet for SUSTAIN");
+        assert!(!j.tick(s(10), 6, Some(Duration::from_secs(3))));
+        assert!(!j.tick(s(12), 2, None), "a quiet tick resets the clock");
+        assert!(!j.tick(s(14), 5, None));
+        assert!(j.tick(s(34), 5, None), "slow for SUSTAIN");
+        assert!(j.tick(s(100), 0, None), "and stays slow");
+
+        let mut j = SlowJudge::default();
+        assert!(!j.tick(s(0), 0, Some(Duration::from_secs(19))));
+        assert!(j.tick(s(2), 0, Some(Duration::from_secs(21))), "a commit stuck 20 s is slow at once");
     }
 
     /// G8 soak #17 (suite T123): a node that left gracefully and was still away when the 60 s

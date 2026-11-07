@@ -198,6 +198,13 @@ enum FaultCommands {
         #[arg(long)]
         for_millis: u64,
     },
+    /// Test-only: the node's next `count` metadata commits each take `millis` longer.
+    SlowCommits {
+        #[arg(long)]
+        millis: u64,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
     /// Test-only: for `millis` the node acts as if its own lease had lapsed (a primary refuses
     /// ordered writes), with no expiry vote.
     LeaseLapse {
@@ -1935,6 +1942,16 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         }
         return Ok(());
     }
+    if let FaultCommands::SlowCommits { millis, count } = &cmd {
+        for &addr in cluster_addrs {
+            match send_request(addr, Request::InjectSlowCommits { millis: *millis, count: *count }).await? {
+                Response::Ok { .. } => println!("{}: the next {} metadata commit(s) each wait {}ms", addr, count, millis),
+                Response::Error { message, .. } => anyhow::bail!("{}: {}", addr, message),
+                other => anyhow::bail!("{}: unexpected response {:?}", addr, other),
+            }
+        }
+        return Ok(());
+    }
     if let FaultCommands::FailChunkTransfers { for_millis } = &cmd {
         for &addr in cluster_addrs {
             match send_request(addr, Request::InjectChunkTransferFailures { for_millis: *for_millis }).await? {
@@ -2020,7 +2037,7 @@ async fn handle_fault_command(cmd: FaultCommands, cluster_addrs: &[SocketAddr]) 
         },
         FaultCommands::Clear => dfs_common::PeerFilter::default(),
         FaultCommands::Stall { .. } | FaultCommands::FailOrdered { .. } | FaultCommands::SlowFold { .. }
-        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::SlowIsrVotes { .. } | FaultCommands::FailChunkTransfers { .. } | FaultCommands::LeaseLapse { .. }
+        | FaultCommands::SlowFoldAdopt { .. } | FaultCommands::SlowIsrVotes { .. } | FaultCommands::FailChunkTransfers { .. } | FaultCommands::SlowCommits { .. } | FaultCommands::LeaseLapse { .. }
         | FaultCommands::FailLocations { .. } | FaultCommands::IgnoreMetadataVersions { .. }
         | FaultCommands::PlantLocation { .. } => unreachable!("handled above"),
     };

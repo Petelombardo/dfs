@@ -4584,6 +4584,77 @@ rm -f "$MOUNT/$T123_FILE" "$T/t123.bin"
 sleep 5
 fi # should_run T123
 
+# ── T124: the leader's metadata commits stall: leadership moves to a node that can commit ──
+# G8 soak #18 (11-06): a puck led, its metadata commits took 1-4 s and once 155 s, and clients'
+# fsyncs failed after waiting 60 s for their file records to commit. A node whose commits are
+# slow now leads only while no faster fit node can (SlowJudge, `Request::LeaderSlow`). Here the
+# leader's next metadata commit stalls 75 s (dfs-admin fault slow-commits) while a writer appends
+# and fsyncs every second: every fsync must succeed, leadership must move during the stall, and
+# the slow node must not take it back once its commit finishes (it stays slow, Pete 10-29).
+snapshot_log T124
+if should_run T124; then
+echo ""
+echo "=== T124: the leader's metadata commit stalls 75 s: leadership moves, no fsync fails ==="
+T124_FILE=t124.bin
+t124_start() {
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node$1/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
+        >> "$LOG/server$1.log" 2>&1 &
+}
+T124_L=$(settled_leader)
+T124_N=$(( ${T124_L##*:} - 8899 ))
+echo "  T124: leader $T124_L (node$T124_N)"
+rm -f "$T/t124.stop"
+python3 - "$MOUNT/$T124_FILE" "$T/t124.stop" > "$T/t124_w.out" 2>&1 <<'PY' &
+import os, sys, time
+path, stop = sys.argv[1], sys.argv[2]
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+acked, errs, worst, r = 0, [], 0.0, 0
+while not os.path.exists(stop) and r < 200:
+    r += 1
+    try:
+        os.pwrite(fd, (("R%d-" % r).encode() * 1024)[:4096], (r - 1) * 4096)
+        t0 = time.time(); os.fsync(fd); worst = max(worst, time.time() - t0)
+        acked = r
+    except OSError as e:
+        errs.append("round %d: %s" % (r, e))
+    time.sleep(1)
+os.close(fd)
+print("rounds %d, acked through %d, max fsync %.1f s, errors %d%s" % (r, acked, worst, len(errs), (" (" + "; ".join(errs[:3]) + ")") if errs else ""))
+PY
+T124_WPID=$!
+sleep 5
+"$BIN/dfs-admin" --cluster "$T124_L" fault slow-commits --millis 75000 --count 1 >> "$LOG/t124_fault.log" 2>&1 \
+    || echo "  T124: could not arm slow-commits: $(tail -1 "$LOG/t124_fault.log")"
+T124_MOVED=""
+for _ in $(seq 1 45); do
+    sleep 2
+    l=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('leader') or '')" 2>/dev/null || true)
+    [ -n "$l" ] && [ "$l" != "$T124_L" ] && { T124_MOVED=$l; break; }
+done
+sleep 70
+T124_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('leader') or '')" 2>/dev/null || true)
+touch "$T/t124.stop"; wait "$T124_WPID" 2>/dev/null || true
+T124_OUT=$(cat "$T/t124_w.out")
+echo "  T124: $T124_OUT"
+echo "  T124: leader during the stall ${T124_MOVED:-unchanged}; after it ${T124_AFTER:-?}"
+echo "$T124_OUT" | grep -q "errors 0" \
+    && check "T124a every fsync succeeded through a 75 s stall of the leader's commits ($(echo "$T124_OUT" | grep -o 'max fsync [0-9.]* s'))" PASS \
+    || check "T124a fsync failed while the leader's commits stalled: $(echo "$T124_OUT" | head -c 200)" FAIL
+[ -n "$T124_MOVED" ] \
+    && check "T124b leadership moved off the stalled leader to $T124_MOVED" PASS \
+    || check "T124b leadership stayed on $T124_L though its commits stalled" FAIL
+[ -n "$T124_AFTER" ] && [ "$T124_AFTER" != "$T124_L" ] \
+    && check "T124c the slow node didn't take the lead back once its commit finished" PASS \
+    || check "T124c leader after the stall: ${T124_AFTER:-unknown} (the slow node $T124_L took it back)" FAIL
+# A fresh process starts fast: the cluster goes back to its usual leader for the later tests.
+pkill -TERM -f "dfs-server start --config $BASE/node$T124_N/config.toml" 2>/dev/null || true
+for _ in $(seq 1 150); do pgrep -f "dfs-server start --config $BASE/node$T124_N/config.toml" >/dev/null || break; sleep 0.1; done
+pkill -9 -f "dfs-server start --config $BASE/node$T124_N/config.toml" 2>/dev/null || true
+t124_start "$T124_N"
+sleep 20
+rm -f "$MOUNT/$T124_FILE"
+fi # should_run T124
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

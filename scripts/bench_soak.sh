@@ -25,7 +25,7 @@ mkdir -p "$OUT"
 say() { echo "$(date '+%F %T') $*" | tee -a "$OUT/summary.log"; }
 # A node named by its IP is that IP: getent has no entry for an address (11-05: puck, 10.25.1.42).
 ip_of() { case "$1" in *[!0-9.]*) getent hosts "$1" | awk '{print $1; exit}' ;; *) echo "$1" ;; esac; }
-bench_pid() { ssh -o BatchMode=yes root@"$1" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && echo \$p; done"; }
+bench_pid() { ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$1" "for p in \$(pgrep -x dfs-server); do [ \"\$(readlink /proc/\$p/exe)\" = $DIR/bin/dfs-server ] && echo \$p; done"; }
 start_node() {
     ssh -o BatchMode=yes root@"$1" "cd $DIR || exit 1; $SERVER_ENV DFS_ORDERED_WRITES=1 DFS_METADATA_DURABLE=1 RUST_LOG=info nohup setsid $DIR/bin/dfs-server start --config $DIR/config/config.toml >> $DIR/server.log 2>&1 < /dev/null & echo started"
 }
@@ -55,6 +55,7 @@ start)
     next_kill=$(( $(date +%s) + 1800 + RANDOM % 1800 ))
     next_verify=$(( $(date +%s) + 3600 ))
     next_health=0
+    declare -A UNREACHABLE
     while [ "$(date +%s)" -lt "$end" ] && [ ! -f "$OUT/stop" ]; do
         now=$(date +%s)
         if [ "$now" -ge "$next_kill" ]; then
@@ -76,7 +77,16 @@ start)
         # it back on staging: soak #17's puck1 exited at 01:19 and stayed down 10 h, until the
         # next random kill happened to pick it. Every node is meant to be up here: the kill
         # above sleeps out its own victim's downtime.
+        # An unreachable host is reported once, not mistaken for an exited server (soak #18: three
+        # pucks went unreachable and this restarted each every 90 s, then hung on ssh).
         for n in $NODES; do
+            if ! timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$n" true 2>/dev/null; then
+                [ "${UNREACHABLE[$n]:-}" = 1 ] || say "UNREACHABLE $n: no ssh; leaving it until it answers"
+                UNREACHABLE[$n]=1
+                continue
+            fi
+            [ "${UNREACHABLE[$n]:-}" = 1 ] && say "REACHABLE $n again"
+            UNREACHABLE[$n]=0
             if [ -z "$(bench_pid "$n")" ]; then
                 say "EXITED $n: its bench server stopped on its own; restarting it (as systemd would)"
                 start_node "$n" > /dev/null

@@ -2043,13 +2043,32 @@ impl SlotMergeOutcome {
     }
 }
 
-const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a dirty slot stays unfolded after its last patch before a holder folds it:
+/// `storage.fold_idle_secs` (600 s by default; set once at startup, `set_fold_idle`). It was a
+/// fixed 20 s. Random 4 KiB writes spread over a file touch each chunk every 15-20 s, so nearly
+/// every one rewrote its whole 4 MiB chunk on every holder: 36 GB written to disk for 32 MB of
+/// client writes (bench 11-07), which kept the pucks' SSDs at their ~20 MB/s sustained floor and
+/// stalled metadata commits for up to 155 s (G8 soak #18). Reads compose base and delta, so a
+/// long-lived delta costs a read little. Unset (unit tests), 20 s.
+static FOLD_IDLE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+
+pub fn set_fold_idle(idle: std::time::Duration) {
+    let _ = FOLD_IDLE.set(idle);
+}
+
+#[allow(non_snake_case)]
+fn PATCH_DEBOUNCE_IDLE() -> std::time::Duration {
+    *FOLD_IDLE.get().unwrap_or(&std::time::Duration::from_secs(20))
+}
 
 /// How long a slot may stay dirty past its last patch before a holder that isn't its
 /// fold owner folds it anyway (SLOT-OWNERSHIP-PLAN.md Phase 2). The owner folds at
 /// PATCH_DEBOUNCE_IDLE; three times that means it has had every chance and hasn't
 /// (it never saw the patch, or it's down but not yet voted expired).
-const FOLD_OWNER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+#[allow(non_snake_case)]
+fn FOLD_OWNER_PATIENCE() -> std::time::Duration {
+    PATCH_DEBOUNCE_IDLE() * 3
+}
 
 /// This node's part in folding one slot (see OverlayForkCtx::fold_role).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5015,7 +5034,7 @@ impl OverlayForkCtx {
         let owner = crate::lease::primary_of(&order, me, self.lease.holds_own_lease(), |n| self.lease.is_expired(n));
         match owner {
             Some(o) if o == me => FoldRole::Owner,
-            other if idle >= FOLD_OWNER_PATIENCE => FoldRole::TakeOver(other),
+            other if idle >= FOLD_OWNER_PATIENCE() => FoldRole::TakeOver(other),
             other => FoldRole::Wait(other),
         }
     }
@@ -5512,10 +5531,10 @@ impl OverlayForkCtx {
     /// idle cluster (no client, no writes) still had 3 patches stuck in Pending
     /// indefinitely. Now retries with capped backoff until it succeeds.
     async fn debounce_fold_slot(&self, file_id: FileId, chunk_idx: u64) {
-        let mut retry_backoff = PATCH_DEBOUNCE_IDLE;
+        let mut retry_backoff = PATCH_DEBOUNCE_IDLE();
         // What the next sleep starts from: retry_backoff after a failed or deferred
         // fold, or what's left of the window after the slot's last patch.
-        let mut next_sleep = PATCH_DEBOUNCE_IDLE;
+        let mut next_sleep = PATCH_DEBOUNCE_IDLE();
         const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
             // Jittered, not a fixed sleep — see PATCH_DEBOUNCE_IDLE's doc
@@ -5540,7 +5559,7 @@ impl OverlayForkCtx {
                 return; // already folded elsewhere (e.g. a forced read) — nothing to do
             };
 
-            if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE {
+            if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE() {
                 // Fold the slot's whole replica set, peers FIRST, then locally.
                 //
                 // A fold mints a NEW chunk identity, so the only nodes that can
@@ -5624,7 +5643,7 @@ impl OverlayForkCtx {
             // patched again a few seconds after its first patch used to fold up to
             // 2x PATCH_DEBOUNCE_IDLE after its last patch, sitting at write quorum
             // that much longer (suite T38b, T103).
-            next_sleep = PATCH_DEBOUNCE_IDLE.saturating_sub(last_patch_at.elapsed());
+            next_sleep = PATCH_DEBOUNCE_IDLE().saturating_sub(last_patch_at.elapsed());
         }
     }
 }
@@ -14868,7 +14887,7 @@ impl Server {
                 // forever, which is exactly the waste this whole mechanism exists to stop.
                 let stale: Vec<(FileId, u64)> = server.dirty_patch_slots.iter()
                     .filter(|e| {
-                        e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE
+                        e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE()
                     })
                     .map(|e| *e.key())
                     .filter(|&(file_id, chunk_idx)| !server.dirty_slot_currently_escalated(file_id, chunk_idx))
@@ -33528,7 +33547,7 @@ mod tests {
             let peer2 = phase2_peer(file2, 0, me, true);
             phase2_holders(&h, file2, peer2, 19362, base).await;
             assert_eq!(ctx.fold_role(file2, 0, quiet), FoldRole::Wait(Some(peer2)));
-            assert_eq!(ctx.fold_role(file2, 0, FOLD_OWNER_PATIENCE), FoldRole::TakeOver(Some(peer2)),
+            assert_eq!(ctx.fold_role(file2, 0, FOLD_OWNER_PATIENCE()), FoldRole::TakeOver(Some(peer2)),
                 "past the patience window a non-owner takes over");
             h.server.lease.declare_expired_for_test(peer2);
             assert_eq!(ctx.fold_role(file2, 0, quiet), FoldRole::Owner, "an expired owner is skipped");
@@ -33572,7 +33591,7 @@ mod tests {
             let quiet = std::time::Duration::from_secs(1);
 
             assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Wait(Some(peer)));
-            assert_eq!(ctx.fold_role(file_id, 0, FOLD_OWNER_PATIENCE), FoldRole::Wait(Some(peer)),
+            assert_eq!(ctx.fold_role(file_id, 0, FOLD_OWNER_PATIENCE()), FoldRole::Wait(Some(peer)),
                 "past the patience window the secondary still leaves an ordered slot to its primary");
             h.server.lease.declare_expired_for_test(peer);
             assert_eq!(ctx.fold_role(file_id, 0, quiet), FoldRole::Wait(Some(peer)),
@@ -33656,7 +33675,7 @@ mod tests {
             let _ = base;
             phase2_holders(&h, file_id, peer, 19366, phase2_token("phase2-takeover")).await;
             h.server.overlay_ctx().dirty_patch_slots.get_mut(&(file_id, 0)).unwrap().last_patch_at =
-                std::time::Instant::now() - FOLD_OWNER_PATIENCE - std::time::Duration::from_secs(1);
+                std::time::Instant::now() - FOLD_OWNER_PATIENCE() - std::time::Duration::from_secs(1);
 
             let _ = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, 0).await;
             assert!(matches!(h.metadata.get_patch_state(&phase2_token("phase2-takeover")).unwrap(), Some(PatchState::Folded(_))),

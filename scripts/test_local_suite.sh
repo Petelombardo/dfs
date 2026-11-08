@@ -167,6 +167,13 @@ cd "$REPO" && cargo build --release 2>&1 | tail -2
 
 echo "=== Starting 5-node cluster ==="
 bash "$REPO/scripts/setup-cluster.sh" 5 2>/dev/null
+# Folds 20 s after a chunk's last patch, not the 600 s default: the fold-path tests (T93, T101,
+# T105, T122, ...) watch a fold happen. T125 covers what the long default leaves behind: reads of
+# chunks whose patches haven't folded.
+# Clients likewise ForceFold 6-10 s into a chunk's patches, not after the 300 s default.
+export DFS_ACTIVE_FOLD_BASE_SECS=${DFS_ACTIVE_FOLD_BASE_SECS:-6}
+suite_fold_idle() { sed -i 's/^fold_idle_secs = .*/fold_idle_secs = 20/' "$@"; }
+suite_fold_idle "$BASE"/node*/config.toml
 for i in 1 2 3 4 5; do
     RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
         > "$LOG/server${i}.log" 2>&1 &
@@ -3671,6 +3678,7 @@ mkdir -p "$T116_DIR" "$T116_MNT"
 for i in 1 2 3; do
     "$BIN/dfs-server" init --data-dir "$T116_DIR/node$i/data" --meta-dir "$T116_DIR/node$i/metadata" \
         --config "$T116_DIR/node$i/config.toml" >/dev/null 2>&1
+    suite_fold_idle "$T116_DIR/node$i/config.toml"
     sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"127.0.0.1:$((8969 + i))\"/" "$T116_DIR/node$i/config.toml"
     [ "$i" -gt 1 ] && sed -i 's/seed_nodes = \[\]/seed_nodes = ["127.0.0.1:8970"]/' "$T116_DIR/node$i/config.toml"
     sed -i 's/heartbeat_interval_secs = .*/heartbeat_interval_secs = 5/; s/failure_timeout_secs = .*/failure_timeout_secs = 120/' "$T116_DIR/node$i/config.toml"
@@ -4654,6 +4662,102 @@ t124_start "$T124_N"
 sleep 20
 rm -f "$MOUNT/$T124_FILE"
 fi # should_run T124
+
+# ── T125: a chunk's patches read back right from a cold client before, during and after its fold ──
+# Folds are rare now (11-07: a chunk folds 600 s after its last patch, not 20 s; clients ForceFold
+# after 300 s, 256 patches or 4 MiB, not 6-10 s or 20), so most of a busy file's chunks are a base
+# plus patches most of the time. Pete 11-07: an outstanding fold must not stop a cold client from
+# reading the data back right. Random 4 KiB patches land on 16 chunks, and a fresh client reads the
+# file (a) before any of its chunks folds, (b) while every node holds its folds 15 s mid-flight
+# (fault slow-fold, the patch lock held), (c) after the folds: every read must match.
+snapshot_log T125
+if should_run T125; then
+echo ""
+echo "=== T125: a cold client reads patched chunks right before, during and after their fold ==="
+T125_FILE=t125.bin
+T125_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+dd if=/dev/urandom of="$T/t125.bin" bs=4M count=16 status=none
+cp "$T/t125.bin" "$MOUNT/$T125_FILE"
+dfs_sync
+sleep 30   # the initial write's own folds, if any, are done before the patches start
+T125_FID=$(grep -h "\[META SERVER\] put path=/$T125_FILE id=" "$LOG"/server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+declare -A T125_MARK
+for n in 1 2 3 4 5; do T125_MARK[$n]=$(stat -c %s "$LOG/server$n.log"); done
+t125_folds() {   # folds of the file committed since the mark, on any node
+    local c=0 n
+    for n in 1 2 3 4 5; do
+        c=$((c + $(tail -c +"$((T125_MARK[$n] + 1))" "$LOG/server$n.log" | sed 's/\x1b\[[0-9;]*m//g' | grep -ac "Fold committed: file $T125_FID " || true)))
+    done
+    echo $c
+}
+t125_read() {   # md5 of the file through a fresh client
+    local m=/tmp/dfs-mount-t125 cpid sum
+    mkdir -p "$m"
+    RUST_LOG=info "$BIN/dfs-client" mount "$m" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t125_$1.log" --allow-other --log-level debug &
+    cpid=$!
+    for _ in $(seq 1 50); do mountpoint -q "$m" && break; sleep 0.1; done
+    sum=$(timeout 60 md5sum < "$m/$T125_FILE" 2>/dev/null | cut -d' ' -f1)
+    fusermount -u "$m" 2>/dev/null || true
+    kill_client_and_wait "$cpid"
+    echo "${sum:-unreadable}"
+}
+# The patches go through a client on the production fold triggers (300 s, 256 patches, 4 MiB), not
+# the suite's 6 s, so the chunks stay unfolded until the servers' 20 s idle fold.
+T125_WM=/tmp/dfs-mount-t125w; mkdir -p "$T125_WM"
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T125_WM" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t125_writer.log" --allow-other --log-level debug &
+T125_WPID=$!
+for _ in $(seq 1 50); do mountpoint -q "$T125_WM" && break; sleep 0.1; done
+python3 - "$T125_WM/$T125_FILE" "$T/t125.bin" <<'PY'
+import os, random, sys
+mnt, exp = sys.argv[1], sys.argv[2]
+fd = os.open(mnt, os.O_RDWR)
+with open(exp, "r+b") as e:
+    for i in range(400):
+        off = random.randrange(0, 16 * 4194304 // 4096) * 4096
+        x = os.urandom(4096)
+        os.pwrite(fd, x, off); e.seek(off); e.write(x)
+        if i % 50 == 49: os.fsync(fd)
+os.fsync(fd); os.close(fd)
+PY
+fusermount -u "$T125_WM" 2>/dev/null || true
+kill_client_and_wait "$T125_WPID"
+T125_M=$(md5sum < "$T/t125.bin" | cut -d' ' -f1)
+T125_A=$(t125_read before)
+T125_A_FOLDS=$(t125_folds)
+"$BIN/dfs-admin" --cluster "$T125_ALL" fault slow-fold --millis 15000 --count 1000 >/dev/null 2>&1 || true
+T125_HELD=""
+for _ in $(seq 1 90); do
+    for n in 1 2 3 4 5; do
+        tail -c +"$((T125_MARK[$n] + 1))" "$LOG/server$n.log" | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -aq "background fold of file $T125_FID chunk .* holding the patch lock" && { T125_HELD=$n; break; }
+    done
+    [ -n "$T125_HELD" ] && break
+    sleep 1
+done
+T125_B=$( [ -n "$T125_HELD" ] && t125_read during || echo "not-reached" )
+"$BIN/dfs-admin" --cluster "$T125_ALL" fault slow-fold --millis 0 --count 0 >/dev/null 2>&1 || true
+sleep 45
+T125_C_FOLDS=$(t125_folds)
+T125_C=$(t125_read after)
+echo "  T125: file ${T125_FID:-?}; folds committed before read (a): $T125_A_FOLDS, by read (c): $T125_C_FOLDS; a fold held on node${T125_HELD:-none}"
+[ "$T125_A_FOLDS" = 0 ] || echo "  T125: (a) some chunks had folded before the first read; it read a mix"
+[ "$T125_A" = "$T125_M" ] \
+    && check "T125a a cold client reads 400 unfolded 4 KiB patches over 16 chunks right" PASS \
+    || check "T125a cold read before any fold: $T125_A vs expected $T125_M" FAIL
+if [ -n "$T125_HELD" ]; then
+    [ "$T125_B" = "$T125_M" ] \
+        && check "T125b a cold client reads right while folds are held mid-flight" PASS \
+        || check "T125b cold read during an outstanding fold: $T125_B vs expected $T125_M" FAIL
+else
+    check "T125b no fold of the file started within 90 s: the test didn't reach the case" FAIL
+fi
+[ "$T125_C_FOLDS" -gt 0 ] && [ "$T125_C" = "$T125_M" ] \
+    && check "T125c a cold client reads right after $T125_C_FOLDS fold(s)" PASS \
+    || check "T125c after the folds ($T125_C_FOLDS committed): $T125_C vs expected $T125_M" FAIL
+rm -f "$MOUNT/$T125_FILE" "$T/t125.bin"
+fi # should_run T125
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

@@ -85,6 +85,13 @@ pub struct StorageConfig {
     /// revert+redeploy; see the 2026-07 write-contention investigation.
     #[serde(default = "default_metadata_batch_drain_enabled")]
     pub metadata_batch_drain_enabled: bool,
+
+    /// How long a chunk's patches accumulate after the last one before a holder folds them
+    /// into a new chunk, in seconds. Reads compose a chunk's base and patches, so folding is
+    /// only to bound the delta; folding after 20 s rewrote whole 4 MiB chunks for every few
+    /// small random writes (1100x write amplification, bench 11-07).
+    #[serde(default = "default_fold_idle_secs")]
+    pub fold_idle_secs: u64,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -103,6 +110,10 @@ fn default_metadata_batch_drain_enabled() -> bool {
     true
 }
 
+fn default_fold_idle_secs() -> u64 {
+    600
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -110,6 +121,7 @@ impl Default for StorageConfig {
             metadata_dir: default_metadata_dir(),
             chunk_size_mb: default_chunk_size_mb(),
             metadata_batch_drain_enabled: default_metadata_batch_drain_enabled(),
+            fold_idle_secs: default_fold_idle_secs(),
         }
     }
 }

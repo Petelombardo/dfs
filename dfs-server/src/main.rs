@@ -247,6 +247,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     let peer_addr = config.peer_addr();
     info!("Peer address: {}", peer_addr);
 
+    server::set_fold_idle(std::time::Duration::from_secs(config.storage.fold_idle_secs.max(1)));
+    info!("Fold idle: {}s after a chunk's last patch", config.storage.fold_idle_secs);
+
     // Initialize cluster manager
     let cluster = std::sync::Arc::new(cluster::ClusterManager::new(
         node_id,

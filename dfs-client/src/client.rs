@@ -9279,21 +9279,29 @@ leader_addr: Arc::new(RwLock::new(None)),
                 use std::hash::{Hash, Hasher};
                 let mut hasher = DefaultHasher::new();
                 (file_id, cidx).hash(&mut hasher);
-                let jitter_ms = (hasher.finish() % 4000) as u64; // 0..4000ms
+                let hash = hasher.finish();
                 // DFS_ACTIVE_FOLD_BASE_SECS: override for local experiments only —
                 // measuring how much of the size-dependent write collapse is
                 // fold-volume-driven (many lightly-patched, mostly-cold chunks
                 // each paying a full fold) vs. real write-path cost, by testing
                 // with this raised high enough that the time trigger effectively
-                // never fires within a short test window. Default (6) is
-                // unchanged production behavior.
+                // never fires within a short test window. Default 300 s (it was 6 s
+                // with a 0-4 s jitter): a chunk's patches are read back composed with
+                // its base, so a fold only bounds the delta; folding every few seconds
+                // rewrote a whole 4 MiB chunk on every replica for every few small
+                // random writes (1100x write amplification, bench 11-07). The suite
+                // pins 6 s so its fold-path tests keep their timing.
                 static BASE_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
                 let base_secs = *BASE_SECS.get_or_init(|| {
                     std::env::var("DFS_ACTIVE_FOLD_BASE_SECS")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(6)
+                        .unwrap_or(300)
                 });
+                // Jitter over max(4 s, base/5): the 4 s it always was at a 6 s base, and 60 s
+                // at the 300 s default, so slots that started together still fold apart.
+                let jitter_window_ms = (base_secs * 1000 / 5).max(4000);
+                let jitter_ms = hash % jitter_window_ms;
                 std::time::Duration::from_secs(base_secs) + std::time::Duration::from_millis(jitter_ms)
             };
             // Size-based early trigger, alongside the time-based one above — see
@@ -9304,7 +9312,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             // patterns still coalesce many small patches per fold (the whole point
             // of debouncing), tight enough to bound worst-case accumulator growth to
             // a small constant multiple of a real chunk instead of unbounded.
-            const ACTIVE_FOLD_SIZE_THRESHOLD: usize = 8 * 1024 * 1024;
+            // 4 MiB (was 8): a delta as big as its chunk is worth folding.
+            const ACTIVE_FOLD_SIZE_THRESHOLD: usize = 4 * 1024 * 1024;
             let this_patch_bytes: usize = patches.iter().map(|(_, d)| d.len()).sum();
             let accumulated_bytes = {
                 let mut entry = self.active_fold_bytes.entry((file_id, cidx)).or_insert(0);
@@ -9323,7 +9332,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             // below that (20) lets the count trigger occasionally preempt
             // time/bytes during busier moments while still comfortably
             // clearing the "no more than ~1 fold/sec" floor — in theory.
-            const ACTIVE_FOLD_PATCH_THRESHOLD: u64 = 20; // was 30, then 50, 100, 500, 1000
+            // 256 (was 20): at 20 a chunk was rewritten whole for every 20 small writes
+            // to it; a read composes up to this many records, which costs far less.
+            const ACTIVE_FOLD_PATCH_THRESHOLD: u64 = 256; // was 20, 30, 50, 100, 500, 1000
 
             // Cooldown since this slot's LAST fold actually completed — a hot
             // slot can't fold again faster than once per MIN_INTERVAL, no matter

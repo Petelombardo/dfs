@@ -1406,6 +1406,29 @@ pub enum Request {
         millis: u64,
         count: u32,
     },
+
+    /// Slot's fold owner -> a node that holds the slot's base but not its pending patches:
+    /// hold `public_token` too (its base plus `delta`, the delta file's exact bytes, whose
+    /// blake3 is `delta_chunk_id`), so the slot's latest writes have a third copy without a
+    /// fold. A slot whose delta is small doesn't fold on idle (`storage.fold_min_delta_bytes`):
+    /// a fold rewrites the whole 4 MiB chunk on every replica, and folding every small delta
+    /// cost ~96x write amplification (bench 11-09); its patches reach only the ISR pair, and
+    /// the fold was what gave them a third copy. The receiver keeps a passive copy: it serves
+    /// reads and never folds it; newer patches or a fold supersede it. Answered with Ok.
+    /// APPENDED at end to preserve wire compatibility.
+    ReplicatePatchDelta {
+        file_id: FileId,
+        chunk_idx: u64,
+        public_token: ChunkId,
+        base_chunk_id: ChunkId,
+        delta_chunk_id: ChunkId,
+        delta: Vec<u8>,
+        size: u64,
+        written_at: u64,
+        client_write_seq: Option<u64>,
+        /// The base's holders, where the receiver pulls the base from if it lacks it.
+        base_holders: Vec<NodeId>,
+    },
 }
 
 /// One slot's head as an ISR member applied it: `location` names the token the member's

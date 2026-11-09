@@ -9285,24 +9285,27 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // fold-volume-driven (many lightly-patched, mostly-cold chunks
                 // each paying a full fold) vs. real write-path cost, by testing
                 // with this raised high enough that the time trigger effectively
-                // never fires within a short test window. Default 300 s (it was 6 s
-                // with a 0-4 s jitter): a chunk's patches are read back composed with
-                // its base, so a fold only bounds the delta; folding every few seconds
-                // rewrote a whole 4 MiB chunk on every replica for every few small
-                // random writes (1100x write amplification, bench 11-07). The suite
-                // pins 6 s so its fold-path tests keep their timing.
+                // never fires within a short test window. Default off (it was 6 s with
+                // a 0-4 s jitter, then 300 s): a chunk's patches are read back composed
+                // with its base, so a fold only bounds the delta; folding every few
+                // seconds rewrote a whole 4 MiB chunk on every replica for every few
+                // small random writes (1100x write amplification, bench 11-07). The
+                // suite pins 6 s so its fold-path tests keep their timing.
                 static BASE_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
                 let base_secs = *BASE_SECS.get_or_init(|| {
                     std::env::var("DFS_ACTIVE_FOLD_BASE_SECS")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(300)
+                        .unwrap_or(0)
                 });
                 // Jitter over max(4 s, base/5): the 4 s it always was at a 6 s base, and 60 s
                 // at the 300 s default, so slots that started together still fold apart.
                 let jitter_window_ms = (base_secs * 1000 / 5).max(4000);
                 let jitter_ms = hash % jitter_window_ms;
-                std::time::Duration::from_secs(base_secs) + std::time::Duration::from_millis(jitter_ms)
+                // 0 (the default): no time trigger. A chunk folds on its patches' size or
+                // count; a small delta stays unfolded and the servers give it its third copy
+                // (see the server's fold_min_delta_bytes).
+                (base_secs > 0).then(|| std::time::Duration::from_secs(base_secs) + std::time::Duration::from_millis(jitter_ms))
             };
             // Size-based early trigger, alongside the time-based one above — see
             // active_fold_bytes's doc comment for why an unbounded accumulator is a
@@ -9312,8 +9315,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             // patterns still coalesce many small patches per fold (the whole point
             // of debouncing), tight enough to bound worst-case accumulator growth to
             // a small constant multiple of a real chunk instead of unbounded.
-            // 4 MiB (was 8): a delta as big as its chunk is worth folding.
-            const ACTIVE_FOLD_SIZE_THRESHOLD: usize = 4 * 1024 * 1024;
+            // 1 MiB (was 8, then 4): the servers fold an idle delta from this size on, and copy
+            // a smaller one to its third replica instead.
+            const ACTIVE_FOLD_SIZE_THRESHOLD: usize = 1024 * 1024;
             let this_patch_bytes: usize = patches.iter().map(|(_, d)| d.len()).sum();
             let accumulated_bytes = {
                 let mut entry = self.active_fold_bytes.entry((file_id, cidx)).or_insert(0);
@@ -9383,7 +9387,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
                 Some(elapsed) if cooldown_ok && (
-                    elapsed >= active_fold_interval
+                    active_fold_interval.is_some_and(|i| elapsed >= i)
                     || accumulated_bytes >= ACTIVE_FOLD_SIZE_THRESHOLD
                     || patch_count >= ACTIVE_FOLD_PATCH_THRESHOLD
                 ) => {

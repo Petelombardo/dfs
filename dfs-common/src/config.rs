@@ -92,6 +92,13 @@ pub struct StorageConfig {
     /// small random writes (1100x write amplification, bench 11-07).
     #[serde(default = "default_fold_idle_secs")]
     pub fold_idle_secs: u64,
+
+    /// An idle chunk folds only once its patches total at least this many bytes; a smaller
+    /// delta is copied to the replicas that lack it instead (keeping three copies). A fold
+    /// rewrites the whole 4 MiB chunk on every replica, so folding small deltas cost ~96x write
+    /// amplification (bench 11-09). 0 folds every idle chunk.
+    #[serde(default = "default_fold_min_delta_bytes")]
+    pub fold_min_delta_bytes: u64,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -114,6 +121,10 @@ fn default_fold_idle_secs() -> u64 {
     600
 }
 
+fn default_fold_min_delta_bytes() -> u64 {
+    1024 * 1024
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -122,6 +133,7 @@ impl Default for StorageConfig {
             chunk_size_mb: default_chunk_size_mb(),
             metadata_batch_drain_enabled: default_metadata_batch_drain_enabled(),
             fold_idle_secs: default_fold_idle_secs(),
+            fold_min_delta_bytes: default_fold_min_delta_bytes(),
         }
     }
 }

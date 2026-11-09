@@ -172,7 +172,9 @@ bash "$REPO/scripts/setup-cluster.sh" 5 2>/dev/null
 # chunks whose patches haven't folded.
 # Clients likewise ForceFold 6-10 s into a chunk's patches, not after the 300 s default.
 export DFS_ACTIVE_FOLD_BASE_SECS=${DFS_ACTIVE_FOLD_BASE_SECS:-6}
-suite_fold_idle() { sed -i 's/^fold_idle_secs = .*/fold_idle_secs = 20/' "$@"; }
+# They also fold every idle chunk (fold_min_delta_bytes = 0), not only those with 1 MiB of patches:
+# T126 covers what that default does instead, copying a small delta to a third replica.
+suite_fold_idle() { sed -i 's/^fold_idle_secs = .*/fold_idle_secs = 20/; s/^fold_min_delta_bytes = .*/fold_min_delta_bytes = 0/' "$@"; }
 suite_fold_idle "$BASE"/node*/config.toml
 for i in 1 2 3 4 5; do
     RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 DFS_FAULT_INJECTION=1 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" --log-level "${DFS_SUITE_SERVER_LOG_LEVEL:-info}" \
@@ -4758,6 +4760,102 @@ fi
     || check "T125c after the folds ($T125_C_FOLDS committed): $T125_C vs expected $T125_M" FAIL
 rm -f "$MOUNT/$T125_FILE" "$T/t125.bin"
 fi # should_run T125
+
+# ── T126: a small unfolded delta gets a third copy; it survives losing both nodes that wrote it ──
+# 11-09 (Pete): an idle chunk folds only once its patches reach 1 MiB (storage.fold_min_delta_bytes):
+# a fold rewrites the whole 4 MiB chunk on every replica, ~96x write amplification for small deltas.
+# Patches reach only the slot's two holders, and the fold was what gave them a third copy, so a
+# smaller delta is copied to a third replica instead (Request::ReplicatePatchDelta). On its own
+# 5-node cluster with the production fold settings (but 20 s idle): chunk 1 gets 20 4 KiB patches,
+# chunk 2 300 (1.2 MiB); after idle chunk 1 must be on 3 holders and unfolded and chunk 2 folded;
+# then the two nodes that took chunk 1's patches are SIGKILLed and a cold client must read every
+# byte back from the other three.
+snapshot_log T126
+if should_run T126; then
+echo ""
+echo "=== T126: a small delta is copied to a third replica, not folded, and survives losing its writers ==="
+T126_DIR="$BASE/t126"; T126_MNT=/tmp/dfs-mount-t126; T126_FILE=t126.bin
+T126_CLUSTER=127.0.0.1:8980,127.0.0.1:8981,127.0.0.1:8982,127.0.0.1:8983,127.0.0.1:8984
+mkdir -p "$T126_DIR" "$T126_MNT"
+t126_start() {
+    DFS_LEASE_CLUSTER_SIZE=5 RUST_LOG=info "$BIN/dfs-server" start --config "$T126_DIR/node$1/config.toml" --log-level info \
+        >> "$LOG/t126_server$1.log" 2>&1 &
+}
+for i in 1 2 3 4 5; do
+    "$BIN/dfs-server" init --data-dir "$T126_DIR/node$i/data" --meta-dir "$T126_DIR/node$i/metadata" \
+        --config "$T126_DIR/node$i/config.toml" >/dev/null 2>&1
+    # Production fold settings but a 20 s idle: fold_min_delta_bytes stays at its 1 MiB default.
+    sed -i 's/^fold_idle_secs = .*/fold_idle_secs = 20/' "$T126_DIR/node$i/config.toml"
+    sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"127.0.0.1:$((8979 + i))\"/" "$T126_DIR/node$i/config.toml"
+    [ "$i" -gt 1 ] && sed -i 's/seed_nodes = \[\]/seed_nodes = ["127.0.0.1:8980"]/' "$T126_DIR/node$i/config.toml"
+    sed -i 's/heartbeat_interval_secs = .*/heartbeat_interval_secs = 5/' "$T126_DIR/node$i/config.toml"
+    t126_start $i
+done
+for _ in $(seq 1 100); do [ "$(ss -Hltn '( sport = :8980 or sport = :8981 or sport = :8982 or sport = :8983 or sport = :8984 )' | grep -c '')" -ge 5 ] && break; sleep 0.1; done
+sleep 10
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T126_MNT" --cluster "$T126_CLUSTER" \
+    --log-file "$LOG/t126_client.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T126_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T126_MNT" && break; sleep 0.1; done
+if ! mountpoint -q "$T126_MNT"; then
+    check "T126 setup: the client mounted the T126 cluster" FAIL
+else
+dd if=/dev/urandom of="$T/t126.bin" bs=4M count=4 status=none
+cp "$T/t126.bin" "$T126_MNT/$T126_FILE"; sync "$T126_MNT" 2>/dev/null || true
+sleep 30
+T126_FID=$(grep -h "\[META SERVER\] put path=/$T126_FILE id=" "$LOG"/t126_server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+python3 - "$T126_MNT/$T126_FILE" "$T/t126.bin" <<'PY'
+import os, random, sys
+mnt, exp = sys.argv[1], sys.argv[2]
+fd = os.open(mnt, os.O_RDWR)
+with open(exp, "r+b") as e:
+    for chunk, n in ((1, 20), (2, 300)):
+        for i in range(n):
+            off = chunk * 4194304 + random.randrange(0, 1024) * 4096
+            x = os.urandom(4096)
+            os.pwrite(fd, x, off); e.seek(off); e.write(x)
+            if i % 20 == 19: os.fsync(fd)
+os.fsync(fd); os.close(fd)
+PY
+fusermount -u "$T126_MNT" 2>/dev/null || true
+kill_client_and_wait "$T126_CPID"
+T126_M=$(md5sum < "$T/t126.bin" | cut -d' ' -f1)
+# Idle 20 s, then the owner's next look (jittered); allow 90 s.
+T126_HEALED=""
+for _ in $(seq 1 45); do
+    grep -ah "DELTA HEAL: file $T126_FID chunk 1: .* on 3 of 3 holders" "$LOG"/t126_server*.log 2>/dev/null | grep -q . && { T126_HEALED=1; break; }
+    sleep 2
+done
+sleep 10
+T126_FOLD1=$(cat "$LOG"/t126_server*.log | grep -ac "Fold committed: file $T126_FID chunk_idx 1 " || true)
+T126_FOLD2=$(cat "$LOG"/t126_server*.log | grep -ac "Fold committed: file $T126_FID chunk_idx 2 " || true)
+T126_HOLDER=$(grep -l "DELTA HEAL: file $T126_FID chunk 1: holding" "$LOG"/t126_server*.log 2>/dev/null | head -1 | grep -oP 't126_server\K[0-9]+' || true)
+# The nodes that took chunk 1's patches: they merged them.
+T126_WRITERS=$(grep -l "MERGE-TRACE\] file=$T126_FID chunk_idx=1 " "$LOG"/t126_server*.log 2>/dev/null | grep -oP 't126_server\K[0-9]+' | tr '\n' ' ')
+echo "  T126: file ${T126_FID:-?}; chunk 1 writers node(s) ${T126_WRITERS:-?}, third copy on node${T126_HOLDER:-?}; folds: chunk 1 $T126_FOLD1, chunk 2 $T126_FOLD2"
+[ -n "$T126_HEALED" ] && [ "$T126_FOLD1" = 0 ] \
+    && check "T126a chunk 1's small delta is on 3 holders and unfolded" PASS \
+    || check "T126a chunk 1: third copy ${T126_HEALED:-not made}, folds $T126_FOLD1 (want a copy, no fold)" FAIL
+[ "$T126_FOLD2" -gt 0 ] \
+    && check "T126b chunk 2's 1.2 MiB delta folded" PASS \
+    || check "T126b chunk 2's 1.2 MiB delta never folded" FAIL
+for n in $T126_WRITERS; do pkill -9 -f "dfs-server start --config $T126_DIR/node$n/config.toml" 2>/dev/null || true; done
+sleep 45
+T126_SURV=""; for n in 1 2 3 4 5; do case " $T126_WRITERS " in *" $n "*) ;; *) T126_SURV="$T126_SURV${T126_SURV:+,}127.0.0.1:$((8979 + n))";; esac; done
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T126_MNT" --cluster "$T126_SURV" \
+    --log-file "$LOG/t126_client_fresh.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T126_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T126_MNT" && break; sleep 0.1; done
+T126_M2=$(timeout 90 md5sum < "$T126_MNT/$T126_FILE" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T126_MNT" 2>/dev/null || true
+kill_client_and_wait "$T126_CPID"
+[ "$(echo $T126_WRITERS | wc -w)" = 2 ] && [ "$T126_M2" = "$T126_M" ] \
+    && check "T126c with both of chunk 1's writers killed, a cold client reads every byte back" PASS \
+    || check "T126c after killing chunk 1's writers (${T126_WRITERS:-?}): read ${T126_M2:-unreadable} vs expected $T126_M" FAIL
+fi
+for n in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $T126_DIR/node$n/config.toml" 2>/dev/null || true; done
+rm -f "$T/t126.bin"
+fi # should_run T126
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

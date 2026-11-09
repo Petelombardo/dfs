@@ -1296,6 +1296,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::GetSlotHeads { .. } => ClientOther,
         Request::ResyncFromPrimary { .. } | Request::ResignIsrMember { .. } | Request::LeaderUnfit { .. }
         | Request::LeaderSlow { .. }
+        | Request::ReplicatePatchDelta { .. }
         | Request::SyncHeldLocations { .. } | Request::CheckSupersededChunks { .. }
         | Request::ReplicateIsrHeads { .. } => PeerOther,
         // A client's leader-directed read, relayed by the node the client asked.
@@ -2054,6 +2055,31 @@ static FOLD_IDLE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock
 
 pub fn set_fold_idle(idle: std::time::Duration) {
     let _ = FOLD_IDLE.set(idle);
+}
+
+/// An idle slot folds only once its delta has at least this many bytes
+/// (`storage.fold_min_delta_bytes`, 1 MiB by default); a smaller one is copied to the replicas
+/// that lack it instead (`OverlayForkCtx::heal_slot_delta`). Unset (unit tests), 0: every idle
+/// slot folds.
+static FOLD_MIN_DELTA: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+pub fn set_fold_min_delta(bytes: u64) {
+    let _ = FOLD_MIN_DELTA.set(bytes);
+}
+
+fn fold_min_delta() -> u64 {
+    *FOLD_MIN_DELTA.get().unwrap_or(&0)
+}
+
+/// A pending slot whose delta is too small to fold (see `fold_min_delta`).
+#[derive(Debug, Clone)]
+struct SmallDelta {
+    token: ChunkId,
+    base: ChunkId,
+    delta: ChunkId,
+    size: usize,
+    written_at: u64,
+    client_write_seq: Option<u64>,
 }
 
 #[allow(non_snake_case)]
@@ -5511,6 +5537,92 @@ impl OverlayForkCtx {
         }
     }
 
+    /// The slot's pending delta, if it is smaller than `fold_min_delta` (so not to be folded).
+    async fn small_slot_delta(&self, file_id: FileId, chunk_idx: u64) -> Option<SmallDelta> {
+        let min = fold_min_delta();
+        if min == 0 {
+            return None;
+        }
+        let token = self.dirty_patch_slots.get(&(file_id, chunk_idx)).map(|e| e.value().token)?;
+        let Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq })) =
+            self.metadata.get_patch_state_async(token).await else { return None };
+        let bytes = self.storage.get_chunk_size(&delta_chunk_id)?;
+        (bytes < min).then_some(SmallDelta {
+            token, base: base_chunk_id, delta: delta_chunk_id, size, written_at, client_write_seq,
+        })
+    }
+
+    /// Give a small pending delta its third copy without a fold: send it to replicas that hold
+    /// the slot's base but not its token (`Request::ReplicatePatchDelta`) until the token has
+    /// `replication_factor` holders, and record them here and on every peer. A fold rewrites
+    /// the whole 4 MiB chunk on every replica; this moves the delta's own bytes. True once the
+    /// token has a full replica set.
+    async fn heal_slot_delta(&self, file_id: FileId, chunk_idx: u64, d: &SmallDelta) -> bool {
+        let rf = self.replication_factor.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        let me = self.cluster.local_node_id();
+        let Ok(Some(mut loc)) = self.metadata.get_chunk_location_async(d.token).await else { return false };
+        if !loc.nodes.contains(&me) {
+            loc.nodes.push(me);
+        }
+        if loc.nodes.len() >= rf {
+            return true;
+        }
+        // Where a receiver lacking the base pulls it from: the token's holders (they patched
+        // it, so they hold it) first, then the base's own row, which minting the token retired
+        // on this node but may survive elsewhere.
+        let mut base_holders: Vec<NodeId> = loc.nodes.clone();
+        if let Ok(Some(b)) = self.metadata.get_chunk_location_async(d.base).await {
+            base_holders.extend(b.nodes.into_iter().filter(|n| !loc.nodes.contains(n)));
+        }
+        let storage = self.storage.clone();
+        let delta_id = d.delta;
+        let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&delta_id)).await else {
+            warn!("heal_slot_delta: file {} chunk {}: delta {} unreadable here", file_id, chunk_idx, d.delta);
+            return false;
+        };
+        // Nodes holding the base first: they need only the delta's bytes.
+        let mut candidates: Vec<dfs_common::NodeInfo> = self.cluster.get_all_nodes().await.into_iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online && !loc.nodes.contains(&n.id))
+            .collect();
+        candidates.sort_by_key(|n| !base_holders.contains(&n.id));
+        let mut added = 0usize;
+        for node in candidates {
+            if loc.nodes.len() >= rf {
+                break;
+            }
+            let req = Request::ReplicatePatchDelta {
+                file_id, chunk_idx, public_token: d.token, base_chunk_id: d.base, delta_chunk_id: d.delta,
+                delta: bytes.as_ref().clone(), size: d.size as u64, written_at: d.written_at,
+                client_write_seq: d.client_write_seq, base_holders: base_holders.clone(),
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(30), self.client.send_message(node.addr, Message::Request(req))).await {
+                Ok(Ok(env)) if matches!(env.message, Message::Response(Response::Ok { .. })) => {
+                    loc.nodes.push(node.id);
+                    added += 1;
+                }
+                Ok(Ok(env)) => info!("heal_slot_delta: {} refused the delta of {}: {:?}", node.addr, d.token, env.message),
+                Ok(Err(e)) => info!("heal_slot_delta: {} unreachable for the delta of {}: {}", node.addr, d.token, e),
+                Err(_) => info!("heal_slot_delta: {} timed out on the delta of {}", node.addr, d.token),
+            }
+        }
+        if added > 0 {
+            if let Err(e) = self.metadata.put_chunk_location_async(loc.clone()).await {
+                warn!("heal_slot_delta: recording {}'s holders failed: {}", d.token, e);
+            }
+            let generation = self.chunk_generations.get(&d.token).map(|v| *v);
+            for peer in self.cluster.get_all_nodes().await.into_iter().filter(|n| n.id != me && n.status == dfs_common::NodeStatus::Online) {
+                let client = self.client.clone();
+                let req = Request::ReplicateChunkLocation { location: loc.clone(), file_id: Some(file_id), generation };
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client.send_message(peer.addr, Message::Request(req))).await;
+                });
+            }
+        }
+        info!("DELTA HEAL: file {} chunk {}: {} ({} delta bytes) on {} of {} holders",
+            file_id, chunk_idx, d.token, bytes.len(), loc.nodes.len(), rf);
+        loc.nodes.len() >= rf
+    }
+
     /// Spawned once by apply_patch when a slot's accumulator starts fresh
     /// (never for a merge onto an existing one — see its call site). This is
     /// now purely a catch-all for an abandoned slot (the client that was
@@ -5536,6 +5648,8 @@ impl OverlayForkCtx {
         // fold, or what's left of the window after the slot's last patch.
         let mut next_sleep = PATCH_DEBOUNCE_IDLE();
         const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+        // The token this task last gave a third copy (see heal_slot_delta).
+        let mut delta_healed: Option<ChunkId> = None;
         loop {
             // Jittered, not a fixed sleep — see PATCH_DEBOUNCE_IDLE's doc
             // comment: this task is spawned once per slot the instant it
@@ -5600,6 +5714,19 @@ impl OverlayForkCtx {
                 // reaches every replica by construction and is deliberately
                 // left untouched — this is the backstop path only, so the hot
                 // write path pays nothing.
+                // A small delta isn't worth a fold: it gets a third copy instead, and the slot
+                // waits for more patches (checked before coordinating, which a node that
+                // doesn't own the slot would otherwise re-run every few seconds forever).
+                if let Some(small) = self.small_slot_delta(file_id, chunk_idx).await {
+                    if delta_healed != Some(small.token)
+                        && matches!(self.fold_role(file_id, chunk_idx, last_patch_at.elapsed()), FoldRole::Owner | FoldRole::TakeOver(_))
+                        && self.heal_slot_delta(file_id, chunk_idx, &small).await
+                    {
+                        delta_healed = Some(small.token);
+                    }
+                    next_sleep = PATCH_DEBOUNCE_IDLE();
+                    continue;
+                }
                 match self.coordinate_and_fold_slot(file_id, chunk_idx).await {
                     CoordinatedFoldOutcome::Done => return,
                     CoordinatedFoldOutcome::Deferred => {
@@ -8810,6 +8937,8 @@ impl Server {
                 self.cluster.record_leader_report(node, unfit, led_term);
                 Response::Ok { data: None }
             }
+            Request::ReplicatePatchDelta { file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id, delta, size, written_at, client_write_seq, base_holders } =>
+                self.handle_replicate_patch_delta(file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id, delta, size, written_at, client_write_seq, base_holders).await,
             Request::LeaderSlow { node, slow } => {
                 if node != self.cluster.local_node_id() {
                     self.cluster.set_leader_slow(node, slow);
@@ -13052,6 +13181,85 @@ impl Server {
         available >= (total / 20).max(MIN_HEADROOM)
     }
 
+    /// Hold a slot's small pending delta as a passive third copy (`Request::ReplicatePatchDelta`):
+    /// the base (pulled, verified, if this node lacks it), the delta's exact bytes, and its
+    /// pending state, so this node serves the slot's latest writes. It never folds or patches
+    /// this copy: newer patches on the slot's holders, or its fold, supersede it. Refused for a
+    /// slot this node writes itself, a deleted file, or when this node already holds a newer
+    /// pending state for the slot.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_replicate_patch_delta(&self, file_id: FileId, chunk_idx: u64, public_token: ChunkId,
+        base_chunk_id: ChunkId, delta_chunk_id: ChunkId, delta: Vec<u8>, size: u64, written_at: u64,
+        client_write_seq: Option<u64>, base_holders: Vec<NodeId>) -> Response
+    {
+        let refuse = |why: String| Response::Error { message: why, code: ErrorCode::InvalidRequest };
+        if self.metadata.is_file_tombstoned(&file_id) {
+            return refuse(format!("file {} is deleted", file_id));
+        }
+        // Already holds the token (the slot's other writer, or an earlier copy): a holder.
+        if matches!(self.metadata.get_patch_state_async(public_token).await, Ok(Some(_))) {
+            return Response::Ok { data: None };
+        }
+        if self.dirty_patch_slots.contains_key(&(file_id, chunk_idx)) {
+            return refuse(format!("this node writes file {} chunk {} itself", file_id, chunk_idx));
+        }
+        if let Ok(Some((_, PatchState::Pending { client_write_seq: Some(have), .. }))) =
+            self.metadata.get_patch_state_for_slot_async(file_id, chunk_idx).await
+        {
+            if client_write_seq.is_none_or(|seq| have >= seq) {
+                return refuse(format!("this node holds a newer pending state for file {} chunk {}", file_id, chunk_idx));
+            }
+        }
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        // A delta's id hashes its file and position first, then its bytes (apply_patch).
+        let computed = {
+            let mut h = blake3::Hasher::new();
+            h.update(file_id.as_bytes());
+            h.update(&(chunk_idx * CHUNK_SIZE).to_le_bytes());
+            h.update(&delta);
+            ChunkId::from_hash(*h.finalize().as_bytes())
+        };
+        if computed != delta_chunk_id {
+            return refuse(format!("delta bytes hash to {}, not {}", computed, delta_chunk_id));
+        }
+        if !self.storage.has_chunk(&base_chunk_id)
+            && self.pull_chunk_from_peers(base_chunk_id, &base_holders, file_id, chunk_idx * CHUNK_SIZE).await.is_none()
+        {
+            return Response::Error { message: format!("base {} unavailable", base_chunk_id), code: ErrorCode::NotFound };
+        }
+        let delta_len = delta.len();
+        let storage = self.storage.clone();
+        let written = tokio::task::spawn_blocking(move || storage.write_chunk(&delta_chunk_id, &delta)).await;
+        if !matches!(written, Ok(Ok(()))) {
+            return Response::Error { message: format!("writing delta {} failed", delta_chunk_id), code: ErrorCode::IOError };
+        }
+        let me = self.cluster.local_node_id();
+        let mut nodes = vec![me];
+        if let Ok(Some(row)) = self.metadata.get_chunk_location_async(public_token).await {
+            nodes.extend(row.nodes.into_iter().filter(|n| *n != me));
+        }
+        let loc = ChunkLocation {
+            chunk_id: public_token, nodes, size: size as usize, checksum: public_token.hash,
+            file_offset: Some(chunk_idx * CHUNK_SIZE), written_at: Some(written_at * 1000),
+            client_write_seq, file_id: Some(file_id),
+        };
+        match self.metadata.put_patch_state_pending_with_locations_async(
+            file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id, size as usize, written_at,
+            client_write_seq, None, None, vec![loc], Vec::new(),
+        ).await {
+            Ok(retired) => {
+                if let Some(retired) = retired {
+                    self.pending_patch_ids.remove(&retired);
+                }
+                self.pending_patch_ids.insert(public_token, (file_id, chunk_idx));
+                info!("DELTA HEAL: file {} chunk {}: holding {} (base {} + {} delta bytes) as a third copy",
+                    file_id, chunk_idx, public_token, base_chunk_id, delta_len);
+                Response::Ok { data: None }
+            }
+            Err(e) => Response::Error { message: format!("recording {} failed: {:#}", public_token, e), code: Self::storage_failure_code(&e) },
+        }
+    }
+
     /// Tell every peer this node's metadata commits are slow (`Request::LeaderSlow`).
     async fn broadcast_leader_slow(&self) {
         let me = self.cluster.local_node_id();
@@ -14905,6 +15113,16 @@ impl Server {
                         !matches!(ctx.fold_role(file_id, chunk_idx, idle), FoldRole::Wait(_))
                     })
                     .collect();
+                // A small delta isn't folded at all (see fold_min_delta): idle past the
+                // debounce is its normal state, not a stuck fold, and the owner's patience
+                // running out on it means nothing.
+                let mut folding = Vec::with_capacity(stale.len());
+                for (file_id, chunk_idx) in stale {
+                    if ctx.small_slot_delta(file_id, chunk_idx).await.is_none() {
+                        folding.push((file_id, chunk_idx));
+                    }
+                }
+                let stale = folding;
                 if stale.is_empty() {
                     continue;
                 }

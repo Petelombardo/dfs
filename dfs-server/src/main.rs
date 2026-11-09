@@ -248,7 +248,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("Peer address: {}", peer_addr);
 
     server::set_fold_idle(std::time::Duration::from_secs(config.storage.fold_idle_secs.max(1)));
-    info!("Fold idle: {}s after a chunk's last patch", config.storage.fold_idle_secs);
+    server::set_fold_min_delta(config.storage.fold_min_delta_bytes);
+    info!("Fold idle: {}s after a chunk's last patch, once its patches reach {} bytes (smaller deltas are copied to a third replica instead)",
+        config.storage.fold_idle_secs, config.storage.fold_min_delta_bytes);
 
     // Initialize cluster manager
     let cluster = std::sync::Arc::new(cluster::ClusterManager::new(

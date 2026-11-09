@@ -17503,15 +17503,62 @@ impl Server {
         info!("[MERGE-TRACE] file={} chunk_idx={} delta={} token={} needed_len={}",
             file_id, cidx, delta_chunk_id, public_token, needed_len);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let mut t_state = std::time::Duration::ZERO;
+        // The new token's ChunkLocation and the previous identity's removal, committed with
+        // the patch state below in one transaction: they were three commits per patch, each
+        // rewriting the tables' copy-on-write pages, ~100 KB of disk writes per 4 KiB patch
+        // (bench 11-08). A fresh accumulator registers a new location (copying nothing from
+        // the base: nodes are this node plus any already known for the token) and retires the
+        // base's; a merge slides the previous token's location forward to the new token.
+        //
+        // Registered unconditionally for a fresh accumulator — do NOT gate it on finding the
+        // base's own row: that lookup routinely comes back None by design, and an unregistered
+        // token had zero CHUNK_TABLE records on any node, a real VM disk read EIO (2026-07-11).
+        // nodes: holders of the token plus this node only, never the base's list carried
+        // forward: a list grown across every generation picked stale holders as write targets
+        // (a T28 data corruption). The previous identity's removal is the ONLY thing that
+        // retires its row: a leaked one outlives its bytes and gets served to a reader as an
+        // unresolvable identity (the 2026-09-13 VM-108 boot EIOs).
+        let (location_puts, location_deletes) = if !is_merge {
+            let new_loc = ChunkLocation {
+                chunk_id: public_token,
+                nodes: self.holders_of_token_with_me(public_token).await,
+                size: needed_len,
+                checksum: public_token.hash,
+                file_offset: Some(chunk_file_offset),
+                written_at: Some(now_ms),
+                client_write_seq,
+                file_id: Some(file_id),
+            };
+            (vec![new_loc], vec![base_chunk_id])
+        } else {
+            let puts = match self.metadata.get_chunk_location_async(chunk_id).await {
+                Ok(Some(mut loc)) => {
+                    loc.chunk_id = public_token;
+                    loc.size = needed_len;
+                    loc.checksum = public_token.hash;
+                    loc.written_at = Some(now_ms);
+                    loc.client_write_seq = client_write_seq;
+                    loc.nodes = self.holders_of_token_with_me(public_token).await;
+                    vec![loc]
+                }
+                _ => Vec::new(),
+            };
+            (puts, vec![chunk_id])
+        };
         // The token -> (base, delta) row, committed before the accumulator's rename below:
         // see PATCH_DELTA_RENAME_TABLE for the acked patches a rename-first order lost.
-        let record_state = |renamed_from: Option<ChunkId>| async move {
-            let t = std::time::Instant::now();
-            let retired = self.metadata.put_patch_state_pending_async(
-                file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq, renamed_from, chunk_seq,
-            ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)));
-            (retired, t.elapsed())
+        let record_state = |renamed_from: Option<ChunkId>| {
+            let (location_puts, location_deletes) = (location_puts.clone(), location_deletes.clone());
+            async move {
+                let t = std::time::Instant::now();
+                let retired = self.metadata.put_patch_state_pending_with_locations_async(
+                    file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq, renamed_from, chunk_seq,
+                    location_puts, location_deletes,
+                ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)));
+                (retired, t.elapsed())
+            }
         };
 
         let retired_token = match prior_delta {
@@ -17580,96 +17627,6 @@ impl Server {
         }
 
         let t_loc_start = std::time::Instant::now();
-
-        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        if !is_merge {
-            // Only a fresh accumulator needs a brand-new ChunkLocation registered
-            // (copying nodes/file_offset from the base it's replacing) and the
-            // base's own location retired — a merge keeps reusing the location
-            // already registered under the previous public_token in this same
-            // accumulation cycle; update_chunk_map_after_patch below still moves
-            // it forward to the new token either way.
-            {
-                // Register unconditionally — do NOT gate this on finding
-                // base_chunk_id's own ChunkLocation first. That lookup routinely
-                // comes back None by design (a prior patch generation may already
-                // have retired/deleted it, or this is the very first patch on a
-                // freshly-written chunk with no separate location record of its
-                // own yet), and skipping registration in that case leaves
-                // public_token completely unregistered anywhere — worse than the
-                // file_offset:None case below, since chunk_map_update_location_for_file
-                // never even sees an entry to drop. Confirmed live (2026-07-11):
-                // a chunk with this exact lineage shape had zero CHUNK_TABLE
-                // records on any of 5 nodes, causing a real VM disk read EIO.
-                // Every field new_loc needs is already available locally —
-                // chunk_file_offset is this function's own parameter, not
-                // something that needs to be inherited from a lookup that can
-                // fail.
-                //
-                // nodes: [local_node_id] only — see full_rewrite_chunk's identical
-                // fix for the full rationale. Carrying old_loc.nodes forward (even
-                // with the local node appended) makes the list grow monotonically
-                // across every generation this slot passes through, including
-                // nodes that only ever held some now-irrelevant earlier
-                // generation — confirmed to cause a real T28 data corruption
-                // regression when a later patch's node selection picked one of
-                // those stale entries as a write target. A single-node list is
-                // correct-by-construction (this node just wrote this generation's
-                // delta locally) and converges to the full accurate set via
-                // handle_replicate_chunk_location's existing under-RF union merge
-                // once the client's own authoritative broadcast lands.
-                let new_loc = ChunkLocation {
-                    chunk_id: public_token,
-                    nodes: self.holders_of_token_with_me(public_token).await,
-                    size: needed_len,
-                    checksum: public_token.hash,
-                    file_offset: Some(chunk_file_offset),
-                    written_at: Some(now_ms),
-                    client_write_seq,
-                    file_id: Some(file_id),
-                };
-                if let Err(e) = self.metadata.put_chunk_location_async(new_loc).await {
-                    warn!("apply_patch: failed to register {} in metadata: {}", public_token, e);
-                }
-            }
-            // Not `let _ =`: this delete is the ONLY thing that retires the base's
-            // CHUNK_TABLE row, and it is one-shot — nothing revisits this generation
-            // later. Swallowing a failure here leaks a row that outlives its bytes and
-            // eventually gets served to a reader as an unresolvable identity (the
-            // 2026-09-13 VM-108 boot EIOs). If this ever fires, the orphan it leaves is
-            // the thing to go looking for.
-            if let Err(e) = self.metadata.delete_chunk_location_async(base_chunk_id).await {
-                warn!("apply_patch: failed to retire base ChunkLocation {} for file {} chunk_idx {} \
-                       after minting {} — this leaks an orphan CHUNK_TABLE row that nothing else \
-                       reclaims: {}", base_chunk_id, file_id, cidx, public_token, e);
-            }
-        } else {
-            // Slide the existing ChunkLocation (registered under the now-retired
-            // previous token) forward to the new token, updating size in case
-            // this merge extended the accumulator past the prior needed_len.
-            if let Ok(Some(mut loc)) = self.metadata.get_chunk_location_async(chunk_id).await {
-                loc.chunk_id = public_token;
-                loc.size = needed_len;
-                loc.checksum = public_token.hash;
-                loc.written_at = Some(now_ms);
-                loc.client_write_seq = client_write_seq;
-                // Same fix as the fresh-accumulator branch above, same rationale:
-                // nodes: [local_node_id] only, not old nodes + append — see that
-                // branch's comment for why carrying the list forward caused a
-                // real T28 data corruption regression.
-                loc.nodes = self.holders_of_token_with_me(public_token).await;
-                if let Err(e) = self.metadata.put_chunk_location_async(loc).await {
-                    warn!("apply_patch: failed to slide {} -> {} in metadata: {}", chunk_id, public_token, e);
-                }
-            }
-            // See the sibling delete in the !is_merge branch above for why this is
-            // not `let _ =`. Same one-shot retirement, same orphan if it fails.
-            if let Err(e) = self.metadata.delete_chunk_location_async(chunk_id).await {
-                warn!("apply_patch: failed to retire previous token ChunkLocation {} for file {} \
-                       chunk_idx {} after sliding to {} — this leaks an orphan CHUNK_TABLE row \
-                       that nothing else reclaims: {}", chunk_id, file_id, cidx, public_token, e);
-            }
-        }
         // Live snapshot, taken strictly before update_chunk_map_after_patch below
         // overwrites it — see DirtyPatchSlot::prior_chunk_id's doc comment. Only
         // meaningful for a fresh accumulator (!is_merge): chunk_map's occupant

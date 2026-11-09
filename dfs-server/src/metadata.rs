@@ -442,6 +442,13 @@ enum MetaWriteOp {
         client_write_seq: Option<u64>,
         renamed_from: Option<ChunkId>,
         chunk_seq: Option<u64>,
+        /// The patch's CHUNK_TABLE changes, in the same transaction as its state: the new
+        /// token's location (moved from the previous token, or new for a fresh accumulator)
+        /// and the previous identity's removal. They were three commits per patch, each
+        /// rewriting the tables' copy-on-write pages: ~100 KB written per 4 KiB patch (bench
+        /// 11-08, meta-committer write_bytes), most of a node's disk writes.
+        location_puts: Vec<ChunkLocation>,
+        location_deletes: Vec<ChunkId>,
         reply: tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>,
     },
     UpdatePatchStateFolded {
@@ -1089,14 +1096,15 @@ impl MetadataStore {
                 }
                 MetaWriteOp::PutPatchStatePending {
                     file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-                    size, written_at, client_write_seq, renamed_from, chunk_seq, reply,
+                    size, written_at, client_write_seq, renamed_from, chunk_seq,
+                    location_puts, location_deletes, reply,
                 } => {
                     let result = Self::put_patch_state_pending_in_txn(
                         &txn, file_id, chunk_idx, &public_token, base_chunk_id,
                         delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq,
-                    ).map(|(retired, bytes)| {
-                        payload_bytes += bytes;
-                        retired
+                    ).and_then(|(retired, bytes)| {
+                        payload_bytes += bytes + Self::patch_locations_in_txn(&txn, &location_puts, &location_deletes)?;
+                        Ok(retired)
                     });
                     self.note_txn("op:put_patch_state_pending", 0);
                     replies.push(PendingReply::RetiredToken(reply, result));
@@ -3204,6 +3212,27 @@ impl MetadataStore {
         Ok((retired.and_then(|hex| decode_hex_32(&hex)).map(ChunkId::from_hash), payload_bytes))
     }
 
+    /// A patch's CHUNK_TABLE changes inside its state's transaction (see
+    /// MetaWriteOp::PutPatchStatePending::location_puts). Returns the bytes written.
+    fn patch_locations_in_txn(txn: &redb::WriteTransaction, puts: &[ChunkLocation], deletes: &[ChunkId]) -> Result<usize> {
+        if puts.is_empty() && deletes.is_empty() {
+            return Ok(0);
+        }
+        let mut table = txn.open_table(CHUNK_TABLE)?;
+        let mut bytes = 0;
+        for location in puts {
+            let value = bincode::serialize(location).context("Failed to serialize chunk location")?;
+            bytes += value.len();
+            table.insert(format!("{}", location.chunk_id).as_str(), value.as_slice())?;
+        }
+        for id in deletes {
+            if puts.iter().all(|l| l.chunk_id != *id) {
+                table.remove(format!("{}", id).as_str())?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Async wrapper for put_patch_state_pending — patches are a normal-volume
     /// client write path; see put_chunk_location_async for why this matters
     /// (group-committed since 2026-07-15; fires once per 4K patch under RND4K load).
@@ -3213,6 +3242,18 @@ impl MetadataStore {
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
         written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
         chunk_seq: Option<u64>,
+    ) -> Result<Option<ChunkId>> {
+        self.put_patch_state_pending_with_locations_async(file_id, chunk_idx, public_token, base_chunk_id,
+            delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq, Vec::new(), Vec::new()).await
+    }
+
+    /// put_patch_state_pending_async plus the patch's CHUNK_TABLE changes, in one commit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_patch_state_pending_with_locations_async(
+        self: &Arc<Self>, file_id: FileId, chunk_idx: u64, public_token: ChunkId,
+        base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
+        written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
+        chunk_seq: Option<u64>, location_puts: Vec<ChunkLocation>, location_deletes: Vec<ChunkId>,
     ) -> Result<Option<ChunkId>> {
         if !Self::group_commit_enabled() {
             let store = Arc::clone(self);
@@ -3224,6 +3265,7 @@ impl MetadataStore {
                     &txn, file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id,
                     size, written_at, client_write_seq, renamed_from, chunk_seq,
                 )?;
+                Self::patch_locations_in_txn(&txn, &location_puts, &location_deletes)?;
                 store.commit(txn)?;
                 store.note_txn("put_patch_state_pending", payload_bytes);
                 Ok(retired)
@@ -3232,7 +3274,8 @@ impl MetadataStore {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.committer_tx().send(MetaWriteOp::PutPatchStatePending {
             file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-            size, written_at, client_write_seq, renamed_from, chunk_seq, reply,
+            size, written_at, client_write_seq, renamed_from, chunk_seq,
+            location_puts, location_deletes, reply,
         }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
         rx.await.context("metadata group-commit thread dropped its reply")?
     }

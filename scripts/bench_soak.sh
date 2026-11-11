@@ -32,6 +32,11 @@ start_node() {
 worker_counts() {  # "<worker>=<ok>/<fail> ..." from the client's worker logs
     ssh -o BatchMode=yes root@"$CLIENT" "cd $CDIR/soak 2>/dev/null && for w in vm qcow2 dvr verify; do printf '%s=%s/%s ' \$w \$(grep -c ' OK ' \$w.log 2>/dev/null || echo 0) \$(grep -c ' FAIL ' \$w.log 2>/dev/null || echo 0); done"
 }
+mem_counts() {  # per node: MemAvailable / Dirty+Writeback in MB, so a lockup leaves evidence (soak #18: three pucks hung at 22:07 with nothing logged)
+    for n in $NODES; do
+        printf '%s:%s ' "$n" "$(timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=10 root@$n "awk '/^MemAvailable:/{a=\$2} /^Dirty:/{d=\$2} /^Writeback:/{w=\$2} END{printf \"%d/%d\", a/1024, (d+w)/1024}' /proc/meminfo" 2>/dev/null || echo '?')"
+    done
+}
 server_counts() {  # panics + DATA LOSS lines on each bench server since the soak started
     for n in $NODES; do
         o=$(awk -v n=$n '$1==n{print $2}' "$OUT/log-offsets")
@@ -100,7 +105,7 @@ start)
         fi
         if [ "$now" -ge "$next_health" ]; then
             up=""; for n in $NODES; do [ -n "$(bench_pid "$n")" ] && up="$up $n"; done
-            say "HEALTH up:${up:- none} | workers $(worker_counts)| panics+dataloss $(server_counts)"
+            say "HEALTH up:${up:- none} | workers $(worker_counts)| panics+dataloss $(server_counts)| mem avail/dirty MB $(mem_counts)"
             next_health=$(( $(date +%s) + 600 ))
         fi
         sleep 30

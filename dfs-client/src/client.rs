@@ -3307,6 +3307,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                 cid: ChunkId,
                 primary: SocketAddr,
                 fallbacks: Vec<SocketAddr>,
+                /// The replicas are the location's own holders (see pick_replica_by_load).
+                listed: bool,
             }
             let mut range_fetches: Vec<RangeFetch> = Vec::new();
 
@@ -3403,10 +3405,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Load-aware pick (same logic the prefetch/swarm paths use): prefers the
                 // replica with fewer in-flight requests over a busier one, with chunk-hash
                 // rotation breaking ties so chunks still fan out across replicas.
-                let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+                let (primary, fallbacks, listed) = self.pick_replica_by_load(loc, &nim, &nodes);
                 self.node_inflight_inc(primary);
 
-                range_fetches.push(RangeFetch { idx, chunk_start, offset_in_chunk, len_in_chunk, cid, primary, fallbacks });
+                range_fetches.push(RangeFetch { idx, chunk_start, offset_in_chunk, len_in_chunk, cid, primary, fallbacks, listed });
             }
 
             // Fetch all missing byte ranges in parallel.
@@ -3420,6 +3422,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let cid = rf.cid;
                     let primary = rf.primary;
                     let fallbacks = rf.fallbacks.clone();
+                    let listed = rf.listed;
                     let ws = write_seq; // Capture for async block
                     let inode = inode; // Capture for async block
                     let file_id = file_id; // Capture for the (file_id, chunk_idx) slot backstop
@@ -3483,7 +3486,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                         match last_err {
                             None => Err(anyhow::anyhow!("no replicas")),
                             // Every replica answered definitively: this identity is retired.
-                            Some(_) if all_not_found => Err(anyhow::anyhow!(
+                            // Only the location's own holders can say so (pick_replica_by_load).
+                            Some(_) if all_not_found && listed => Err(anyhow::anyhow!(
                                 "Range chunk {} missing on all replicas — metadata may be stale", cid
                             )),
                             // Nobody served it, but at least one failure was ambiguous, so we
@@ -3771,6 +3775,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         // --- Cache check ---
         let mut result_chunks: Vec<(usize /*chunk_idx*/, Arc<Vec<u8>>)> = Vec::new();
         let mut to_fetch: Vec<(usize, ChunkId, SocketAddr, Vec<SocketAddr>)> = Vec::new();
+        // Fetched from every cluster node, not the location's holders (see pick_replica_by_load).
+        let mut unlisted_fetches: std::collections::HashSet<ChunkId> = std::collections::HashSet::new();
         let mut to_wait: Vec<(usize, ChunkId, ChunkLocation)> = Vec::new();
 
         for (chunk_idx, _chunk_start, _chunk_size) in &needed {
@@ -3803,7 +3809,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
 
             // 3. We own the fetch — pick replica and queue it.
-            let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+            let (primary, fallbacks, listed) = self.pick_replica_by_load(loc, &nim, &nodes);
+            if !listed {
+                unlisted_fetches.insert(cid);
+            }
             self.node_inflight_inc(primary);
             to_fetch.push((idx, cid, primary, fallbacks));
         }
@@ -3826,7 +3835,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
 
                 let loc = &chunk_map[la_idx];
-                let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+                let (primary, fallbacks, _) = self.pick_replica_by_load(loc, &nim, &nodes);
 
                 // Cap background fetches per node: spinning HDDs can't efficiently
                 // serve multiple concurrent requests. If the least-loaded replica is
@@ -3983,7 +3992,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         // blacklisting a live chunk_id on a transient error would pin the
                         // slot exactly the way this mechanism exists to prevent — so gate
                         // on fetch_chunk_with_fallback's all_not_found discriminator.
-                        if e.to_string().contains("metadata may be stale") {
+                        if e.to_string().contains("metadata may be stale") && !unlisted_fetches.contains(&cid) {
                             engine.mark_chunk_proven_absent(cid);
                         }
                         stale_retries.push((idx, cid));
@@ -4248,7 +4257,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                     if should_swarm {
                         let swarm_loc = &chunk_map[*swarm_idx];
-                        let (primary, fallbacks) = self.pick_replica_by_load(swarm_loc, &nim, &nodes);
+                        let (primary, fallbacks, _) = self.pick_replica_by_load(swarm_loc, &nim, &nodes);
 
                         // Skip if the least-loaded replica is already handling a background
                         // fetch. Spinning HDDs are fastest with one sequential request at a
@@ -4302,7 +4311,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                 let next_cid = cm[next_idx].chunk_id;
                                                 if client.chunk_cache.get(&next_cid).is_none() {
                                                     let chain_nodes = client.cluster_nodes.read().await.clone();
-                                                    let (next_primary, next_fallbacks) = client.pick_replica_by_load(&cm[next_idx], &nim, &chain_nodes);
+                                                    let (next_primary, next_fallbacks, _) = client.pick_replica_by_load(&cm[next_idx], &nim, &chain_nodes);
                                                     // Same per-node cap for chain fetches.
                                                     let chain_load = client.node_inflight.get(&next_primary)
                                                         .map(|e| e.load(Ordering::Relaxed))
@@ -4381,12 +4390,18 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// chunk_id rather than by address, so different chunks that share the same
     /// replica set fan out across all of them instead of always favoring the
     /// lowest-address node. Returns (primary, remaining_in_load_order).
+    /// The replicas to read `loc` from: (primary, fallbacks, listed). `listed` is false when
+    /// none of the nodes its location names is addressable here and every cluster node is
+    /// asked instead: then "not found" from all of them proves nothing about the id, since
+    /// the nodes that hold it weren't asked (Legata 943cd035: both holders of a slot's newest
+    /// patches were down, the three other nodes said "not found", the client took the token
+    /// for retired and read the chunk's older version).
     fn pick_replica_by_load(
         &self,
         loc: &ChunkLocation,
         nim: &HashMap<dfs_common::NodeId, SocketAddr>,
         cluster_nodes: &[SocketAddr],
-    ) -> (SocketAddr, Vec<SocketAddr>) {
+    ) -> (SocketAddr, Vec<SocketAddr>, bool) {
         let mut addrs: Vec<SocketAddr> = loc.nodes.iter()
             .filter_map(|nid| nim.get(nid).copied())
             .collect();
@@ -4399,7 +4414,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 .copied()
                 .unwrap_or(cluster_nodes[0]);
             let fallbacks = cluster_nodes.iter().filter(|&&a| a != p).copied().collect();
-            return (p, fallbacks);
+            return (p, fallbacks, false);
         }
 
         // Sort deterministically by address, then rotate by a hash of chunk_id —
@@ -4419,7 +4434,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let primary = scored[0].0;
         let fallbacks = scored[1..].iter().map(|&(a, _)| a).collect();
-        (primary, fallbacks)
+        (primary, fallbacks, true)
     }
 
     fn node_inflight_inc(&self, addr: SocketAddr) {
@@ -12383,11 +12398,11 @@ mod tests {
         let cluster = [addr_a, addr_b];
 
         let loc0 = loc_with_nodes(chunk_id_with_hash0(0), nodes.clone());
-        let (p0, _) = client.pick_replica_by_load(&loc0, &nim, &cluster);
+        let (p0, _, _) = client.pick_replica_by_load(&loc0, &nim, &cluster);
         assert_eq!(p0, addr_a);
 
         let loc1 = loc_with_nodes(chunk_id_with_hash0(1), nodes.clone());
-        let (p1, _) = client.pick_replica_by_load(&loc1, &nim, &cluster);
+        let (p1, _, _) = client.pick_replica_by_load(&loc1, &nim, &cluster);
         assert_eq!(p1, addr_b);
     }
 
@@ -12415,9 +12430,16 @@ mod tests {
         client.node_inflight_inc(addr_a);
 
         let loc0 = loc_with_nodes(chunk_id_with_hash0(0), nodes.clone());
-        let (primary, fallbacks) = client.pick_replica_by_load(&loc0, &nim, &cluster);
+        let (primary, fallbacks, listed) = client.pick_replica_by_load(&loc0, &nim, &cluster);
         assert_eq!(primary, addr_b);
         assert_eq!(fallbacks, vec![addr_a]);
+        assert!(listed, "the location's own holders were picked");
+
+        // None of the location's holders is addressable (both down, say): every cluster node
+        // is asked instead, and their "not found" must not count as proof (Legata 943cd035).
+        let loc_unknown = loc_with_nodes(chunk_id_with_hash0(1), vec![dfs_common::NodeId::new(), dfs_common::NodeId::new()]);
+        let (_, _, listed) = client.pick_replica_by_load(&loc_unknown, &nim, &cluster);
+        assert!(!listed, "a fallback to every cluster node is not the location's holders");
     }
 
     /// Regression for the 2026-09-08 latch defect. `send_chunk_locations_batched` falls

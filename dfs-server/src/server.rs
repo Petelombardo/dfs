@@ -13193,6 +13193,9 @@ impl Server {
         client_write_seq: Option<u64>, base_holders: Vec<NodeId>) -> Response
     {
         let refuse = |why: String| Response::Error { message: why, code: ErrorCode::InvalidRequest };
+        if crate::write_order::chunk_transfers_failing() {
+            return Response::Error { message: "delta copy refused (fault injection)".into(), code: ErrorCode::InternalError };
+        }
         if self.metadata.is_file_tombstoned(&file_id) {
             return refuse(format!("file {} is deleted", file_id));
         }
@@ -22285,6 +22288,7 @@ impl Server {
         // answer legitimately is the whole cluster.
         let all_nodes = self.cluster.get_all_nodes().await;
         let known = all_nodes.len().max(1);
+        let members: HashSet<NodeId> = all_nodes.iter().map(|n| n.id).collect();
         let peers: Vec<_> = all_nodes
             .into_iter()
             .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
@@ -22294,7 +22298,8 @@ impl Server {
             .map(|node| {
                 let client = self.client.clone();
                 let ids = tokens.clone();
-                tokio::spawn(async move {
+                let node_id = node.id;
+                (node_id, tokio::spawn(async move {
                     let req = Request::HasChunks { chunk_ids: ids };
                     let result = tokio::time::timeout(
                         HAS_CHUNK_TIMEOUT,
@@ -22307,17 +22312,19 @@ impl Server {
                         },
                         _ => None,
                     }
-                })
+                }))
             })
             .collect();
 
-        for task in tasks {
+        let mut answerers: HashSet<NodeId> = HashSet::from([local_id]);
+        for (node_id, task) in tasks {
             // A node that did not answer is not a vote either way.
             let Ok(Some(values)) = task.await else { continue };
             if values.len() != tokens.len() {
                 continue;
             }
             answered += 1;
+            answerers.insert(node_id);
             for (id, present) in tokens.iter().zip(values) {
                 if present {
                     resolvable_somewhere.insert(*id);
@@ -22329,8 +22336,27 @@ impl Server {
             return out;
         }
         for id in tokens {
-            if !resolvable_somewhere.contains(&id) {
+            if resolvable_somewhere.contains(&id) {
+                continue;
+            }
+            // Bystanders saying no prove nothing while the nodes that hold the token are down:
+            // with both holders of a slot's latest patches SIGKILLed, the three other nodes'
+            // "no" declared the token dangling, the slot reverted to its base, and a cold
+            // client silently read the chunk as it was before those acked patches (suite
+            // T126 with the delta copy off, 11-11; Legata 943cd035). A token is unresolvable
+            // only once every cluster member its row names as a holder answered no. A holder
+            // the cluster doesn't know can hold nothing, so a row naming only such ids, or
+            // none (the 2026-09-13 dangling rows), keeps the quorum rule.
+            let holders: Vec<NodeId> = match self.metadata.get_chunk_location_async(id).await {
+                Ok(Some(loc)) => loc.nodes.into_iter().filter(|h| members.contains(h)).collect(),
+                _ => Vec::new(),
+            };
+            if holders.iter().all(|h| answerers.contains(h)) {
                 out.insert(id);
+            } else {
+                info!("confirm_tokens_unresolvable: {} not resolvable on any node that answered, but its holder(s) {:?} \
+                       didn't answer; leaving it (never fall back past an acked write)",
+                    id, holders.iter().filter(|h| !answerers.contains(h)).collect::<Vec<_>>());
             }
         }
         out

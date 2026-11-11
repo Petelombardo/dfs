@@ -4700,6 +4700,17 @@ t125_read() {   # md5 of the file through a fresh client
     cpid=$!
     for _ in $(seq 1 50); do mountpoint -q "$m" && break; sleep 0.1; done
     sum=$(timeout 60 md5sum < "$m/$T125_FILE" 2>/dev/null | cut -d' ' -f1)
+    # A wrong read keeps its bytes and the 4 KiB blocks that differ, for the diagnosis.
+    if [ -n "$sum" ] && [ "$sum" != "$(md5sum < "$T/t125.bin" | cut -d' ' -f1)" ]; then
+        timeout 60 cat "$m/$T125_FILE" > "$LOG/t125_$1.bin" 2>/dev/null
+        python3 - "$LOG/t125_$1.bin" "$T/t125.bin" > "$LOG/t125_$1.diff" 2>&1 <<'PY'
+import sys
+got, want = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read()
+bad = [i for i in range(0, max(len(got), len(want)), 4096) if got[i:i+4096] != want[i:i+4096]]
+print("%d of %d blocks differ; chunks %s; first blocks %s" % (len(bad), len(want) // 4096,
+      sorted({b // 4194304 for b in bad}), [b // 4096 for b in bad[:10]]))
+PY
+    fi
     fusermount -u "$m" 2>/dev/null || true
     kill_client_and_wait "$cpid"
     echo "${sum:-unreadable}"
@@ -4856,6 +4867,102 @@ fi
 for n in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $T126_DIR/node$n/config.toml" 2>/dev/null || true; done
 rm -f "$T/t126.bin"
 fi # should_run T126
+
+# ── T127: a slot whose newest patches' holders are all down never reads back as its older version ──
+# Legata 943cd035 (11-11): with both holders of a slot's latest (unfolded) patches SIGKILLed, the
+# leader's rebuild of the slot kept the newest version out (its record listed fewer than 2
+# holders, and the holders it could ask were dead) and served the chunk's base: a cold client
+# silently read the chunk as it was before those acked patches. On its own 5-node cluster with
+# the production fold settings (20 s idle), the third copy is blocked (fail-chunk-transfers on
+# every node, which also refuses delta copies), 30 patches land on chunk 1, its two writers are
+# SIGKILLed 100 s later, and a cold client reads the chunk through the other three: it may fail
+# (EIO) while the holders are down, but must never return the chunk's older bytes.
+snapshot_log T127
+if should_run T127; then
+echo ""
+echo "=== T127: a slot whose newest holders are down reads as an error, never as its older version ==="
+T127_DIR="$BASE/t127"; T127_MNT=/tmp/dfs-mount-t127; T127_FILE=t127.bin
+T127_CLUSTER=127.0.0.1:8985,127.0.0.1:8986,127.0.0.1:8987,127.0.0.1:8988,127.0.0.1:8989
+mkdir -p "$T127_DIR" "$T127_MNT"
+t127_start() {
+    DFS_LEASE_CLUSTER_SIZE=5 DFS_FAULT_INJECTION=1 RUST_LOG=info "$BIN/dfs-server" start --config "$T127_DIR/node$1/config.toml" --log-level info \
+        >> "$LOG/t127_server$1.log" 2>&1 &
+}
+for i in 1 2 3 4 5; do
+    "$BIN/dfs-server" init --data-dir "$T127_DIR/node$i/data" --meta-dir "$T127_DIR/node$i/metadata" \
+        --config "$T127_DIR/node$i/config.toml" >/dev/null 2>&1
+    sed -i 's/^fold_idle_secs = .*/fold_idle_secs = 20/' "$T127_DIR/node$i/config.toml"
+    sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"127.0.0.1:$((8984 + i))\"/" "$T127_DIR/node$i/config.toml"
+    [ "$i" -gt 1 ] && sed -i 's/seed_nodes = \[\]/seed_nodes = ["127.0.0.1:8985"]/' "$T127_DIR/node$i/config.toml"
+    sed -i 's/heartbeat_interval_secs = .*/heartbeat_interval_secs = 5/' "$T127_DIR/node$i/config.toml"
+    t127_start $i
+done
+for _ in $(seq 1 100); do [ "$(ss -Hltn '( sport = :8985 or sport = :8986 or sport = :8987 or sport = :8988 or sport = :8989 )' | grep -c '')" -ge 5 ] && break; sleep 0.1; done
+sleep 10
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T127_MNT" --cluster "$T127_CLUSTER" \
+    --log-file "$LOG/t127_client.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T127_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T127_MNT" && break; sleep 0.1; done
+if ! mountpoint -q "$T127_MNT"; then
+    check "T127 setup: the client mounted the T127 cluster" FAIL
+else
+dd if=/dev/urandom of="$T/t127.bin" bs=4M count=4 status=none
+cp "$T/t127.bin" "$T127_MNT/$T127_FILE"; sync "$T127_MNT" 2>/dev/null || true
+sleep 30
+cp "$T/t127.bin" "$T/t127.old"
+T127_FID=$(grep -h "\[META SERVER\] put path=/$T127_FILE id=" "$LOG"/t127_server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+"$BIN/dfs-admin" --cluster "$T127_CLUSTER" fault fail-chunk-transfers --for-millis 600000 >/dev/null 2>&1 \
+    || echo "  T127: could not arm fail-chunk-transfers"
+python3 - "$T127_MNT/$T127_FILE" "$T/t127.bin" <<'PY'
+import os, random, sys
+mnt, exp = sys.argv[1], sys.argv[2]
+fd = os.open(mnt, os.O_RDWR)
+with open(exp, "r+b") as e:
+    for i in range(30):
+        off = 4194304 + random.randrange(0, 1024) * 4096
+        x = os.urandom(4096)
+        os.pwrite(fd, x, off); e.seek(off); e.write(x)
+os.fsync(fd); os.close(fd)
+PY
+fusermount -u "$T127_MNT" 2>/dev/null || true
+kill_client_and_wait "$T127_CPID"
+T127_WRITERS=$(grep -l "MERGE-TRACE\] file=$T127_FID chunk_idx=1 " "$LOG"/t127_server*.log 2>/dev/null | grep -oP 't127_server\K[0-9]+' | tr '\n' ' ')
+sleep 100
+T127_HEALED=$(cat "$LOG"/t127_server*.log | grep -ac "DELTA HEAL: file $T127_FID chunk 1: holding" || true)
+for n in $T127_WRITERS; do pkill -9 -f "dfs-server start --config $T127_DIR/node$n/config.toml" 2>/dev/null || true; done
+echo "  T127: file ${T127_FID:-?}; chunk 1's writers node(s) ${T127_WRITERS:-?}killed 100 s after its patches (third copies made: $T127_HEALED)"
+sleep 45
+T127_SURV=""; for n in 1 2 3 4 5; do case " $T127_WRITERS " in *" $n "*) ;; *) T127_SURV="$T127_SURV${T127_SURV:+,}127.0.0.1:$((8984 + n))";; esac; done
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T127_MNT" --cluster "$T127_SURV" \
+    --log-file "$LOG/t127_client_fresh.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T127_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T127_MNT" && break; sleep 0.1; done
+T127_READ=$(python3 - "$T127_MNT/$T127_FILE" "$T/t127.bin" "$T/t127.old" <<'PY'
+import sys
+path, new, old = sys.argv[1], sys.argv[2], sys.argv[3]
+want = open(new, "rb").read()[4194304:8388608]
+was = open(old, "rb").read()[4194304:8388608]
+try:
+    with open(path, "rb") as f:
+        f.seek(4194304); got = f.read(4194304)
+except OSError as e:
+    print("ERROR %s" % e.strerror); sys.exit(0)
+print("NEW" if got == want else "OLD" if got == was else "OTHER")
+PY
+)
+fusermount -u "$T127_MNT" 2>/dev/null || true
+kill_client_and_wait "$T127_CPID"
+echo "  T127: cold read of chunk 1 with its writers down: $T127_READ"
+[ "$(echo $T127_WRITERS | wc -w)" = 2 ] && [ "$T127_HEALED" = 0 ] \
+    || check "T127 setup: want 2 writers and no third copy, got writers '${T127_WRITERS}' and $T127_HEALED copies" FAIL
+case "$T127_READ" in
+    OLD|OTHER) check "T127 chunk 1 read back as $T127_READ data while its newest holders were down: acked patches silently lost" FAIL ;;
+    *) check "T127 chunk 1 never read back as its older version (read: $T127_READ)" PASS ;;
+esac
+fi
+for n in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $T127_DIR/node$n/config.toml" 2>/dev/null || true; done
+rm -f "$T/t127.bin" "$T/t127.old"
+fi # should_run T127
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2

@@ -1381,8 +1381,8 @@ pub enum Request {
     },
 
     /// Test-only (DFS_FAULT_INJECTION=1): for `for_millis`, no whole chunk moves between this node
-    /// and its peers: it refuses every WriteChunk sent to it and every chunk it pulls from a peer
-    /// fails (G8 soak #16: an ordered slot's secondary neither got the primary's fold result,
+    /// and its peers: it refuses every WriteChunk and ReplicatePatchDelta sent to it and every
+    /// chunk it pulls from a peer fails (G8 soak #16: an ordered slot's secondary neither got the primary's fold result,
     /// which went to a third replica, nor could pull it). APPENDED at end to preserve wire
     /// compatibility.
     InjectChunkTransferFailures {

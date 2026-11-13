@@ -4964,6 +4964,148 @@ for n in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $T127_DIR/node$n/c
 rm -f "$T/t127.bin" "$T/t127.old"
 fi # should_run T127
 
+# ── T128: a writer restarted after its slot moved on never hands its old version back out ──
+# Legata 6bec1f3a (G8 soak #19, 11-12): puck2 minted a patch token for /vm/q.qcow2 chunk 0 and was
+# SIGKILLed 13 s later. While it was down the slot moved on (~30k writes), but the restart's resume
+# sweep put the old token back as puck2's own pending slot, and 2 h 40 m later its delta heal sent
+# that token as a "third copy" to two peers that had no pending state for the slot at that moment.
+# Both took it, and its location broadcast (stale generation) made chunk 0 resolve to the old
+# version again: every qcow2 L2 mapping allocated since was lost (1739 clusters). Here, on its own
+# 5-node cluster with the production fold settings (20 s idle): 5 small patches land on chunk 1,
+# one of their two writers is SIGKILLed at once (before any third copy), 300 more patches (1.2 MiB,
+# so it folds) land while it is down, then it restarts with its old token pending. After its delta
+# heal has had time to fire, no node may hold the pre-kill token as a third copy, and a cold client
+# must read every byte of the newest data.
+snapshot_log T128
+if should_run T128; then
+echo ""
+echo "=== T128: a restarted writer whose slot moved on never brings its old version back ==="
+T128_DIR="$BASE/t128"; T128_MNT=/tmp/dfs-mount-t128; T128_FILE=t128.bin
+T128_CLUSTER=127.0.0.1:8990,127.0.0.1:8991,127.0.0.1:8992,127.0.0.1:8993,127.0.0.1:8994
+mkdir -p "$T128_DIR" "$T128_MNT"
+t128_start() {
+    DFS_LEASE_CLUSTER_SIZE=5 RUST_LOG=info "$BIN/dfs-server" start --config "$T128_DIR/node$1/config.toml" --log-level info \
+        >> "$LOG/t128_server$1.log" 2>&1 &
+}
+for i in 1 2 3 4 5; do
+    "$BIN/dfs-server" init --data-dir "$T128_DIR/node$i/data" --meta-dir "$T128_DIR/node$i/metadata" \
+        --config "$T128_DIR/node$i/config.toml" >/dev/null 2>&1
+    sed -i 's/^fold_idle_secs = .*/fold_idle_secs = 20/' "$T128_DIR/node$i/config.toml"
+    sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"127.0.0.1:$((8989 + i))\"/" "$T128_DIR/node$i/config.toml"
+    [ "$i" -gt 1 ] && sed -i 's/seed_nodes = \[\]/seed_nodes = ["127.0.0.1:8990"]/' "$T128_DIR/node$i/config.toml"
+    sed -i 's/heartbeat_interval_secs = .*/heartbeat_interval_secs = 5/' "$T128_DIR/node$i/config.toml"
+    t128_start $i
+done
+for _ in $(seq 1 100); do [ "$(ss -Hltn '( sport = :8990 or sport = :8991 or sport = :8992 or sport = :8993 or sport = :8994 )' | grep -c '')" -ge 5 ] && break; sleep 0.1; done
+sleep 10
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T128_MNT" --cluster "$T128_CLUSTER" \
+    --log-file "$LOG/t128_client.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T128_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T128_MNT" && break; sleep 0.1; done
+if ! mountpoint -q "$T128_MNT"; then
+    check "T128 setup: the client mounted the T128 cluster" FAIL
+else
+dd if=/dev/urandom of="$T/t128.bin" bs=4M count=4 status=none
+cp "$T/t128.bin" "$T128_MNT/$T128_FILE"; sync "$T128_MNT" 2>/dev/null || true
+sleep 30
+T128_FID=$(grep -h "\[META SERVER\] put path=/$T128_FILE id=" "$LOG"/t128_server*.log 2>/dev/null | tail -1 | grep -oP 'id=\K[0-9a-f-]+' || true)
+t128_patch() {   # t128_patch <count>: <count> random 4 KiB patches to chunk 1, fsynced
+python3 - "$T128_MNT/$T128_FILE" "$T/t128.bin" "$1" <<'PY'
+import os, random, sys
+mnt, exp, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+fd = os.open(mnt, os.O_RDWR)
+with open(exp, "r+b") as e:
+    for i in range(n):
+        off = 4194304 + random.randrange(0, 1024) * 4096
+        x = os.urandom(4096)
+        os.pwrite(fd, x, off); e.seek(off); e.write(x)
+        if i % 20 == 19: os.fsync(fd)
+os.fsync(fd); os.close(fd)
+PY
+}
+t128_patch 5
+T128_WRITERS=$(grep -l "MERGE-TRACE\] file=$T128_FID chunk_idx=1 " "$LOG"/t128_server*.log 2>/dev/null | grep -oP 't128_server\K[0-9]+' | tr '\n' ' ')
+T128_VICTIM=$(echo $T128_WRITERS | cut -d' ' -f1)
+if [ -n "$T128_VICTIM" ]; then
+    pkill -9 -f "dfs-server start --config $T128_DIR/node$T128_VICTIM/config.toml" 2>/dev/null || true
+    # The token the victim last minted for chunk 1: its own pending version when it comes back.
+    T128_OLD=$(grep -a "MERGE-TRACE\] file=$T128_FID chunk_idx=1 " "$LOG/t128_server$T128_VICTIM.log" | tail -1 | grep -oP 'token=\K[0-9a-f]+' || true)
+fi
+sleep 5
+t128_patch 300
+sleep 60   # chunk 1's 1.2 MiB delta folds on the surviving holders
+T128_FOLDED=$(cat "$LOG"/t128_server*.log | grep -ac "Fold committed: file $T128_FID chunk_idx 1 " || true)
+fusermount -u "$T128_MNT" 2>/dev/null || true
+kill_client_and_wait "$T128_CPID"
+# In the soak the old token's copies landed on the slot's live writers, which then built new
+# patches on it. Stop the nodes that never took chunk 1's patches, so the restarted writer's
+# delta heal goes to the slot's current holders, but keep 3 of 5 up: without a majority there
+# is no leader, and without ordered writes every fsync then waits on it and fails (EIO).
+T128_IDLE=""; T128_UP=$(echo $T128_WRITERS | wc -w)
+for n in 1 2 3 4 5; do
+    [ "$n" = "$T128_VICTIM" ] && continue
+    grep -aq "MERGE-TRACE\] file=$T128_FID chunk_idx=1 " "$LOG/t128_server$n.log" 2>/dev/null && continue
+    if [ "$T128_UP" -lt 3 ]; then T128_UP=$((T128_UP + 1)); else T128_IDLE="$T128_IDLE $n"; fi
+done
+for n in $T128_IDLE; do pkill -9 -f "dfs-server start --config $T128_DIR/node$n/config.toml" 2>/dev/null || true; done
+T128_CLUSTER=""; for n in 1 2 3 4 5; do case " $T128_IDLE " in *" $n "*) ;; *) T128_CLUSTER="$T128_CLUSTER${T128_CLUSTER:+,}127.0.0.1:$((8989 + n))";; esac; done
+[ -n "$T128_VICTIM" ] && t128_start "$T128_VICTIM"
+# The victim's resumed slot is a takeover after 3x idle (60 s), then its debounce tick: allow 150 s.
+sleep 150
+T128_RESUMED=$(grep -ac "patch_state resume sweep: found" "$LOG/t128_server${T128_VICTIM:-0}.log" 2>/dev/null || true)
+T128_STALE=0
+[ -n "$T128_OLD" ] && T128_STALE=$(cat "$LOG"/t128_server*.log | grep -ac "DELTA HEAL: file $T128_FID chunk 1: holding $T128_OLD" || true)
+# Read right away, as the soak's qcow2 reader did seconds after the old token's copy landed.
+T128_M_NOW=$(md5sum < "$T/t128.bin" | cut -d' ' -f1)
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T128_MNT" --cluster "$T128_CLUSTER" \
+    --log-file "$LOG/t128_client_mid.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T128_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T128_MNT" && break; sleep 0.1; done
+T128_M_MID=$(timeout 90 md5sum < "$T128_MNT/$T128_FILE" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T128_MNT" 2>/dev/null || true
+kill_client_and_wait "$T128_CPID"
+[ "$T128_M_MID" = "$T128_M_NOW" ] \
+    && check "T128c a cold client reads the newest bytes right after the restarted writer's delta heal" PASS \
+    || check "T128c cold read ${T128_M_MID:-unreadable} vs expected $T128_M_NOW right after the delta heal: an older version served" FAIL
+# Writing on, as the soak's qcow2 did: small patches, then enough to fold, on whatever the
+# holders now take as the slot's state.
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T128_MNT" --cluster "$T128_CLUSTER" \
+    --log-file "$LOG/t128_client2.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T128_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T128_MNT" && break; sleep 0.1; done
+T128_WERR=""
+t128_patch 5 2>"$T/t128.err" || T128_WERR=$(tail -1 "$T/t128.err")
+sleep 30
+[ -z "$T128_WERR" ] && { t128_patch 300 2>"$T/t128.err" || T128_WERR=$(tail -1 "$T/t128.err"); }
+rm -f "$T/t128.err"
+sleep 60
+fusermount -u "$T128_MNT" 2>/dev/null || true
+kill_client_and_wait "$T128_CPID"
+T128_M=$(md5sum < "$T/t128.bin" | cut -d' ' -f1)
+echo "  T128: file ${T128_FID:-?}; writers ${T128_WRITERS:-?}; stopped idle node(s)${T128_IDLE:- none}; killed node${T128_VICTIM:-?} holding ${T128_OLD:0:16}; folds after: $T128_FOLDED; resume sweeps on restart: $T128_RESUMED; stale third copies taken: $T128_STALE"
+env -u DFS_ACTIVE_FOLD_BASE_SECS RUST_LOG=info "$BIN/dfs-client" mount "$T128_MNT" --cluster "$T128_CLUSTER" \
+    --log-file "$LOG/t128_client_fresh.log" --allow-other --log-level debug > /dev/null 2>&1 &
+T128_CPID=$!
+for _ in $(seq 1 100); do mountpoint -q "$T128_MNT" && break; sleep 0.1; done
+T128_M2=$(timeout 90 md5sum < "$T128_MNT/$T128_FILE" 2>/dev/null | cut -d' ' -f1)
+fusermount -u "$T128_MNT" 2>/dev/null || true
+kill_client_and_wait "$T128_CPID"
+{ [ "$(echo $T128_WRITERS | wc -w)" = 2 ] && [ -n "$T128_OLD" ] && [ "$T128_FOLDED" -gt 0 ]; } \
+    || check "T128 setup: want 2 writers, the victim's token and a fold; got writers '${T128_WRITERS}', token '${T128_OLD}', $T128_FOLDED folds" FAIL
+[ "$T128_STALE" = 0 ] \
+    && check "T128a no node took the restarted writer's retired token as a third copy" PASS \
+    || check "T128a $T128_STALE node(s) took the restarted writer's retired token ${T128_OLD:0:16} as a third copy" FAIL
+[ -z "$T128_WERR" ] \
+    && check "T128d every fsynced patch after the restart succeeds" PASS \
+    || check "T128d a patch after the restart failed: $T128_WERR" FAIL
+[ "$T128_M2" = "$T128_M" ] \
+    && check "T128b a cold client reads the newest bytes after the restarted writer's delta heal" PASS \
+    || check "T128b cold read ${T128_M2:-unreadable} vs expected $T128_M: chunk 1 went back to an older version" FAIL
+fi
+for n in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $T128_DIR/node$n/config.toml" 2>/dev/null || true; done
+rm -f "$T/t128.bin"
+fi # should_run T128
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

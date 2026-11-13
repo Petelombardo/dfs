@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// Starts the error a passive third copy gets when its slot already holds a pending token at
+/// least as new (see MetadataStore::refuse_passive_copy_over_newer_in_txn).
+pub const PASSIVE_COPY_REFUSED: &str = "passive copy refused";
+
 // ---------------------------------------------------------------------------
 // Table definitions — each replaces one sled prefix or named tree.
 // Keys carry no prefix since the table name is already the namespace.
@@ -449,6 +453,9 @@ enum MetaWriteOp {
         /// 11-08, meta-committer write_bytes), most of a node's disk writes.
         location_puts: Vec<ChunkLocation>,
         location_deletes: Vec<ChunkId>,
+        /// A third copy of another node's patch (Request::ReplicatePatchDelta), not a patch
+        /// this node built: see put_patch_state_pending_in_txn.
+        passive: bool,
         reply: tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>,
     },
     UpdatePatchStateFolded {
@@ -1097,11 +1104,11 @@ impl MetadataStore {
                 MetaWriteOp::PutPatchStatePending {
                     file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
                     size, written_at, client_write_seq, renamed_from, chunk_seq,
-                    location_puts, location_deletes, reply,
+                    location_puts, location_deletes, passive, reply,
                 } => {
                     let result = Self::put_patch_state_pending_in_txn(
                         &txn, file_id, chunk_idx, &public_token, base_chunk_id,
-                        delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq,
+                        delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq, passive,
                     ).and_then(|(retired, bytes)| {
                         payload_bytes += bytes + Self::patch_locations_in_txn(&txn, &location_puts, &location_deletes)?;
                         Ok(retired)
@@ -3136,7 +3143,7 @@ impl MetadataStore {
         txn.set_durability(self.next_write_durability());
         let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
             &txn, file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
-            size, written_at, client_write_seq, None, None,
+            size, written_at, client_write_seq, None, None, false,
         )?;
         self.commit(txn)?;
         self.note_txn("put_patch_state_pending", payload_bytes);
@@ -3156,8 +3163,21 @@ impl MetadataStore {
         // transaction: a holder pushes its head to a new leader stamped with it, so a
         // patch whose state committed without it had no head to push (step 1, T95[orphan]).
         chunk_seq: Option<u64>,
+        // A third copy of another node's patch (Request::ReplicatePatchDelta): this node did
+        // not build `public_token` from the slot's current token, so it must neither retire a
+        // NEWER pending token nor alias the slot's current token to this one's content.
+        // Checked here, inside the transaction that writes it, because the receiver's own
+        // check ran before the slot's latest patch had committed: G8 soak #19 (Legata
+        // 6bec1f3a), server3 took puck2's 2 h 40 m old token for /vm/q.qcow2 chunk 0 200 ms
+        // after patching the slot itself, and the alias below rewrote the slot's live token
+        // to the old token's base + delta; the next patch built on that, and 1739 qcow2 L2
+        // mappings were gone.
+        passive: bool,
     ) -> Result<(Option<ChunkId>, usize)> {
         let slot_key = format!("{}:{}", file_id, chunk_idx);
+        if passive {
+            Self::refuse_passive_copy_over_newer_in_txn(txn, &slot_key, public_token, client_write_seq)?;
+        }
         if let Some(seq) = chunk_seq {
             let mut seq_table = txn.open_table(CHUNK_SEQ_TABLE)?;
             let current = seq_table.get(slot_key.as_str())?.map(|v| v.value()).unwrap_or(0);
@@ -3182,7 +3202,7 @@ impl MetadataStore {
         {
             let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
             let mut alias_table = txn.open_table(PATCH_STATE_ALIAS_TABLE)?;
-            if let Some(retired) = retired.as_deref().filter(|r| *r != token_key) {
+            if let Some(retired) = retired.as_deref().filter(|r| *r != token_key && !passive) {
                 // The token two patches back, which the retired one aliased, goes now; the
                 // retired one stays readable as this patch's content (PATCH_STATE_ALIAS_TABLE).
                 let older = alias_table.remove(retired)?.map(|v| String::from_utf8_lossy(v.value()).to_string());
@@ -3214,6 +3234,33 @@ impl MetadataStore {
 
     /// A patch's CHUNK_TABLE changes inside its state's transaction (see
     /// MetaWriteOp::PutPatchStatePending::location_puts). Returns the bytes written.
+    /// For a passive third copy (see put_patch_state_pending_in_txn's `passive`): refuse when
+    /// the slot already resolves through a different token that is pending at the same or a
+    /// later client_write_seq, or when the copy has no seq to compare. A slot with no pending
+    /// state here, or an older one, takes the copy.
+    fn refuse_passive_copy_over_newer_in_txn(
+        txn: &redb::WriteTransaction, slot_key: &str, public_token: &ChunkId, client_write_seq: Option<u64>,
+    ) -> Result<()> {
+        let token_key = format!("{}", public_token);
+        let current = txn.open_table(PATCH_STATE_SLOT_TABLE)?.get(slot_key)?
+            .map(|v| String::from_utf8_lossy(v.value()).to_string());
+        let Some(current) = current.filter(|c| *c != token_key) else { return Ok(()) };
+        let state = txn.open_table(PATCH_STATE_TABLE)?.get(current.as_str())?
+            .and_then(|v| bincode::deserialize::<PatchState>(v.value()).ok());
+        if let Some(PatchState::Pending { client_write_seq: have, .. }) = state {
+            let newer = match (have, client_write_seq) {
+                (Some(have), Some(copy)) => have >= copy,
+                (_, None) => true,
+                (None, Some(_)) => false,
+            };
+            if newer {
+                anyhow::bail!("{}: slot {} is pending at {} (seq {:?}), not older than the copy {} (seq {:?})",
+                    PASSIVE_COPY_REFUSED, slot_key, current, have, public_token, client_write_seq);
+            }
+        }
+        Ok(())
+    }
+
     fn patch_locations_in_txn(txn: &redb::WriteTransaction, puts: &[ChunkLocation], deletes: &[ChunkId]) -> Result<usize> {
         if puts.is_empty() && deletes.is_empty() {
             return Ok(0);
@@ -3244,7 +3291,7 @@ impl MetadataStore {
         chunk_seq: Option<u64>,
     ) -> Result<Option<ChunkId>> {
         self.put_patch_state_pending_with_locations_async(file_id, chunk_idx, public_token, base_chunk_id,
-            delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq, Vec::new(), Vec::new()).await
+            delta_chunk_id, size, written_at, client_write_seq, renamed_from, chunk_seq, Vec::new(), Vec::new(), false).await
     }
 
     /// put_patch_state_pending_async plus the patch's CHUNK_TABLE changes, in one commit.
@@ -3254,6 +3301,7 @@ impl MetadataStore {
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
         written_at: u64, client_write_seq: Option<u64>, renamed_from: Option<ChunkId>,
         chunk_seq: Option<u64>, location_puts: Vec<ChunkLocation>, location_deletes: Vec<ChunkId>,
+        passive: bool,
     ) -> Result<Option<ChunkId>> {
         if !Self::group_commit_enabled() {
             let store = Arc::clone(self);
@@ -3263,7 +3311,7 @@ impl MetadataStore {
                 txn.set_durability(store.next_write_durability());
                 let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
                     &txn, file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id,
-                    size, written_at, client_write_seq, renamed_from, chunk_seq,
+                    size, written_at, client_write_seq, renamed_from, chunk_seq, passive,
                 )?;
                 Self::patch_locations_in_txn(&txn, &location_puts, &location_deletes)?;
                 store.commit(txn)?;
@@ -3275,7 +3323,7 @@ impl MetadataStore {
         self.committer_tx().send(MetaWriteOp::PutPatchStatePending {
             file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
             size, written_at, client_write_seq, renamed_from, chunk_seq,
-            location_puts, location_deletes, reply,
+            location_puts, location_deletes, passive, reply,
         }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
         rx.await.context("metadata group-commit thread dropped its reply")?
     }
@@ -7752,6 +7800,43 @@ mod tests {
         store.delete_patch_state_abandoned(&b, file_id, 1).unwrap();
         assert!(store.get_patch_state(&b).unwrap().is_none());
         assert!(store.get_patch_state(&a).unwrap().is_none(), "abandoning a token drops its alias");
+    }
+
+    /// Legata 6bec1f3a (G8 soak #19): a passive third copy of an OLD token, committed after
+    /// the slot's newer patch, must be refused in the commit itself and leave the newer
+    /// token's row as it was; a copy newer than what the slot holds is taken, but it never
+    /// aliases the slot's previous token to its own content.
+    #[test]
+    fn a_passive_copy_never_overwrites_a_newer_pending_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let file_id = FileId::new();
+        let base = ChunkId::from_hash([1; 32]);
+        let old_base = ChunkId::from_hash([2; 32]);
+        let (live, old, newer) = (ChunkId::from_hash([11; 32]), ChunkId::from_hash([12; 32]), ChunkId::from_hash([13; 32]));
+        let (d_live, d_old, d_newer) = (ChunkId::from_hash([21; 32]), ChunkId::from_hash([22; 32]), ChunkId::from_hash([23; 32]));
+        let passive = |token: &ChunkId, b: ChunkId, d: ChunkId, seq: Option<u64>| -> Result<Option<ChunkId>> {
+            let db = store.db.read();
+            let txn = store.begin_write(&db)?;
+            let (retired, _) = MetadataStore::put_patch_state_pending_in_txn(
+                &txn, file_id, 0, token, b, d, 4096, 1, seq, None, None, true)?;
+            store.commit(txn)?;
+            Ok(retired)
+        };
+        store.put_patch_state_pending(file_id, 0, &live, base, d_live, 4096, 2, Some(287928)).unwrap();
+
+        let err = passive(&old, old_base, d_old, Some(257981)).unwrap_err();
+        assert!(format!("{:#}", err).starts_with(PASSIVE_COPY_REFUSED), "{:#}", err);
+        assert_eq!(pending_delta(&store, &live), Some(d_live), "the live token keeps its own delta");
+        assert!(store.get_patch_state(&old).unwrap().is_none(), "nothing of the refused copy was written");
+        assert_eq!(store.get_patch_state_for_slot(file_id, 0).unwrap().map(|(t, _)| t), Some(live));
+
+        assert!(passive(&old, old_base, d_old, None).is_err(), "a copy with no seq can't be shown to be newer");
+
+        assert_eq!(passive(&newer, base, d_newer, Some(300000)).unwrap(), Some(live));
+        assert_eq!(pending_delta(&store, &live), Some(d_live), "a passive copy aliases nothing");
+        assert_eq!(store.patch_token_alias(&newer).unwrap(), None);
+        assert_eq!(pending_delta(&store, &newer), Some(d_newer));
     }
 
     /// Suite T83: a patch's row is committed before its delta file is renamed; a death in

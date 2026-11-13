@@ -2605,6 +2605,31 @@ fn jittered_debounce_sleep(base: std::time::Duration, active_fold_count: u64, fi
 /// generation, so this normally inserts once and the max guard only matters if the
 /// same id is re-stamped out of order (e.g. a late RCL after a local patch already
 /// recorded it). Shared by `Server` and the fold path's `OverlayForkCtx`.
+/// See Server::slot_has_moved_past (shared with OverlayForkCtx, whose debounce loop asks it).
+fn slot_has_moved_past(
+    chunk_map: &DashMap<FileId, (Vec<ChunkLocation>, u64)>, chunk_generations: &DashMap<ChunkId, u64>,
+    file_id: FileId, chunk_idx: u64, token: ChunkId, token_seq: Option<u64>,
+) -> Option<ChunkId> {
+    let current = {
+        let entry = chunk_map.get(&file_id)?;
+        let (locs, _) = entry.value();
+        locs[Server::chunk_map_find_by_idx(locs, chunk_idx)?].clone()
+    };
+    if current.chunk_id == token {
+        return None;
+    }
+    let gen_of = |c: &ChunkId| chunk_generations.get(c).map(|g| *g);
+    if let (Some(cur), Some(tok)) = (gen_of(&current.chunk_id), gen_of(&token)) {
+        if cur != tok {
+            return (cur > tok).then_some(current.chunk_id);
+        }
+    }
+    match (current.client_write_seq, token_seq) {
+        (Some(cur), Some(tok)) if cur > tok => Some(current.chunk_id),
+        _ => None,
+    }
+}
+
 fn bump_chunk_generation(map: &DashMap<ChunkId, u64>, chunk_id: ChunkId, generation: u64) {
     map.entry(chunk_id)
         .and_modify(|g| { if generation > *g { *g = generation; } })
@@ -5714,6 +5739,33 @@ impl OverlayForkCtx {
                 // reaches every replica by construction and is deliberately
                 // left untouched — this is the backstop path only, so the hot
                 // write path pays nothing.
+                // A pending slot the rest of the cluster has already written past (this node
+                // was down while it moved on, then the resume sweep handed it back its old
+                // token) is not this node's to heal or fold: either would hand that old
+                // version back out. Stop tracking it; its durable row stays, and the next
+                // restart's sweep is answered by this same check.
+                //
+                // Only a resumed slot (not verified: no patch merged onto it since the
+                // restart). A newer generation elsewhere says nothing about ancestry: without
+                // ordered writes two live writers mint SIBLING versions of one parent, and the
+                // lower one holds acked bytes the higher one lacks — dropping it lost them
+                // (suite T128 OFF, 2026-11-13). A slot this process patched goes on as before.
+                if let Some(token) = self.dirty_patch_slots.get(&(file_id, chunk_idx))
+                    .filter(|e| !e.value().verified)
+                    .map(|e| e.value().token)
+                {
+                    let token_seq = match self.metadata.get_patch_state_async(token).await {
+                        Ok(Some(PatchState::Pending { client_write_seq, .. })) => client_write_seq,
+                        _ => None,
+                    };
+                    if let Some(newer) = slot_has_moved_past(&self.chunk_map, &self.chunk_generations, file_id, chunk_idx, token, token_seq) {
+                        warn!("debounce_fold_slot: file {} chunk {}: this node's pending {} (seq {:?}) was \
+                               overtaken by {} — dropping it, neither healed nor folded",
+                            file_id, chunk_idx, token, token_seq, newer);
+                        self.dirty_patch_slots.remove_if(&(file_id, chunk_idx), |_, e| e.token == token);
+                        return;
+                    }
+                }
                 // A small delta isn't worth a fold: it gets a third copy instead, and the slot
                 // waits for more patches (checked before coordinating, which a node that
                 // doesn't own the slot would otherwise re-run every few seconds forever).
@@ -10662,6 +10714,23 @@ impl Server {
         Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
     }
 
+    /// The version this node's chunk map names for the slot, if it is provably LATER than
+    /// `token` (written at `token_seq`): a different chunk with a strictly higher generation,
+    /// or, when either generation is unknown, a strictly higher client_write_seq. An equal
+    /// seq proves nothing (a fold result keeps its token's seq), and no seq on either side
+    /// proves nothing, so this never declines a token it cannot show was overtaken.
+    ///
+    /// Why (Legata 6bec1f3a, G8 soak #19): puck2 was SIGKILLed 13 s after minting a patch
+    /// token for /vm/q.qcow2 chunk 0. Its restart's resume sweep made that token its own
+    /// pending slot again, although the slot had moved ~30k writes on without it, and its
+    /// delta heal sent it to two peers as a "third copy" 2 h 40 m later. The only guards
+    /// asked the slot's PATCH_STATE record, which on a node that has stopped taking the
+    /// slot's patches (or that has none pending) says nothing about the slot's progress;
+    /// the chunk map does.
+    fn slot_has_moved_past(&self, file_id: FileId, chunk_idx: u64, token: ChunkId, token_seq: Option<u64>) -> Option<ChunkId> {
+        slot_has_moved_past(&self.chunk_map, &self.chunk_generations, file_id, chunk_idx, token, token_seq)
+    }
+
     fn merge_replicated_chunk_location(
         location: ChunkLocation,
         existing: Option<ChunkLocation>,
@@ -10774,6 +10843,21 @@ impl Server {
 
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>, generation: Option<u64>) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?}, generation {:?})", location.chunk_id, location.nodes, generation);
+
+        // A patch token the slot has already moved past is declined before its generation is
+        // recorded: nothing about it should feed the slot's arbitration (G8 soak #19, Legata
+        // 6bec1f3a: after one such broadcast, server4 and puck1 ranked chunk 0's current
+        // version under the old token's epoch-11 generation while the slot was in epoch 12).
+        if location.chunk_id.looks_like_patch_token() {
+            if let (Some(fid), Some(offset)) = (file_id.or(location.file_id), location.file_offset) {
+                let chunk_idx = offset / self.chunker.chunk_size() as u64;
+                if let Some(newer) = self.slot_has_moved_past(fid, chunk_idx, location.chunk_id, location.client_write_seq) {
+                    debug!("Declining ChunkLocation for overtaken patch token {} (file {} chunk_idx {}, seq {:?}): \
+                            the slot already names {}", location.chunk_id, fid, chunk_idx, location.client_write_seq, newer);
+                    return Response::Ok { data: None };
+                }
+            }
+        }
 
         // Fix S: record the incoming chunk's per-slot generation BEFORE any chunk_map
         // arbitration below, so `location_supersedes` (which reads chunk_generations)
@@ -13206,6 +13290,11 @@ impl Server {
         if self.dirty_patch_slots.contains_key(&(file_id, chunk_idx)) {
             return refuse(format!("this node writes file {} chunk {} itself", file_id, chunk_idx));
         }
+        // Holding an overtaken version as the slot's pending state would make this node serve
+        // and build on it (see slot_has_moved_past).
+        if let Some(newer) = self.slot_has_moved_past(file_id, chunk_idx, public_token, client_write_seq) {
+            return refuse(format!("file {} chunk {} has moved past {} to {}", file_id, chunk_idx, public_token, newer));
+        }
         if let Ok(Some((_, PatchState::Pending { client_write_seq: Some(have), .. }))) =
             self.metadata.get_patch_state_for_slot_async(file_id, chunk_idx).await
         {
@@ -13248,7 +13337,7 @@ impl Server {
         };
         match self.metadata.put_patch_state_pending_with_locations_async(
             file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id, size as usize, written_at,
-            client_write_seq, None, None, vec![loc], Vec::new(),
+            client_write_seq, None, None, vec![loc], Vec::new(), true,
         ).await {
             Ok(retired) => {
                 if let Some(retired) = retired {
@@ -13259,6 +13348,8 @@ impl Server {
                     file_id, chunk_idx, public_token, base_chunk_id, delta_len);
                 Response::Ok { data: None }
             }
+            // The slot already holds a pending token at least as new (checked in the commit).
+            Err(e) if format!("{:#}", e).starts_with(crate::metadata::PASSIVE_COPY_REFUSED) => refuse(format!("{:#}", e)),
             Err(e) => Response::Error { message: format!("recording {} failed: {:#}", public_token, e), code: Self::storage_failure_code(&e) },
         }
     }
@@ -17776,7 +17867,7 @@ impl Server {
                 let t = std::time::Instant::now();
                 let retired = self.metadata.put_patch_state_pending_with_locations_async(
                     file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq, renamed_from, chunk_seq,
-                    location_puts, location_deletes,
+                    location_puts, location_deletes, false,
                 ).await.map_err(|e| (format!("Failed to record patch state: {:#}", e), Self::storage_failure_code(&e)));
                 (retired, t.elapsed())
             }

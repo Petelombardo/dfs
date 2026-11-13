@@ -5406,6 +5406,16 @@ impl OverlayForkCtx {
         if !location.nodes.contains(&me) {
             location.nodes.push(me);
         }
+        // The record pull_chunk_from_peers just wrote carries no file offset. Sent to the
+        // leader as it was, it replaced the slot's entry with an unplaceable one: readers then
+        // filed it under chunk 0, the file's map lost the chunk, and a writer that trusted that
+        // map sent zeros over its real bytes (soak #20 2026-11-13, q.qcow2 chunk 179).
+        if location.file_offset.is_none() {
+            location.file_offset = Some(chunk_idx * CHUNK_SIZE);
+        }
+        if location.file_id.is_none() {
+            location.file_id = Some(file_id);
+        }
         if let Err(e) = self.metadata.put_chunk_location_async(location.clone()).await {
             warn!("adopt_fold_result: failed to persist location for {}: {}", real, e);
         }
@@ -7515,9 +7525,19 @@ impl Server {
         // No file_offset (legacy path only — every real write carries one, so this is
         // never the hot path): chunk_idx position can't be determined, so fall back to
         // matching by exact chunk_id before giving up and appending a new entry.
+        // The same chunk_id is the same bytes at the same place, so only its holders can be news.
+        // Taking the incoming record whole wiped the entry's file_offset and client_write_seq,
+        // and the slot became unplaceable: soak #20 2026-11-13, q.qcow2 chunk 179, where a
+        // fold result's offset-less holder record reached the leader. Readers filed it under
+        // chunk 0, the map lost chunk 179, and a writer sent zeros over its real bytes.
         for loc in locs.iter_mut() {
             if loc.chunk_id == location.chunk_id {
-                *loc = location.clone();
+                let mut merged = location.clone();
+                merged.file_offset = loc.file_offset;
+                merged.client_write_seq = merged.client_write_seq.or(loc.client_write_seq);
+                merged.written_at = merged.written_at.or(loc.written_at);
+                merged.file_id = merged.file_id.or(loc.file_id);
+                *loc = merged;
                 chunk_to_file.insert(location.chunk_id, file_id);
                 return SlotMergeOutcome::Applied { current: location.chunk_id };
             }
@@ -23876,6 +23896,37 @@ mod tests {
         assert_eq!(chunk_to_file.get(&newest.chunk_id).map(|e| *e.value()), Some(file_id));
         assert!(chunk_to_file.get(&old.chunk_id).is_none(), "superseded chunk_id must not remain in chunk_to_file");
         assert!(chunk_to_file.get(&middle.chunk_id).is_none(), "superseded chunk_id must not remain in chunk_to_file");
+    }
+
+    /// Soak #20 2026-11-13 (q.qcow2 chunk 179): a fold result's holder record with no file
+    /// offset (adopt_fold_result, from pull_chunk_from_peers' record) reached the leader for a
+    /// chunk_id the file's map already held at its slot. It must add the holder and leave the
+    /// entry placed: taken whole, the entry lost its offset and seq, readers filed it under
+    /// chunk 0, and the map no longer had the slot.
+    #[test]
+    fn an_offset_less_record_for_a_placed_chunk_adds_its_holder_and_keeps_it_placed() {
+        let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+        let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+        let fold_ids: Arc<dashmap::DashSet<ChunkId>> = Arc::new(dashmap::DashSet::new());
+        let file_id = dfs_common::FileId::new();
+        let (a, b) = (dfs_common::NodeId::new(), dfs_common::NodeId::new());
+        let off = 179 * 4 * 1024 * 1024u64;
+        let hash = compute_chunk_hash(b"fold-result-179");
+        let placed = ChunkLocation {
+            chunk_id: ChunkId::from_hash(hash), nodes: vec![a], size: 2752512, checksum: hash,
+            file_offset: Some(off), written_at: Some(1000), client_write_seq: Some(48200), file_id: Some(file_id),
+        };
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id, &placed, dfs_common::types::write_quorum(3));
+        let holder = ChunkLocation { nodes: vec![a, b], file_offset: None, client_write_seq: None, file_id: None, ..placed.clone() };
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id, &holder, dfs_common::types::write_quorum(3));
+
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].file_offset, Some(off), "the slot's entry must stay placed at chunk 179");
+        assert_eq!(locs[0].client_write_seq, Some(48200));
+        assert_eq!(locs[0].file_id, Some(file_id));
+        assert_eq!(locs[0].nodes, vec![a, b], "the new holder is the news");
     }
 
     fn recon_loc(offset: u64, seq: u64, written_at: Option<u64>) -> ChunkLocation {

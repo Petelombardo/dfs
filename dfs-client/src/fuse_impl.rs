@@ -2756,7 +2756,13 @@ impl FlushHandle {
         // so we skip MultiPatch (which forces the server to read the old chunk) and use the
         // fresh write path instead — parallel dual-replica write, no server disk read.
         // The old chunk_id is queued for broadcast-delete cleanup afterward.
+        // Not with ordered writes: a slot's primary applies each ordered write onto its own head,
+        // and a plain WriteChunk names no file or slot, so the head never moves past it. The next
+        // patch then lands on the pre-rewrite version and the whole rewrite is gone (suite T130;
+        // soak #20 2026-11-13, q.qcow2 chunk 179). As a patch the rewrite is ordered like any
+        // other write to the slot.
         let is_full_replacement = is_overwrite
+            && !crate::client::DfsClient::ordered_writes_enabled()
             && gap_filled_prefix == 0
             && dirty_ranges.len() == 1
             && dirty_ranges[0].0 == 0
@@ -3652,7 +3658,17 @@ impl FlushHandle {
                 info!("[SIZE TRACE] flush-safety-check ino={} chunk={} no_path_known", ino, chunk_idx);
                 false
             };
-            if fresh_has_chunk {
+            // This session flushed bytes into this chunk itself (flushed_size): they exist
+            // whatever the leader's map says. The leader can lag or lose the slot's entry: soak
+            // #20 2026-11-13, q.qcow2 chunk 179, where a fold's location reached the leader
+            // without its file offset, the lookup above found no chunk 179, and the zero-filled
+            // prefix went out over 2.6 MiB of real data.
+            let session_wrote_chunk = !is_first_flush_this_session && chunk_exists;
+            if session_wrote_chunk && !fresh_has_chunk {
+                warn!("flush_buffer_async_one: ino={} chunk={} fresh-write safety check: the leader lists no chunk here but this session flushed {} bytes into it — refusing to send gap-fill zeros over them",
+                    ino, chunk_idx, existing_chunk_size);
+            }
+            if fresh_has_chunk || session_wrote_chunk {
                 warn!("flush_buffer_async_one: ino={} chunk={} fresh-write safety check: server says this chunk actually has real data (metadata_cache was stale) — refusing to send gap-fill zeros over it; will retry with corrected metadata",
                     ino, chunk_idx);
                 // lock, not try_lock: a release skipped because the shard was busy left the
@@ -3679,6 +3695,28 @@ impl FlushHandle {
                     FlushAttemptRefused(msg).into()
                 });
             }
+        }
+
+        // With ordered writes, a chunk this session already wrote has a live ordered stream: a
+        // plain WriteChunk over it names no slot, the primary's head never moves past it, and
+        // the next patch undoes it (suite T130). Full rewrites go as patches (is_full_replacement
+        // above); one that got here because its patch failed retries the patch path instead.
+        if !has_gaps && chunk_exists && !is_first_flush_this_session && !is_truncated_session
+            && crate::client::DfsClient::ordered_writes_enabled()
+        {
+            warn!("flush_buffer_async_one: ino={} chunk={} ordered slot this session already wrote: not sending it as a plain chunk write; will retry as a patch",
+                ino, chunk_idx);
+            if let Some(shard) = buf.as_ref().and_then(|b| b.chunk_get(chunk_idx)) {
+                let mut cs = shard.lock().await;
+                cs.slot.flushing = false;
+            }
+            self.notify_chunk_flush_complete(ino, chunk_idx).await;
+            let msg = format!("chunk {} is an ordered slot this session already wrote: its write must go through the slot's stream", chunk_idx);
+            return Err(if self.client.cluster_storage_full() {
+                anyhow::anyhow!("{} (every replica's own storage refused the patch: out of space)", msg)
+            } else {
+                FlushAttemptRefused(msg).into()
+            });
         }
 
         // Normal fresh write path (contiguous data, no gaps)

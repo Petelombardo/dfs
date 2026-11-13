@@ -5177,6 +5177,78 @@ fi
 for f in 1 2 3 4 5 6; do rm -f "$MOUNT/t129_$f.log" "$T/t129_$f.log.exp"; done
 fi # should_run T129
 
+# ── Test 130: a chunk rewritten whole in the middle of its ordered stream keeps the rewrite ──
+# Soak #20 2026-11-13 10:03 ET (q.qcow2 chunk 179): the client sent an existing chunk as a
+# whole-chunk WriteChunk, which names no file or slot, so the slot's primary never moved its
+# ordered head. The next append was applied onto the pre-rewrite version and the rewrite was
+# gone (an acked 64 KiB cluster read back as zeros). A full 4 MiB overwrite of an existing
+# chunk takes that same path (is_full_replacement). Each round: patches keep the stream live,
+# chunk 1 is rewritten whole, one 4 KiB patch follows, and a fresh client reads chunk 1.
+snapshot_log T130
+if should_run T130; then
+echo ""
+echo "=== T130: a chunk rewritten whole mid-stream keeps the rewrite after the next patch ==="
+T130_F=t130.img
+python3 - "$MOUNT/$T130_F" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.pwrite(fd, b"A" * (8 << 20), 0); os.fsync(fd); os.close(fd)
+PY
+dfs_sync
+T130_BAD=""
+for r in 1 2 3; do
+    T130_RES=$(python3 - "$MOUNT/$T130_F" "$r" "$T/t130.exp" <<'PY' 2>&1
+import os, sys
+path, r, exp = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+M = 1 << 20; base = 4 * M
+fd = os.open(path, os.O_RDWR)
+for k in range(4):                       # the slot's ordered stream is live
+    os.pwrite(fd, (b"p%d-%d " % (r, k)) * 512, base + k * 64 * 1024); os.fsync(fd)
+whole = (b"W%d" % r) * (2 * M)           # chunk 1 rewritten whole, one write
+os.pwrite(fd, whole[:4 * M], base); os.fsync(fd)
+tail = (b"t%d" % r) * 2048               # then one patch inside it
+os.pwrite(fd, tail, base + M); os.fsync(fd)
+os.close(fd)
+want = bytearray(whole[:4 * M]); want[M:M + len(tail)] = tail
+open(exp, "wb").write(bytes(want)); print("OK")
+PY
+)
+    dfs_sync
+    if [ "$T130_RES" != OK ]; then T130_BAD="$T130_BAD round $r write: $T130_RES;"; continue; fi
+    T130_M=/tmp/dfs-mount-fresh; mkdir -p "$T130_M"
+    RUST_LOG=info "$BIN/dfs-client" mount "$T130_M" --cluster "$CLUSTER" \
+        --log-file "$LOG/client_t130_fresh.log" --allow-other --log-level debug &
+    T130_PID=$!
+    for _ in $(seq 1 50); do mountpoint -q "$T130_M" && break; sleep 0.1; done
+    T130_GOT=$(python3 - "$T130_M/$T130_F" "$T/t130.exp" <<'PY' 2>&1
+import sys
+M = 1 << 20
+want = open(sys.argv[2], "rb").read()
+try:
+    f = open(sys.argv[1], "rb"); f.seek(4 * M); got = f.read(4 * M)
+except OSError as e:
+    print("ERR", e); sys.exit()
+if got == want: print("OK"); sys.exit()
+bad = [i for i in range(0, 4 * M, 65536) if got[i:i + 65536] != want[i:i + 65536]]
+print("%d of 64 clusters differ, first at +%d holds %r" % (len(bad), bad[0], got[bad[0]:bad[0] + 6]))
+PY
+)
+    fusermount -u "$T130_M" 2>/dev/null || true
+    kill_client_and_wait "$T130_PID"
+    [ "$T130_GOT" = OK ] || T130_BAD="$T130_BAD round $r: $T130_GOT;"
+done
+# Required with ordering. Without it the rewrite is lost too (unfixed 3f69b81 fails the same way);
+# the unordered path is not being fixed (Pete 10-13), so OFF runs report it only.
+t130_check() {
+    if [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then check "$1" "$2"
+    else echo "  (informational without DFS_ORDERED_WRITES) $2: $1"; fi
+}
+[ -z "$T130_BAD" ] \
+    && t130_check "T130a a chunk rewritten whole keeps the rewrite after the next patch (3 rounds, fresh client)" PASS \
+    || t130_check "T130a the whole-chunk rewrite was lost:$T130_BAD" FAIL
+rm -f "$MOUNT/$T130_F" "$T/t130.exp"
+fi # should_run T130
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then

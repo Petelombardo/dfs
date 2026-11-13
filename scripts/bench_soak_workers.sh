@@ -88,8 +88,13 @@ PY
         if [ "$1" = OK ]; then echo "$2" > "$SOAK/rec_$i.md5"; log dvr "OK rec_$i written md5 $2"
         else log dvr "FAIL rec_$i: $res"; fi
         # Keep the newest 8 recordings (4 GiB): delete older ones and their md5s.
+        # The md5 goes first: the verify worker reads every recording that has one and skips a
+        # read whose md5 is gone by the time it finishes. Deleting the recording first, verify
+        # read a just-deleted file (EIO) while its md5 was still there and reported it bad
+        # (soak #19 2026-11-12 23:16 ET, rec_1507: deleted 9 ms before the read).
         for old in $(ls "$SOAK"/rec_*.md5 2>/dev/null | sed 's/.*rec_\([0-9]*\).md5/\1/' | sort -n | head -n -8); do
-            rm -f "$MNT/dvr/rec_$old.ts" "$SOAK/rec_$old.md5"
+            rm -f "$SOAK/rec_$old.md5"
+            rm -f "$MNT/dvr/rec_$old.ts"
             echo "$old" >> "$SOAK/deleted.list"
         done
         # A deleted recording must stay deleted (G8 11-01: a leader SIGKILLed during the delete

@@ -16015,6 +16015,32 @@ impl Server {
             }
             m
         };
+        // A truncate to zero ends every ordered stream of the file (chunk_map_update clears the
+        // heads), but only on the nodes that have processed it. A slot's primary builds the next
+        // ordered write on its own head, not on the client's base (handle_ordered_inner), so a
+        // primary that hasn't heard of the truncate yet when the refill's next append reaches it
+        // continues the pre-truncate content: soak #19 2026-11-12 23:10 ET, /dvr/app.log
+        // truncated, refilled by 40 appends, ended 4011 bytes of old + new lines. The ack waits
+        // for every member of the file's slot ISRs, not just any majority (see
+        // replicate_metadata_to_majority).
+        let truncate_fence: Vec<dfs_common::NodeId> = if metadata.size == 0 && metadata.chunk_locations.is_empty() {
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            let idxs: Vec<u64> = self.chunk_map.get(&metadata.id)
+                .map(|e| e.value().0.iter().filter_map(|l| l.file_offset.map(|o| o / CHUNK_SIZE)).collect())
+                .unwrap_or_default();
+            let me = self.cluster.local_node_id();
+            let mut ids: Vec<dfs_common::NodeId> = Vec::new();
+            for isr in idxs.into_iter().filter_map(|i| self.slot_isr.get(metadata.id, i)) {
+                for m in isr.members {
+                    if m != me && !ids.contains(&m) {
+                        ids.push(m);
+                    }
+                }
+            }
+            ids
+        } else {
+            Vec::new()
+        };
         self.chunk_map_update(&metadata).await;
         {
             let chunk_map_after = self.chunk_map.get(&metadata.id)
@@ -16095,7 +16121,7 @@ impl Server {
         // leader that died right after the ack took the file with it (followers hear of a put
         // from the 5 s metadata healer push), and a new leader served ENOENT for a fsynced
         // create (suite T98, T94[immediate]b). Ack once a majority has committed it.
-        if let Err(e) = self.replicate_metadata_to_majority(replicate).await {
+        if let Err(e) = self.replicate_metadata_to_majority(replicate, &truncate_fence).await {
             warn!("[META SERVER] put committed here but not on a majority, failing it: {}", e);
             return Response::Error {
                 message: format!("metadata not committed on a majority: {}", e),
@@ -16113,15 +16139,18 @@ impl Server {
     /// every online follower at once; returns as soon as enough answered (a follower answers
     /// ReplicateMetadataBatch once committed), so one slow or frozen follower doesn't hold the
     /// ack. The rest still get it from the metadata healer's push.
-    async fn replicate_metadata_to_majority(&self, metadata: FileMetadata) -> Result<(), String> {
+    ///
+    /// `fence`: followers that must also have committed it before the ack (a truncate's slot
+    /// ISR members, see handle_put_file_metadata), each up to the same timeout. One that
+    /// doesn't answer in time is down or frozen; its lease runs out before it can order another
+    /// write, so the ack goes out without it (logged) rather than failing the truncate.
+    async fn replicate_metadata_to_majority(&self, metadata: FileMetadata, fence: &[dfs_common::NodeId]) -> Result<(), String> {
         const FOLLOWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
         // DFS_METADATA_MAJORITY_ACK=0 restores the leader-only ack (same-binary A/B bench).
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("DFS_METADATA_MAJORITY_ACK").map(|v| v != "0").unwrap_or(true)) {
-            return Ok(());
-        }
-        let need = self.lease.majority().saturating_sub(1);
-        if need == 0 {
+        let majority_on = *ON.get_or_init(|| std::env::var("DFS_METADATA_MAJORITY_ACK").map(|v| v != "0").unwrap_or(true));
+        let need = if majority_on { self.lease.majority().saturating_sub(1) } else { 0 };
+        if need == 0 && fence.is_empty() {
             return Ok(());
         }
         // Every known member, whatever its status here: membership marks a peer Online only
@@ -16136,10 +16165,10 @@ impl Server {
         const MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
         let local_id = self.cluster.local_node_id();
         let waited = std::time::Instant::now();
-        let followers: Vec<SocketAddr> = loop {
-            let followers: Vec<SocketAddr> = self.cluster.get_all_nodes().await.into_iter()
+        let followers: Vec<(dfs_common::NodeId, SocketAddr)> = loop {
+            let followers: Vec<(dfs_common::NodeId, SocketAddr)> = self.cluster.get_all_nodes().await.into_iter()
                 .filter(|n| n.id != local_id && n.status != dfs_common::NodeStatus::Leaving)
-                .map(|n| n.addr)
+                .map(|n| (n.id, n.addr))
                 .collect();
             if followers.len() >= need {
                 break followers;
@@ -16149,25 +16178,47 @@ impl Server {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         };
+        // Fence members that are followers here (a Leaving one or an unknown id can't be waited on).
+        let mut fence_pending: Vec<dfs_common::NodeId> = fence.iter()
+            .filter(|id| followers.iter().any(|(f, _)| f == *id))
+            .copied()
+            .collect();
         let items = vec![metadata];
-        let mut sends: futures::stream::FuturesUnordered<_> = followers.into_iter().map(|addr| {
-            let req = Request::ReplicateMetadataBatch { items: items.clone() };
+        let deadline = tokio::time::Instant::now() + FOLLOWER_TIMEOUT;
+        let mut sends: futures::stream::FuturesUnordered<_> = followers.into_iter().map(|(id, addr)| {
+            let items = items.clone();
             let client = self.client.clone();
+            // A fence member is sent again after a failed send until the deadline: a dropped
+            // connection must not let the truncate's ack go out without it.
+            let retry = fence_pending.contains(&id);
             async move {
-                match tokio::time::timeout(FOLLOWER_TIMEOUT, client.send_message(addr, Message::Request(req))).await {
-                    Ok(Ok(env)) => matches!(env.message, Message::Response(Response::Ok { .. })),
-                    _ => false,
+                loop {
+                    let req = Request::ReplicateMetadataBatch { items: items.clone() };
+                    let ok = match tokio::time::timeout_at(deadline, client.send_message(addr, Message::Request(req))).await {
+                        Ok(Ok(env)) => matches!(env.message, Message::Response(Response::Ok { .. })),
+                        _ => false,
+                    };
+                    if ok || !retry || tokio::time::Instant::now() + std::time::Duration::from_millis(100) >= deadline {
+                        return (id, ok);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }).collect();
         let mut acked = 0usize;
-        while let Some(ok) = futures::StreamExt::next(&mut sends).await {
+        while let Some((id, ok)) = futures::StreamExt::next(&mut sends).await {
             if ok {
                 acked += 1;
-                if acked >= need {
+                fence_pending.retain(|f| *f != id);
+                if acked >= need && fence_pending.is_empty() {
                     return Ok(());
                 }
             }
+        }
+        if acked >= need {
+            warn!("[META SERVER] truncate of file {} acked without slot ISR member(s) {:?}: no commit from them within {:?}",
+                items[0].id, fence_pending, FOLLOWER_TIMEOUT);
+            return Ok(());
         }
         Err(format!("{} of {} needed follower(s) committed", acked, need))
     }

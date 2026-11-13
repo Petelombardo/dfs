@@ -5106,6 +5106,77 @@ for n in 1 2 3 4 5; do pkill -9 -f "dfs-server start --config $T128_DIR/node$n/c
 rm -f "$T/t128.bin"
 fi # should_run T128
 
+# ── Test 129: a log emptied and refilled by appends keeps only the new lines although the
+# slot's primary hears of the truncate late ─────────────────────────────────────────────────
+# Soak #19 2026-11-12 23:10 ET (/dvr/app.log, 40 shell appends after `: >`): the slot's primary
+# builds an ordered write on its own head, not the client's base, and only the truncate's
+# metadata broadcast clears that head. The leader acked the truncate once any majority had
+# committed it; the primary hadn't, took the refill's appends onto the pre-truncate 2671 bytes
+# and the file came back 4011 bytes of old and new lines. Here the leader can't reach chunk 0's
+# primary for 1.5 s from just before each truncate. Ordering only: unordered writes have no head.
+snapshot_log T129
+if should_run T129 && [ "${DFS_ORDERED_WRITES:-0}" = 1 ]; then
+echo ""
+echo "=== T129: a log emptied and refilled keeps only the new lines while the primary hears of the truncate late ==="
+T129_ALL=127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904
+T129_MAP=$("$BIN/dfs-admin" --cluster "$T129_ALL" lease status 2>/dev/null \
+    | python3 -c "import json,sys; [print(r['node'], r['addr']) for r in map(json.loads, sys.stdin) if 'node' in r]" || true)
+t129_lines() {   # t129_lines <file> <round> <truncate first: 1|0>: 40 appends, each its own open
+python3 - "$MOUNT/$1" "$2" "$3" "$T/$1.exp" <<'PY'
+import os, sys, time
+path, rnd, trunc, exp = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+if trunc:
+    os.close(os.open(path, os.O_WRONLY | os.O_TRUNC))
+    open(exp, "w").close()
+for k in range(1, 41):
+    line = "%s round %s startup line %d: padding to look like a log line\n" % (time.strftime("%T"), rnd, k)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    os.write(fd, line.encode()); os.close(fd)
+    with open(exp, "a") as e: e.write(line)
+PY
+}
+# A file whose chunk 0 primary isn't the leader (the leader clears its own heads in the put).
+T129_FILE=""; T129_P=""; T129_L=""
+for f in 1 2 3 4 5 6; do
+    F=t129_$f.log
+    : > "$T/$F.exp"; t129_lines "$F" 0 0; dfs_sync
+    ISR=""
+    for _ in $(seq 1 20); do
+        ISR=$("$BIN/dfs-admin" --cluster 127.0.0.1:8900 isr get --file "/$F" --chunks 1 2>/dev/null \
+            | python3 -c "import json,sys; r=json.loads(sys.stdin.readline())['isr'][0]; print(r['members'][0] if r else '')" 2>/dev/null || true)
+        [ -n "$ISR" ] && break; sleep 0.5
+    done
+    P=$(echo "$T129_MAP" | awk -v n="$ISR" '$1==n{print $2}')
+    L=""
+    for n in 1 2 3 4 5; do grep -aq "put path=/$F .*is_leader=true" "$LOG/server$n.log" 2>/dev/null && L=127.0.0.1:$((8899 + n)); done
+    if [ -n "$P" ] && [ -n "$L" ] && [ "$P" != "$L" ]; then T129_FILE=$F; T129_P=$P; T129_L=$L; break; fi
+done
+if [ -z "$T129_FILE" ]; then
+    check "T129 setup: a file whose chunk 0 primary isn't the leader (last: primary '$P', leader '$L')" FAIL
+else
+    echo "  T129: /$T129_FILE chunk 0 primary $T129_P, leader $T129_L"
+    T129_BAD=""
+    for r in 1 2 3; do
+        t129_lines "$T129_FILE" "$((r - 1))b" 0; dfs_sync   # the ordered stream is live again
+        "$BIN/dfs-admin" --cluster "$T129_L" fault set --drop-to "$T129_P" >/dev/null 2>&1 || true
+        ( sleep 1.5; "$BIN/dfs-admin" --cluster "$T129_L" fault clear >/dev/null 2>&1 || true ) &
+        T129_HEAL=$!
+        t129_lines "$T129_FILE" "$r" 1
+        wait $T129_HEAL 2>/dev/null || true
+        dfs_sync
+        if ! cmp -s "$T/$T129_FILE.exp" "$MOUNT/$T129_FILE"; then
+            T129_BAD="$T129_BAD round $r: $(diff "$T/$T129_FILE.exp" "$MOUNT/$T129_FILE" | grep -c '^[<>]') line(s) differ, $(stat -c %s "$MOUNT/$T129_FILE") bytes (want $(stat -c %s "$T/$T129_FILE.exp"));"
+        fi
+    done
+    "$BIN/dfs-admin" --cluster "$T129_L" fault clear >/dev/null 2>&1 || true
+    echo "  T129: fenced truncates: $(cat "$LOG"/server*.log | grep -ac 'acked without slot ISR member') acked without an ISR member"
+    [ -z "$T129_BAD" ] \
+        && check "T129a after each truncate the log holds only its 40 new lines" PASS \
+        || check "T129a the refilled log kept pre-truncate bytes:$T129_BAD" FAIL
+fi
+for f in 1 2 3 4 5 6; do rm -f "$MOUNT/t129_$f.log" "$T/t129_$f.log.exp"; done
+fi # should_run T129
+
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
 snapshot_log T2
 if should_run T2; then
